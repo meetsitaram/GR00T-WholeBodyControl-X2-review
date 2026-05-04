@@ -1,0 +1,147 @@
+name: x2_ultra_showcase_v1
+output_key: showcase__v1__hands_only_demo
+fps: 30
+
+# 1.5-2 minute showcase reel. Stand-in-place choreography with NO
+# walking and NO body-penetrating poses (revised v2 2026-05-03 after
+# kinematic preview showed crossed_arms_idle and idle_hands_on_back
+# clipping the X2 Ultra mesh -- those are SMPL-source poses the X2
+# torso/arm-length geometry can't physically execute).
+#
+# Curation criteria for this revision:
+#
+#   * Per-clip leg_std < 0.18 rad and root xy excursion < 0.10 m
+#     (stand-in-place; at most one stabilising step).
+#   * Max |elbow flexion| < 1.5 rad AND no center-line crossing of
+#     the opposing arm (ruling out arms-folded-across-chest and any
+#     pose where one hand reaches across to the opposite shoulder).
+#   * Max f0/fL delta vs the relaxed-arms rest pose < 1.0 rad
+#     (smooth blendable seam through the rest layer).
+#   * Prioritised clips already validated on the iter-16k gestures
+#     run (raise_two_hands_front_high, sweep_to_right,
+#     one_hand_front_gesture, two_hands_swing_curated,
+#     put_down_two_hands_front) plus the §6.7 sim-bench icecream
+#     clip and two new gentle picks from x2_ultra_top15_standing.pkl.
+#
+# Smooth-transition design (carried over from v1):
+#
+#   * rest_frames=75 (2.5 s seam: 1.0 s blend_out -> 0.5 s rest hold
+#     -> 1.0 s blend_in). Drops worst seam elbow speed from
+#     ~12 rad/s (v0) to ~1.2 rad/s (smooth, human-paced).
+#
+# Total wall-time budget: ~102 s (~1 m 42 s).
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75            # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  # ---- Opener: gentle two-hand work, then asymmetric solo ----
+
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: raise_two_hands_front
+    # Validated on the iter-16k gestures run. f-delta 0.28/0.30.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_light_two_hands_front_medium_to_front_high_R_001__A525_M
+    start_frame: 0
+    n_frames: 118                # 3.93 s
+
+  - name: sweep_two_hands_to_right
+    # Validated. Big arc, asymmetric finish. f-delta 0.42/0.30.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_two_hands_front_high_to_right_side_high_R_001__A527_M
+    start_frame: 0
+    n_frames: 171                # 5.70 s
+
+  - name: one_hand_front_gesture
+    # Validated. SMOOTHEST clip in the catalog: f-delta 0.16/0.21.
+    # Asymmetric one-hand emphasis, very expressive.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_one_hand_front_high_to_front_medium_R_001__A525_M
+    start_frame: 0
+    n_frames: 256                # 8.53 s
+
+  # ---- Big overhead drama ----
+
+  - name: overhead_swing_front_to_behind
+    # Two-hands swing front_high -> behind_high (overhead, NOT
+    # behind-the-back). Hands stay above the head throughout, no
+    # mesh penetration. From the curated x2_ultra_top15_standing.
+    # f-delta 0.35/0.38, arm_std=0.71.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__small_light_two_hands_front_high_to_behind_high_R_001__A524
+    start_frame: 0
+    n_frames: 238                # 7.93 s
+
+  - name: step_swing_commit
+    # Validated as `two_hands_swing_curated` in standing_gestures_v1
+    # (the iter-16k run). The actor steps forward into the swing
+    # with a knee bend (R_hip_pitch range = 46 deg, knee max ~20
+    # deg) while swinging two hands front_medium <-> behind_medium.
+    # Operator specifically called this out as a "natural physical
+    # commitment" beat to keep in the showcase. Note: rx=0.31 m
+    # in the kinematic ref (the foot actually advances) so this
+    # contributes ~9 deg of integrated yaw drift -- placed mid-
+    # reel so the eat_icecream / item_give / eat_hotdog narration
+    # block immediately after re-establishes the standing rhythm.
+    source: gear_sonic/data/motions/x2_ultra_two_hands_swing.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: 90                 # 3.00 s (matches standing_gestures_v1's window)
+
+  # ---- Playful interactions: icecream + give + hotdog. Three
+  # distinct hand-to-mouth / hand-extending gestures, each with a
+  # different rhythm. ----
+
+  - name: eat_icecream
+    # The §6.7 sim2sim_ablation bench clip. Sphere-foot policies
+    # saturate the 30 s gate on this. f-delta 0.46/0.46.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__eat_icecream_fall_standing_R_001__A457
+    start_frame: 0
+    n_frames: 454                # 15.13 s -- full clip, sustained playful beat
+
+  - name: item_give
+    # "Here you go" presentation. Validated 2026-05-03 walk run.
+    # f0_delta=1.16 but follows eat_icecream (fL_delta=0.46 ->
+    # rest -> blend in to item_give) so smoothing is fine.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_item_give_R_002__A545_M
+    start_frame: 0
+    n_frames: 69                 # 2.30 s
+
+  - name: eat_hotdog
+    # Second narration-window clip from x2_ultra_top15_standing.
+    # Asymmetric one-hand-to-mouth gesture ("eat hotdog, drop it").
+    # f-delta 0.60/0.42, arm_std=0.99, no mesh penetration.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__eat_hotdog_standing_fail_R_001__A459_M
+    start_frame: 0
+    n_frames: 433                # 14.43 s
+
+  # ---- Finale: wide swing + single-hand emphasis ----
+
+  - name: one_hand_emphasis_replay
+    # Closer hand-gesture for emphasis at the back of the reel.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_one_hand_front_high_to_front_medium_R_001__A525_M
+    start_frame: 0
+    n_frames: 256                # 8.53 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
