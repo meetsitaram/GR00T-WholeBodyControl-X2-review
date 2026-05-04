@@ -1,0 +1,98 @@
+name: x2_ultra_walk_demo_v6
+output_key: walk_demo__v6__home_loop
+fps: 30
+
+# Operator-refined choreography (2026-05-04). v6 closes the loop --
+# the robot returns to its exact starting tile AND original heading:
+#
+#   1. Pivot LEFT 90 deg.        heading 0 -> +90
+#   2. Walk 2 steps forward.     traces edge 1 of a rectangle
+#   3. Stop.
+#   4. Pivot RIGHT 90 deg.       heading +90 -> 0
+#   5. Pivot RIGHT 90 deg.       heading 0 -> -90 (now facing
+#                                 the way that cancels walk 1)
+#   6. Walk 2 steps forward.     undoes the first walk -> back at
+#                                 starting XY tile
+#   7. Stop.
+#   8. Pivot LEFT 90 deg.        heading -90 -> 0 (back to
+#                                 original facing).
+#
+# Two stops total (after each walk). All pivots are clean
+# in-place rotations (knees flat at 6 deg). All walks are
+# straight-line marches with gait-neutral start AND end frames so
+# the cumulative chain math closes cleanly on (0, 0, 0 deg).
+#
+# Building blocks (same as v5):
+#
+#   * pivot_left:  loco__idle_turn_270_003__A149_M  (4.90 s, +90)
+#   * pivot_right: loco__step_rotate_idle_090_002__A026_M  (5.17 s, -90)
+#   * walk_2_steps: loco__neutral_walk_180_R_002__A105[0..66)
+#       2.20 s, ~1.00 m forward, f0 waist_pitch +2 deg,
+#       f66 yaw drift +1.2 deg (gait-neutral end frame).
+#
+# Total reel: ~46 s (8 segments + 7 rest seams of 2.5 s each).
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: walk_3_steps_a
+    # Frames [0..68) of neutral_walk_180_R_002__A105. Operator
+    # feedback 2026-05-04 chose this slice as "3 steps total":
+    # heel-strikes at f24 (L), f44 (R), f68 (R again -- the strike
+    # that completes the visual landing). Both knees return to
+    # +5 / +7 deg at f68, so the swing foot has fully planted.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_walk_180_R_002__A105
+    start_frame: 0
+    n_frames: 68                 # 2.27 s, ~1.05 m forward
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A026_M
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A026_M
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: walk_3_steps_b
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_walk_180_R_002__A105
+    start_frame: 0
+    n_frames: 68                 # 2.27 s, ~1.05 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
