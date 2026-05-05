@@ -67,7 +67,13 @@ instance/
 .scrapy
 
 # Sphinx documentation
-data/
+# data/ is generally untracked (large local datasets), but specific
+# subdirectories are whitelisted below as paper / archive provenance.
+data/*
+# Whitelist: paper provenance archive (sim-to-real anchor recordings,
+# matching plots, and per-anchor SUMMARY docs). Tracked in git so the
+# paper artefacts travel with the repo.
+!data/sim_to_real_anchors/
 
 # PyBuilder
 .pybuilder/

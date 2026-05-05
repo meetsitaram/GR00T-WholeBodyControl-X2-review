@@ -1,0 +1,32 @@
+Sim-to-Real Comparison
+============================================================
+  REAL: iter-22k real (walk_demo_v6)
+        scratch/runs/x2_run_20260504_004150/run.npz
+        CONTROL window: 46.99s (2350 samples)
+        handoff back to MC at wall t = 81.43s
+  SIM:  iter-22k MuJoCo (walk_demo_v6)
+        scratch/runs/sim_anchor_d_20260504_200943/run.npz
+        CONTROL window: 50.02s (2501 samples)
+
+Tracking error RMS (state - cmd), deg:
+     iter-22k real (walk_demo_v6): 13.116
+   iter-22k MuJoCo (walk_demo_v6): 12.949
+
+Sim-to-real diff (over aligned CONTROL window):
+   cmd_pos   real - sim  RMS = 11.510 deg
+   state_pos real - sim  RMS = 5.033 deg
+
+IMU angvel RMS:
+     iter-22k real (walk_demo_v6): 0.4466 rad/s
+   iter-22k MuJoCo (walk_demo_v6): 0.4364 rad/s
+
+Top 8 DoFs by tracking-error gap (real RMS - sim RMS), deg:
+   DoF                                  real      sim   real-sim
+   right_wrist_roll                   23.273   14.689      8.584
+   left_wrist_roll                    28.391   20.991      7.400
+   right_ankle_roll                    6.036   10.925     -4.890
+   left_ankle_roll                     7.913   12.119     -4.206
+   left_hip_roll                       8.079   11.566     -3.488
+   head_yaw                           16.622   20.099     -3.477
+   right_hip_roll                      8.430   11.065     -2.635
+   left_ankle_pitch                   23.337   25.418     -2.080
