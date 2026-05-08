@@ -183,14 +183,6 @@ logs_rl/TRL_G1_Track/<experiment_name>-<timestamp>/
 └── ...
 ```
 
-### Expected training time
-
-| Hardware | Time to 100K iterations |
-|----------|------------------------|
-| 8x L40 | ~5-7 days |
-| 8x A100 | ~3-5 days |
-| 8x H100 | ~2-3 days |
-
 ## Evaluation
 
 ### Visualize reference motions

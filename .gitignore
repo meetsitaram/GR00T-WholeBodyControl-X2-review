@@ -184,6 +184,7 @@ huggingface/
 *.engine
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
+!motionbricks/out/**/*.ckpt
 
 
 # Mujoco
@@ -204,6 +205,7 @@ uv.lock
 .venv_teleop/
 .venv_data_collection/
 .venv_camera/
+.venv_inference/
 
 # XRoboToolkit-PC-Service-Pybind
 xrobotoolkit_sdk.cpython-*-*-*.so
@@ -213,8 +215,10 @@ teleop_vids/
 # Quest 3 TLS certificates (generated locally)
 gear_sonic/utils/teleop/vr/quest3_certs/
 
-# Motion data (large local datasets, not tracked in git)
+# Motion/training data (large local datasets, not tracked in git)
 data/motion_lib_bones_seed
+bones_seed_smpl/
+sonic_release/
 
 # Training output logs
 logs_rl/
