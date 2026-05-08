@@ -67,7 +67,13 @@ instance/
 .scrapy
 
 # Sphinx documentation
-data/
+# data/ is generally untracked (large local datasets), but specific
+# subdirectories are whitelisted below as paper / archive provenance.
+data/*
+# Whitelist: paper provenance archive (sim-to-real anchor recordings,
+# matching plots, and per-anchor SUMMARY docs). Tracked in git so the
+# paper artefacts travel with the repo.
+!data/sim_to_real_anchors/
 
 # PyBuilder
 .pybuilder/
@@ -220,3 +226,28 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+# Agibot X2 (local reference material & notes; not tracked for now)
+agibot-x2-references/
+
+# Personal local dev notes (not tracked)
+vastai-dev-notes.md
+*-dev-notes.md
+
+# X2 deploy: per-run robot logs (binary obs dumps, tick.csv, target_pos.csv,
+# joint_pos.csv etc). Generated under logs/x2/<runtag>/ by deploy_x2.sh and
+# the offline parity tools. They're large (tens of MB per run), regenerated
+# on every smoke test, and only useful in the originating workspace.
+logs/x2/
+
+# Generic per-workstation scratch space used by debugging tools (e.g.
+# obs-dump blobs, ad-hoc captures). Never check in.
+scratch/
+
+# Standalone CMake build dir we use for the offline unit tests in
+# gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/. The colcon build/
+# directory is already covered by the toplevel build/ rule, but
+# build_offline/ is hand-driven by `cmake -B build_offline ...` and won't
+# match it.
+build_offline/
+agibot_x2_embodiment.md

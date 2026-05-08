@@ -16,7 +16,7 @@ import joblib
 import pxr
 
 from gear_sonic.envs.manager_env.mdp import terrain
-from gear_sonic.envs.manager_env.robots import g1, h2
+from gear_sonic.envs.manager_env.robots import g1, h2, x2_ultra
 from gear_sonic.trl.utils import common
 
 
@@ -969,7 +969,16 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = config.get("sim_dt", 0.005)
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        # PhysX GPU narrowphase contact patch buffer. The default 10*2**15
+        # (~327K) overflows on contact-rich URDFs (e.g. x2_ultra_sphere_feet
+        # with 24 spheres/foot) above ~12K envs/GPU — see "Patch buffer
+        # overflow" errors in the bones_seed_sphere_feet-20260501 run, which
+        # peaked at ~511K requested. Bumped to 2**20 (~1M) to give 2x
+        # headroom at 24K envs/GPU on B200; cheap GPU memory (~64 MB).
+        # Override via config if you push past 32K envs/GPU.
+        self.sim.physx.gpu_max_rigid_patch_count = config.get(
+            "gpu_max_rigid_patch_count", 2**20
+        )
 
         # Increase collision stack size for scenes with complex collision meshes (e.g. staircases)
         gpu_collision_stack_size_exp = config.get("gpu_collision_stack_size_exp", 26)
@@ -1006,9 +1015,42 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
                 "action_scale": h2.H2_ACTION_SCALE,
                 "isaaclab_to_mujoco_mapping": h2.H2_ISAACLAB_TO_MUJOCO_MAPPING,
             },
+            "x2_ultra": {
+                "robot_cfg": x2_ultra.X2_ULTRA_CFG,
+                "action_scale": x2_ultra.X2_ULTRA_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": x2_ultra.X2_ULTRA_ISAACLAB_TO_MUJOCO_MAPPING,
+            },
         }
 
         robot_type = config["robot"].get("type", "g1")
+
+        # X2 Ultra opt-in MuJoCo-mirroring overrides (used by the
+        # isaaclab_mujoco_mirror diagnostic; see docs G18). Defaults below
+        # produce X2_ULTRA_CFG bit-for-bit, so existing training is unaffected.
+        if robot_type == "x2_ultra":
+            actuator_regime = config["robot"].get("actuator_regime", "implicit")
+            frictionloss = float(config["robot"].get("frictionloss", 0.0))
+            foot = config["robot"].get("foot", "mesh")
+            ankle_kp_scale = float(config["robot"].get("ankle_kp_scale", 1.0))
+            non_default = (
+                actuator_regime != "implicit"
+                or frictionloss != 0.0
+                or foot != "mesh"
+                or ankle_kp_scale != 1.0
+            )
+            if non_default:
+                print(  # noqa: T201
+                    "[x2_ultra] Building MuJoCo-mirror cfg: "
+                    f"actuator_regime={actuator_regime} frictionloss={frictionloss} "
+                    f"foot={foot} ankle_kp_scale={ankle_kp_scale}"
+                )
+                robot_mapping["x2_ultra"]["robot_cfg"] = x2_ultra.make_x2_ultra_cfg(
+                    actuator_regime=actuator_regime,
+                    frictionloss=frictionloss,
+                    foot=foot,
+                    ankle_kp_scale=ankle_kp_scale,
+                )
+
         self.scene.robot = robot_mapping[robot_type]["robot_cfg"].replace(
             prim_path="{ENV_REGEX_NS}/Robot"
         )

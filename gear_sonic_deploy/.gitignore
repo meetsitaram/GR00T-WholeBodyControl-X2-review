@@ -5,3 +5,13 @@ build/
 target/
 logs/
 *.trt
+
+# colcon-generated workspace dirs (top-level of gear_sonic_deploy)
+install/
+log/
+
+# Sim/viewer output captured during ad-hoc bring-up runs. Useful while
+# debugging a single session but not worth tracking in git.
+docker_x2/*.log
+docker_x2/logs/
+docker_x2/.viewer.pid

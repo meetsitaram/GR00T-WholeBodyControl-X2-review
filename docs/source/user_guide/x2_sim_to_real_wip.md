@@ -1,0 +1,389 @@
+# X2 Ultra Sim-to-Real WIP — Status & Hand-off Notes
+
+**Branch:** `deploy_sim_to_real`
+**Last update:** 2026-05-03
+**Owner:** sitaram
+
+This document is the running notebook for the AgiBot X2 Ultra
+sim-to-real bring-up. It is intentionally written as a hand-off so the
+work can be paused (currently to chase the IsaacLab → MuJoCo sim-sim
+gap) and resumed without re-deriving context.
+
+For the per-shift operator checklist see
+[`x2_first_real_robot.md`](x2_first_real_robot.md). For architecture
+and CLI reference see
+[`../references/x2_deployment_code.md`](../references/x2_deployment_code.md).
+
+---
+
+## TL;DR
+
+- ONNX deploy on a real X2 Ultra is **stable and safe** end-to-end:
+  yaw-anchored reference, IsaacLab-matched action clip, soft-start
+  ramp in, soft-exit ramp out, MC handoff is clean (no red flashing
+  light on the last 4 powered runs of `take_a_sip`).
+- Active-balance behaviour (push-recovery, dynamic motion) is **not yet
+  visible on hardware**. The 16k checkpoint hits the ±20 rad
+  `action_clip` ceiling for >90 % of ticks and the
+  `--max-target-dev 0.30 rad` clamp throttles the resulting commanded
+  delta. Increasing `--max-target-dev` toward IsaacLab's measured peak
+  (~1.30 rad on `take_a_sip`) is the next powered-run task.
+- Work paused here to fix the **IsaacLab vs MuJoCo sim-sim parity
+  gap**. Mismatch in the sim-sim loop is the most likely upstream
+  cause of "policy clips at 20 in IsaacLab too" and "deploy is
+  numerically stable but visually unresponsive".
+- **2026-05-02 update.** Sim-sim parity gap on the C++ deploy side is
+  now closed. Two bridge-level bugs were the dominant residual after
+  G20 / G21:
+  - **G22**: `OnWriter` (500 Hz) was publishing a default-zero
+    `latest_cmd_` the moment the FSM hit `CONTROL`, prematurely
+    cancelling the bridge's pre-handoff freeze and corrupting the
+    first-tick obs by ~15 ms of zero-PD physics evolution.
+  - **G23**: bridge IMU was reading `mj_objectVelocity(local).ang`
+    instead of `qvel[3:6]`, drifting `base_ang_vel` by 0.02 rad/s.
+  After both fixes, `--sim-profile parity` first-tick obs is
+  bit-exact against `eval_x2_mujoco_onnx.py --obs-dump`
+  (`joint_pos_mj` / `joint_vel_mj` / `tokenizer_obs` / `base_ang_vel`
+  all max\|Δ\| = 0.0) and the robot stands cleanly through the 30 s
+  gate. See {doc}`sim2sim_mujoco` G22 / G23 for the full write-up.
+- **2026-05-03 update.** **First powered walk on the real X2 Ultra.**
+  iter-22000 sphere-foot checkpoint tracked the `casual_walk_v1`
+  reference (one out-and-back cycle of `Turn_Start_Walk_0090_003`,
+  ~13.5 s of locomotion + idle anchors) on a one-way rail gantry. Hip
+  yaw tracked at 97 % cmd→state on both legs (±55° foot rotation),
+  waist yaw at 98 %, max tilt 18.8° at the turn apex, no fall, no
+  RAMP_OUT trip, clean MC handoff with **0.20 s `JOINT_DEFAULT` dwell**
+  (down from 1.60 s on the previous gestures run thanks to the
+  persistent-client escalator with `GetMcAction` ground-truth). Full
+  write-up in
+  {doc}`milestones/2026-05-03_first_iter22000_powered_walk`.
+
+---
+
+## What works today
+
+### Code
+
+| Area | File(s) | Status |
+|---|---|---|
+| Yaw-anchor (virtual RSI) | `gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/math_utils.hpp`, `include/reference_motion.hpp`, `src/reference_motion.cpp`, `src/x2_deploy_onnx_ref.cpp` | ✅ Unit-tested (`TestPklMotionYawAnchor`); validated on robot via 81.75° anchor on `take_a_sip` |
+| IsaacLab-parity action clip | `src/x2_deploy_onnx_ref.cpp` (`--action-clip`, default 20.0) | ✅ Mirrors `ManagerEnvWrapper.step` `torch.clip(env_actions, -20, 20)` |
+| Soft-start ramp in | `--ramp-seconds`, `SoftStartRamp` in `safety.hpp` | ✅ Pre-existing |
+| Soft-exit ramp out | `src/x2_deploy_onnx_ref.cpp` `State::RAMP_OUT`, `--return-seconds` (default 2.0s) | ✅ Validated 4× on `take_a_sip`, no red light at MC handoff |
+| Per-joint hard clamp | `--max-target-dev RAD` | ✅ Working but currently throttling policy authority (see Open Issues §1) |
+| Tilt watchdog | `--tilt-cos`, `TiltWatchdog` | ✅ Pre-existing |
+| Obs dump + parity tool | `src/x2_deploy_onnx_ref.cpp` `--obs-dump`, `gear_sonic_deploy/scripts/compare_deploy_vs_isaaclab_obs.py` | ✅ Used to surface the yaw-anchor bug; reusable for any future obs divergence |
+| IsaacLab GT capture | `gear_sonic/scripts/dump_isaaclab_step0.py`, `dump_isaaclab_trajectory.py` | ✅ Single-step + per-tick trajectory dumps; the trajectory script wraps `os._exit` so `eval_agent_trl.py` doesn't drop the data |
+| MuJoCo eval driver | `gear_sonic/scripts/eval_x2_mujoco_onnx.py` | ✅ Mirrors `eval_x2_mujoco.py` but consumes the deployed ONNX directly |
+| MuJoCo ↔ ROS bridge | `gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py` | ✅ Lets the `agi_x2_deploy_onnx_ref` ROS node drive a MuJoCo sim under the same topics it would use on hardware |
+| Pre-flight + monitor | `gear_sonic_deploy/scripts/x2_preflight.py`, `x2_action_monitor.py` | ✅ pre-flight green; monitor has a known cosmetic bug (TODO in file header) |
+| Codegen for policy params | `gear_sonic_deploy/scripts/codegen_x2_policy_parameters.py` | ✅ Regenerates `policy_parameters.hpp` from the run's `config.yaml` |
+| Motion → deploy format | `gear_sonic_deploy/scripts/export_motion_for_deploy.py` (`.pkl` → `.x2m2`) | ✅ Used for `idle_stand`, `take_a_sip` |
+
+### Build & test
+
+- `colcon build --packages-select agi_x2_deploy_onnx_ref` — green inside
+  the `docker_x2` container.
+- Offline unit suite — green:
+  ```
+  TestQuatMath
+  TestProprioceptionPriming
+  TestProprioceptionTermOrderAndAging
+  TestStandStillTokenizerSize
+  TestPklMotionYawAnchor
+  ```
+
+### On-robot validation
+
+| Date | Motion | Duration | Outcome |
+|---|---|---|---|
+| 2026-04-22 | `idle_stand` | 1 s, 2 s, 5 s | All clean. `--max-target-dev 0.03` saturates but no danger. |
+| 2026-04-22 | `take_a_sip` | 5 s, `--max-target-dev 0.30` | Clean run. Original red-light incident at MC handoff — root cause: no return-to-default ramp. |
+| 2026-04-27 | `take_a_sip` | 5 s × 4 runs, `--max-target-dev 0.30`, `--return-seconds 2.0` | All clean, no red light, MC happily resumed walking. |
+| 2026-05-02 | `minimal_v1` | 5 s, iter-4000 sphere-foot, `--max-target-dev 0.30` | First powered run after closing the C++ sim-to-sim gap. Rock-solid stand, 0 action-clip events. See {doc}`milestones/2026-05-02_first_iter4000_powered_run`. |
+| 2026-05-02 | `standing_gestures_v1` | 22 s, iter-{4k,10k,16k}, `expressive` preset (`--max-target-dev 1.80 --target-lpf-hz 5.0`) | Visibly fuller arm motion than `conservative`. Recorder + tuning toolchain landed alongside. See {doc}`milestones/2026-05-02_post_deploy_tuning`. |
+| 2026-05-03 | `casual_walk_v1` | 14 s, iter-22000 sphere-foot, `expressive` + `--max-target-dev 1.50 --target-lpf-hz 5.0` | **First powered walk.** Out-and-back cycle with 180° turn at the apex on a one-way rail gantry. Hip-yaw tracking 97 %, waist-yaw 98 %, max tilt 18.8°, no fall. MC handoff `JOINT_DEFAULT` dwell 0.20 s (8× shorter than gestures run). See {doc}`milestones/2026-05-03_first_iter22000_powered_walk`. |
+
+---
+
+## Open issues / known gaps
+
+### 1. Policy authority is gated by `--max-target-dev`
+
+The 16k checkpoint emits `|action_il|` up to ~33 rad per tick during
+`take_a_sip` and the IsaacLab-parity clamp truncates to ±20. Even with
+the trained `x2_action_scale[i]`, this can produce target-pos
+deltas of O(0.5–1.3 rad) per joint. Today we run with
+`--max-target-dev 0.30` for safety, which rejects ≥50 % of those
+commands. Next powered run should follow the documented ladder:
+
+```
+0.30  (current; pre-flight pose check)
+0.50  (mid-range; expect visible arm motion on take_a_sip)
+1.00  (close to IsaacLab P95)
+1.50  (≥ IsaacLab peak; effectively no clamp on this motion)
+```
+
+Run each step at least twice with `--return-seconds 2.0` and a `take_a_sip`
+or `eat_hot_dog` motion. Promote to the next step only on a clean
+handoff.
+
+### 2. Robot doesn't react to pushes
+
+Even after the action-clip patch, on-gantry pushes don't trigger
+anything that looks like active balancing. The IsaacLab trajectory dump
+shows the policy *does* react to disturbances in sim. Two suspects:
+
+- **(a)** The deploy still under-reports IMU velocity / contact-related
+  obs vs IsaacLab. Re-run `compare_deploy_vs_isaaclab_obs.py` with the
+  robot held tilted (not just standing) to check. We have only ever
+  diffed the standing-pose dump.
+- **(b)** Sim-sim gap (see next section): if the IsaacLab policy is
+  actually unhealthy and only "looks fine" because IsaacLab has lower
+  effective dynamics, deploy stability won't help.
+
+Don't try to debug (2) further until the sim-sim parity story is
+closed.
+
+### 3. `x2_action_monitor.py` shows `max|step|=0.000`
+
+500 Hz writer ZOH + `.3f` print precision rounds legitimate steps to
+zero. Cosmetic only — `tick.csv` and `target_pos.csv` are still
+correct. There's a TODO comment at the top of
+`gear_sonic_deploy/scripts/x2_action_monitor.py` describing the fix
+(switch to scientific notation or compute over a 50 Hz decimated view).
+
+### 4. Ctrl-C bypasses `RAMP_OUT`
+
+The new `--return-seconds` ramp only fires on `--max-duration`.
+Operator Ctrl-C still calls `rclcpp::shutdown()` immediately because
+the default rclcpp signal handler doesn't know about our state
+machine. Fix: install a custom SIGINT handler that flips
+`state_ -> RAMP_OUT` and lets the executor drain. Low risk, ~30 lines.
+
+### 5. C++ test suite is not wired into colcon
+
+`test_obs_builder` is built standalone via the
+`build_offline/` CMake config. Need to register it as a `gtest` target
+(or even just an `add_executable` test in a colcon `IfBuildingTests`
+block) so `colcon test --packages-select agi_x2_deploy_onnx_ref`
+actually runs it.
+
+### 6. `eval_agent_trl.py` wrap is fragile
+
+`dump_isaaclab_trajectory.py` monkey-patches `os._exit` to flush
+trajectory data because `eval_agent_trl.py` skips Python's `atexit`.
+This is brittle — a future refactor of `eval_agent_trl.py` will silently
+disable the dump. Move the trajectory hook into `eval_agent_trl.py`
+itself behind a `--dump-trajectory` flag.
+
+---
+
+## Suspected root cause (sim-sim gap)
+
+The strongest signal that the current pipeline has an **upstream**
+problem is:
+
+> The IsaacLab `ManagerEnvWrapper` clips actions at ±20 rad during
+> training, and our `take_a_sip` rollout sits **at the clip** for
+> >90 % of ticks. A healthy policy should not be saturated against the
+> training-time safety clamp on the very motion it was trained on.
+
+If MuJoCo sim-sim shows the **same** saturation, the ONNX export or
+observation pipeline is wrong even before deploy. If MuJoCo shows
+healthy actions, the IsaacLab → ONNX export drops something the
+`agi_x2_deploy_onnx_ref` proprioception pipeline depends on.
+
+This is the next thing to chase. Suggested entry points:
+
+1. Run `gear_sonic/scripts/eval_x2_mujoco_onnx.py` on the same 16k
+   checkpoint and dump per-tick `|action|`. Compare against
+   `dump_isaaclab_trajectory.py` output.
+2. Run `gear_sonic_deploy/scripts/compare_isaaclab_vs_mujoco_obs.py`
+   for the standing pose. If observation diff > 1e-3 anywhere, fix it
+   before continuing.
+3. Re-export the ONNX with `gear_sonic_deploy/scripts/reexport_x2_onnx.sh`
+   if a per-step parity test against the live PyTorch policy fails.
+
+---
+
+## Resuming this branch
+
+When sim-sim is sorted:
+
+1. Rebase `deploy_sim_to_real` onto whatever branch landed the
+   sim-sim fixes (likely `x2-deploy` or a sibling).
+2. Re-run the offline parity:
+   ```bash
+   gear_sonic_deploy/scripts/compare_deploy_vs_isaaclab_obs.py \
+     --deploy   logs/x2/obs_dump_idle_yawanchor.bin \
+     --isaaclab /tmp/x2_step0_isaaclab_idle.pt \
+     --rerun-onnx gear_sonic_deploy/models/x2_sonic_16k.onnx
+   ```
+   Expect each named slot ≤ 1e-4 from IsaacLab.
+3. On-robot smoke test ladder (see `x2_first_real_robot.md`).
+4. Walk `--max-target-dev` up the ladder in §1 above.
+5. If push-recovery still doesn't appear, schedule a controlled tilt
+   test and capture `compare_deploy_vs_isaaclab_obs.py` output for the
+   tilted pose (currently we've only ever dumped the standing pose).
+
+---
+
+## Useful commands cheat sheet
+
+### Pre-flight before every powered run
+
+`deploy_x2.sh local` (and `onbot`) now invokes
+`gear_sonic_deploy/scripts/x2_preflight.py` automatically as part of
+Step 1/4, *before* the MC stop. A failing preflight aborts while MC
+is still holding the robot.
+
+Default behaviour (gantry bring-up): all pose / effort violations are
+WARN, not FAIL. Tighten for a floor-stand powered run:
+
+```bash
+./gear_sonic_deploy/deploy_x2.sh local \
+    --preflight-strict \
+    --preflight-args "--imu-tilt-deg 12 --max-effort 10" \
+    ... rest of args ...
+```
+
+Skip entirely (operator override, e.g. you've already run preflight
+manually and want to short-circuit a re-run):
+
+```bash
+./gear_sonic_deploy/deploy_x2.sh local --no-preflight-py ...
+```
+
+### Real-deploy tuning presets (parity-safe)
+
+Real-robot-only post-policy knobs (per-joint clamp, output target LPF) are
+captured in YAML presets under
+`gear_sonic_deploy/configs/real_deploy_tuning/` and loaded via
+`deploy_x2.sh --tuning-config PATH.yaml`. Two presets ship today:
+
+* `conservative.yaml` — first-run validation. Tight `max_target_dev=0.30`,
+  no LPF. Use after a new checkpoint or motion playlist.
+* `expressive.yaml` — `max_target_dev=0.80` + `target_lpf_hz=8`. Use after
+  conservative passes; gives the policy room to track wider arm motions
+  while the EMA filter tames leg/waist jitter from real sensor noise.
+
+**Parity rule.** `--tuning-config` is **rejected in sim mode**. Sim
+profiles (`parity`, `handoff`, `gantry`, `gantry-dangle`) must keep
+talking to the deploy binary with bit-identical CLI flags so
+`compare_deploy_vs_python_obs.py` keeps comparing apples to apples.
+Architecturally, every knob in a preset that *could* affect the
+observation stream lives strictly downstream of the policy: the LPF runs
+**after** `ApplySafetyStack`, and `--obs-dump` returns from `OnControl`
+before the LPF code path is even reached. Adding a knob here that affects
+inputs to the policy must come with an explicit "breaks parity" warning
+in `_schema.yaml`. See
+`gear_sonic_deploy/configs/real_deploy_tuning/README.md` for the full
+contract and the procedure to add a new knob.
+
+```bash
+# Conservative — first powered run with iter-N
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model  ~/x2_cloud_checkpoints/h200-iter-N/model_step_NNN.onnx \
+    --motion ./gear_sonic/data/motions/playlists/minimal_v1.yaml \
+    --autostart-after 5 --max-duration 5 \
+    --tuning-config gear_sonic_deploy/configs/real_deploy_tuning/conservative.yaml \
+    --record
+
+# Expressive — once conservative passes, opens up arm range + LPF
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model  ~/x2_cloud_checkpoints/h200-iter-N/model_step_NNN.onnx \
+    --motion ./gear_sonic/data/motions/playlists/standing_gestures_v1.yaml \
+    --autostart-after 5 --max-duration 22 \
+    --tuning-config gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml \
+    --record
+```
+
+### Powered run — current safest settings
+
+The script auto-relaunches inside the `docker_x2/x2sim` container if invoked
+from a host shell (no `/workspace/sonic`), mounting `$HOME` at `$HOME` so
+all your paths just work. No more manual
+`cd docker_x2 && docker compose run --rm --service-ports x2sim bash -lc ...`
+incantation. Use `--no-docker` to opt out (requires ROS + aimdk_msgs sourced
+on the host).
+
+```bash
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model  ~/x2_cloud_checkpoints/h200-iter-4000-20260501/model_step_004000.onnx \
+    --motion ./gear_sonic/data/motions/playlists/minimal_v1.yaml \
+    --autostart-after 5 --max-duration 5 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
+    --return-seconds 2.0 \
+    --log-dir /tmp/minv1_$(date +%Y%m%d_%H%M%S)
+```
+
+### RAMP_OUT confirmation ladder (3 runs, used 2026-04-27)
+
+Use this exact sequence after any change to the deploy node to verify
+soft-exit + MC handoff still works. All three should print
+``RAMP_OUT (...s return-to-default)`` then ``RAMP_OUT complete``,
+followed by ``[cleanup] MC start_app POSTed.`` with no red flashing
+light when MC restarts. Walk a few steps after each run to confirm MC
+is happy.
+
+```bash
+# Run 1 — repeat of the known-good config (sanity check)
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 5 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm1_$(date +%Y%m%d_%H%M%S)
+
+# Run 2 — longer in CONTROL so the policy ends up further off-default
+#         before RAMP_OUT fires. Stress-tests the lerp distance.
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 8 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm2_$(date +%Y%m%d_%H%M%S)
+
+# Run 3 — slower return ramp to exercise the lerp at a different speed.
+#         3.0 s instead of the default 2.0 s.
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 5 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 --return-seconds 3.0 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm3_$(date +%Y%m%d_%H%M%S)
+```
+
+If any of the three faults, grab the matching
+``logs/x2/takesip_confirm*_/tick.csv`` and check the ``ramp_out`` rows:
+``target_pos`` should converge linearly to ``default_angles`` within
+``return_seconds`` of the ``RAMP_OUT`` warn.
+
+IsaacLab single-step ground truth:
+
+```bash
+python gear_sonic/scripts/dump_isaaclab_step0.py \
+    +checkpoint=$HOME/x2_cloud_checkpoints/run-20260420_083925 \
+    ++dump_path=/tmp/x2_step0_isaaclab_idle.pt
+```
+
+IsaacLab full trajectory (500 steps):
+
+```bash
+python gear_sonic/scripts/dump_isaaclab_trajectory.py \
+    +checkpoint=$HOME/x2_cloud_checkpoints/run-20260420_083925 \
+    ++dump_path=/tmp/x2_traj_takesip.pt \
+    ++max_render_steps=500
+```
+
+Offline unit tests (in container):
+
+```bash
+docker exec docker_x2-x2sim-run-... bash -lc '
+    source /opt/ros/humble/setup.bash &&
+    source /ros2_ws/install/setup.bash &&
+    source /workspace/sonic/gear_sonic_deploy/install/setup.bash &&
+    /workspace/sonic/gear_sonic_deploy/build/agi_x2_deploy_onnx_ref/test_obs_builder
+'
+```

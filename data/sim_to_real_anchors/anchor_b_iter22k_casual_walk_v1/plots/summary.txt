@@ -1,0 +1,32 @@
+Sim-to-Real Comparison
+============================================================
+  REAL: iter-22k real (casual_walk_v1)
+        data/sim_to_real_anchors/anchor_b_iter22k_casual_walk_v1/real.npz
+        CONTROL window: 14.03s (702 samples)
+        handoff back to MC at wall t = 34.01s
+  SIM:  iter-22k MuJoCo (casual_walk_v1)
+        data/sim_to_real_anchors/anchor_b_iter22k_casual_walk_v1/sim.npz
+        CONTROL window: 14.02s (702 samples)
+
+Tracking error RMS (state - cmd), deg:
+   iter-22k real (casual_walk_v1): 14.988
+   iter-22k MuJoCo (casual_walk_v1): 15.343
+
+Sim-to-real diff (over aligned CONTROL window):
+   cmd_pos   real - sim  RMS = 14.976 deg
+   state_pos real - sim  RMS = 7.267 deg
+
+IMU angvel RMS:
+   iter-22k real (casual_walk_v1): 1.0265 rad/s
+   iter-22k MuJoCo (casual_walk_v1): 1.0242 rad/s
+
+Top 8 DoFs by tracking-error gap (real RMS - sim RMS), deg:
+   DoF                                  real      sim   real-sim
+   right_ankle_roll                   13.103   21.158     -8.055
+   waist_roll                         32.343   37.217     -4.874
+   left_ankle_pitch                   36.812   32.623      4.190
+   left_ankle_roll                    17.407   21.355     -3.948
+   right_ankle_pitch                  40.163   37.922      2.241
+   left_wrist_yaw                      2.750    3.853     -1.102
+   left_shoulder_yaw                   3.115    4.133     -1.017
+   left_hip_yaw                        8.105    9.049     -0.944

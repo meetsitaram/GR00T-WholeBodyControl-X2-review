@@ -1,0 +1,45 @@
+# @package _global_
+# SONIC X2 Ultra — BONES-SEED training with the 24-sphere foot collider.
+#
+# Same training stack as ``sonic_x2_ultra_bones_seed`` (BONES-SEED motion
+# library, full reward + termination + DR composition). The only delta is
+# ``manager_env.config.robot.foot=sphere``, which routes the env spawn
+# through ``make_x2_ultra_cfg(foot="sphere")`` in
+# ``gear_sonic/envs/manager_env/robots/x2_ultra.py`` and loads
+# ``x2_ultra_sphere_feet.urdf`` instead of the default mesh foot.
+#
+# Motivation: G18 of ``docs/source/user_guide/sim2sim_mujoco.md`` showed
+# that the trained-on-mesh policy collapses the moment IsaacLab is moved
+# to the 24-sphere foot collider that MuJoCo deploys against (progress
+# 0.49, terminations 0.67 at the 16k checkpoint vs 1.00 / 0.00 with
+# mesh feet). Training the policy on the same sphere geometry it will
+# face at deploy time is the open-work-#1 fix.
+#
+# Recommended launch modes (see docs/source/user_guide/train-on-cloud.md):
+#
+#   # (a) Fine-tune from the existing mesh-trained 16k checkpoint
+#   #     (cheapest first cut, ~hours):
+#   accelerate launch ... \
+#     +exp=manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet \
+#     +checkpoint=$HOME/x2_cloud_checkpoints/run-20260420_083925/model_step_016000.pt \
+#     ++algo.config.num_learning_iterations=4000
+#
+#   # (b) Train from scratch on spheres (full 20-30k iters):
+#   accelerate launch ... \
+#     +exp=manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet
+#
+# Bundle additions (over and above the BONES-SEED bundle):
+#   - gear_sonic/data/assets/robot_description/urdf/x2_ultra/x2_ultra_sphere_feet.urdf
+#   - this file (sonic_x2_ultra_bones_seed_sphere_feet.yaml)
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed
+  - _self_
+
+exp_var: bones_seed_sphere_feet
+project_name: TRL_X2Ultra_BonesSeed_SphereFeet
+
+manager_env:
+  config:
+    robot:
+      foot: sphere

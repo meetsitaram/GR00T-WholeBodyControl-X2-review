@@ -133,19 +133,21 @@ class ImEvalCallback(TrainerCallback):
             metrics_eval = self.evaluate_policy()
 
     def save_metrics_eval(self, metrics_eval):
+        def _coerce(v):
+            # numpy scalars (np.float32 etc.) and arrays both need a hop
+            # through Python primitives before json.dump will accept them.
+            if isinstance(v, np.ndarray):
+                return v.tolist()
+            if isinstance(v, np.generic):
+                return v.item()
+            return v
+
         metrics_json = {}
         for k, v in metrics_eval.items():
             if k in ["eval/all_metrics_dict", "eval/failed_metrics_dict"]:
-                metrics_json[k] = {}
-                for kk, vv in v.items():
-                    if isinstance(vv, np.ndarray):
-                        metrics_json[k][kk] = vv.tolist()
-                    else:
-                        metrics_json[k][kk] = vv
-            elif isinstance(v, np.ndarray):
-                metrics_json[k] = v.tolist()
+                metrics_json[k] = {kk: _coerce(vv) for kk, vv in v.items()}
             else:
-                metrics_json[k] = v
+                metrics_json[k] = _coerce(v)
 
         os.makedirs(self.output_dir, exist_ok=True)
         with open(os.path.join(self.output_dir, "metrics_eval.json"), "w") as f:
@@ -594,20 +596,42 @@ class ImEvalCallback(TrainerCallback):
                     g[:, other_upper_bodies_indices, :] for g in self.gt_pos_all
                 ]
 
-                # Lazy import to avoid cffi version conflict with IsaacSim
-                from smpl_sim.smpllib.smpl_eval import compute_metrics_lite
+                # Lazy import to avoid cffi version conflict with IsaacSim.
+                # smpl_sim is optional: if it's not installed the MPJPE-style
+                # body-segment metrics are skipped, but `terminated` and
+                # `progress` per motion are still produced. This is what the
+                # isaaclab_mujoco_mirror diagnostic relies on (see G18 in
+                # docs/source/user_guide/sim2sim_mujoco.md).
+                try:
+                    from smpl_sim.smpllib.smpl_eval import compute_metrics_lite
 
-                metrics_all = compute_metrics_lite(
-                    self.pred_pos_all, self.gt_pos_all, concatenate=False
-                )  # list of length N_env
-                metrics_legs = compute_metrics_lite(pred_pos_legs, gt_pos_legs, concatenate=False)
-                metrics_vr_3points = compute_metrics_lite(
-                    pred_pos_vr_3points, gt_pos_vr_3points, concatenate=False
-                )
-                metrics_other_upper_bodies = compute_metrics_lite(
-                    pred_pos_other_upper_bodies, gt_pos_other_upper_bodies, concatenate=False
-                )
-                metrics_foot = compute_metrics_lite(pred_pos_foot, gt_pos_foot, concatenate=False)
+                    metrics_all = compute_metrics_lite(
+                        self.pred_pos_all, self.gt_pos_all, concatenate=False
+                    )  # list of length N_env
+                    metrics_legs = compute_metrics_lite(
+                        pred_pos_legs, gt_pos_legs, concatenate=False
+                    )
+                    metrics_vr_3points = compute_metrics_lite(
+                        pred_pos_vr_3points, gt_pos_vr_3points, concatenate=False
+                    )
+                    metrics_other_upper_bodies = compute_metrics_lite(
+                        pred_pos_other_upper_bodies,
+                        gt_pos_other_upper_bodies,
+                        concatenate=False,
+                    )
+                    metrics_foot = compute_metrics_lite(
+                        pred_pos_foot, gt_pos_foot, concatenate=False
+                    )
+                except ImportError:
+                    print(  # noqa: T201
+                        "[im_eval_callback] smpl_sim not installed - skipping MPJPE "
+                        "metrics. Per-motion progress/terminated still produced."
+                    )
+                    metrics_all = {}
+                    metrics_legs = {}
+                    metrics_vr_3points = {}
+                    metrics_other_upper_bodies = {}
+                    metrics_foot = {}
 
                 # Rename keys for subset metrics
                 metrics_legs = {f"{k}_legs": v for k, v in metrics_legs.items()}

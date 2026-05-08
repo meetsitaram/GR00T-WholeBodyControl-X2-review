@@ -1,0 +1,24 @@
+# Expressive real-deploy tuning preset.
+#
+# Use case: showcase the policy's motion-tracking range on standing
+# playlists (e.g. standing_gestures_v1) once the model+motion combo has
+# already passed `conservative`. Wider per-joint clamp gives the policy
+# room to actually reach the reference's wrist/shoulder envelopes; the 8 Hz
+# output LPF tames the leg/waist jitter caused by noisy real sensor obs
+# (which sim doesn't have).
+#
+# Do NOT start with this preset on a fresh model -- if the policy is going
+# to misbehave, the tighter conservative clamp catches it first.
+description: |
+  Wider arm/wrist range + light output LPF for jitter mitigation. Suitable
+  for stand-in-place gesture playlists after the model has cleared
+  conservative.yaml on the same motion class.
+
+action_clip:    20.0
+max_target_dev:  0.80  # ~46 deg, accommodates ~50 deg wrist sweeps in the
+                       # standing_gestures playlist (arm_std up to 0.44 rad)
+ramp_seconds:    2.0
+return_seconds:  2.0
+tilt_cos:       -0.3
+target_lpf_hz:   8.0   # ~5 Hz effective bandwidth; tames 5-30x cmd jitter
+                       # observed in legs/waist on real-deploy recordings

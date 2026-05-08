@@ -100,6 +100,13 @@ Documentation
    user_guide/training
    user_guide/training_data
    user_guide/new_embodiments
+   user_guide/sim2sim_mujoco
+   user_guide/sim2sim_ablation_study
+   user_guide/train-on-cloud
+   user_guide/training_runs
+   user_guide/compute_scaling_sonic_vs_ours
+   user_guide/gpu_cost_comparison
+   user_guide/ppo_batch_size_explainer
 
 .. toctree::
    :maxdepth: 2
@@ -124,6 +131,10 @@ Documentation
    references/conventions
    references/training_code
    references/deployment_code
+   references/x2_deployment_code
+   user_guide/x2_sonic_deploy_real
+   user_guide/x2_first_real_robot
+   user_guide/x2_sim_to_real_wip
    references/observation_config
    references/motion_reference
    references/planner_onnx
