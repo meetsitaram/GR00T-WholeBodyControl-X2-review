@@ -1,0 +1,48 @@
+name: x2_ultra_minimal_v1
+output_key: minimal__v1__one_hand_tiny
+
+# Sanity-check playlist: anchor + tiny gesture + anchor, ~8 s.
+# Wrapping the gesture in matched-source idle anchors makes the loop
+# boundary smooth -- when the eval script wraps motion_frame % T, it goes
+# from anchor_close[-1] -> anchor_open[0] (the same idle clip), instead of
+# from gesture[-1] -> gesture[0] which is a visible jump.
+#
+# Use to confirm the eval pipeline (PT or ONNX) drives the policy without
+# falling on a known in-distribution standing clip. If this fails, the
+# regression is in the eval script / model / MJCF, not in the stitching
+# logic.
+
+fps: 30
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 20         # 0.67 s; only used at the two seams
+  blend_in_frames: 6
+  blend_out_frames: 6
+
+segments:
+  - name: anchor_open
+    # Idle loop. Same slice used for anchor_close so the wraparound is a
+    # near-no-op (anchor_close[end] ~= anchor_open[start]).
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # 1.0 s
+
+  - name: tiny_one_hand_pick
+    # arm_std = 0.106 rad (~6 deg SD) -- among the gentlest clips in the
+    # corpus. dxy<0.01 m, |dyaw|<0.5 deg, pelvis_z almost flat.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__small_light_one_hand_pick_up_front_medium_R_001__A509_M
+    start_frame: 0
+    n_frames: 140          # 4.67 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # 1.0 s, matches anchor_open

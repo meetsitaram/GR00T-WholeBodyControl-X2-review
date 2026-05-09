@@ -731,10 +731,19 @@ def _build_one_episode(
                 f"({EGO_VIEW_HEIGHT}, {EGO_VIEW_WIDTH}, 3) uint8."
             )
 
+        # body_q is in Pinocchio order; the dataset's
+        # action.commanded_body_q_mj column expects MuJoCo order. The
+        # synthetic smoke episode keeps the body in the default stand
+        # pose so we zero-fill at the canonical 31 DOF -- downstream
+        # tests only care that the column has the right shape and
+        # appears in every frame.
+        commanded_body_q_mj = np.zeros(robot_model.num_joints, dtype=np.float64)
+
         frame_data = {
             "observation.state": observation_state,
             "observation.projected_gravity": projected_gravity,
             "action.motion_token": token_provider(f),
+            "action.commanded_body_q_mj": commanded_body_q_mj,
             "action.left_hand_joints": left_q.copy(),
             "action.right_hand_joints": right_q.copy(),
             "observation.images.ego_view": ego_view,

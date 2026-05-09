@@ -118,6 +118,10 @@ def _build_one_episode(
         # gets a stable target distribution but the pipeline still
         # exercises every action key.
         motion_token = np.zeros(SONIC_MOTION_TOKEN_DIM, dtype=np.float64)
+        # action.commanded_body_q_mj is the *new* authoritative body
+        # command surface. The smoke episode keeps the body in the
+        # default stand pose, so just zero-fill at the canonical 31 DOF.
+        commanded_body_q_mj = np.zeros(num_body, dtype=np.float64)
         action_left_hand = left_hand_q.copy()
         action_right_hand = right_hand_q.copy()
 
@@ -127,6 +131,7 @@ def _build_one_episode(
             "observation.state": observation_state,
             "observation.projected_gravity": projected_gravity,
             "action.motion_token": motion_token,
+            "action.commanded_body_q_mj": commanded_body_q_mj,
             "action.left_hand_joints": action_left_hand,
             "action.right_hand_joints": action_right_hand,
             "observation.images.ego_view": ego_view,

@@ -1,0 +1,87 @@
+name: x2_ultra_walk_demo_v5
+output_key: walk_demo__v5__left_walk_right_walk
+fps: 30
+
+# Operator-refined choreography (2026-05-04). v5 changes from v4:
+#
+#   * Choreography revised to "L turn -> walk 2 steps -> stop ->
+#     R turn -> walk 2 steps -> stop". The right turn cancels the
+#     left turn so the robot ends pointing in its original heading,
+#     but offset by an L-shaped path (~0.84 m forward + ~0.84 m
+#     sideways).
+#
+# Building blocks:
+#
+#   * pivot_left:  loco__idle_turn_270_003__A149_M  (4.90 s, +90 deg)
+#
+#   * walk_2_steps: loco__neutral_walk_180_R_002__A105[0..60)
+#       2.0 s straight-line walk, ~0.84 m forward in -Y body frame.
+#       f0 waist_pitch +2 deg so no pre-walk lean.
+#
+#   * pivot_right: loco__step_rotate_idle_090_002__A026_M  (5.20 s,
+#       -90 deg, peak XY drift 0.14 m, knees flat at 6 deg).
+#
+# Net trajectory (start pointing +X):
+#   (0.0, 0.0,  +0deg) -- anchor open
+#   ( "  ,  ", +90deg) -- after L pivot
+#   (0.0, +0.84,+90deg) -- after walk 1 (now along +Y in world)
+#   ( "  ,  ",  +0deg) -- after R pivot (back to original heading)
+#   (+0.84,+0.84,+0deg) -- after walk 2 (forward in original
+#                           heading from offset position)
+#
+# Hard constraint preserved: no walking while turning.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: walk_2_steps_a
+    # Frames [0..66) of neutral_walk_180_R_002__A105. Begins from
+    # an upright stand pose (waist_pitch +2 deg) and ends at a
+    # gait-neutral pose (yaw drift +1.2 deg) after ~1.0 m of
+    # straight-line travel (2 full steps, ~2.2 s). The end-frame
+    # alignment matters because the walk segment's body-frame yaw
+    # gets absorbed into the chain, so non-zero end yaw makes the
+    # subsequent right pivot fail to cancel the left pivot.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_walk_180_R_002__A105
+    start_frame: 0
+    n_frames: 66                 # 2.20 s, ~1.00 m forward
+
+  - name: pivot_right
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A026_M
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: walk_2_steps_b
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_walk_180_R_002__A105
+    start_frame: 0
+    n_frames: 66                 # 2.20 s, ~1.00 m forward
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

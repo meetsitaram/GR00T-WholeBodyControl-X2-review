@@ -1,0 +1,95 @@
+name: x2_ultra_walk_demo_v2
+output_key: walk_demo__v2__walk_pivot_pivot_walk
+fps: 30
+
+# Operator-requested choreography (2026-05-04):
+#
+#   1. Walk forward (a few steps), stop.
+#   2. Turn 90 deg in place, stop.
+#   3. Turn 90 deg in place again (now facing back, 180 deg total), stop.
+#   4. Walk forward (in the new heading -- this brings the robot back to
+#      its starting tile because the body is now facing the original
+#      origin), stop.
+#
+# Hard constraint: no walking while turning. Each pivot is a true
+# in-place rotation (knees flat at 6 deg, peak XY drift < 0.30 m).
+#
+# Building blocks:
+#
+#   * walk_out: cycle 9 of loco__Turn_Start_Walk_0090_003__A020
+#     trimmed to frames [2639..2774) -- the walk-out half only
+#     (0 m -> 1.37 m, 4.5 s). Source clip doesn't actually contain
+#     a clean stop, so we lean on a 2.0 s rest-layer blend to settle
+#     the mid-stride pose into the relaxed-arms idle.
+#
+#   * pivot_left_1: loco__idle_turn_270_003__A149_M (4.9 s, +90 deg
+#     left turn, peak 0.26 m, knees flat at 6 deg).
+#
+#   * pivot_left_2: loco__step_rotate_idle_090_002__A040 (6.1 s,
+#     +90 deg left turn, peak 0.12 m). Different source clip so the
+#     two pivots don't look like a copy-paste.
+#
+#   * walk_back: same casual-walk-out slice. Because the robot is
+#     now facing the original origin (after two +90 deg turns), the
+#     forward walk lands the robot back at the starting tile.
+#
+# Net trajectory: start (0,0,0deg) -> +1.37m forward (1.37,0,0deg)
+# -> two pivots (1.37,0,180deg) -> walk forward in new heading
+# (0,0,180deg). Robot ends ~at home, facing the operator.
+#
+# Seams use a 2.0 s rest layer (1.0 s blend_out + 1.0 s held rest +
+# 1.0 s blend_in) so the mid-stride -> standing transitions don't
+# look snappy.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam (1.0 s blend_out + 0.5 s held + 1.0 s blend_in)
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: walk_out
+    # First half of cycle 9 (frames 2639..2774). Walks 0 -> 1.37 m
+    # in 4.5 s without any in-cycle yaw turn.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 135                # 4.50 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg left
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A040
+    start_frame: 0
+    n_frames: 183                # 6.10 s, +90 deg left (cumulative 180)
+
+  - name: walk_back
+    # Same forward-walk slice. After the two +90 deg pivots the
+    # robot is facing the original origin, so this segment carries
+    # it home.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 135                # 4.50 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

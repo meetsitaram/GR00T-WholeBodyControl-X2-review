@@ -1,0 +1,84 @@
+name: x2_ultra_walk_demo_v4
+output_key: walk_demo__v4__pivot_pivot_walk_stop
+fps: 30
+
+# Operator-refined choreography (2026-05-04). v4 changes from v3:
+#
+#   1. Reordering: drop the pre-pivot walk. The actor now does
+#      anchor -> pivot left -> pivot left -> walk 2 steps -> stop.
+#      Motivated by operator feedback "left turn followed by another
+#      left and then walk two steps and stop".
+#
+#   2. Lean fix: the walk source is no longer
+#      Neutral_walk_forward_002__A057 (frame 0 has waist_pitch
+#      +11 deg, so the rest-layer blend visibly leaned the robot
+#      forward for ~1 s before any feet moved). Switched to
+#      loco__neutral_walk_180_R_002__A105 which has
+#      waist_pitch +2 deg at f0 (essentially upright) and ramps
+#      into the gait gradually -- the lean now develops as part of
+#      the walking motion rather than as a static settle.
+#
+# Building blocks:
+#
+#   * pivot_left_1: loco__idle_turn_270_003__A149_M
+#       4.9 s, +90 deg pivot in place, knees flat at 6 deg.
+#
+#   * pivot_left_2: loco__step_rotate_idle_090_002__A040
+#       6.1 s, +90 deg pivot from a different source (cumulative
+#       180 deg).
+#
+#   * walk_2_steps: loco__neutral_walk_180_R_002__A105[0..60)
+#       2.0 s straight-line walk, ~0.84 m forward in -Y.
+#       f0 waist_pitch +2 deg so no pre-walk lean.
+#
+# Net trajectory: start (0,0,0deg) -> pivots in place -> ends at
+# (~0,~0,~+180deg) -> walk 0.84 m forward in new heading -> ~0.84 m
+# behind original origin, facing the operator. Robot is well within
+# the gantry rail clearance.
+#
+# Seam math (worst case): 0.022 rad/tick (per v3 bake).
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A040
+    start_frame: 0
+    n_frames: 183                # 6.10 s, +90 deg (cumulative 180)
+
+  - name: walk_2_steps_then_stop
+    # Frames [0..60) of neutral_walk_180_R_002__A105. Begins from
+    # an upright stand pose (waist_pitch +2 deg) and ramps into a
+    # straight-line march along -Y, covering ~0.84 m in 2.0 s.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_walk_180_R_002__A105
+    start_frame: 0
+    n_frames: 60                 # 2.00 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

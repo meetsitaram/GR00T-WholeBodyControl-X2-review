@@ -886,6 +886,40 @@ known v0 limitations (mode-collapsed VLA, ~15 s sim freeze, residual
 
 ---
 
+## 5c. VR teleop dataset capture (Quest 3 → X2)
+
+The full operator runbook lives in its own document:
+**[X2 Dataset Record and Replay](x2_dataset_record_and_replay.md)**.
+
+That doc covers:
+
+* the closed-loop architecture (Quest 3 → DLS IK → SONIC FSQ →
+  ZMQ → C++ deploy → MuJoCo);
+* the `record_x2_dataset.sh` co-launcher and its
+  `--teleop-only` / `--sim-viewer` flags;
+* the Quest 3 controller cheat-sheet (A engage, B start, X save, Y
+  discard);
+* the LeRobot v2.1 schema landed on disk (`observation.state`,
+  `observation.images.ego_view`, `action.motion_token`, …);
+* three replay recipes (parquet inspection, ego_view MP4, and
+  re-publishing saved tokens to a fresh deploy);
+* acceptance tests, troubleshooting, and pointers into the
+  implementation files.
+
+A one-liner for a record session, for context:
+
+```bash
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir /path/to/quest3_dataset_v0 \
+    --task "pick up the red block from the table" \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+For everything else (operator workflow, on-disk schema, replay,
+troubleshooting), see [X2 Dataset Record and Replay](x2_dataset_record_and_replay.md).
+
+---
+
 ## 6. Future Enhancement: X2 Kinematic Planner + Dummy Planner Stop-Gap
 
 > *Decision recorded as part of the v0 plan: VLA streams motion tokens

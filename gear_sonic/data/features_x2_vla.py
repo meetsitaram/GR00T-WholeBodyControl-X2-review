@@ -58,6 +58,34 @@ HAND_DOF_G1_COMPAT: int = 7
 """Per-side hand DOF count when down-projected to the G1 ThreeFinger surface."""
 
 
+# Canonical 31-joint name list in MuJoCo (MJCF) order. Mirrors
+# ``mujoco_joint_names[]`` in
+# ``gear_sonic_deploy/.../include/policy_parameters.hpp``. Used to
+# label the per-scalar names of ``action.commanded_body_q_mj`` in the
+# LeRobot v2.1 features schema. NOTE: this is *not* the same as
+# ``RobotModel.joint_names`` (Pinocchio URDF order); the two orderings
+# differ for the head / arm blocks. ``observation.state`` keeps the
+# Pinocchio order; ``action.commanded_body_q_mj`` keeps the MuJoCo
+# order to match what the C++ deploy actually consumes.
+MUJOCO_JOINT_NAMES: tuple[str, ...] = (
+    "left_hip_pitch_joint",   "left_hip_roll_joint",   "left_hip_yaw_joint",
+    "left_knee_joint",        "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint",  "right_hip_roll_joint",  "right_hip_yaw_joint",
+    "right_knee_joint",       "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint",        "waist_pitch_joint",     "waist_roll_joint",
+    "left_shoulder_pitch_joint",  "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",    "left_elbow_joint",
+    "left_wrist_yaw_joint",       "left_wrist_pitch_joint",
+    "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",   "right_elbow_joint",
+    "right_wrist_yaw_joint",      "right_wrist_pitch_joint",
+    "right_wrist_roll_joint",
+    "head_yaw_joint",             "head_pitch_joint",
+)
+assert len(MUJOCO_JOINT_NAMES) == 31
+
+
 # Body-joint groups exposed to the modality config. Order matters: the
 # groups are projected into ``observation.state`` slices via the
 # RobotModel's joint-group indices, and the trainer attends to *these*
@@ -167,7 +195,21 @@ def get_features_x2_vla(
     robot_model: RobotModel,
     hand_dof_per_side: int = HAND_DOF_OMNI,
 ) -> dict:
-    """Return the LeRobot v2.1 ``features`` dict for the X2 SONIC dataset."""
+    """Return the LeRobot v2.1 ``features`` dict for the X2 SONIC dataset.
+
+    The action surface declares both:
+
+    * ``action.motion_token`` (64-D) -- legacy / v1 surface kept for
+      cross-embodiment compat with ``unitree_g1_sonic``. During live
+      recording (kinematic teleop or SONIC-stabilised teleop) this
+      field is filled with zeros and is meant to be overwritten by an
+      offline labeling pass that runs ``SonicMotionTokenLabeler`` over
+      ``action.commanded_body_q_mj`` (see ``label_recorded_dataset.py``).
+    * ``action.commanded_body_q_mj`` (``num_body``-D, MuJoCo joint
+      ordering) -- the *true* command sent into the C++ deploy /
+      MuJoCo viewer at recording time. This is the authoritative
+      target a learned policy should regress against.
+    """
     body_joint_names = robot_model.joint_names
     num_body = robot_model.num_joints
 
@@ -211,6 +253,11 @@ def get_features_x2_vla(
             "dtype": "float64",
             "shape": (SONIC_MOTION_TOKEN_DIM,),
             "names": [f"motion_token_{i}" for i in range(SONIC_MOTION_TOKEN_DIM)],
+        },
+        "action.commanded_body_q_mj": {
+            "dtype": "float64",
+            "shape": (num_body,),
+            "names": list(MUJOCO_JOINT_NAMES),
         },
         "action.left_hand_joints": {
             "dtype": "float64",
@@ -309,6 +356,7 @@ __all__ = [
     "FPS",
     "HAND_DOF_G1_COMPAT",
     "HAND_DOF_OMNI",
+    "MUJOCO_JOINT_NAMES",
     "SONIC_MOTION_TOKEN_DIM",
     "assemble_observation_state",
     "get_features_x2_vla",

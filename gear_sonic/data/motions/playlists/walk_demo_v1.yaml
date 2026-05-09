@@ -1,0 +1,66 @@
+name: x2_ultra_walk_demo_v1
+output_key: walk_demo__v1__pirouette_then_walk
+fps: 30
+
+# Two-act demo combining the gentle 0045 pirouette (operator picked
+# this in mujoco preview 2026-05-03) with a single validated out-and-
+# back walk cycle from casual_walk_v2.
+#
+#   Act 1 -- pirouette (~10 s):
+#     loco__Turn_Start_Walk_0045_001__A020_M[693..993)
+#     Actor pivots in place through ~225 deg of rotation while
+#     stepping <0.20 m (knees stay flat at 6 deg -- very stable).
+#     Picked the middle of cycle [663..1606) where the rotation
+#     is most legible and the dist drift stays under 0.16 m.
+#
+#   Act 2 -- forward walk + return (~9.4 s):
+#     loco__Turn_Start_Walk_0090_003__A020[2639..2920)
+#     Cycle 9 of the multi-take recording -- the same self-contained
+#     walk-out-and-back that powers casual_walk_v2 (peak 1.37 m, ends
+#     at home within 1 cm).
+#
+# Final rest anchor brings the robot to a neutral stand.
+#
+# Total reel: ~22 s.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 30                # 1.0 s held rest between acts
+  blend_in_frames: 9
+  blend_out_frames: 9
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pirouette_in_place
+    # Frames [663..1143): full 16 s window of the 0045 pirouette
+    # cycle that starts and ends with the actor facing within ~30 deg
+    # of the original heading (raw yaw goes 0 deg -> -140 deg ->
+    # +180 deg -> +28 deg). Picking a shorter slice produces ~125 deg
+    # of net yaw drift since the actor's rotations don't unwind on
+    # smaller windows.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0045_001__A020_M
+    start_frame: 663
+    n_frames: 480                # 16.00 s
+
+  - name: walk_out_and_back
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 281                # 9.37 s, casual_walk_v2 cycle 9
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

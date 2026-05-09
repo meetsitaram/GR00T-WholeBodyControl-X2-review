@@ -172,11 +172,16 @@ class Quest3Reader:
         ws_port: int = 8765,
         http_port: int = 8443,
         use_ssl: bool = True,
+        quiet_periodic: bool = False,
     ):
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.http_port = http_port
         self.use_ssl = use_ssl
+        # When True, suppress the per-100-msg "msgs=N fps=X idle" line.
+        # The first-packet snapshot and one-shot XR / controller / hand
+        # tracking events still log -- those are diagnostic gold.
+        self.quiet_periodic = bool(quiet_periodic)
 
         self._latest: dict | None = None
         self._lock = threading.Lock()
@@ -362,7 +367,7 @@ class Quest3Reader:
             axes = data.get("axes", {})
             print(f"[Quest3Reader]   buttons: {btns}")
             print(f"[Quest3Reader]   axes: {axes}")
-        elif self._msg_count % 100 == 0:
+        elif self._msg_count % 100 == 0 and not self.quiet_periodic:
             btns = data.get("buttons", {})
             axes = data.get("axes", {})
             has_input = any(v for k, v in btns.items() if k in ("a", "b", "x", "y") and v)

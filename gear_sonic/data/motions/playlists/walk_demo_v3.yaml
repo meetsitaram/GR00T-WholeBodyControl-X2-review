@@ -1,0 +1,87 @@
+name: x2_ultra_walk_demo_v3
+output_key: walk_demo__v3__straight_walk_pivot_pivot_walk
+fps: 30
+
+# Operator-requested choreography (2026-05-04), v3 fixes the v2 issue
+# where the walk segment was "walking while turning" (the source clip
+# loco__Turn_Start_Walk_0090_003__A020 has ~80 deg of yaw drift baked
+# into its first 4.5 s).
+#
+# v3 swaps the walking source for the dedicated forward-march clip
+# x2_ultra_walk_forward.pkl::Neutral_walk_forward_002__A057, which
+# travels a clean -Y straight line:
+#
+#   * f0..40 covers 0 m -> ~0.95 m forward in 1.33 s (about 2 steps)
+#   * cumulative yaw stays oscillating around 0 deg (body sway from
+#     the gait, no directional turn)
+#
+# Choreography:
+#   1. Walk straight forward ~0.95 m (no turning), stop.
+#   2. Pivot 90 deg in place, stop.
+#   3. Pivot 90 deg in place again (180 deg total), stop.
+#   4. Walk straight forward (in the new heading) ~0.95 m -- this
+#      brings the robot back near origin facing the operator.
+#
+# Hard constraint preserved: no walking while turning. Walk segments
+# are pure straight-line marches; pivots are clean idle-turn clips
+# with knees flat at 6 deg.
+#
+# Net trajectory: start (0,0,0deg) -> +0.95m forward -> two pivots
+# (still at +0.95m, now facing -original) -> walk forward in new
+# heading -> back near (0,0,180deg).
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: walk_straight_out
+    # Frames [0..40) of the dedicated forward march. Travels ~0.95 m
+    # along -Y in 1.33 s with no directional yaw drift (yaw
+    # oscillates +/-30 deg from gait sway only).
+    source: gear_sonic/data/motions/x2_ultra_walk_forward.pkl
+    motion_key: Neutral_walk_forward_002__A057
+    start_frame: 0
+    n_frames: 40                 # 1.33 s
+
+  - name: pivot_left_1
+    # +90 deg pivot in place, knees flat at 6 deg, peak XY drift 0.26 m.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_turn_270_003__A149_M
+    start_frame: 0
+    n_frames: 147                # 4.90 s
+
+  - name: pivot_left_2
+    # +90 deg pivot from a different source so the two halves don't
+    # look like a copy-paste. Cumulative rotation: 180 deg.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__step_rotate_idle_090_002__A040
+    start_frame: 0
+    n_frames: 183                # 6.10 s
+
+  - name: walk_straight_back
+    # Same straight-march slice. After the two pivots the body is
+    # facing the original origin, so this carries the robot home.
+    source: gear_sonic/data/motions/x2_ultra_walk_forward.pkl
+    motion_key: Neutral_walk_forward_002__A057
+    start_frame: 0
+    n_frames: 40                 # 1.33 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

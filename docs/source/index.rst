@@ -92,6 +92,7 @@ Documentation
    tutorials/manager
    tutorials/vr_wholebody_teleop
    tutorials/data_collection
+   tutorials/x2_dataset_record_and_replay
    tutorials/vla_workflow
    tutorials/vla_training
    tutorials/vla_inference
