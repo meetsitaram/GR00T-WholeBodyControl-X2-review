@@ -48,6 +48,24 @@ if(AGI_X2_OFFLINE_SYNTAX_CHECK)
   message(STATUS "agi_x2_deploy_onnx_ref: OFFLINE syntax-check mode "
                  "(skipping ROS 2 deploy binary)")
 
+  # ZMQ + nlohmann_json find -- only required for the ZMQ helpers, but we
+  # surface them in the offline mode too so the M2 wiring (subscriber /
+  # pose source / debug publisher) can be syntax-checked on a workstation
+  # that doesn't have ROS 2 available. Both are header-only on Debian
+  # (nlohmann_json) or come with a libzmq dev package.
+  find_path(ZMQ_INCLUDE_DIR zmq.hpp
+    PATHS /usr/include /usr/local/include)
+  find_library(ZMQ_LIBRARY zmq
+    PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+  find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+    PATHS /usr/include /usr/local/include)
+  if(NOT ZMQ_INCLUDE_DIR OR NOT ZMQ_LIBRARY OR NOT NLOHMANN_JSON_INCLUDE_DIR)
+    message(WARNING "agi_x2: skipping ZMQ helpers in offline mode (missing zmq/nlohmann_json)")
+    set(AGI_X2_BUILD_ZMQ_HELPERS OFF)
+  else()
+    set(AGI_X2_BUILD_ZMQ_HELPERS ON)
+  endif()
+
   add_library(agi_x2_obs STATIC
     src/proprioception_buffer.cpp
     src/tokenizer_obs.cpp
@@ -56,6 +74,19 @@ if(AGI_X2_OFFLINE_SYNTAX_CHECK)
     ${CMAKE_CURRENT_LIST_DIR}/include)
   target_link_libraries(agi_x2_obs PUBLIC sonic_common)
   target_compile_features(agi_x2_obs PUBLIC cxx_std_20)
+
+  if(AGI_X2_BUILD_ZMQ_HELPERS)
+    add_library(agi_x2_zmq STATIC
+      src/zmq_pose_input_source.cpp)
+    target_include_directories(agi_x2_zmq PUBLIC
+      ${CMAKE_CURRENT_LIST_DIR}/include
+      ${ZMQ_INCLUDE_DIR}
+      ${NLOHMANN_JSON_INCLUDE_DIR})
+    target_link_libraries(agi_x2_zmq PUBLIC
+      sonic_common
+      ${ZMQ_LIBRARY})
+    target_compile_features(agi_x2_zmq PUBLIC cxx_std_20)
+  endif()
 
   enable_testing()
   add_executable(test_obs_builder test/test_obs_builder.cpp)
@@ -71,6 +102,29 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(aimdk_msgs REQUIRED)
+
+# ZMQ (for VLA input + x2_debug PUB output) and nlohmann_json (for the
+# packed-binary header). Both are header-only on the Python side; on
+# Debian/Ubuntu we expect libzmq3-dev + nlohmann-json3-dev. On the X2
+# dev box these are pre-installed by install_x2_deploy_deps.sh.
+find_path(ZMQ_INCLUDE_DIR zmq.hpp
+  PATHS /usr/include /usr/local/include)
+find_library(ZMQ_LIBRARY zmq
+  PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+  PATHS /usr/include /usr/local/include)
+if(NOT ZMQ_INCLUDE_DIR OR NOT ZMQ_LIBRARY)
+  message(FATAL_ERROR
+    "libzmq + cppzmq required for ZMQ VLA / debug helpers.\n"
+    "Install via: apt install libzmq3-dev")
+endif()
+if(NOT NLOHMANN_JSON_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "nlohmann_json required for packed-binary header decoding.\n"
+    "Install via: apt install nlohmann-json3-dev")
+endif()
+message(STATUS "ZMQ: ${ZMQ_LIBRARY} (include ${ZMQ_INCLUDE_DIR})")
+message(STATUS "nlohmann_json: include ${NLOHMANN_JSON_INCLUDE_DIR}")
 
 # ONNX Runtime is not a ROS package; locate it manually. ONNXRUNTIME_ROOT may
 # point at either /opt/onnxruntime (prebuilt tarball layout) or a custom
@@ -106,13 +160,17 @@ add_library(agi_x2_deploy_lib STATIC
   src/onnx_actor.cpp
   src/aimdk_io.cpp
   src/safety.cpp
-  src/deploy_logger.cpp)
+  src/deploy_logger.cpp
+  src/zmq_pose_input_source.cpp)
 target_include_directories(agi_x2_deploy_lib PUBLIC
   ${CMAKE_CURRENT_LIST_DIR}/include
-  ${ONNXRUNTIME_INCLUDE_DIR})
+  ${ONNXRUNTIME_INCLUDE_DIR}
+  ${ZMQ_INCLUDE_DIR}
+  ${NLOHMANN_JSON_INCLUDE_DIR})
 target_link_libraries(agi_x2_deploy_lib PUBLIC
   sonic_common
-  ${ONNXRUNTIME_LIBRARY})
+  ${ONNXRUNTIME_LIBRARY}
+  ${ZMQ_LIBRARY})
 ament_target_dependencies(agi_x2_deploy_lib PUBLIC
   rclcpp sensor_msgs aimdk_msgs)
 

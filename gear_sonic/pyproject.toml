@@ -87,7 +87,19 @@ inference = [
     "tyro",
     "opencv-python",
     "scipy",
-    "Isaac-GR00T @ git+https://github.com/NVIDIA/Isaac-GR00T.git",
+    # NOTE: Isaac-GR00T is intentionally NOT listed here. As of M0 we vendor the
+    # clone at external_dependencies/Isaac-GR00T so the data/embodiment contract
+    # can be audited and patched without re-publishing wheels (see
+    # docs/source/references/x2_isaac_groot_data_contract.md). After
+    # `pip install -e gear_sonic[inference]`, also run ONE of:
+    #   pip install -e external_dependencies/Isaac-GR00T --no-deps
+    #   uv pip install -e external_dependencies/Isaac-GR00T --no-deps --python .venv/bin/python
+    # `--no-deps` is critical: upstream pins torch==2.7.1 / opencv-python-headless,
+    # which would clobber the gear_sonic torch + opencv-python pins. The few extra
+    # runtime imports (av, cv2, torchcodec, lerobot, pandas) are already covered
+    # by gear_sonic[data_collection] / [inference].
+    # Fallback for minimal CI containers that cannot vendor the clone:
+    #   pip install "Isaac-GR00T @ git+https://github.com/NVIDIA/Isaac-GR00T.git" --no-deps
 ]
 # Training: full RL training stack (Isaac Lab must be installed separately)
 # Usage: pip install -e "gear_sonic[training]"

@@ -221,7 +221,35 @@ Examples:
 """,
     )
     p.add_argument("--mjcf", type=pathlib.Path, default=None,
-                   help="MJCF path (default: gear_sonic/data/assets/.../x2_ultra.xml)")
+                   help="MJCF path (default: gear_sonic/data/assets/.../x2_ultra.xml). "
+                        "Mutually exclusive with --with-omnihand (which programmatically "
+                        "composes a different model).")
+    p.add_argument("--with-omnihand", action="store_true",
+                   help="Compose the X2 + OmniHand augmented MJCF in-memory via "
+                        "gear_sonic.scripts.compose_x2_with_omnihand instead of "
+                        "loading the bare x2_ultra.xml. Replaces the dummy wrist "
+                        "stubs with the 10-active-DOF (per side) OmniHand "
+                        "fingers. The body joints and actuator names are "
+                        "unchanged so the deploy harness sees the exact same "
+                        "31-DoF interface; the hand qpos slots are driven by "
+                        "an optional ZMQ subscriber (see --hand-zmq-host / "
+                        "--hand-zmq-port).")
+    p.add_argument("--hand-zmq-host", type=str, default="localhost",
+                   help="Host the bridge SUBs on for OmniHand finger commands "
+                        "when --with-omnihand is set. Default 'localhost' "
+                        "(matches the live VLA bridge's PUB).")
+    p.add_argument("--hand-zmq-port", type=int, default=5556,
+                   help="Port for the OmniHand SUB (default 5556 -- the same "
+                        "port the SONIC C++ harness already subscribes to). "
+                        "ZMQ PUB/SUB is multi-subscriber-safe so the bridge "
+                        "can ride alongside the harness.")
+    p.add_argument("--hand-zmq-topic", type=str, default="pose",
+                   help="ZMQ topic prefix for the OmniHand SUB. Must match "
+                        "the live VLA bridge's --pub-topic (default 'pose').")
+    p.add_argument("--no-hand-zmq", action="store_true",
+                   help="Skip the OmniHand ZMQ subscriber even when "
+                        "--with-omnihand is set. Useful for static viewer "
+                        "screenshots: fingers stay at their MJCF rest pose.")
     p.add_argument("--motion", type=pathlib.Path, default=None,
                    help="Optional motion source for Reference State Initialization (RSI). "
                         "Accepts a motion-lib .pkl or a warehouse playlist .yaml/.yml "
@@ -326,12 +354,41 @@ class X2MujocoRosBridge:
         self._ros_domain_id = os.environ.get("ROS_DOMAIN_ID", "0")
 
         # --- MuJoCo ---
-        mjcf_path = args.mjcf or pathlib.Path(self.eval_x2.MJCF_PATH)
-        if not mjcf_path.is_file():
-            raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
-        self.mjcf_path = mjcf_path
+        # Two paths:
+        #   * default (--mjcf or eval_x2.MJCF_PATH): bare X2 (dummy wrist
+        #     stubs, no OmniHand) -- the canonical 31-DoF model the
+        #     SONIC ONNX was trained against.
+        #   * --with-omnihand: programmatic compose via
+        #     gear_sonic.scripts.compose_x2_with_omnihand. Adds 10
+        #     active + 4 passive finger DOFs per side. The body joint
+        #     names + actuators are unchanged so the deploy harness's
+        #     joint-name handshake still passes.
+        if args.with_omnihand:
+            if args.mjcf is not None:
+                raise ValueError(
+                    "--with-omnihand and --mjcf are mutually exclusive: "
+                    "the augmented spec is composed in-memory."
+                )
+            # Lazy import: compose_x2_with_omnihand pulls additional
+            # urdfpy / mesh-IO machinery that we don't need on the
+            # default code path.
+            sys.path.insert(0, str(REPO_ROOT))  # so `gear_sonic.*` resolves
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                build_x2_with_omnihand_spec,
+            )
 
-        self.mj_model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+            spec, model, hand_layout = build_x2_with_omnihand_spec()
+            self.mj_model = model
+            self.mjcf_path = pathlib.Path("<composed: x2_ultra + omnihand>")
+            self._omnihand_layout = hand_layout
+        else:
+            mjcf_path = args.mjcf or pathlib.Path(self.eval_x2.MJCF_PATH)
+            if not mjcf_path.is_file():
+                raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
+            self.mjcf_path = mjcf_path
+            self.mj_model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+            self._omnihand_layout = None
+
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = float(args.sim_dt)
 
@@ -508,6 +565,17 @@ class X2MujocoRosBridge:
         self._stop = threading.Event()
         self.viewer = None
 
+        # --- OmniHand ZMQ subscriber state (filled in run() if enabled) ---
+        # ``_hand_qpos_targets`` is the most recent (10-D-per-side)
+        # active-finger setpoint vector; ``_apply_omnihand_qpos`` writes
+        # it into ``mj_data.qpos`` every sim step. Held under a lock so
+        # the SUB thread and the sim thread can race without tearing.
+        self._hand_lock = threading.Lock()
+        self._hand_left_active = np.zeros(10, dtype=np.float64)
+        self._hand_right_active = np.zeros(10, dtype=np.float64)
+        self._hand_first_msg_logged = False
+        self._hand_msg_count = 0
+
     # ----------------------------------------------------------------
     # Command ingestion
     # ----------------------------------------------------------------
@@ -659,6 +727,155 @@ class X2MujocoRosBridge:
         self.mj_data.ctrl[self.act_idx] = tau
 
     # ----------------------------------------------------------------
+    # OmniHand finger drive
+    # ----------------------------------------------------------------
+    def _apply_omnihand_qpos(self):
+        """Write the latest hand setpoints into ``mj_data.qpos``.
+
+        Cheap qpos-direct write rather than PD: the OmniHand actuators
+        on the augmented spec are kinematic (no feedback gains tuned),
+        and the live VLA stream already sends *target* joint positions
+        rather than torques. This matches what the offline video
+        recorder does in
+        :func:`gear_sonic.scripts.compose_x2_with_omnihand.apply_active_hand_qpos`.
+
+        No-op when ``--with-omnihand`` is off (``_omnihand_layout`` is
+        None) -- the bare X2 has no hand qpos to write.
+        """
+        if self._omnihand_layout is None:
+            return
+        with self._hand_lock:
+            left = self._hand_left_active
+            right = self._hand_right_active
+        # Lazy import to keep this module importable on the bare-X2
+        # path (where compose_x2_with_omnihand is never needed).
+        from gear_sonic.scripts.compose_x2_with_omnihand import (
+            apply_active_hand_qpos,
+        )
+        apply_active_hand_qpos(
+            self.mj_data,
+            self._omnihand_layout,
+            left_active=left,
+            right_active=right,
+        )
+
+    def _omnihand_zmq_thread(self):
+        """SUB on the live VLA bridge's pose topic and refresh hand setpoints.
+
+        The pose message we expect (defined in
+        :mod:`gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder`) carries
+        ``left_hand_joints`` / ``right_hand_joints`` 10-D fields per tick at
+        the publisher's rate (50 Hz for the live VLA bridge). We unpack each
+        message, copy the two hand vectors under ``_hand_lock``, and let
+        ``_apply_omnihand_qpos`` write them at the sim cadence. ZMQ PUB/SUB
+        is multi-subscriber-safe so this can ride alongside the SONIC C++
+        harness reading the same port.
+
+        Connection setup is best-effort: if pyzmq isn't installed (the
+        Docker base image doesn't always carry it) we log once and exit
+        the thread. The viewer then shows OmniHand fingers at their MJCF
+        rest pose -- still better than the dummy stubs.
+        """
+        try:
+            import zmq
+        except ImportError:
+            self.node.get_logger().warn(
+                "[bridge] OmniHand ZMQ subscriber: pyzmq not installed; "
+                "fingers will stay at the MJCF rest pose. Install pyzmq "
+                "in the bridge env to drive the fingers."
+            )
+            return
+        # The decoder lives under gear_sonic which is already on sys.path
+        # (we inserted REPO_ROOT earlier when --with-omnihand resolved
+        # compose_x2_with_omnihand). Be defensive in case of an exotic
+        # docker mount.
+        try:
+            from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (
+                unpack_message,
+            )
+        except ImportError as exc:
+            self.node.get_logger().warn(
+                f"[bridge] OmniHand ZMQ subscriber: cannot import "
+                f"unpack_message ({exc}); fingers stay at rest pose."
+            )
+            return
+
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        # CONFLATE keeps only the latest message; we don't need a queue
+        # and it bounds memory if the SUB thread ever falls behind.
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.RCVTIMEO, 200)  # ms: 5x our 50 Hz period
+        sock.setsockopt(zmq.SUBSCRIBE, self.args.hand_zmq_topic.encode())
+        endpoint = f"tcp://{self.args.hand_zmq_host}:{self.args.hand_zmq_port}"
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            self.node.get_logger().warn(
+                f"[bridge] OmniHand ZMQ connect to {endpoint} failed: {exc}; "
+                "fingers stay at rest pose."
+            )
+            sock.close(linger=0)
+            return
+
+        self.node.get_logger().info(
+            f"[bridge] OmniHand ZMQ SUB connected at {endpoint} "
+            f"(topic='{self.args.hand_zmq_topic}'); waiting for poses."
+        )
+        while not self._stop.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ recv error: {exc}"
+                )
+                continue
+            try:
+                msg = unpack_message(raw, expected_topic=self.args.hand_zmq_topic)
+            except ValueError as exc:
+                # Topic may legitimately drift if the publisher restarts
+                # mid-run; keep going.
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ decode error: {exc}"
+                )
+                continue
+            left = msg.fields.get("left_hand_joints")
+            right = msg.fields.get("right_hand_joints")
+            if left is None or right is None:
+                continue
+            left_arr = np.asarray(left, dtype=np.float64).reshape(-1)
+            right_arr = np.asarray(right, dtype=np.float64).reshape(-1)
+            if left_arr.size != 10 or right_arr.size != 10:
+                # Wrong shape -- log once and stop trying. Layouts that
+                # send 16-D or 20-D hand vectors must remap upstream.
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ unexpected shape "
+                    f"left={left_arr.shape} right={right_arr.shape}; "
+                    "expected (10,) each. Dropping."
+                )
+                continue
+            with self._hand_lock:
+                self._hand_left_active = left_arr
+                self._hand_right_active = right_arr
+                self._hand_msg_count += 1
+            if not self._hand_first_msg_logged:
+                self._hand_first_msg_logged = True
+                self.node.get_logger().info(
+                    f"[bridge] OmniHand ZMQ: first finger setpoint received "
+                    f"(|L|={float(np.linalg.norm(left_arr)):.3f} "
+                    f"|R|={float(np.linalg.norm(right_arr)):.3f})."
+                )
+
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------
     # ElasticBand
     # ----------------------------------------------------------------
     def _apply_elastic_band(self):
@@ -756,6 +973,11 @@ class X2MujocoRosBridge:
         if not self._first_command_received:
             # Frozen-body publish: state stays at RSI values, the deploy
             # gets fresh timestamps so its freshness check still clears.
+            # We still apply OmniHand qpos (if armed) so the viewer
+            # shows finger motion as soon as the live VLA bridge starts
+            # publishing -- which can be well before SONIC takes over,
+            # and is a useful "pipeline alive" signal for the operator.
+            self._apply_omnihand_qpos()
             self._sim_step_count += 1
             if self._sim_step_count % state_period_steps == 0:
                 self._publish_joint_states()
@@ -764,6 +986,7 @@ class X2MujocoRosBridge:
             return
         self._apply_pd()
         self._apply_elastic_band()
+        self._apply_omnihand_qpos()
         if viewer is not None:
             with viewer.lock():
                 mujoco.mj_step(self.mj_model, self.mj_data)
@@ -969,8 +1192,26 @@ class X2MujocoRosBridge:
           serialised through ``viewer.lock()`` to avoid the well-known
           GLFW segfault when ``mj_step`` and ``viewer.sync`` race on
           ``mj_data``). ROS spinning is pushed to a background thread.
+
+        The OmniHand ZMQ subscriber, when armed (``--with-omnihand`` and
+        not ``--no-hand-zmq``), is *always* a background thread regardless
+        of viewer mode. It only refreshes a small numpy buffer under a
+        lock; the actual qpos write happens on the sim thread inside
+        ``_apply_omnihand_qpos``.
         """
         self._print_banner()
+
+        # Spawn OmniHand ZMQ SUB once we know the bridge is past
+        # construction. Only when --with-omnihand AND --no-hand-zmq is
+        # off; the latter is useful for static screenshots.
+        hand_zmq_thread = None
+        if self.args.with_omnihand and not self.args.no_hand_zmq:
+            hand_zmq_thread = threading.Thread(
+                target=self._omnihand_zmq_thread,
+                name="x2-omnihand-zmq",
+                daemon=True,
+            )
+            hand_zmq_thread.start()
 
         if not self.args.viewer:
             sim_thread = threading.Thread(
