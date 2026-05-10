@@ -72,17 +72,24 @@ from pathlib import Path
 import numpy as np
 
 
-# ── Mirror the OPEN/CLOSED anchors from x2_hand_retarget so this
-# script is self-contained and importable without circular deps ─────────
-_OPEN_LEFT_DEG = [0.0, 10.0, -5.0, 0.0, 5.0, 5.0, 0.0, 5.0, 0.0, 5.0]
-_CLOSED_LEFT_DEG = [-30.0, 60.0, -40.0, 6.0, 80.0, 80.0, -5.0, 80.0, -5.0, 80.0]
-_OPEN_RIGHT_DEG = [0.0, -10.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0, 0.0, 5.0]
-_CLOSED_RIGHT_DEG = [30.0, -60.0, 40.0, -6.0, 80.0, 80.0, 5.0, 80.0, 5.0, 80.0]
+# Re-export the OPEN/CLOSED anchors from x2_hand_retarget so this
+# tuner stays in sync whenever the anchors are tweaked. (We
+# previously mirrored the deg lists locally and they drifted: the
+# May 10 thumb-anchor expansion (50% -> 80% hardware travel) and
+# the subsequent non-thumb pip expansion (80° -> 88°) didn't
+# propagate here, which silently broke the tuner's
+# decode-vs-replay parity check.)
+from gear_sonic.utils.teleop.x2_hand_retarget import (  # noqa: E402
+    HAND_GRASP_CLOSED_RAD_LEFT as _CLOSED_LEFT_TUPLE,
+    HAND_GRASP_CLOSED_RAD_RIGHT as _CLOSED_RIGHT_TUPLE,
+    HAND_GRASP_OPEN_RAD_LEFT as _OPEN_LEFT_TUPLE,
+    HAND_GRASP_OPEN_RAD_RIGHT as _OPEN_RIGHT_TUPLE,
+)
 
-_OPEN_LEFT = np.deg2rad(_OPEN_LEFT_DEG)
-_CLOSED_LEFT = np.deg2rad(_CLOSED_LEFT_DEG)
-_OPEN_RIGHT = np.deg2rad(_OPEN_RIGHT_DEG)
-_CLOSED_RIGHT = np.deg2rad(_CLOSED_RIGHT_DEG)
+_OPEN_LEFT = np.asarray(_OPEN_LEFT_TUPLE, dtype=np.float64)
+_CLOSED_LEFT = np.asarray(_CLOSED_LEFT_TUPLE, dtype=np.float64)
+_OPEN_RIGHT = np.asarray(_OPEN_RIGHT_TUPLE, dtype=np.float64)
+_CLOSED_RIGHT = np.asarray(_CLOSED_RIGHT_TUPLE, dtype=np.float64)
 
 # Motor index per finger that is most reliably driven by that
 # finger's flex curl alone (the *_pip motors and thumb_mcp).

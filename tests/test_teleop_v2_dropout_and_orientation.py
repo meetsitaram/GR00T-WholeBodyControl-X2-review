@@ -45,6 +45,8 @@ from gear_sonic.utils.teleop.x2_hand_retarget import (
     DEFAULT_OPPOSE_FULL_THRESHOLD,
     DEFAULT_OPPOSE_GAMMA,
     HAND_FINGER_NAMES_PER_SIDE,
+    HAND_GRASP_CLOSED_LEFT_DEG,
+    HAND_GRASP_CLOSED_RIGHT_DEG,
     HAND_GRASP_CLOSED_RAD_LEFT,
     HAND_GRASP_CLOSED_RAD_RIGHT,
     HAND_GRASP_OPEN_RAD_LEFT,
@@ -658,6 +660,173 @@ def test_zero_oppose_with_thumb_flex_drives_thumb_mcp_via_flex_curl() -> None:
     for idx in (0, 1, 2):
         expected = 0.9 * full_open[idx] + 0.1 * full_closed[idx]
         np.testing.assert_allclose(cmd[idx], expected, atol=1e-12)
+
+
+def test_finger_tip_oppose_drives_pinky_motors_independent_of_curl() -> None:
+    """A deliberate thumb-to-pinky-tip touch with the rest of the
+    hand otherwise relaxed must drive ``pinky_pip`` (and the matching
+    ``pinky_abad``) all the way to the CLOSED anchor, even when the
+    raw pinky curl is well below 1.
+
+    Rationale (the v0.5 fix for the "open: non-thumb fingertip-to-
+    thumb touch" issue): Quest 3's "fingers move together" prior
+    caps isolated single-finger curls at ~0.30-0.40 raw, so even
+    after per-operator p05/p95 normalisation the receiving finger
+    only travels ~36 % to CLOSED on a deliberate thumb-finger
+    touch. The WebXR ``computeFingerTipOppose`` saturates at
+    literal contact (d_norm < 0.06 ~ 0.5 cm) and the Python
+    retargeter folds it in via ``max(curls[i], finger_tip_oppose[i])``
+    so the touched fingertip closes regardless of curl
+    under-reporting. None of the OTHER finger motors should move
+    (their tip_oppose is zero on this gesture).
+    """
+    for side in ("left", "right"):
+        # Low-but-not-zero pinky curl (matches the v4 NPZ
+        # touch-frame distribution where raw pinky_curl ~= 0.37 on
+        # an actual operator-pinky-touches-operator-thumb frame).
+        curls = _curl_array(thumb=0.5, pinky=0.37)
+        thumb_oppose = 0.95
+        finger_tip_oppose = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+        cmd_with_tip = per_finger_grasp_command_from_curls_and_oppose(
+            side, curls, thumb_oppose,
+            finger_tip_oppose=finger_tip_oppose,
+        )
+        cmd_without = per_finger_grasp_command_from_curls_and_oppose(
+            side, curls, thumb_oppose,
+            finger_tip_oppose=None,
+        )
+        full_closed = per_finger_grasp_command_from_curls(
+            side, _curl_array(thumb=1.0, index=1.0, middle=1.0, ring=1.0, pinky=1.0),
+        )
+
+        # pinky_abad (idx 8) and pinky_pip (idx 9): ride
+        # max(0.37, 1.0) = 1.0 -> CLOSED anchor.
+        np.testing.assert_allclose(cmd_with_tip[8], full_closed[8], atol=1e-12)
+        np.testing.assert_allclose(cmd_with_tip[9], full_closed[9], atol=1e-12)
+
+        # All non-pinky / non-thumb motors must match the no-tip-oppose
+        # baseline EXACTLY (their tip_oppose is zero in this gesture).
+        for motor_idx in (3, 4, 5, 6, 7):  # index_abad..ring_pip
+            np.testing.assert_allclose(
+                cmd_with_tip[motor_idx],
+                cmd_without[motor_idx],
+                atol=1e-12,
+                err_msg=f"{side}: motor {motor_idx} unexpectedly moved by pinky-only tip_oppose",
+            )
+
+        # The pinky output should also be strictly more closed than
+        # the no-tip-oppose baseline (since 1.0 > 0.37).
+        assert abs(cmd_with_tip[9] - full_closed[9]) < abs(cmd_without[9] - full_closed[9]), (
+            f"{side}: pinky_pip with tip_oppose=1 should be closer to CLOSED than without."
+        )
+
+
+def test_finger_tip_oppose_zero_matches_curl_only_baseline() -> None:
+    """When all four ``finger_tip_oppose`` entries are zero, the
+    motor command must equal the legacy curl-only path EXACTLY for
+    the four non-thumb fingers. This is the "smooth proportional
+    control on non-touch frames" guarantee.
+    """
+    for side in ("left", "right"):
+        curls = _curl_array(thumb=0.4, index=0.6, middle=0.5, ring=0.45, pinky=0.55)
+        thumb_oppose = 0.3
+        finger_tip_oppose_zero = np.zeros(4, dtype=np.float64)
+
+        cmd_zero = per_finger_grasp_command_from_curls_and_oppose(
+            side, curls, thumb_oppose,
+            finger_tip_oppose=finger_tip_oppose_zero,
+        )
+        cmd_none = per_finger_grasp_command_from_curls_and_oppose(
+            side, curls, thumb_oppose,
+            finger_tip_oppose=None,
+        )
+        np.testing.assert_allclose(cmd_zero, cmd_none, atol=1e-12)
+
+
+def test_finger_tip_oppose_nan_falls_back_to_curl_per_finger() -> None:
+    """Per-finger NaN entries in ``finger_tip_oppose`` must fall back
+    to the curl signal for that finger only, leaving the other
+    fingers driven by their finite tip_oppose values. This handles
+    the "some XRHand fingertip joints dropped out this frame"
+    case where the WebXR client emits a partial 4-vector.
+    """
+    side = "right"
+    curls = _curl_array(thumb=0.5, index=0.3, middle=0.6, ring=0.3, pinky=0.3)
+    thumb_oppose = 0.5
+    finger_tip_oppose = np.array(
+        [np.nan, 0.9, np.nan, 0.0],
+        dtype=np.float64,
+    )
+
+    cmd = per_finger_grasp_command_from_curls_and_oppose(
+        side, curls, thumb_oppose,
+        finger_tip_oppose=finger_tip_oppose,
+    )
+    cmd_baseline = per_finger_grasp_command_from_curls_and_oppose(
+        side, curls, thumb_oppose,
+        finger_tip_oppose=None,
+    )
+    # Index (NaN tip) and ring (NaN tip) must match baseline EXACTLY.
+    np.testing.assert_allclose(cmd[3], cmd_baseline[3], atol=1e-12)  # index_abad
+    np.testing.assert_allclose(cmd[4], cmd_baseline[4], atol=1e-12)  # index_pip
+    np.testing.assert_allclose(cmd[6], cmd_baseline[6], atol=1e-12)  # ring_abad
+    np.testing.assert_allclose(cmd[7], cmd_baseline[7], atol=1e-12)  # ring_pip
+    # Pinky (tip=0.0 < pinky_curl=0.3) must match baseline EXACTLY (max
+    # returns the curl).
+    np.testing.assert_allclose(cmd[8], cmd_baseline[8], atol=1e-12)
+    np.testing.assert_allclose(cmd[9], cmd_baseline[9], atol=1e-12)
+    # Middle (tip=0.9 > middle_curl=0.6) must close FURTHER than baseline.
+    full_closed = per_finger_grasp_command_from_curls(
+        side, _curl_array(thumb=1.0, index=1.0, middle=1.0, ring=1.0, pinky=1.0),
+    )
+    # cmd[5] should lerp at 0.9 toward the new (88°) CLOSED anchor.
+    assert abs(cmd[5] - full_closed[5]) < abs(cmd_baseline[5] - full_closed[5])
+
+
+def test_finger_tip_oppose_invalid_shape_raises() -> None:
+    """``finger_tip_oppose`` must be a (4,) array; (3,) or (5,) must
+    raise -- the function asserts the shape rather than silently
+    truncating because a wrong shape almost always means a wiring
+    bug upstream.
+    """
+    side = "right"
+    curls = _curl_array(index=0.3)
+    thumb_oppose = 0.5
+    for bad in (
+        np.zeros(3, dtype=np.float64),
+        np.zeros(5, dtype=np.float64),
+        np.zeros((4, 1), dtype=np.float64),
+    ):
+        try:
+            per_finger_grasp_command_from_curls_and_oppose(
+                side, curls, thumb_oppose, finger_tip_oppose=bad,
+            )
+        except ValueError as e:
+            assert "finger_tip_oppose" in str(e)
+        else:
+            raise AssertionError(
+                f"finger_tip_oppose with shape {bad.shape} should have raised ValueError"
+            )
+
+
+def test_non_thumb_pip_closed_anchors_at_88_degrees() -> None:
+    """The non-thumb pip CLOSED anchors must be 88° (~98 % of the
+    0..90° hardware range), not the historical 80°. Complements
+    the JS-side ``computeFingerTipOppose`` plumbing: even when
+    the ``*_pip`` motor lerps all the way to its CLOSED anchor on
+    a deliberate thumb-finger touch, the OmniHand fingertip arc is
+    still narrower than the operator's because the human hand has
+    3 cascaded knuckles per finger vs OmniHand's 1 active PIP +
+    1 mimic-coupled DIP. Pushing the anchor to hardware max is
+    the kinematic ceiling for this design.
+    """
+    expected_pip_indices = (4, 5, 7, 9)  # index_pip, middle_pip, ring_pip, pinky_pip
+    for closed_deg in (HAND_GRASP_CLOSED_LEFT_DEG, HAND_GRASP_CLOSED_RIGHT_DEG):
+        for idx in expected_pip_indices:
+            assert abs(abs(closed_deg[idx]) - 88.0) < 1e-9, (
+                f"non-thumb pip CLOSED anchor at idx={idx} is {closed_deg[idx]} (expected ±88°)"
+            )
 
 
 def test_stretch_finger_curls_deadzone_and_saturation() -> None:

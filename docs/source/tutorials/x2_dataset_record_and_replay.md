@@ -48,6 +48,99 @@ from its action distribution while the operator drives the upper body.
 
 ---
 
+## 0. Quick command reference
+
+The full operator runbook is in [Section 3 (Launch)](#3-launch-one-command),
+[Section 4 (Operator workflow)](#4-operator-workflow) and
+[Section 6 (Replay)](#6-replay). This section is a one-screen cheat-
+sheet for the three verbs and the most common flags.
+
+A condensed version with every command on one page also lives in
+[`sample_commands.md`](../../../sample_commands.md) at the repo root.
+
+### Calibrate (one-time per operator)
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.vr_operator_calibrate \
+    --operator-id <name>
+```
+
+Writes `data/operator_calibrations/<name>.yaml`. Re-run when switching
+operators or after a session where the wrist mapping felt off.
+
+### Teleop (kinematic, no SONIC) — fastest debug loop
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.teleop_x2_kinematic \
+    --output-dir data/lerobot/x2_quest3_kinematic_v6 \
+    --task "<task string>" \
+    --rate 50 --hand-input max
+```
+
+Record by pressing **B** on the Quest 3 controller; **X** saves, **Y**
+discards. Drop `--output-dir` for pure-viewer teleop with no disk
+writes. Per-finger smoothing filter is enabled by default (see
+[v0.6 below](#finger-signal-smoothing-v06-may-12)); pass
+`--no-finger-filter` to disable for an A/B baseline.
+
+### Record (full SONIC-stabilised loop)
+
+```bash
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_quest3_v0 \
+    --task "<task string>" \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+The wrapper co-launches the C++ deploy + the Python recorder. Same
+operator buttons as kinematic teleop. All filter flags pass through.
+For a pure connectivity smoke-test that doesn't write to disk, add
+`--teleop-only` and drop `--output-dir` / `--task`.
+
+### Replay (kinematic, from parquet)
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
+    --dataset x2_quest3_kinematic_v6 --episode 0
+```
+
+Opens a passive MuJoCo viewer on the recorded `action.commanded_body_q_mj`
++ hand columns. No Quest 3, no IK, no policy. See
+[Section 6.4](#64-kinematic-mujoco-replay-replay_x2_kinematicpy) for
+windowing + loop options.
+
+### Offline retargeting replay (re-derive parquet from the debug NPZ)
+
+When you want to test a new retargeter / calibration / filter without
+restrapping the headset:
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.replay_recorded_dataset \
+    --npz     <episode>.npz \
+    --parquet <episode>.parquet \
+    --output-dir /tmp/replay_out
+```
+
+Add `--apply-finger-filter {auto,always,never}` to A/B the v0.6
+smoothing filter against the raw signals; `auto` is the default and
+uses the pre-computed `*_filtered` channels if the NPZ has them
+(post-v0.6 recordings) or applies the filter offline otherwise.
+
+### Common shared flags
+
+| Flag | Effect |
+| ---- | ------ |
+| `--no-finger-filter` | Disable the v0.6 EMA + deadband-hold smoother on the hand inputs. Both teleop_x2_kinematic and record_x2_dataset accept this. |
+| `--finger-filter-alpha FLOAT` | Override the EMA alpha (default 0.5). |
+| `--finger-filter-hold-window INT` | Override the deadband-hold window (default 8 frames = 160 ms at 50 Hz). |
+| `--finger-filter-hold-std FLOAT` | Override the std threshold for entering the held-pose latch (default 0.005). |
+| `--apply-finger-filter {auto,always,never}` | Replay only. `auto` = use NPZ's `*_filtered` if present, else apply offline. `never` = use raw. `always` = force offline pass. |
+| `--hand-input {trigger,grip,max}` | Which controller analog drives the uniform fallback grasp when XRHand isn't reported. |
+| `--calibration PATH` / `--recalibrate` / `--operator-id NAME` | Operator calibration plumbing. |
+| `--task STR` | Required when `--output-dir` is set. Stamped on every recorded frame. |
+
+---
+
 ## 1. Architecture
 
 A single recorder process owns the VR ingress, IK, online tokenization,
@@ -1268,7 +1361,7 @@ thumb-finger touch). Pass `apply_oppose_compensation=False` to
 `per_finger_grasp_command_from_curls_and_oppose(...)` to opt out
 (legacy direct-lerp behaviour).
 
-### Open: non-thumb fingertip-to-thumb touch
+### Non-thumb fingertip-to-thumb touch (v0.5: in progress, needs new recording to verify)
 
 This is the current edge of the quality envelope. The thumb fix
 above closed the **thumb side** of a thumb-fingertip touch
@@ -1294,18 +1387,51 @@ Two factors stack:
    only travels ~36 % of the way from OPEN to CLOSED while the
    thumb has already been pushed to 100 %.
 
-The planned fix mirrors the thumb-opposition treatment: emit a
-**per-finger fingertip-to-thumb proximity** signal on the WebXR
-side (one scalar per non-thumb finger, same `dist / palm_width`
-formulation as the existing `thumb_oppose`), and on the Python side
-drive each `*_pip` motor on `max(curls[i], finger_tip_oppose[i])`.
-Effect: on any deliberate fingertip touch, the relevant pip closes
-to CLOSED regardless of whether Quest 3's per-finger curl signal
-saturates, while smooth variation is preserved everywhere else
-(non-touch frames have low oppose, so `max` reduces to the
-existing curl path). This is filed as a v1 follow-up rather than
-another v0 patch — it adds a JS payload field that has to land
-both on the WebXR client and in the Python parsing path.
+**v0.5 fix (May 11)**: mirror of the thumb-opposition treatment.
+Two changes land together so the kinematic ceiling is raised at
+the same time as the new signal that lifts isolated fingers up
+to that ceiling:
+
+* **Per-finger tip-proximity in JS** (`computeFingerTipOppose`
+  in `gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html`):
+  same `dist / palm_width` formulation as `computeThumbOpposition`
+  but applied per non-thumb fingertip, returning a 4-vector
+  `[index, middle, ring, pinky]`. Saturates at literal contact
+  (d_norm < 0.06 ≈ 0.5 cm), zero past d_norm > 0.45 (≈ 3.5 cm).
+  Emitted alongside the existing `thumb_oppose` in
+  `hands.<side>.finger_tip_oppose` on the WebSocket payload, and
+  persisted to debug NPZ as
+  `quest_left_finger_tip_oppose` / `quest_right_finger_tip_oppose`
+  (shape `(N, 4)`, NaN row for pre-May-2026 schemas).
+* **Python combined drive** in
+  `per_finger_grasp_command_from_curls_and_oppose`: each non-thumb
+  `*_pip` motor (and the matching `*_abad` for index/ring/pinky)
+  is now driven on `max(curls[i+1], finger_tip_oppose[i])` for
+  `i ∈ {0..3}`. On non-touch frames `finger_tip_oppose ≈ 0` and
+  `max` reduces to the existing curl path so smooth proportional
+  variation is preserved. NaN entries (a fingertip dropped out
+  this frame) fall back to the curl signal per finger.
+* **Pip CLOSED anchor pushed from 80° to 88°**
+  (`HAND_GRASP_CLOSED_LEFT_DEG[4,5,7,9]` and
+  `HAND_GRASP_CLOSED_RIGHT_DEG[4,5,7,9]`). The pip range is
+  `0..90°`, so 88° is ~98 % of hardware travel — the closest
+  we can land to the geometric tip arc without bumping the
+  hardware limit. Without this bump the JS signal would lift
+  the robot to its old ~89 % ceiling on touch, leaving a
+  visible gap.
+
+The thumb-side coverage stays bit-identical: thumb_oppose still
+saturates on the same touch frames, the `_THUMB_COMBINED_DRIVE_MOTORS`
+set is unchanged, and the four thumb anchors are still at their
+~80 % hardware travel from the previous fix.
+
+**Verification status**: code lands behind a back-compat-safe API
+(`finger_tip_oppose=None` is identical to the previous behaviour,
+and tests assert this). The v4 NPZ doesn't contain the new field
+— we can't iterate offline against existing recordings — so a
+fresh test session is required to visually confirm the
+thumb-fingertip touch now closes the receiving finger. See the
+"How to verify" checklist in [Section 11](#11-next-steps).
 
 A more ambitious alternative (filed but not planned) would do
 **fingertip-position IK** on the per-finger 2-link chain: solve
@@ -1313,6 +1439,75 @@ for the pip angle that lands the robot tip closest to the
 operator's tip in palm frame. Kinematically correct but a much
 larger change to live retargeting math and end-to-end timing
 budget.
+
+### Finger-signal smoothing (v0.6, May 12)
+
+`v5/ep1` showed clean signal acquisition and the `finger_tip_oppose`
+plumbing landed cleanly, but a fine ~2–4° peak-to-peak finger
+tremor was still visible during held poses. We characterised it on
+the recording:
+
+- **Held-pose curl std = 0.003–0.012** (~ 0.3–1° at the 88° pip
+  anchor); spectrum sits at 1–2 Hz.
+- **0 % of single-frame `|d/dt| > 0.05` curl spikes return to
+  baseline** — they're real intentional motion, not noise.
+- **`finger_tip_oppose` median delta = 0.000**, but max delta
+  0.5–0.9 — signal is event-like (touch-onset spikes).
+
+This means the right shape is **NOT** a low-pass filter: any
+cutoff that catches the 1–2 Hz tremor band also lags real motion
+by 100–200 ms. Instead we use a hybrid:
+
+1. **Light EMA (α=0.5)** for single-frame outliers (+20 ms lag).
+2. **Rolling-median deadband-hold** (8-frame window, ~160 ms): when
+   the per-channel rolling std drops below `hold_std=0.005`, the
+   output snaps to the rolling median (which still tracks slow
+   drift). Releases on `std > release_std=0.012` OR
+   `|x - median| > release_disp=0.020`.
+3. **Hysteresis** keeps the latch from chattering near threshold.
+4. **Brief-NaN bridging** lets the held value survive a 1-3 frame
+   XRHand re-acquire.
+
+Validated on `v5/ep1`: held-pose `|d/dt|` p99 reduced **20-40 %**
+on the worst-twitching fingers, **+20 ms** motion-edge lag, **0 ms**
+touch-onset lag, max single-frame jump reduced ~30-40 % across all
+10 channels.
+
+The filter is wired into:
+
+- `teleop_x2_kinematic.py` — live kinematic teleop + record.
+- `x2_dataset_recorder.py` — SONIC-record path.
+- `replay_recorded_dataset.py` — offline replay (with `auto`
+  / `always` / `never` mode flag).
+
+The debug NPZ now persists **both** raw and filtered channels
+(`quest_*_hand_curls` + `quest_*_hand_curls_filtered`, etc.),
+so offline A/B is just a flag flip.
+
+CLI flags (all opt-in to **disable** or **tweak** — defaults are
+on, calibrated):
+
+```text
+--no-finger-filter
+--finger-filter-alpha       <float>     # default 0.5
+--finger-filter-hold-window <int>       # default 8 (160 ms at 50 Hz)
+--finger-filter-hold-std    <float>     # default 0.005
+```
+
+For `replay_recorded_dataset.py`:
+
+```text
+--apply-finger-filter {auto,always,never}
+   auto    : use NPZ's pre-computed *_filtered if present (post-v0.6),
+             else apply offline. Default.
+   always  : force an offline pass even when filtered keys are present
+             (useful for tuning a different filter cfg).
+   never   : replay raw signals as recorded (matches pre-v0.6 behaviour).
+```
+
+Full design + tuning rationale, and the complete code surface, are
+in
+[2026-05-12 finger-signal smoothing milestone](../user_guide/milestones/2026-05-12_finger_signal_filter.md).
 
 ### Other v0 hand limitations
 
@@ -1383,20 +1578,34 @@ budget.
 
 ### Hand-retargeting follow-ups
 
-* **Per-finger tip-to-thumb proximity** (the open issue from §8).
-  Mirror of the existing `thumb_oppose` plumbing, but per non-thumb
-  finger. Closes the gap on thumb-fingertip touches without
-  sacrificing smooth intermediate variation. Touches both the WebXR
-  client (`computeFingerTipOppose` in `index.html`) and the Python
-  retarget path (`per_finger_grasp_command_from_curls_and_oppose`
-  gains a `finger_tip_oppose: tuple[float, float, float, float]`
-  argument). Filed as a v1 task because it's a JS-payload schema
-  change.
+* **Per-finger tip-to-thumb proximity**: **landed in v0.5** (May
+  11). Wires `finger_tip_oppose` end-to-end and bumps the non-thumb
+  pip CLOSED anchor from 80° to 88°. See "Non-thumb fingertip-to-
+  thumb touch" in §8 for the kinematic motivation. Visually
+  verified on `data/lerobot/x2_quest3_kinematic_v5/debug/teleop_episode_000001.npz`
+  ("very promising" feedback).
+* **Finger-signal smoothing**: **landed in v0.6** (May 12). Per-side
+  EMA + rolling-median deadband-hold on the 10 hand-input channels.
+  Kills 20–40 % of held-pose tremor, +20 ms motion lag, 0 ms touch-
+  onset lag. Enabled by default; live + record + replay all wired;
+  debug NPZ persists raw + filtered. See the
+  ["Finger-signal smoothing (v0.6)"](#finger-signal-smoothing-v06-may-12)
+  section in §8 for the full design and tuning rationale.
 * **Sonic-enabled record + replay path.** The teleop / record /
   replay matrix currently has only the kinematic backend wired
   end-to-end. Add Sonic-backed variants of `record_x2_dataset.py`
   and a Sonic replayer to fill out the 2 × 3 grid in
   [Section 6.5](#65-architecture-teleop--record--replay-matrix).
+* **Per-operator `finger_tip_oppose` calibration**. The v0.5 wire
+  layout uses the JS-side proximity output directly (saturates at
+  d_norm < 0.06 ≈ 0.5 cm). Different operators have different
+  finger lengths and palm widths, so the proximity-to-touch
+  threshold may need a per-operator stretch the same way
+  `thumb_oppose` got `oppose_floor` / `oppose_ceiling` in
+  `HandRangeCalibration`. Hold this until we have ≥ 2 operators
+  worth of recorded data to compare distributions; before then
+  any normalization curve we choose is over-fitting to a sample
+  size of one.
 * **Wrist orientation in calibration.** v0 runs IK position-only
   (`--ik-rotation-weight 0`). Adding an operator-to-robot rotation
   map alongside the position map would let elbow circumduction and

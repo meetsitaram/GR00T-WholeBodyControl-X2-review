@@ -90,12 +90,24 @@ HAND_GRASP_CLOSED_LEFT_DEG: list[float] = [
     80.0,   # thumb_abad  (range   0..+100, was 60; now 80 % of 100° travel)
     -40.0,  # thumb_mcp
     6.0,    # index_abad
-    80.0,   # index_pip
-    80.0,   # middle_pip
+    # Non-thumb pip CLOSED anchors pushed from 80° to 88° (~98 % of
+    # the 0..90° hardware range). Companion to the per-finger
+    # ``finger_tip_oppose`` plumbing: even when the receiving
+    # finger's PIP motor lerps all the way to its CLOSED anchor on a
+    # deliberate thumb-finger touch, the OmniHand fingertip arc is
+    # still narrower than the operator's because the human hand has
+    # 3 cascaded knuckles per finger (MCP+PIP+DIP, total bend ~240°)
+    # vs OmniHand's 1 active PIP + 1 mimic-coupled DIP (~189° at
+    # 90° pip). Pushing the anchor to hardware max claws back the
+    # last ~9 mm of fingertip travel toward the palm. See
+    # docs/source/tutorials/x2_dataset_record_and_replay.md
+    # "Open: non-thumb fingertip-to-thumb touch".
+    88.0,   # index_pip   (range 0..+90, was 80; now 98 % of 90° travel)
+    88.0,   # middle_pip
     -5.0,   # ring_abad
-    80.0,   # ring_pip
+    88.0,   # ring_pip
     -5.0,   # pinky_abad
-    80.0,   # pinky_pip
+    88.0,   # pinky_pip
 ]
 
 HAND_GRASP_OPEN_RIGHT_DEG: list[float] = [
@@ -118,12 +130,12 @@ HAND_GRASP_CLOSED_RIGHT_DEG: list[float] = [
     -80.0,  # thumb_abad  (range -100..0, was -60; now 80 % of 100° travel)
     40.0,   # thumb_mcp
     -6.0,   # index_abad
-    80.0,   # index_pip
-    80.0,   # middle_pip
+    88.0,   # index_pip   (range 0..+90, was 80; now 98 % of 90° travel)
+    88.0,   # middle_pip
     5.0,    # ring_abad
-    80.0,   # ring_pip
+    88.0,   # ring_pip
     5.0,    # pinky_abad
-    80.0,   # pinky_pip
+    88.0,   # pinky_pip
 ]
 
 HAND_GRASP_OPEN_RAD_LEFT: tuple[float, ...] = tuple(_deg_list_to_rad(HAND_GRASP_OPEN_LEFT_DEG))
@@ -687,6 +699,7 @@ def per_finger_grasp_command_from_curls_and_oppose(
     finger_curls: np.ndarray,
     thumb_oppose: float | None,
     *,
+    finger_tip_oppose: np.ndarray | tuple[float, ...] | None = None,
     apply_curl_compensation: bool = DEFAULT_APPLY_CURL_COMPENSATION,
     apply_oppose_compensation: bool = DEFAULT_APPLY_OPPOSE_COMPENSATION,
     curl_floor: float | tuple[float, ...] | np.ndarray | None = None,
@@ -695,26 +708,38 @@ def per_finger_grasp_command_from_curls_and_oppose(
     oppose_ceiling: float | None = None,
 ) -> np.ndarray:
     """Like :func:`per_finger_grasp_command_from_curls` but with an
-    independent thumb-opposition signal driving ``thumb_roll`` and
-    ``thumb_abad``.
+    independent thumb-opposition signal driving the thumb motors
+    AND an optional per-finger thumb-tip-to-fingertip proximity
+    signal driving the four non-thumb fingers.
 
     The five finger-curl values come from XRHand chain bends and
-    capture per-finger flexion well, but the thumb's CMC joint --
-    the joint responsible for swinging the thumb across the palm to
-    touch the other fingertips -- is NOT in the XRHand chain. So
-    when the operator does a thumb-finger touch, the thumb-curl
-    value barely budges (~0.4-0.6) even though the operator's
-    thumb has fully crossed the palm. Driving the X2's
-    ``thumb_roll`` / ``thumb_abad`` motors from that curl signal
-    leaves the robot's thumb stuck at ~50 % of its opposition
-    range.
+    capture per-finger flexion well, but two anatomical motions are
+    poorly captured by the chain alone:
 
-    The WebXR client computes a separate opposition score from the
-    thumb-tip's lateral position in the palm coordinate frame (see
-    ``computeThumbOpposition`` in ``index.html``). We use that
-    score for the two opposition motors and keep the existing curl
-    signal for ``thumb_mcp`` (knuckle flex) and the other four
-    fingers.
+    * The thumb's CMC opposition (swinging the thumb across the
+      palm) is not in the XRHand chain, so the thumb-curl signal
+      barely moves on a thumb-finger touch even when the operator's
+      thumb is fully opposed. This is fixed by the WebXR client's
+      ``computeThumbOpposition`` scalar (see ``index.html``), which
+      is fed in as ``thumb_oppose`` and drives all three thumb
+      motors via ``max(thumb_oppose, thumb_flex_curl)``.
+
+    * Symmetrically, the OmniHand's non-thumb fingers each have one
+      active flexion DOF (``*_pip``) cascading two mimic-coupled
+      segments, but the operator's finger has THREE knuckles
+      (MCP+PIP+DIP) summing to a much larger total bend. Even after
+      per-operator curl normalisation the receiving finger only
+      travels ~36 % to CLOSED on a deliberate thumb-finger touch
+      because Quest 3's "fingers move together" prior caps isolated
+      single-finger curls at ~0.30-0.40 raw. The
+      ``finger_tip_oppose`` 4-vector (one entry per non-thumb
+      finger, from the WebXR client's ``computeFingerTipOppose``)
+      saturates at literal contact (d_norm < 0.06 ≈ 0.5 cm) and
+      drives each ``*_pip`` (and the matching ``*_abad`` for index
+      / ring / pinky) via ``max(curls[i], finger_tip_oppose[i])``.
+      During non-touch frames the proximity signal is near zero
+      and ``max`` reduces to the curl, preserving smooth
+      proportional control.
 
     Args:
         side: ``"left"`` or ``"right"``.
@@ -724,6 +749,15 @@ def per_finger_grasp_command_from_curls_and_oppose(
             falls back to thumb-curl-driven opposition (legacy
             behaviour identical to
             :func:`per_finger_grasp_command_from_curls`).
+        finger_tip_oppose: ``(4,)`` array in ``[0, 1]`` ordered
+            ``[index, middle, ring, pinky]`` -- per-finger
+            thumb-tip proximity (saturates at touch, ~0 when far).
+            ``None`` (the back-compat default) skips the
+            tip-proximity drive entirely. Individual NaN entries
+            are tolerated and treated as "fall back to the curl
+            signal for that finger only" -- this lets the WebXR
+            client emit partial data when only some fingertips
+            tracked this frame.
 
     Returns:
         ``(NUM_HAND_DOF_PER_SIDE,)`` motor command in radians,
@@ -804,12 +838,43 @@ def per_finger_grasp_command_from_curls_and_oppose(
     thumb_flex = curls[0]
     oppose_motor_signal = max(oppose, thumb_flex)
 
+    # Per-finger combined drive for the four non-thumb fingers:
+    #   tip_drive[i] = curls[i+1]                          if no tip_oppose
+    #   tip_drive[i] = max(curls[i+1], tip_oppose[i])      if tip_oppose finite
+    #   tip_drive[i] = curls[i+1]                          if tip_oppose[i] is NaN
+    #
+    # The 4-vector is ordered [index, middle, ring, pinky]; entry i
+    # drives both the matching ``*_abad`` (index/ring/pinky) and the
+    # matching ``*_pip``. middle has no abad motor. Driving abad on
+    # the same combined signal as pip means a deliberate
+    # thumb-to-finger-tip touch closes the receiving finger fully
+    # (CLOSED anchor includes a small abad component for "fist
+    # convergence" -- 6° radial for index, -5° ulnar for ring /
+    # pinky). When the operator just curls the four fingers
+    # without touching the thumb, ``tip_oppose`` is near zero and
+    # the ``max`` reduces to the curl signal so smooth proportional
+    # control is preserved.
+    tip_drive = curls[1:5].copy()
+    if finger_tip_oppose is not None:
+        tip_arr = np.asarray(finger_tip_oppose, dtype=np.float64)
+        if tip_arr.shape != (4,):
+            raise ValueError(
+                f"finger_tip_oppose must be (4,); got {tip_arr.shape}"
+            )
+        finite = np.isfinite(tip_arr)
+        if finite.any():
+            clipped = np.clip(tip_arr[finite], 0.0, 1.0)
+            tip_drive[finite] = np.maximum(tip_drive[finite], clipped)
+
     cmd = np.empty(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
     for motor_idx in range(NUM_HAND_DOF_PER_SIDE):
         if motor_idx in _THUMB_COMBINED_DRIVE_MOTORS:
             c = oppose_motor_signal
         else:
-            c = curls[_MOTOR_TO_FINGER_INDEX[motor_idx]]
+            finger_idx = _MOTOR_TO_FINGER_INDEX[motor_idx]
+            # finger_idx is 1..4 here (thumb motors took the branch
+            # above). Map to tip_drive index 0..3.
+            c = tip_drive[finger_idx - 1]
         cmd[motor_idx] = (1.0 - c) * open_arr[motor_idx] + c * closed_arr[motor_idx]
 
     lo = np.array([a for a, _ in limits], dtype=np.float64)

@@ -13,6 +13,8 @@ encountered + fixes applied, and what's left for the next session.
 2026-05-03_first_iter22000_powered_walk
 2026-05-08_live_vla_sonic_sim_v0
 2026-05-10_omnihand_finger_tuning
+2026-05-11_finger_tip_oppose_signal
+2026-05-12_finger_signal_filter
 ```
 
 ## At a glance
@@ -24,3 +26,5 @@ encountered + fixes applied, and what's left for the next session.
 | 2026-05-03 | First iter-22000 powered walk | Real X2 + SONIC | First out-and-back walking cycle, 36.75 s wall-time, clean MC handoff. |
 | 2026-05-08 | Live VLA → SONIC sim (v0) | **Sim-only**, X2 + SONIC + N1.7 | Closed-loop VLA → SONIC pipeline runs end to end. Visible motion is mode-collapsed; full triage is documented in the milestone page. |
 | 2026-05-10 | OmniHand finger-tuning iteration | **Sim-only**, Quest 3 → X2 kinematic | Thumb-fingertip-touch gesture now closes correctly. Anchor expansion + 3-motor opposition fold-in. Topology mismatch on non-thumb tips filed for v1. |
+| 2026-05-11 | Per-finger fingertip-to-thumb proximity (v0.5) | **Sim-only**, Quest 3 → X2 kinematic | New JS `computeFingerTipOppose` 4-vector + Python `max(curl, finger_tip_oppose)` drive on non-thumb pips + pip CLOSED anchor 80° → 88°. Wired end-to-end (JS → reader → retargeter → debug NPZ → replay); needs a fresh recording to verify visually. |
+| 2026-05-12 | Finger-signal smoothing filter (v0.6) | **Sim-only**, Quest 3 → X2 kinematic | EMA(α=0.5) + rolling-median deadband-hold on the 10 per-side hand inputs. Calibrated against v5/ep1: held-pose tremor reduced 20–40 % on the worst fingers, +20 ms motion lag, 0 ms touch-onset lag. Live + record + replay paths all wired; debug NPZ persists raw + filtered for offline A/B. |

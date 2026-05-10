@@ -110,6 +110,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "grip squeeze; 'max' picks whichever is greater this frame.",
     )
 
+    # Per-finger noise / jitter / occlusion filter (v0.6)
+    parser.add_argument(
+        "--no-finger-filter", action="store_true",
+        help="Disable the per-side EMA + rolling-median deadband on "
+             "the Quest 3 hand-curl / thumb-oppose / finger-tip-oppose "
+             "streams. The filter reduces visual finger tremor by "
+             "~20-40%% on held poses with ~20 ms motion lag.",
+    )
+    parser.add_argument(
+        "--finger-filter-alpha", type=float, default=None,
+        help="EMA alpha for the finger-signal filter. Default 0.5.",
+    )
+    parser.add_argument(
+        "--finger-filter-hold-window", type=int, default=None,
+        help="Rolling-window length for the deadband-hold. Default 8.",
+    )
+    parser.add_argument(
+        "--finger-filter-hold-std", type=float, default=None,
+        help="Per-channel rolling-std threshold for entering the "
+             "held-pose latch. Default 0.005.",
+    )
+
     # IK
     parser.add_argument("--ik-damping", type=float, default=0.08)
     parser.add_argument(
@@ -174,10 +196,23 @@ def main(argv: list[str] | None = None) -> int:
     # Deferred import: pulling X2DatasetRecorder also pulls
     # ``datasets`` and the LeRobot writer chain, which the
     # ensure_runtime_deps() call above just guaranteed are present.
+    from gear_sonic.utils.teleop.finger_signal_filter import FingerFilterParams
     from gear_sonic.utils.teleop.x2_dataset_recorder import (
         RecorderConfig,
         X2DatasetRecorder,
     )
+
+    if args.no_finger_filter:
+        finger_filter_params = None
+    else:
+        kwargs: dict[str, Any] = {}
+        if args.finger_filter_alpha is not None:
+            kwargs["ema_alpha"] = float(args.finger_filter_alpha)
+        if args.finger_filter_hold_window is not None:
+            kwargs["hold_window"] = int(args.finger_filter_hold_window)
+        if args.finger_filter_hold_std is not None:
+            kwargs["hold_std"] = float(args.finger_filter_hold_std)
+        finger_filter_params = FingerFilterParams(**kwargs)
 
     if not args.teleop_only:
         if args.output_dir is None or not args.task:
@@ -213,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         recalibrate=args.recalibrate,
         operator_id=args.operator_id,
         embodiment_tag=args.embodiment_tag,
+        finger_filter_params=finger_filter_params,
         verbose=(not args.quiet),
     )
 

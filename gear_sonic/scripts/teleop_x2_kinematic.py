@@ -77,6 +77,10 @@ from gear_sonic.scripts.live_vla_publish_motion_token import (  # noqa: E402
     DEFAULT_STAND_POSE_MUJOCO_RAD,
     NUM_BODY_DOFS,
 )
+from gear_sonic.utils.teleop.finger_signal_filter import (  # noqa: E402
+    FingerFilterParams,
+    FingerSignalFilter,
+)
 from gear_sonic.utils.teleop.operator_calibration import (  # noqa: E402
     OperatorCalibration,
 )
@@ -230,6 +234,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--hand-input", choices=("trigger", "grip", "max"), default="trigger",
         help="Which controller analog drives finger curl.",
+    )
+
+    # Per-finger noise / jitter / occlusion filter (v0.6)
+    p.add_argument(
+        "--no-finger-filter", action="store_true",
+        help="Disable the per-side EMA + rolling-median deadband on "
+             "the Quest 3 hand-curl / thumb-oppose / finger-tip-oppose "
+             "streams. The filter reduces visual finger tremor by "
+             "~20-40%% on held poses with ~20 ms motion lag (calibrated "
+             "against v5/ep1). Disable to A/B vs raw retargeting; "
+             "the debug NPZ always persists both raw and filtered "
+             "channels for offline replay.",
+    )
+    p.add_argument(
+        "--finger-filter-alpha", type=float, default=None,
+        help="EMA alpha for the finger-signal filter. Default 0.5 "
+             "(calibrated). Lower = smoother but more lag; 1.0 "
+             "disables the EMA stage.",
+    )
+    p.add_argument(
+        "--finger-filter-hold-window", type=int, default=None,
+        help="Rolling-window length (frames) for the deadband-hold. "
+             "Default 8 (= 160 ms at 50 Hz).",
+    )
+    p.add_argument(
+        "--finger-filter-hold-std", type=float, default=None,
+        help="Per-channel rolling-std threshold for entering the "
+             "held-pose latch. Default 0.005 (calibrated against "
+             "rest-state Quest 3 noise).",
     )
 
     # IK
@@ -521,6 +554,45 @@ def main(argv: list[str] | None = None) -> int:
     episode_t0 = 0.0
     last_tick_result: Any = None
 
+    # Per-side stateful filters for the Quest 3 hand signals.
+    # See ``finger_signal_filter`` for design + tuning rationale.
+    # Reset on episode start so each recording starts with a clean
+    # buffer (no leftover state from a previous episode).
+    finger_filter_params: FingerFilterParams | None = None
+    if not args.no_finger_filter:
+        kwargs: dict[str, Any] = {}
+        if args.finger_filter_alpha is not None:
+            kwargs["ema_alpha"] = float(args.finger_filter_alpha)
+        if args.finger_filter_hold_window is not None:
+            kwargs["hold_window"] = int(args.finger_filter_hold_window)
+        if args.finger_filter_hold_std is not None:
+            kwargs["hold_std"] = float(args.finger_filter_hold_std)
+        finger_filter_params = FingerFilterParams(**kwargs)
+        finger_filter_params.validate()
+        print(
+            f"[teleop-kinematic] finger filter ENABLED: "
+            f"alpha={finger_filter_params.ema_alpha} "
+            f"hold_window={finger_filter_params.hold_window} "
+            f"hold_std={finger_filter_params.hold_std} "
+            f"release_std={finger_filter_params.release_std} "
+            f"release_disp={finger_filter_params.release_disp}",
+            flush=True,
+        )
+    else:
+        print(
+            "[teleop-kinematic] finger filter DISABLED (--no-finger-filter)",
+            flush=True,
+        )
+
+    finger_filter_left: FingerSignalFilter | None = (
+        FingerSignalFilter(finger_filter_params)
+        if finger_filter_params is not None else None
+    )
+    finger_filter_right: FingerSignalFilter | None = (
+        FingerSignalFilter(finger_filter_params)
+        if finger_filter_params is not None else None
+    )
+
     period = 1.0 / max(args.rate, 1e-6)
     next_tick = time.monotonic()
 
@@ -632,6 +704,13 @@ def main(argv: list[str] | None = None) -> int:
                             episode_buffer.task = args.task
                             is_recording = True
                             episode_t0 = time.monotonic()
+                            # Each episode starts with a clean filter
+                            # buffer so the warm-up window doesn't leak
+                            # state from the previous episode.
+                            if finger_filter_left is not None:
+                                finger_filter_left.reset()
+                            if finger_filter_right is not None:
+                                finger_filter_right.reset()
                             print(
                                 f"[teleop-kinematic] [B] episode start "
                                 f"(task={args.task!r}, # {episode_count + 1})",
@@ -700,12 +779,36 @@ def main(argv: list[str] | None = None) -> int:
                     # AND the thumb opposition correction.
                     l_curls, r_curls, l_src, r_src = quest.get_hand_curls()
                     l_oppose, r_oppose = quest.get_thumb_opposition()
+                    l_finger_tip_oppose, r_finger_tip_oppose = quest.get_finger_tip_oppose()
+
+                    # Keep the RAW signals for the debug NPZ dump so we
+                    # can A/B against the filtered output offline.
+                    l_curls_raw = l_curls
+                    r_curls_raw = r_curls
+                    l_oppose_raw = l_oppose
+                    r_oppose_raw = r_oppose
+                    l_finger_tip_oppose_raw = l_finger_tip_oppose
+                    r_finger_tip_oppose_raw = r_finger_tip_oppose
+
+                    if finger_filter_left is not None and finger_filter_right is not None:
+                        l_curls, l_oppose, l_finger_tip_oppose = (
+                            finger_filter_left.update(
+                                l_curls, l_oppose, l_finger_tip_oppose,
+                            )
+                        )
+                        r_curls, r_oppose, r_finger_tip_oppose = (
+                            finger_filter_right.update(
+                                r_curls, r_oppose, r_finger_tip_oppose,
+                            )
+                        )
+
                     hr = calibration.hand_range
                     l_hr = hr.left if hr is not None else None
                     r_hr = hr.right if hr is not None else None
                     if l_curls is not None:
                         left_hand = per_finger_grasp_command_from_curls_and_oppose(
                             "left", l_curls, l_oppose,
+                            finger_tip_oppose=l_finger_tip_oppose,
                             curl_floor=l_hr.floor if l_hr is not None else None,
                             curl_ceiling=l_hr.ceiling if l_hr is not None else None,
                             oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
@@ -726,6 +829,7 @@ def main(argv: list[str] | None = None) -> int:
                     if r_curls is not None:
                         right_hand = per_finger_grasp_command_from_curls_and_oppose(
                             "right", r_curls, r_oppose,
+                            finger_tip_oppose=r_finger_tip_oppose,
                             curl_floor=r_hr.floor if r_hr is not None else None,
                             curl_ceiling=r_hr.ceiling if r_hr is not None else None,
                             oppose_floor=r_hr.oppose_floor if r_hr is not None else None,
@@ -914,26 +1018,82 @@ def main(argv: list[str] | None = None) -> int:
                             "commanded_left_hand_q": np.asarray(left_hand, dtype=np.float32),
                             "commanded_right_hand_q": np.asarray(right_hand, dtype=np.float32),
                             # Quest 3 XRHand inputs (same signals as live retargeting).
-                            # NaN when that side uses uniform controller grasp (no per-finger curls).
+                            # RAW Quest 3 signals -- exactly what the
+                            # WebXR client emitted, before any smoothing.
+                            # NaN when that side uses uniform controller
+                            # grasp (no per-finger curls). The legacy
+                            # field names (``quest_*_hand_curls`` etc.)
+                            # carry the RAW values so older offline
+                            # tooling stays bit-compatible.
                             "quest_left_hand_curls": (
+                                np.asarray(l_curls_raw, dtype=np.float32)
+                                if l_curls_raw is not None
+                                else np.full(5, np.nan, dtype=np.float32)
+                            ),
+                            "quest_right_hand_curls": (
+                                np.asarray(r_curls_raw, dtype=np.float32)
+                                if r_curls_raw is not None
+                                else np.full(5, np.nan, dtype=np.float32)
+                            ),
+                            "quest_left_thumb_oppose": (
+                                np.float32(l_oppose_raw)
+                                if l_oppose_raw is not None
+                                else np.float32(np.nan)
+                            ),
+                            "quest_right_thumb_oppose": (
+                                np.float32(r_oppose_raw)
+                                if r_oppose_raw is not None
+                                else np.float32(np.nan)
+                            ),
+                            # Per-finger thumb-tip-to-fingertip proximity:
+                            # length-4 ``[index, middle, ring, pinky]`` in
+                            # ``[0, 1]``. NaN row when the WebXR side is
+                            # too old to emit the field, NaN entries
+                            # within a row for fingertips that dropped
+                            # out (callers must handle NaN).
+                            "quest_left_finger_tip_oppose": (
+                                np.asarray(l_finger_tip_oppose_raw, dtype=np.float32)
+                                if l_finger_tip_oppose_raw is not None
+                                else np.full(4, np.nan, dtype=np.float32)
+                            ),
+                            "quest_right_finger_tip_oppose": (
+                                np.asarray(r_finger_tip_oppose_raw, dtype=np.float32)
+                                if r_finger_tip_oppose_raw is not None
+                                else np.full(4, np.nan, dtype=np.float32)
+                            ),
+                            # FILTERED signals (post EMA + deadband-hold) --
+                            # this is what actually drove the retargeter
+                            # this frame. Identical to the raw fields when
+                            # ``--no-finger-filter`` is set.
+                            "quest_left_hand_curls_filtered": (
                                 np.asarray(l_curls, dtype=np.float32)
                                 if l_curls is not None
                                 else np.full(5, np.nan, dtype=np.float32)
                             ),
-                            "quest_right_hand_curls": (
+                            "quest_right_hand_curls_filtered": (
                                 np.asarray(r_curls, dtype=np.float32)
                                 if r_curls is not None
                                 else np.full(5, np.nan, dtype=np.float32)
                             ),
-                            "quest_left_thumb_oppose": (
+                            "quest_left_thumb_oppose_filtered": (
                                 np.float32(l_oppose)
                                 if l_oppose is not None
                                 else np.float32(np.nan)
                             ),
-                            "quest_right_thumb_oppose": (
+                            "quest_right_thumb_oppose_filtered": (
                                 np.float32(r_oppose)
                                 if r_oppose is not None
                                 else np.float32(np.nan)
+                            ),
+                            "quest_left_finger_tip_oppose_filtered": (
+                                np.asarray(l_finger_tip_oppose, dtype=np.float32)
+                                if l_finger_tip_oppose is not None
+                                else np.full(4, np.nan, dtype=np.float32)
+                            ),
+                            "quest_right_finger_tip_oppose_filtered": (
+                                np.asarray(r_finger_tip_oppose, dtype=np.float32)
+                                if r_finger_tip_oppose is not None
+                                else np.full(4, np.nan, dtype=np.float32)
                             ),
                         }
                         episode_buffer.push_debug(debug_row)

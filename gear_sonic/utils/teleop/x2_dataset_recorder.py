@@ -112,6 +112,10 @@ from gear_sonic.scripts.live_vla_publish_motion_token import (  # noqa: E402
     _quat_wxyz_to_projected_gravity,
     _x2_debug_subscriber,
 )
+from gear_sonic.utils.teleop.finger_signal_filter import (
+    FingerFilterParams,
+    FingerSignalFilter,
+)
 from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader
 from gear_sonic.utils.teleop.vr_arm_teleop_v2 import VRArmTeleopCalibrated
@@ -184,6 +188,13 @@ class RecorderConfig:
 
     # Dataset
     embodiment_tag: str = "new_embodiment"
+
+    # Per-finger noise / jitter / occlusion filter (v0.6).
+    # ``finger_filter_params = None`` disables the filter; setting it
+    # to ``FingerFilterParams()`` enables the v5-calibrated defaults.
+    finger_filter_params: Optional[FingerFilterParams] = field(
+        default_factory=FingerFilterParams
+    )
 
     # Misc
     verbose: bool = True
@@ -354,6 +365,33 @@ class X2DatasetRecorder:
             per_tick_step_rad=self._cfg.ik_per_tick_step_rad,
         )
 
+        # Per-side stateful smoothers for the Quest 3 hand signals.
+        # See ``finger_signal_filter`` for design + tuning rationale.
+        if self._cfg.finger_filter_params is not None:
+            self._cfg.finger_filter_params.validate()
+            self._finger_filter_left: Optional[FingerSignalFilter] = (
+                FingerSignalFilter(self._cfg.finger_filter_params)
+            )
+            self._finger_filter_right: Optional[FingerSignalFilter] = (
+                FingerSignalFilter(self._cfg.finger_filter_params)
+            )
+            if self._cfg.verbose:
+                p = self._cfg.finger_filter_params
+                print(
+                    f"[recorder] finger filter ENABLED: alpha={p.ema_alpha} "
+                    f"hold_window={p.hold_window} hold_std={p.hold_std} "
+                    f"release_std={p.release_std} release_disp={p.release_disp}",
+                    flush=True,
+                )
+        else:
+            self._finger_filter_left = None
+            self._finger_filter_right = None
+            if self._cfg.verbose:
+                print(
+                    "[recorder] finger filter DISABLED",
+                    flush=True,
+                )
+
     def _resolve_calibration(self) -> OperatorCalibration:
         """Load the operator calibration YAML, or capture inline."""
         cfg = self._cfg
@@ -484,12 +522,33 @@ class X2DatasetRecorder:
                 # per-finger detail AND the thumb opposition correction.
                 l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
                 l_oppose, r_oppose = self._quest.get_thumb_opposition()
+                l_finger_tip_oppose, r_finger_tip_oppose = (
+                    self._quest.get_finger_tip_oppose()
+                )
+
+                # Apply the per-side smoothing filter on top of the raw
+                # Quest 3 inputs. The retargeter sees only the filtered
+                # values; the raw values are no longer kept (the SONIC-
+                # record path doesn't write a debug NPZ).
+                if self._finger_filter_left is not None and self._finger_filter_right is not None:
+                    l_curls, l_oppose, l_finger_tip_oppose = (
+                        self._finger_filter_left.update(
+                            l_curls, l_oppose, l_finger_tip_oppose,
+                        )
+                    )
+                    r_curls, r_oppose, r_finger_tip_oppose = (
+                        self._finger_filter_right.update(
+                            r_curls, r_oppose, r_finger_tip_oppose,
+                        )
+                    )
+
                 hr = self._calibration.hand_range if self._calibration is not None else None
                 l_hr = hr.left if hr is not None else None
                 r_hr = hr.right if hr is not None else None
                 if l_curls is not None:
                     left_hand_q = per_finger_grasp_command_from_curls_and_oppose(
                         "left", l_curls, l_oppose,
+                        finger_tip_oppose=l_finger_tip_oppose,
                         curl_floor=l_hr.floor if l_hr is not None else None,
                         curl_ceiling=l_hr.ceiling if l_hr is not None else None,
                         oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
@@ -509,6 +568,7 @@ class X2DatasetRecorder:
                 if r_curls is not None:
                     right_hand_q = per_finger_grasp_command_from_curls_and_oppose(
                         "right", r_curls, r_oppose,
+                        finger_tip_oppose=r_finger_tip_oppose,
                         curl_floor=r_hr.floor if r_hr is not None else None,
                         curl_ceiling=r_hr.ceiling if r_hr is not None else None,
                         oppose_floor=r_hr.oppose_floor if r_hr is not None else None,
@@ -621,6 +681,12 @@ class X2DatasetRecorder:
         self._episode_buffer.reset()
         self._episode_buffer.started_at = time.time()
         self._episode_buffer.task = self._cfg.task
+        # Each episode starts with a clean filter buffer so the warm-up
+        # window doesn't leak state from the previous episode.
+        if self._finger_filter_left is not None:
+            self._finger_filter_left.reset()
+        if self._finger_filter_right is not None:
+            self._finger_filter_right.reset()
         self._is_recording = True
         print(
             f"[recorder] [B] episode start (task={self._cfg.task!r}, "

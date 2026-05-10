@@ -123,6 +123,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "is bit-equivalent to a live recording. Mutually exclusive "
              "with --auto-range and --curl-floor / --curl-ceiling.",
     )
+
+    # Per-finger noise / jitter / occlusion filter (v0.6)
+    p.add_argument(
+        "--apply-finger-filter",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Whether to apply the per-side EMA + rolling-median deadband "
+             "during replay. 'auto' (default) uses pre-computed filtered "
+             "channels from the NPZ if present (live runs since v0.6 "
+             "persist them); falls back to applying the filter offline "
+             "for older NPZs that only have raw signals. 'always' forces "
+             "an offline pass even when filtered keys are present (useful "
+             "for tuning a different filter cfg). 'never' disables the "
+             "filter and replays directly from the raw curls/oppose "
+             "channels (matches pre-v0.6 behaviour).",
+    )
     return p.parse_args(argv)
 
 
@@ -184,6 +200,7 @@ def _replay_hand_q(
     side: str,
     curls: np.ndarray,
     oppose: float,
+    finger_tip_oppose: np.ndarray | None,
     triggers_4: np.ndarray,
     hand_input: str,
     apply_curl_compensation: bool,
@@ -206,9 +223,14 @@ def _replay_hand_q(
     )
 
     if curls is not None and not np.isnan(curls).any():
+        # finger_tip_oppose is forwarded as-is when present in the NPZ
+        # and finite. Old-format NPZs (no per-finger field) pass None
+        # here -- the retargeter then exactly reproduces the legacy
+        # curls+oppose drive (no kinematic regression).
         return per_finger_grasp_command_from_curls_and_oppose(
             side, curls,
             None if (oppose is None or np.isnan(oppose)) else float(oppose),
+            finger_tip_oppose=finger_tip_oppose,
             apply_curl_compensation=apply_curl_compensation,
             apply_oppose_compensation=apply_oppose_compensation,
             curl_floor=curl_floor,
@@ -387,6 +409,116 @@ def main(argv: list[str] | None = None) -> int:
     r_oppose_arr = np.asarray(npz["quest_right_thumb_oppose"], dtype=np.float64)
     triggers_arr = np.asarray(npz["controller_triggers"], dtype=np.float64)
 
+    # Per-finger thumb-tip-to-fingertip proximity. Added in the post
+    # May-2026 schema; older NPZs lack the field and we fall back to
+    # the curls + thumb_oppose drive (kinematically identical to the
+    # legacy live behaviour for those recordings).
+    if "quest_left_finger_tip_oppose" in npz.files:
+        l_tip_oppose_arr = np.asarray(
+            npz["quest_left_finger_tip_oppose"], dtype=np.float64
+        )
+        r_tip_oppose_arr = np.asarray(
+            npz["quest_right_finger_tip_oppose"], dtype=np.float64
+        )
+        if l_tip_oppose_arr.shape != (n_frames, 4) or r_tip_oppose_arr.shape != (
+            n_frames,
+            4,
+        ):
+            raise SystemExit(
+                f"Unexpected finger_tip_oppose shapes: "
+                f"left={l_tip_oppose_arr.shape} right={r_tip_oppose_arr.shape} "
+                f"(expected ({n_frames}, 4))"
+            )
+        print(
+            f"[replay] finger_tip_oppose present in NPZ "
+            f"(L={int((~np.isnan(l_tip_oppose_arr).any(axis=1)).sum())}/{n_frames} valid, "
+            f"R={int((~np.isnan(r_tip_oppose_arr).any(axis=1)).sum())}/{n_frames} valid)"
+        )
+    else:
+        l_tip_oppose_arr = None
+        r_tip_oppose_arr = None
+        print(
+            "[replay] finger_tip_oppose NOT in NPZ (pre-May-2026 schema); "
+            "non-thumb pip motors will be driven on curls + thumb_oppose only."
+        )
+
+    # ── Per-finger smoothing filter ──
+    # 'auto'   (default): use the v0.6 pre-computed filtered channels
+    #                     from the NPZ if present, else apply offline.
+    # 'always': always re-apply the filter offline (override pre-computed).
+    # 'never':  use the raw signals, bypassing the filter entirely.
+    has_filtered = (
+        "quest_left_hand_curls_filtered" in npz.files
+        and "quest_right_hand_curls_filtered" in npz.files
+    )
+    if args.apply_finger_filter == "never":
+        filter_mode = "off"
+    elif args.apply_finger_filter == "always":
+        filter_mode = "offline"
+    else:  # auto
+        filter_mode = "live" if has_filtered else "offline"
+
+    if filter_mode == "live":
+        # The recording was made with the v0.6+ live filter; replay the
+        # pre-computed filtered channels for bit-equivalent behaviour.
+        l_curls_arr = np.asarray(
+            npz["quest_left_hand_curls_filtered"], dtype=np.float64,
+        )
+        r_curls_arr = np.asarray(
+            npz["quest_right_hand_curls_filtered"], dtype=np.float64,
+        )
+        l_oppose_arr = np.asarray(
+            npz["quest_left_thumb_oppose_filtered"], dtype=np.float64,
+        )
+        r_oppose_arr = np.asarray(
+            npz["quest_right_thumb_oppose_filtered"], dtype=np.float64,
+        )
+        if (
+            "quest_left_finger_tip_oppose_filtered" in npz.files
+            and l_tip_oppose_arr is not None
+        ):
+            l_tip_oppose_arr = np.asarray(
+                npz["quest_left_finger_tip_oppose_filtered"], dtype=np.float64,
+            )
+            r_tip_oppose_arr = np.asarray(
+                npz["quest_right_finger_tip_oppose_filtered"], dtype=np.float64,
+            )
+        print("[replay] using PRE-COMPUTED filtered signals from NPZ "
+              "(auto mode; use --apply-finger-filter=always to re-filter offline)")
+    elif filter_mode == "offline":
+        from gear_sonic.utils.teleop.finger_signal_filter import (
+            FingerFilterParams, filter_npz_offline,
+        )
+        params = FingerFilterParams()  # v5-calibrated defaults
+        if l_tip_oppose_arr is None:
+            l_tip_oppose_arr = np.full((n_frames, 4), np.nan, dtype=np.float64)
+            r_tip_oppose_arr = np.full((n_frames, 4), np.nan, dtype=np.float64)
+            tip_was_synthetic = True
+        else:
+            tip_was_synthetic = False
+        l_curls_arr, l_oppose_arr, l_tip_filt = filter_npz_offline(
+            l_curls_arr, l_oppose_arr, l_tip_oppose_arr, params=params,
+        )
+        r_curls_arr, r_oppose_arr, r_tip_filt = filter_npz_offline(
+            r_curls_arr, r_oppose_arr, r_tip_oppose_arr, params=params,
+        )
+        if not tip_was_synthetic:
+            l_tip_oppose_arr = l_tip_filt
+            r_tip_oppose_arr = r_tip_filt
+        else:
+            # NPZ didn't carry tip_oppose; restore None so downstream
+            # code falls back to the curls + thumb_oppose drive.
+            l_tip_oppose_arr = None
+            r_tip_oppose_arr = None
+        print(
+            f"[replay] applying finger filter OFFLINE: "
+            f"alpha={params.ema_alpha} hold_window={params.hold_window} "
+            f"hold_std={params.hold_std}"
+        )
+    else:  # off
+        print("[replay] finger filter OFF (--apply-finger-filter=never): "
+              "replaying raw Quest 3 signals as recorded.")
+
     cli_curl_floor = _parse_5("curl-floor", args.curl_floor)
     cli_curl_ceiling = _parse_5("curl-ceiling", args.curl_ceiling)
     if (cli_curl_floor is None) != (cli_curl_ceiling is None):
@@ -489,10 +621,13 @@ def main(argv: list[str] | None = None) -> int:
     left_regen = np.zeros((n_frames, 10), dtype=np.float64)
     right_regen = np.zeros((n_frames, 10), dtype=np.float64)
     for i in range(n_frames):
+        l_tip = l_tip_oppose_arr[i] if l_tip_oppose_arr is not None else None
+        r_tip = r_tip_oppose_arr[i] if r_tip_oppose_arr is not None else None
         left_regen[i] = _replay_hand_q(
             side="left",
             curls=l_curls_arr[i],
             oppose=l_oppose_arr[i],
+            finger_tip_oppose=l_tip,
             triggers_4=triggers_arr[i],
             hand_input=args.hand_input,
             apply_curl_compensation=args.apply_curl_compensation,
@@ -506,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
             side="right",
             curls=r_curls_arr[i],
             oppose=r_oppose_arr[i],
+            finger_tip_oppose=r_tip,
             triggers_4=triggers_arr[i],
             hand_input=args.hand_input,
             apply_curl_compensation=args.apply_curl_compensation,

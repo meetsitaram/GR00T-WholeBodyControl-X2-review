@@ -377,6 +377,56 @@ class Quest3Reader:
 
         return _to_oppose_scalar(left_raw), _to_oppose_scalar(right_raw)
 
+    def get_finger_tip_oppose(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-side, per-finger thumb-tip-to-fingertip proximity score.
+
+        Returns:
+            ``(left_finger_tip_oppose, right_finger_tip_oppose)`` --
+            length-4 numpy arrays in ``[0, 1]``, ordered as
+            ``[index, middle, ring, pinky]``. ``None`` when the side
+            has no XRHand data this frame, or when the WebXR client
+            is too old to emit the field (forwards-compat). Within
+            the array, individual entries may be NaN if a specific
+            fingertip joint dropped out for the frame -- callers
+            should treat NaN as "fall back to the curl signal".
+
+        Companion to :meth:`get_thumb_opposition` (which returns a
+        single scalar = MIN over fingertips). This 4-vector splits
+        that signal so each receiving finger gets its own dedicated
+        proximity score, and the omnihand non-thumb pip motors can
+        be driven on ``max(curls[i], finger_tip_oppose[i])``.
+
+        See ``computeFingerTipOppose`` in the WebXR client for the
+        exact geometric definition. Same touch (~0.5 cm) and far
+        (~3.5 cm) thresholds as :meth:`get_thumb_opposition`.
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return None, None
+        hands = sample.get("hands") or {}
+        left_raw = hands.get("left") or {}
+        right_raw = hands.get("right") or {}
+
+        def _to_tip_oppose_array(raw: dict) -> np.ndarray | None:
+            v = raw.get("finger_tip_oppose")
+            if v is None:
+                return None
+            try:
+                arr = np.asarray(v, dtype=np.float32)
+            except (TypeError, ValueError):
+                return None
+            if arr.shape != (4,):
+                return None
+            # NaN entries are kept; callers must handle them. Clamp
+            # finite entries to [0, 1].
+            finite = np.isfinite(arr)
+            arr[finite] = np.clip(arr[finite], 0.0, 1.0)
+            return arr
+
+        return _to_tip_oppose_array(left_raw), _to_tip_oppose_array(right_raw)
+
     # -- WebSocket server -----------------------------------------------------
 
     def _make_ssl_context(self) -> ssl.SSLContext | None:

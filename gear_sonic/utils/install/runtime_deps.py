@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 
@@ -50,6 +51,40 @@ def _is_importable(module_name: str) -> bool:
     except (ImportError, ValueError):
         return False
     return spec is not None
+
+
+def _resolve_install_cmd(specs: list[str], *, quiet: bool) -> tuple[list[str], str]:
+    """Pick the best installer available for the current interpreter.
+
+    Returns ``(cmd_list, label)``. Strategy:
+
+    1. **Stdlib pip** if importable in this interpreter
+       (``python -m pip install``) -- the canonical path.
+    2. **uv pip** with explicit ``--python <sys.executable>`` if the
+       ``uv`` binary is on PATH -- handles ``uv venv`` environments
+       that ship without stdlib pip.
+    3. Raise ``RuntimeError`` so the caller can fall back to the
+       manual-install message.
+    """
+    if _is_importable("pip"):
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if quiet:
+            cmd.append("-q")
+        cmd.extend(specs)
+        return cmd, "pip"
+
+    uv_bin = shutil.which("uv")
+    if uv_bin is not None:
+        cmd = [uv_bin, "pip", "install", "--python", sys.executable]
+        if quiet:
+            cmd.append("-q")
+        cmd.extend(specs)
+        return cmd, "uv pip"
+
+    raise RuntimeError(
+        "no installer available: stdlib pip is not importable in "
+        f"{sys.executable} and no `uv` binary on PATH"
+    )
 
 
 def ensure_runtime_deps(
@@ -118,15 +153,30 @@ def ensure_runtime_deps(
             )
             return False
 
-    cmd = [sys.executable, "-m", "pip", "install"]
-    if quiet:
-        cmd.append("-q")
-    cmd.extend(missing.values())
+    specs = list(missing.values())
+    try:
+        cmd, label = _resolve_install_cmd(specs, quiet=quiet)
+    except RuntimeError as exc:
+        # Neither pip nor uv is available; no automatic remediation.
+        print(
+            f"[runtime-deps] {exc}. "
+            f"Install the missing packages manually:\n"
+            f"    {sys.executable} -m pip install {' '.join(specs)}\n"
+            f"  (or)  uv pip install --python {sys.executable} {' '.join(specs)}",
+            flush=True,
+        )
+        return False
+
+    print(
+        f"[runtime-deps] using {label}: "
+        f"{' '.join(cmd)}",
+        flush=True,
+    )
     try:
         subprocess.check_call(cmd)
     except subprocess.CalledProcessError as exc:
         print(
-            f"[runtime-deps] pip install failed (exit {exc.returncode}). "
+            f"[runtime-deps] {label} install failed (exit {exc.returncode}). "
             f"Continuing with degraded functionality. Re-run manually:\n"
             f"    {' '.join(cmd)}",
             flush=True,
@@ -134,9 +184,10 @@ def ensure_runtime_deps(
         return False
     except FileNotFoundError:
         print(
-            f"[runtime-deps] could not invoke pip ({sys.executable} -m pip). "
-            f"Install the missing packages manually: "
-            f"{sorted(missing.values())}",
+            f"[runtime-deps] could not invoke {label} ({cmd[0]}). "
+            f"Install the missing packages manually:\n"
+            f"    {sys.executable} -m pip install {' '.join(specs)}\n"
+            f"  (or)  uv pip install --python {sys.executable} {' '.join(specs)}",
             flush=True,
         )
         return False

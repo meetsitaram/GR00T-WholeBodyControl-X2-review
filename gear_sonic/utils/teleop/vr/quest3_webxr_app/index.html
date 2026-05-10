@@ -1060,6 +1060,89 @@ function computeThumbOpposition(hand, frame, refSpace) {
   return s;
 }
 
+/* PER-FINGER thumb-tip-to-fingertip proximity score in [0, 1].
+ *
+ * Companion to ``computeThumbOpposition`` above. ``computeThumbOpposition``
+ * returns a single scalar = the MIN distance from thumb-tip to ANY of
+ * the four fingertips. That's enough to drive the thumb (one signal,
+ * any-finger touch saturates it). It's NOT enough to drive the
+ * RECEIVING finger -- a thumb-pad-touches-index-pad gesture should
+ * close the index, NOT the middle/ring/pinky.
+ *
+ * This function returns a 4-vector
+ *   [index, middle, ring, pinky]
+ * where each entry is the same dist/palm-width proximity score
+ * applied per finger. Operators get the same calibration thresholds:
+ *
+ *   * dNorm < 0.06 (~0.5 cm contact)      -> s = 1.0
+ *   * dNorm = 0.20 (~1.5 cm near touch)   -> s = 0.64
+ *   * dNorm = 0.45 (~3.5 cm controller)   -> s = 0.0
+ *   * dNorm > 0.60 (~5+ cm extended)      -> s = 0.0
+ *
+ * Why we need this in addition to per-finger curls
+ * ------------------------------------------------
+ * The X2 OmniHand non-thumb fingers have ONE active flexion DOF per
+ * finger (`*_pip`) driving 2 mimic-coupled segments. The operator's
+ * finger has THREE knuckles (MCP+PIP+DIP). The Quest 3 chain summed
+ * over all 3 knuckles already, but Quest 3's "fingers move together"
+ * prior caps isolated single-finger curls at ~0.30-0.40 raw -- so
+ * even after per-operator p05/p95 normalization, the robot finger
+ * only travels ~36% to CLOSED on a deliberate thumb-finger touch.
+ * The thumb itself was fixed by folding `oppose` into all 3 thumb
+ * motors via `max(thumb_oppose, thumb_flex_curl)`. Per-finger
+ * tip-oppose is the symmetric fix for the receiving finger:
+ * Python-side will drive each `*_pip` motor on
+ * `max(curls[i], finger_tip_oppose[i])` so the touched fingertip
+ * closes regardless of curl-signal saturation while smooth
+ * intermediate variation is preserved on non-touch frames (where
+ * tip_oppose is near 0).
+ *
+ * Returns ``null`` if any of the required joints (thumb-tip, two
+ * MCP anchors for palm width, all four fingertips) is not tracked
+ * this frame -- the Python side then falls back to the curl path
+ * via `max(curl, tip_oppose ?? 0)`. If only some fingertips are
+ * tracked, returns a 4-vector with NaN entries for the missing
+ * fingers. */
+function computeFingerTipOppose(hand, frame, refSpace) {
+  if (!hand) return null;
+  const thumbTipSpace = hand.get('thumb-tip');
+  const indexMcSpace  = hand.get('index-finger-metacarpal');
+  const pinkyMcSpace  = hand.get('pinky-finger-metacarpal');
+  if (!thumbTipSpace || !indexMcSpace || !pinkyMcSpace) return null;
+  const tp = frame.getJointPose(thumbTipSpace, refSpace);
+  const ip = frame.getJointPose(indexMcSpace, refSpace);
+  const pp = frame.getJointPose(pinkyMcSpace, refSpace);
+  if (!tp || !ip || !pp) return null;
+
+  const i = ip.transform.position;
+  const p = pp.transform.position;
+  const palmWidth = Math.hypot(p.x - i.x, p.y - i.y, p.z - i.z);
+  if (palmWidth < 1e-3) return null;
+
+  const tt = tp.transform.position;
+  const out = [NaN, NaN, NaN, NaN];
+  let anyTracked = false;
+  for (let k = 0; k < _OPPOSE_FINGERTIP_JOINTS.length; k++) {
+    const jointName = _OPPOSE_FINGERTIP_JOINTS[k];
+    const space = hand.get(jointName);
+    if (!space) continue;
+    const pose = frame.getJointPose(space, refSpace);
+    if (!pose) continue;
+    const fp = pose.transform.position;
+    const dx = tt.x - fp.x, dy = tt.y - fp.y, dz = tt.z - fp.z;
+    const d = Math.hypot(dx, dy, dz);
+    const dNorm = d / palmWidth;
+    let s = (_OPPOSE_FAR_NORM - dNorm)
+          / (_OPPOSE_FAR_NORM - _OPPOSE_TOUCH_NORM);
+    if (s < 0) s = 0;
+    if (s > 1) s = 1;
+    out[k] = s;
+    anyTracked = true;
+  }
+  if (!anyTracked) return null;
+  return out;
+}
+
 function computeHandCurls(hand, frame, refSpace) {
   if (!hand) return null;
   const curls = [];
@@ -1157,14 +1240,19 @@ function onXRFrame(time, frame) {
 
   let numControllers = 0;
   /* hands payload: per-side analog finger curls + thumb opposition +
-   * the source kind that supplied this frame. ``source`` is 'hand',
-   * 'controller', or null; ``curls`` is null when no XRHand data is
-   * available; ``oppose`` is the thumb-tip-relative-to-palm
-   * opposition score in [0, 1] (see computeThumbOpposition), null
-   * when not tracked. */
+   * per-finger thumb-to-fingertip proximity + the source kind that
+   * supplied this frame. ``source`` is 'hand', 'controller', or
+   * null; ``curls`` is null when no XRHand data is available;
+   * ``oppose`` is the global thumb-tip-relative-to-nearest-fingertip
+   * proximity score in [0, 1] (see computeThumbOpposition), null
+   * when not tracked; ``finger_tip_oppose`` is a 4-element array of
+   * per-finger thumb-tip-to-fingertip proximities (index, middle,
+   * ring, pinky) in [0, 1] (see computeFingerTipOppose), null when
+   * the hand is not tracked at all, or with NaN entries for
+   * individual fingertips that dropped out this frame. */
   const hands = {
-    left:  { source: null, curls: null, oppose: null, pinch: 0 },
-    right: { source: null, curls: null, oppose: null, pinch: 0 },
+    left:  { source: null, curls: null, oppose: null, finger_tip_oppose: null, pinch: 0 },
+    right: { source: null, curls: null, oppose: null, finger_tip_oppose: null, pinch: 0 },
   };
 
   /* Two-pass collection: first gather BOTH controller and hand poses
@@ -1220,6 +1308,7 @@ function onXRFrame(time, frame) {
   let leftHandPose = null, rightHandPose = null;
   let leftCurls = null, rightCurls = null;
   let leftOppose = null, rightOppose = null;
+  let leftFingerTipOppose = null, rightFingerTipOppose = null;
 
   for (const src of xrSession.inputSources) {
     /* IMPORTANT: process .hand and .gripSpace as INDEPENDENT
@@ -1273,12 +1362,15 @@ function onXRFrame(time, frame) {
       }
       const curls = computeHandCurls(src.hand, frame, refSpace);
       const oppose = computeThumbOpposition(src.hand, frame, refSpace);
+      const fingerTipOppose = computeFingerTipOppose(src.hand, frame, refSpace);
       if (src.handedness === 'left') {
         leftCurls = curls;
         leftOppose = oppose;
+        leftFingerTipOppose = fingerTipOppose;
       } else if (src.handedness === 'right') {
         rightCurls = curls;
         rightOppose = oppose;
+        rightFingerTipOppose = fingerTipOppose;
       }
       /* NO `continue` here -- fall through to also collect the
        * gripSpace pose + gamepad buttons if this same source has
@@ -1341,9 +1433,16 @@ function onXRFrame(time, frame) {
       if (buttons.leftGrip === 0) buttons.leftGrip = (leftCurls[2] + leftCurls[3] + leftCurls[4]) / 3;
     }
     if (leftOppose !== null) hands.left.oppose = leftOppose;
+    if (leftFingerTipOppose !== null) hands.left.finger_tip_oppose = leftFingerTipOppose;
   } else if (leftHandPose) {
     leftData = leftHandPose;
-    hands.left = { source: 'hand', curls: leftCurls, oppose: leftOppose, pinch: leftCurls ? leftCurls[1] : 0 };
+    hands.left = {
+      source: 'hand',
+      curls: leftCurls,
+      oppose: leftOppose,
+      finger_tip_oppose: leftFingerTipOppose,
+      pinch: leftCurls ? leftCurls[1] : 0,
+    };
     if (leftCurls) {
       buttons.leftTrigger = Math.max(buttons.leftTrigger, leftCurls[1]);
       buttons.leftGrip = Math.max(buttons.leftGrip, (leftCurls[2] + leftCurls[3] + leftCurls[4]) / 3);
@@ -1360,9 +1459,16 @@ function onXRFrame(time, frame) {
       if (buttons.rightGrip === 0) buttons.rightGrip = (rightCurls[2] + rightCurls[3] + rightCurls[4]) / 3;
     }
     if (rightOppose !== null) hands.right.oppose = rightOppose;
+    if (rightFingerTipOppose !== null) hands.right.finger_tip_oppose = rightFingerTipOppose;
   } else if (rightHandPose) {
     rightData = rightHandPose;
-    hands.right = { source: 'hand', curls: rightCurls, oppose: rightOppose, pinch: rightCurls ? rightCurls[1] : 0 };
+    hands.right = {
+      source: 'hand',
+      curls: rightCurls,
+      oppose: rightOppose,
+      finger_tip_oppose: rightFingerTipOppose,
+      pinch: rightCurls ? rightCurls[1] : 0,
+    };
     if (rightCurls) {
       buttons.rightTrigger = Math.max(buttons.rightTrigger, rightCurls[1]);
       buttons.rightGrip = Math.max(buttons.rightGrip, (rightCurls[2] + rightCurls[3] + rightCurls[4]) / 3);
