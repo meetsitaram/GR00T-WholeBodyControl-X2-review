@@ -731,21 +731,28 @@ def _build_one_episode(
                 f"({EGO_VIEW_HEIGHT}, {EGO_VIEW_WIDTH}, 3) uint8."
             )
 
-        # body_q is in Pinocchio order; the dataset's
-        # action.commanded_body_q_mj column expects MuJoCo order. The
-        # synthetic smoke episode keeps the body in the default stand
-        # pose so we zero-fill at the canonical 31 DOF -- downstream
-        # tests only care that the column has the right shape and
-        # appears in every frame.
+        # body_q is in Pinocchio order; the dataset's action.body_q_mj
+        # column expects MuJoCo order. The synthetic smoke episode
+        # keeps the body in the default stand pose so we zero-fill at
+        # the canonical 31 DOF -- downstream tests only care that the
+        # column has the right shape and appears in every frame.
+        # v1 schema: synthetic data has no SONIC rollout so executed ==
+        # pre_sonic == zeros, sonic_correction_max_rad == 0.
         commanded_body_q_mj = np.zeros(robot_model.num_joints, dtype=np.float64)
+        left_q_arr = left_q.copy()
+        right_q_arr = right_q.copy()
 
         frame_data = {
             "observation.state": observation_state,
             "observation.projected_gravity": projected_gravity,
             "action.motion_token": token_provider(f),
-            "action.commanded_body_q_mj": commanded_body_q_mj,
-            "action.left_hand_joints": left_q.copy(),
-            "action.right_hand_joints": right_q.copy(),
+            "action.body_q_mj": commanded_body_q_mj,
+            "action.left_hand_joints": left_q_arr,
+            "action.right_hand_joints": right_q_arr,
+            "action.body_q_mj_pre_sonic": commanded_body_q_mj.copy(),
+            "action.left_hand_joints_pre_sonic": left_q_arr.copy(),
+            "action.right_hand_joints_pre_sonic": right_q_arr.copy(),
+            "action.sonic_correction_max_rad": np.zeros(1, dtype=np.float32),
             "observation.images.ego_view": ego_view,
             "task": task,
         }

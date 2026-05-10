@@ -207,15 +207,21 @@ def _write_fixture_parquet(
     skip_columns: tuple[str, ...] = (),
     bad_body_width: int | None = None,
     bad_left_width: int | None = None,
+    body_action_col: str = "action.body_q_mj",
 ) -> None:
-    """Synthesize a minimal LeRobot-shaped parquet for unit tests."""
+    """Synthesize a minimal LeRobot-shaped parquet for unit tests.
+
+    By default writes the v1 schema name ``action.body_q_mj``. Pass
+    ``body_action_col="action.commanded_body_q_mj"`` to exercise v0
+    backward compatibility.
+    """
     body_w = bad_body_width if bad_body_width is not None else body_dim
     left_w = bad_left_width if bad_left_width is not None else hand_dim
     rng = np.random.default_rng(0)
 
     cols: dict[str, list] = {}
-    if "action.commanded_body_q_mj" not in skip_columns:
-        cols["action.commanded_body_q_mj"] = list(
+    if body_action_col not in skip_columns:
+        cols[body_action_col] = list(
             rng.standard_normal((num_frames, body_w)).astype(np.float64)
         )
     if "action.left_hand_joints" not in skip_columns:
@@ -265,7 +271,7 @@ def test_load_and_validate_parquet_missing_columns_raises(tmp_path: Path) -> Non
         p, num_frames=5, body_dim=31, hand_dim=10,
         skip_columns=("action.left_hand_joints",),
     )
-    with pytest.raises(ValueError, match="missing required columns"):
+    with pytest.raises(ValueError, match="missing required hand columns"):
         _load_and_validate_parquet(
             p, num_body_dofs=31, num_hand_dof_per_side=10, require_omnihand=True,
         )
@@ -276,7 +282,7 @@ def test_load_and_validate_parquet_wrong_body_width_raises(tmp_path: Path) -> No
     _write_fixture_parquet(
         p, num_frames=5, body_dim=31, hand_dim=10, bad_body_width=29,
     )
-    with pytest.raises(ValueError, match="action.commanded_body_q_mj"):
+    with pytest.raises(ValueError, match="action.body_q_mj"):
         _load_and_validate_parquet(
             p, num_body_dofs=31, num_hand_dof_per_side=10, require_omnihand=True,
         )
@@ -288,6 +294,46 @@ def test_load_and_validate_parquet_wrong_hand_width_raises(tmp_path: Path) -> No
         p, num_frames=5, body_dim=31, hand_dim=10, bad_left_width=7,
     )
     with pytest.raises(ValueError, match="action.left_hand_joints"):
+        _load_and_validate_parquet(
+            p, num_body_dofs=31, num_hand_dof_per_side=10, require_omnihand=True,
+        )
+
+
+def test_load_and_validate_parquet_v0_legacy_column_falls_back(
+    tmp_path: Path,
+) -> None:
+    """v0 datasets shipped action.commanded_body_q_mj; replay must read them."""
+    p = tmp_path / "ep_v0.parquet"
+    _write_fixture_parquet(
+        p,
+        num_frames=20,
+        body_dim=31,
+        hand_dim=10,
+        body_action_col="action.commanded_body_q_mj",
+    )
+    body, left, right = _load_and_validate_parquet(
+        p,
+        num_body_dofs=31,
+        num_hand_dof_per_side=10,
+        require_omnihand=True,
+    )
+    assert body.shape == (20, 31)
+    assert left is not None and left.shape == (20, 10)
+    assert right is not None and right.shape == (20, 10)
+
+
+def test_load_and_validate_parquet_no_body_action_column_raises(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "ep.parquet"
+    _write_fixture_parquet(
+        p,
+        num_frames=5,
+        body_dim=31,
+        hand_dim=10,
+        skip_columns=("action.body_q_mj",),
+    )
+    with pytest.raises(ValueError, match="missing the body action column"):
         _load_and_validate_parquet(
             p, num_body_dofs=31, num_hand_dof_per_side=10, require_omnihand=True,
         )

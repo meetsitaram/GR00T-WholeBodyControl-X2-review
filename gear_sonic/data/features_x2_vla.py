@@ -66,12 +66,12 @@ HAND_DOF_G1_COMPAT: int = 7
 # Canonical 31-joint name list in MuJoCo (MJCF) order. Mirrors
 # ``mujoco_joint_names[]`` in
 # ``gear_sonic_deploy/.../include/policy_parameters.hpp``. Used to
-# label the per-scalar names of ``action.commanded_body_q_mj`` in the
-# LeRobot v2.1 features schema. NOTE: this is *not* the same as
-# ``RobotModel.joint_names`` (Pinocchio URDF order); the two orderings
-# differ for the head / arm blocks. ``observation.state`` keeps the
-# Pinocchio order; ``action.commanded_body_q_mj`` keeps the MuJoCo
-# order to match what the C++ deploy actually consumes.
+# label the per-scalar names of ``action.body_q_mj`` (and its
+# ``_pre_sonic`` sibling) in the LeRobot v2.1 features schema. NOTE:
+# this is *not* the same as ``RobotModel.joint_names`` (Pinocchio URDF
+# order); the two orderings differ for the head / arm blocks.
+# ``observation.state`` keeps the Pinocchio order; ``action.body_q_mj``
+# keeps the MuJoCo order to match what the C++ deploy actually consumes.
 MUJOCO_JOINT_NAMES: tuple[str, ...] = (
     "left_hip_pitch_joint",   "left_hip_roll_joint",   "left_hip_yaw_joint",
     "left_knee_joint",        "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -199,21 +199,48 @@ def assemble_observation_state(
 def get_features_x2_vla(
     robot_model: RobotModel,
     hand_dof_per_side: int = HAND_DOF_OMNI,
+    *,
+    post_sonic_canonical: bool = True,
 ) -> dict:
     """Return the LeRobot v2.1 ``features`` dict for the X2 SONIC dataset.
 
-    The action surface declares both:
+    Action surface (v1 schema, ``post_sonic_canonical=True``):
 
     * ``action.motion_token`` (64-D) -- legacy / v1 surface kept for
       cross-embodiment compat with ``unitree_g1_sonic``. During live
-      recording (kinematic teleop or SONIC-stabilised teleop) this
-      field is filled with zeros and is meant to be overwritten by an
-      offline labeling pass that runs ``SonicMotionTokenLabeler`` over
-      ``action.commanded_body_q_mj`` (see ``label_recorded_dataset.py``).
-    * ``action.commanded_body_q_mj`` (``num_body``-D, MuJoCo joint
-      ordering) -- the *true* command sent into the C++ deploy /
-      MuJoCo viewer at recording time. This is the authoritative
-      target a learned policy should regress against.
+      recording this field is filled with zeros and is meant to be
+      overwritten by an offline labeling pass that runs
+      ``SonicMotionTokenLabeler`` over ``action.body_q_mj`` (see
+      ``label_recorded_dataset.py``).
+    * ``action.body_q_mj`` (``num_body``-D, MuJoCo joint ordering) --
+      **CANONICAL training target**. The post-SONIC executed q (what
+      the trained tracking policy actually achieved, i.e. what's
+      visible in the MuJoCo viewer). For pure-kinematic recordings
+      (``post_sonic_canonical=False``) it is just the commanded q
+      since no policy is in the loop.
+    * ``action.left_hand_joints`` / ``action.right_hand_joints``
+      (``hand_dof_per_side``-D each) -- canonical hand action;
+      post-deploy URDF-clipped q in v1, raw retargeted q in kinematic
+      mode.
+
+    When ``post_sonic_canonical=True`` (the default for
+    SONIC-stabilised recordings), four debug-only sibling columns are
+    added. They live on disk for retargeter / SONIC-correction
+    analysis and are explicitly *not* exposed as training targets via
+    :func:`get_modality_config_x2_vla`:
+
+    * ``action.body_q_mj_pre_sonic`` -- the operator's X2 joint
+      command sent on the wire to the deploy, before SONIC and
+      MuJoCo physics. Same vector space as ``action.body_q_mj``.
+    * ``action.left_hand_joints_pre_sonic`` /
+      ``action.right_hand_joints_pre_sonic`` -- pre-deploy hand q
+      (operator retarget output, before URDF clipping).
+    * ``action.sonic_correction_max_rad`` -- per-frame
+      ``max_arms |body_q_mj - body_q_mj_pre_sonic|`` summary scalar.
+
+    For pure-kinematic recordings (``post_sonic_canonical=False``)
+    these debug siblings are omitted because there's no SONIC in the
+    loop to correct anything.
     """
     body_joint_names = robot_model.joint_names
     num_body = robot_model.num_joints
@@ -238,7 +265,7 @@ def get_features_x2_vla(
     state_dim = num_body + 2 * hand_dof_per_side
     state_names = list(body_joint_names) + list(finger_names_left) + list(finger_names_right)
 
-    return {
+    features: dict = {
         "observation.images.ego_view": {
             "dtype": "video",
             "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
@@ -259,7 +286,7 @@ def get_features_x2_vla(
             "shape": (SONIC_MOTION_TOKEN_DIM,),
             "names": [f"motion_token_{i}" for i in range(SONIC_MOTION_TOKEN_DIM)],
         },
-        "action.commanded_body_q_mj": {
+        "action.body_q_mj": {
             "dtype": "float64",
             "shape": (num_body,),
             "names": list(MUJOCO_JOINT_NAMES),
@@ -275,6 +302,30 @@ def get_features_x2_vla(
             "names": list(finger_names_right),
         },
     }
+
+    if post_sonic_canonical:
+        features["action.body_q_mj_pre_sonic"] = {
+            "dtype": "float64",
+            "shape": (num_body,),
+            "names": list(MUJOCO_JOINT_NAMES),
+        }
+        features["action.left_hand_joints_pre_sonic"] = {
+            "dtype": "float64",
+            "shape": (hand_dof_per_side,),
+            "names": list(finger_names_left),
+        }
+        features["action.right_hand_joints_pre_sonic"] = {
+            "dtype": "float64",
+            "shape": (hand_dof_per_side,),
+            "names": list(finger_names_right),
+        }
+        features["action.sonic_correction_max_rad"] = {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["arm_delta_max_rad"],
+        }
+
+    return features
 
 
 # ---------------------------------------------------------------------------

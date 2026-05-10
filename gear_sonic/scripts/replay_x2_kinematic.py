@@ -1,12 +1,23 @@
 """Kinematic-only MuJoCo replay of a recorded LeRobot v2.1 episode.
 
-Reads ``action.commanded_body_q_mj`` plus ``action.left_hand_joints`` /
+Reads ``action.body_q_mj`` plus ``action.left_hand_joints`` /
 ``action.right_hand_joints`` straight out of the recorded parquet and
 faithfully replays them in a passive MuJoCo viewer with the floating
 base pinned to the on-feet stand pose. Nothing is re-derived: no
 SONIC, no policy, no Quest 3 reader, no IK. This is the offline
 counterpart to :file:`teleop_x2_kinematic.py` -- pure ``mj_forward``
 kinematics, the same way the smoketest renderer works.
+
+Schema dispatch (v0 vs v1)
+    * **v1 datasets** (``meta/dataset_format_version.json`` with
+      ``version=1``): the canonical body action lives in
+      ``action.body_q_mj``. SONIC-recorded datasets additionally have
+      ``action.body_q_mj_pre_sonic`` for retargeter analysis; this
+      replay reads only the canonical column.
+    * **v0 datasets** (no version file, legacy schema): the canonical
+      body action lives in ``action.commanded_body_q_mj``. The replay
+      auto-falls-back to that column when ``action.body_q_mj`` is
+      absent.
 
 What it shows
     The exact joint trajectory the recorder wrote to disk. If the
@@ -64,9 +75,14 @@ _DEFAULT_CHUNK_SIZE: int = 1000
 
 # Required columns that this replay CLI consumes. Kept here (not in
 # the embodiment config) because the schema is part of the LeRobot
-# contract, not the robot.
-_REQUIRED_COLUMNS = (
-    "action.commanded_body_q_mj",
+# contract, not the robot. The body action column is one of two
+# alternatives (v1 = ``action.body_q_mj``, v0 = ``action.commanded_body_q_mj``);
+# we resolve to whichever is present at load time.
+_BODY_ACTION_CANDIDATES: tuple[str, ...] = (
+    "action.body_q_mj",            # v1 schema (post-SONIC canonical or kinematic)
+    "action.commanded_body_q_mj",  # v0 legacy
+)
+_REQUIRED_HAND_COLUMNS = (
     "action.left_hand_joints",
     "action.right_hand_joints",
 )
@@ -168,20 +184,31 @@ def _load_and_validate_parquet(
         )
 
     table = pq.read_table(parquet_path)
-    missing = [c for c in _REQUIRED_COLUMNS if c not in table.column_names]
-    if missing:
+
+    body_col = next(
+        (c for c in _BODY_ACTION_CANDIDATES if c in table.column_names),
+        None,
+    )
+    if body_col is None:
         raise ValueError(
-            f"Parquet {parquet_path} is missing required columns: {missing}. "
+            f"Parquet {parquet_path} is missing the body action column. "
+            f"Tried (in order): {_BODY_ACTION_CANDIDATES}. "
+            f"Available: {table.column_names}"
+        )
+    missing = [c for c in _REQUIRED_HAND_COLUMNS if c not in table.column_names]
+    if require_omnihand and missing:
+        raise ValueError(
+            f"Parquet {parquet_path} is missing required hand columns: {missing}. "
             f"Available: {table.column_names}"
         )
 
     def _stack(col: str) -> np.ndarray:
         return np.stack(table[col].to_numpy()).astype(np.float64)
 
-    body_q = _stack("action.commanded_body_q_mj")
+    body_q = _stack(body_col)
     if body_q.ndim != 2 or body_q.shape[1] != num_body_dofs:
         raise ValueError(
-            f"action.commanded_body_q_mj has shape {body_q.shape}; "
+            f"{body_col} has shape {body_q.shape}; "
             f"expected (num_frames, {num_body_dofs}) for the configured robot."
         )
 

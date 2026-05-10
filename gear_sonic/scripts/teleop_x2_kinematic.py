@@ -116,8 +116,8 @@ _RIGHT_ARM_MJ_SLICE = slice(22, 29)
 
 # Placeholder for action.motion_token written into recorded parquets.
 # Live kinematic teleop never runs the FSQ encoder online -- the offline
-# labeler pass is responsible for re-tokenising action.commanded_body_q_mj
-# into the 64-D motion-token surface used by the SONIC tracker.
+# labeler pass is responsible for re-tokenising action.body_q_mj into
+# the 64-D motion-token surface used by the SONIC tracker.
 _ZERO_MOTION_TOKEN = np.zeros(64, dtype=np.float64)
 
 
@@ -482,8 +482,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         robot_model = get_x2_robot_model(hand_variant="omnihand_10")
+        # Kinematic mode has no SONIC in the loop -- there's nothing to
+        # correct, so the post_sonic_canonical=True schema's pre_sonic +
+        # sonic_correction_max_rad columns aren't meaningful here.
         features = get_features_x2_vla(
-            robot_model, hand_dof_per_side=HAND_DOF_OMNI
+            robot_model,
+            hand_dof_per_side=HAND_DOF_OMNI,
+            post_sonic_canonical=False,
         )
         modality_cfg = get_modality_config_x2_vla(
             robot_model, hand_dof_per_side=HAND_DOF_OMNI
@@ -505,6 +510,18 @@ def main(argv: list[str] | None = None) -> int:
             },
             robot_type="agibot_x2_ultra",
         )
+        # v1 format marker: kinematic-only (no SONIC, so the canonical
+        # action.body_q_mj column carries the operator-commanded q).
+        import json as _kinematic_json
+        _kin_version_path = (
+            exporter.root / "meta" / "dataset_format_version.json"
+        )
+        _kin_version_path.write_text(_kinematic_json.dumps({
+            "version": 1,
+            "post_sonic_canonical": False,
+            "writer": "teleop_x2_kinematic",
+            "teleop_mode": "kinematic",
+        }, indent=2) + "\n")
         renderer = MujocoFrameRenderer(
             camera="ego_view",
             width=args.render_width,
@@ -937,16 +954,22 @@ def main(argv: list[str] | None = None) -> int:
                         proj_grav = np.array([0.0, 0.0, -1.0], dtype=np.float64)
                         # action.motion_token is a placeholder filled by an
                         # offline labeling pass (SonicMotionTokenLabeler over
-                        # action.commanded_body_q_mj). Recording it as zeros
-                        # keeps the parquet schema-compatible with
-                        # unitree_g1_sonic / GR00T datasets without forcing
-                        # the live loop to run an FSQ encoder.
+                        # action.body_q_mj). Recording it as zeros keeps
+                        # the parquet schema-compatible with unitree_g1_sonic
+                        # / GR00T datasets without forcing the live loop to
+                        # run an FSQ encoder.
+                        #
+                        # Kinematic mode has no SONIC in the loop, so
+                        # action.body_q_mj == commanded body_q (no policy
+                        # to override the operator). The pre_sonic /
+                        # sonic_correction_max_rad columns are NOT in the
+                        # kinematic features schema; they're SONIC-only.
                         episode_buffer.push(
                             {
                                 "observation.state": obs_state,
                                 "observation.projected_gravity": proj_grav,
                                 "action.motion_token": _ZERO_MOTION_TOKEN.copy(),
-                                "action.commanded_body_q_mj": body_q_mj.copy(),
+                                "action.body_q_mj": body_q_mj.copy(),
                                 "action.left_hand_joints": left_hand.copy(),
                                 "action.right_hand_joints": right_hand.copy(),
                                 "observation.images.ego_view": np.ascontiguousarray(

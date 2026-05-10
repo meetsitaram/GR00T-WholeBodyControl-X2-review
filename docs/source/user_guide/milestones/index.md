@@ -15,6 +15,7 @@ encountered + fixes applied, and what's left for the next session.
 2026-05-10_omnihand_finger_tuning
 2026-05-11_finger_tip_oppose_signal
 2026-05-12_finger_signal_filter
+2026-05-10_sonic_loop_v1_schema
 ```
 
 ## At a glance
@@ -28,3 +29,4 @@ encountered + fixes applied, and what's left for the next session.
 | 2026-05-10 | OmniHand finger-tuning iteration | **Sim-only**, Quest 3 → X2 kinematic | Thumb-fingertip-touch gesture now closes correctly. Anchor expansion + 3-motor opposition fold-in. Topology mismatch on non-thumb tips filed for v1. |
 | 2026-05-11 | Per-finger fingertip-to-thumb proximity (v0.5) | **Sim-only**, Quest 3 → X2 kinematic | New JS `computeFingerTipOppose` 4-vector + Python `max(curl, finger_tip_oppose)` drive on non-thumb pips + pip CLOSED anchor 80° → 88°. Wired end-to-end (JS → reader → retargeter → debug NPZ → replay); needs a fresh recording to verify visually. |
 | 2026-05-12 | Finger-signal smoothing filter (v0.6) | **Sim-only**, Quest 3 → X2 kinematic | EMA(α=0.5) + rolling-median deadband-hold on the 10 per-side hand inputs. Calibrated against v5/ep1: held-pose tremor reduced 20–40 % on the worst fingers, +20 ms motion lag, 0 ms touch-onset lag. Live + record + replay paths all wired; debug NPZ persists raw + filtered for offline A/B. |
+| 2026-05-10 | SONIC-loop v1 dataset schema | **Sim-only**, X2 + SONIC 25k + Quest 3 | Canonical training-target columns flip from operator-commanded to **post-SONIC executed** q. Operator command preserved as `_pre_sonic` siblings (debug-only, training-invisible). New `meta/dataset_format_version.json` marker, `inspect_sonic_correction.py` offline diagnostic, live `--sonic-correction-warn-rad` operator log. `record_x2_dataset.sh` is now the recommended path for VLA captures. |

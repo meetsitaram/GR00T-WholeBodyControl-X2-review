@@ -32,8 +32,10 @@ class EmbodimentConfig:
         name: Short canonical key used by the registry (e.g. ``"x2"``,
             ``"g1"``). Matches the value passed via ``--robot``.
         num_body_dofs: Number of body joints in the MuJoCo joint order
-            used by ``action.commanded_body_q_mj``. The replay CLI
-            validates the parquet column width against this.
+            used by ``action.body_q_mj`` (v1 schema; legacy v0 datasets
+            still use ``action.commanded_body_q_mj``, which the replay
+            CLI auto-falls-back to). The replay CLI validates the
+            parquet column width against this.
         num_hand_dof_per_side: Number of OmniHand-style finger DOFs per
             side (or 0 if the embodiment has no dexterous hand).
             Validated against ``action.left_hand_joints`` /

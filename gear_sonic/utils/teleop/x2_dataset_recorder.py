@@ -31,13 +31,13 @@ Architecture overview
                                           ``Gr00tDataExporter``
 
 There is **no SONIC FSQ encoder in the live recording loop**. The dataset
-is built from the operator's *intent* (commanded ``body_q`` + hand joints)
+is built from the operator's *intent* (pre-SONIC ``body_q`` + hand joints)
 plus the deploy's observed proprio + ego_view. If you want VLA training
 labels (FSQ ``motion_token``) attached, run the offline labeler in a
-post-processing pass over the recorded ``action.commanded_body_q_mj``
-trajectories. Putting an FSQ encoder *inside* a "data to train a VLA"
-recording loop would just bake that VLA's biases into its own training
-data.
+post-processing pass over the recorded ``action.body_q_mj`` (post-SONIC
+canonical) trajectories. Putting an FSQ encoder *inside* a "data to
+train a VLA" recording loop would just bake that VLA's biases into its
+own training data.
 
 The script is meant to be co-launched with the C++ deploy in VLA-input
 mode (``deploy_x2.sh sim --vla --sim-profile gantry --sim-with-omnihand``).
@@ -196,6 +196,14 @@ class RecorderConfig:
         default_factory=FingerFilterParams
     )
 
+    # SONIC corrective-delta observability (v1 schema).
+    # ``sonic_correction_warn_rad`` is the threshold over which the
+    # operator log fires once per second; ``log_sonic_correction``
+    # toggles the print itself. The ``action.sonic_correction_max_rad``
+    # column is always populated regardless.
+    sonic_correction_warn_rad: float = 0.05
+    log_sonic_correction: bool = True
+
     # Misc
     verbose: bool = True
 
@@ -333,6 +341,12 @@ class X2DatasetRecorder:
 
         # Button-edge tracking for the Quest 3 controller buttons.
         self._prev_buttons = (False, False, False, False)
+
+        # SONIC corrective-delta logging state. ``_last_correction_log_t``
+        # throttles the operator log to once per second.
+        self._last_correction_log_t: float = 0.0
+        self._frame_correction_max_seen: float = 0.0
+        self._frame_correction_max_idx: int = -1
 
         if cfg.teleop_only:
             print(
@@ -845,13 +859,57 @@ class X2DatasetRecorder:
             )
             return
 
+        # v1 schema: bare-canonical action columns carry the post-SONIC
+        # executed q (what the trained tracking policy achieved, i.e.
+        # what the MuJoCo viewer shows). The pre-SONIC operator command
+        # is preserved as ``_pre_sonic`` siblings for retargeter /
+        # SONIC-correction analysis -- training-invisible.
+        commanded_body_q_arr = np.asarray(commanded_body_q_mj, dtype=np.float64)
+        commanded_left_hand_arr = np.asarray(commanded_left_hand_q, dtype=np.float64)
+        commanded_right_hand_arr = np.asarray(commanded_right_hand_q, dtype=np.float64)
+        executed_body_q_arr = np.asarray(obs_body_q_mj, dtype=np.float64)
+        executed_left_hand_arr = np.asarray(obs_left_hand_q, dtype=np.float64)
+        executed_right_hand_arr = np.asarray(obs_right_hand_q, dtype=np.float64)
+
+        # Scalar summary of how much SONIC pushed back this frame:
+        # max |executed - commanded| over the 14 arm joints. The lower
+        # body is pinned to the stand pose so its delta is uninteresting
+        # noise; head / waist similarly. Live deploy already sets
+        # alive=False during the warm-up window, in which case
+        # executed == commanded so the delta is zero.
+        arm_delta_max = max(
+            float(
+                np.abs(
+                    executed_body_q_arr[_LEFT_ARM_MJ_SLICE]
+                    - commanded_body_q_arr[_LEFT_ARM_MJ_SLICE]
+                ).max()
+            ),
+            float(
+                np.abs(
+                    executed_body_q_arr[_RIGHT_ARM_MJ_SLICE]
+                    - commanded_body_q_arr[_RIGHT_ARM_MJ_SLICE]
+                ).max()
+            ),
+        )
+        self._maybe_log_sonic_correction(
+            executed_body_q=executed_body_q_arr,
+            commanded_body_q=commanded_body_q_arr,
+            arm_delta_max=arm_delta_max,
+        )
+
         frame_data = {
             "observation.state": observation_state,
             "observation.projected_gravity": proj_grav,
             "action.motion_token": commanded_token.astype(np.float64),
-            "action.commanded_body_q_mj": np.asarray(commanded_body_q_mj, dtype=np.float64),
-            "action.left_hand_joints": commanded_left_hand_q.astype(np.float64),
-            "action.right_hand_joints": commanded_right_hand_q.astype(np.float64),
+            "action.body_q_mj": executed_body_q_arr,
+            "action.left_hand_joints": executed_left_hand_arr,
+            "action.right_hand_joints": executed_right_hand_arr,
+            "action.body_q_mj_pre_sonic": commanded_body_q_arr,
+            "action.left_hand_joints_pre_sonic": commanded_left_hand_arr,
+            "action.right_hand_joints_pre_sonic": commanded_right_hand_arr,
+            "action.sonic_correction_max_rad": np.array(
+                [arm_delta_max], dtype=np.float32
+            ),
             "observation.images.ego_view": ego_view,
             "task": self._episode_buffer.task,
         }
@@ -901,6 +959,18 @@ class X2DatasetRecorder:
             },
             robot_type="agibot_x2_ultra",
         )
+        # v1 format marker: distinguishes post-SONIC canonical action
+        # columns (this recorder) from kinematic-only datasets and from
+        # legacy v0 datasets (which only had ``action.commanded_body_q_mj``).
+        # Tools downstream of the parquet should dispatch on this file.
+        import json
+        version_path = self._exporter.root / "meta" / "dataset_format_version.json"
+        version_path.write_text(json.dumps({
+            "version": 1,
+            "post_sonic_canonical": True,
+            "writer": "X2DatasetRecorder",
+            "sim_profile": "gantry",
+        }, indent=2) + "\n")
         print(f"[recorder] exporter ready -> {self._cfg.output_dir}", flush=True)
 
     def _print_status(self, *, tick: int, tick_result: Any) -> None:
@@ -924,6 +994,51 @@ class X2DatasetRecorder:
         slack = target_monotonic - time.monotonic()
         if slack > 0:
             time.sleep(slack)
+
+    def _maybe_log_sonic_correction(
+        self,
+        *,
+        executed_body_q: np.ndarray,
+        commanded_body_q: np.ndarray,
+        arm_delta_max: float,
+    ) -> None:
+        """Once-per-second print when SONIC is overriding operator commands.
+
+        Tracks the worst arm-joint delta seen in the last second and
+        emits one line if it exceeds ``cfg.sonic_correction_warn_rad``.
+        Suppressed entirely when ``cfg.log_sonic_correction`` is False.
+        """
+        if not self._cfg.log_sonic_correction or not self._cfg.verbose:
+            return
+        if arm_delta_max > self._frame_correction_max_seen:
+            # Re-derive the offending joint index across the full body
+            # vector so the operator gets a useful joint name.
+            full_delta = np.abs(executed_body_q - commanded_body_q)
+            full_delta[: _LEFT_ARM_MJ_SLICE.start] = 0.0
+            full_delta[_RIGHT_ARM_MJ_SLICE.stop :] = 0.0
+            self._frame_correction_max_seen = arm_delta_max
+            self._frame_correction_max_idx = int(np.argmax(full_delta))
+        now = time.monotonic()
+        if now - self._last_correction_log_t < 1.0:
+            return
+        self._last_correction_log_t = now
+        if self._frame_correction_max_seen >= self._cfg.sonic_correction_warn_rad:
+            from gear_sonic.data.features_x2_vla import MUJOCO_JOINT_NAMES
+            idx = self._frame_correction_max_idx
+            joint_name = (
+                MUJOCO_JOINT_NAMES[idx]
+                if 0 <= idx < len(MUJOCO_JOINT_NAMES)
+                else f"joint_{idx}"
+            )
+            print(
+                f"[recorder] SONIC override |Δq|max={self._frame_correction_max_seen:.3f}"
+                f" rad ({np.rad2deg(self._frame_correction_max_seen):.1f}°) at "
+                f"{joint_name}",
+                flush=True,
+            )
+        # Reset the rolling-second peak.
+        self._frame_correction_max_seen = 0.0
+        self._frame_correction_max_idx = -1
 
 
 __all__ = [

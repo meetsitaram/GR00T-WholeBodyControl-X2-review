@@ -4,6 +4,50 @@ Top-level cheat-sheet for the X2 + Quest 3 teleop / record / replay
 loop. Defaults assume a `uv venv` at `.venv/` and the dataset
 landing under `data/lerobot/`.
 
+## SONIC-stabilised teleop + record (recommended for v1+ datasets)
+
+The full deploy-in-the-loop path. Co-launches the C++ deploy (running
+the SONIC 25k tracking policy) with the Python recorder. The trained
+policy enforces lower-body stability + joint-limit / collision
+feasibility on top of operator IK output. **This is what you want
+for VLA training data.**
+
+### Sanity-check the loop without writing data
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --teleop-only \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+### Full record session
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_quest3_sonic_v1 \
+    --task "wave hello with both hands" \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+The wrapper forwards every flag below to `record_x2_dataset.py`:
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `--sonic-correction-warn-rad FLOAT` | `0.05` | Threshold for the once-per-second log when SONIC pushes back on operator commands. |
+| `--no-sonic-correction-log` | off | Suppress that log. The `action.sonic_correction_max_rad` parquet column is still populated. |
+| `--no-finger-filter` / `--finger-filter-*` | filter ON | Same v0.6 finger-smoothing knobs as kinematic teleop. |
+| `--calibration PATH` / `--recalibrate` / `--operator-id NAME` | — | Operator calibration plumbing. |
+
+The recorded dataset uses the **v1 schema**: `action.body_q_mj` is the
+**post-SONIC** executed q (what the trained policy actually achieved
+and what the MuJoCo viewer shows); the operator's pre-SONIC X2 joint
+command is preserved as `action.body_q_mj_pre_sonic` for retargeter /
+SONIC-correction analysis (debug-only, not pulled into training
+batches). See [docs/source/tutorials/x2_dataset_record_and_replay.md](docs/source/tutorials/x2_dataset_record_and_replay.md)
+for the schema spec.
+
 ## Calibration (one-time per operator)
 
 ```sh
@@ -16,10 +60,15 @@ namaste) and writes `data/operator_calibrations/<name>.yaml`. Re-run
 when switching operators or after sessions where the wrist mapping
 felt off.
 
-## Kinematic teleop + record (no SONIC)
+## Kinematic teleop + record (no SONIC, debug only)
 
-The fastest debug loop. Pure VR → IK → MuJoCo with the lower body
-pinned to the SONIC stand pose; no deploy, no policy, no ZMQ.
+The fastest debug loop for retargeting / filter A/B with **no
+feasibility enforcement**. Pure VR → IK → MuJoCo with the lower body
+pinned to the SONIC stand pose; no deploy, no policy, no ZMQ. Use
+this for retargeter debug; **do not use it to capture training data
+for VLA fine-tuning** (operator commands can drive the robot through
+joint limits / self-collisions and the trainer will then learn those
+infeasible targets).
 
 ```sh
 .venv/bin/python -m gear_sonic.scripts.teleop_x2_kinematic \
@@ -72,37 +121,14 @@ A/B in two consecutive sessions:
     --no-finger-filter
 ```
 
-## SONIC-stabilised teleop + record
-
-The full deploy-in-the-loop path. Runs the C++ deploy in the
-background (lower body stabilised by the SONIC tracking policy); the
-recorder publishes commanded `joint_pos_mj` over ZMQ.
-
-```sh
-cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
-bash gear_sonic/scripts/record_x2_dataset.sh \
-    --output-dir data/lerobot/x2_quest3_v0 \
-    --task "wave hello with both hands" \
-    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
-```
-
-Same operator buttons as above. The wrapper forwards
-`--no-finger-filter` / `--finger-filter-*` through to the recorder.
-
-### Sanity-check the loop without writing data
-
-```sh
-bash gear_sonic/scripts/record_x2_dataset.sh \
-    --teleop-only \
-    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
-```
-
 ## Replay
 
 ### Kinematic MuJoCo replay (fastest)
 
-Plays the recorded `action.commanded_body_q_mj` straight from the
-parquet — no Quest 3, no IK, no policy.
+Plays the recorded `action.body_q_mj` (v1 schema, post-SONIC executed
+q in SONIC datasets / commanded q in kinematic datasets) straight
+from the parquet — no Quest 3, no IK, no policy. Auto-falls-back to
+the legacy `action.commanded_body_q_mj` for v0 datasets.
 
 ```sh
 .venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
@@ -155,6 +181,20 @@ Then point the kinematic replay at each output to view side-by-side:
 .venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
     --parquet /tmp/v6_filter_on/episode_000000_replay_baseline.parquet
 ```
+
+### SONIC corrective-delta diagnostic
+
+Runs offline against any v1 SONIC dataset to surface frames where
+the trained policy had to override operator commands.
+
+```sh
+.venv/bin/python -m gear_sonic.scripts.inspect_sonic_correction \
+    --dataset x2_quest3_sonic_v1 --episode 0
+```
+
+Outputs a per-arm-joint delta summary table and writes a 4-panel
+time-series PNG to `<dataset>/debug/sonic_correction_ep<N>.png`.
+Falls back to commanded-trajectory stats on legacy v0 datasets.
 
 ## Build bones-seed motion library
 

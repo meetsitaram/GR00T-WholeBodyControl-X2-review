@@ -132,6 +132,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "held-pose latch. Default 0.005.",
     )
 
+    # SONIC corrective-delta observability (v1 schema)
+    parser.add_argument(
+        "--sonic-correction-warn-rad", type=float, default=0.05,
+        help="Threshold in radians; the operator log prints when the "
+             "max arm |executed - commanded| over the last second "
+             "exceeds this value. Default 0.05 rad (~2.9 deg).",
+    )
+    parser.add_argument(
+        "--no-sonic-correction-log", action="store_true",
+        help="Suppress the once-per-second SONIC corrective-delta "
+             "operator log. The action.sonic_correction_max_rad column "
+             "is still populated regardless.",
+    )
+
     # IK
     parser.add_argument("--ik-damping", type=float, default=0.08)
     parser.add_argument(
@@ -249,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         operator_id=args.operator_id,
         embodiment_tag=args.embodiment_tag,
         finger_filter_params=finger_filter_params,
+        sonic_correction_warn_rad=args.sonic_correction_warn_rad,
+        log_sonic_correction=(not args.no_sonic_correction_log),
         verbose=(not args.quiet),
     )
 

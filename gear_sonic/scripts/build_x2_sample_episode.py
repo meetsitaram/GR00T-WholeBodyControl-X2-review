@@ -112,15 +112,16 @@ def _build_one_episode(
         )
         projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
-        # Action targets: the v0 SONIC pipeline emits a 64-D motion token
+        # Action targets: the SONIC VLA pipeline emits a 64-D motion token
         # plus the next-step hand joint targets. For the smoke episode we
         # use a constant standing token (zeros) so downstream training
         # gets a stable target distribution but the pipeline still
         # exercises every action key.
         motion_token = np.zeros(SONIC_MOTION_TOKEN_DIM, dtype=np.float64)
-        # action.commanded_body_q_mj is the *new* authoritative body
-        # command surface. The smoke episode keeps the body in the
-        # default stand pose, so just zero-fill at the canonical 31 DOF.
+        # v1 schema: action.body_q_mj is the canonical post-SONIC body
+        # command surface. The smoke episode is synthetic (no real SONIC
+        # rollout), so executed == pre_sonic == default stand pose
+        # zero-fill, and sonic_correction_max_rad is exactly zero.
         commanded_body_q_mj = np.zeros(num_body, dtype=np.float64)
         action_left_hand = left_hand_q.copy()
         action_right_hand = right_hand_q.copy()
@@ -131,9 +132,13 @@ def _build_one_episode(
             "observation.state": observation_state,
             "observation.projected_gravity": projected_gravity,
             "action.motion_token": motion_token,
-            "action.commanded_body_q_mj": commanded_body_q_mj,
+            "action.body_q_mj": commanded_body_q_mj,
             "action.left_hand_joints": action_left_hand,
             "action.right_hand_joints": action_right_hand,
+            "action.body_q_mj_pre_sonic": commanded_body_q_mj.copy(),
+            "action.left_hand_joints_pre_sonic": action_left_hand.copy(),
+            "action.right_hand_joints_pre_sonic": action_right_hand.copy(),
+            "action.sonic_correction_max_rad": np.zeros(1, dtype=np.float32),
             "observation.images.ego_view": ego_view,
             "task": task,
         }

@@ -132,6 +132,7 @@ def test_teleop_step_unengaged_returns_neutral():
 
 
 def test_dataset_features_match_recorder_outputs():
+    """v1 SONIC schema (post_sonic_canonical=True, the default)."""
     rm = get_x2_robot_model(hand_variant="omnihand_10")
     features = get_features_x2_vla(rm, hand_dof_per_side=HAND_DOF_OMNI)
 
@@ -143,19 +144,50 @@ def test_dataset_features_match_recorder_outputs():
     assert tuple(features["action.motion_token"]["shape"]) == (
         SONIC_MOTION_TOKEN_DIM,
     )
-    assert tuple(features["action.commanded_body_q_mj"]["shape"]) == (
-        rm.num_joints,
-    )
-    # Names for commanded_body_q_mj must be in MuJoCo order, not Pinocchio
-    # order. The MJ layout exposes head as the LAST two scalars (slots 29..31)
-    # whereas Pinocchio puts head between waist and left_arm.
-    cmd_names = features["action.commanded_body_q_mj"]["names"]
-    assert cmd_names[-2:] == ["head_yaw_joint", "head_pitch_joint"], (
-        f"commanded_body_q_mj must be MuJoCo-ordered; got tail={cmd_names[-2:]}"
+    # Bare-canonical body action (post-SONIC executed q in SONIC mode,
+    # commanded q in kinematic mode).
+    assert tuple(features["action.body_q_mj"]["shape"]) == (rm.num_joints,)
+    # Names must be in MuJoCo order, not Pinocchio order. The MJ layout
+    # exposes head as the LAST two scalars (slots 29..31) whereas
+    # Pinocchio puts head between waist and left_arm.
+    body_names = features["action.body_q_mj"]["names"]
+    assert body_names[-2:] == ["head_yaw_joint", "head_pitch_joint"], (
+        f"action.body_q_mj must be MuJoCo-ordered; got tail={body_names[-2:]}"
     )
     assert tuple(features["action.left_hand_joints"]["shape"]) == (HAND_DOF_OMNI,)
     assert tuple(features["action.right_hand_joints"]["shape"]) == (HAND_DOF_OMNI,)
     assert tuple(features["observation.projected_gravity"]["shape"]) == (3,)
+    # v1 SONIC schema also adds debug-only sibling columns and a
+    # corrective-delta scalar. These are NOT in get_modality_config_x2_vla.
+    assert tuple(features["action.body_q_mj_pre_sonic"]["shape"]) == (rm.num_joints,)
+    pre_names = features["action.body_q_mj_pre_sonic"]["names"]
+    assert pre_names == body_names, "pre_sonic must mirror canonical names"
+    assert tuple(features["action.left_hand_joints_pre_sonic"]["shape"]) == (HAND_DOF_OMNI,)
+    assert tuple(features["action.right_hand_joints_pre_sonic"]["shape"]) == (HAND_DOF_OMNI,)
+    assert tuple(features["action.sonic_correction_max_rad"]["shape"]) == (1,)
+    assert features["action.sonic_correction_max_rad"]["dtype"] == "float32"
+
+
+def test_kinematic_features_omit_pre_sonic_columns():
+    """post_sonic_canonical=False schema is what teleop_x2_kinematic writes."""
+    rm = get_x2_robot_model(hand_variant="omnihand_10")
+    features = get_features_x2_vla(
+        rm, hand_dof_per_side=HAND_DOF_OMNI, post_sonic_canonical=False
+    )
+    # Bare canonical columns are present.
+    assert "action.body_q_mj" in features
+    assert "action.left_hand_joints" in features
+    assert "action.right_hand_joints" in features
+    # SONIC-only debug siblings are absent.
+    for k in (
+        "action.body_q_mj_pre_sonic",
+        "action.left_hand_joints_pre_sonic",
+        "action.right_hand_joints_pre_sonic",
+        "action.sonic_correction_max_rad",
+    ):
+        assert k not in features, (
+            f"{k} should not be in the kinematic feature schema"
+        )
 
 
 def test_modality_config_consistency():

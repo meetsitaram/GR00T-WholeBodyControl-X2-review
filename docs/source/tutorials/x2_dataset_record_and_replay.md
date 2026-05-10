@@ -104,8 +104,9 @@ For a pure connectivity smoke-test that doesn't write to disk, add
     --dataset x2_quest3_kinematic_v6 --episode 0
 ```
 
-Opens a passive MuJoCo viewer on the recorded `action.commanded_body_q_mj`
-+ hand columns. No Quest 3, no IK, no policy. See
+Opens a passive MuJoCo viewer on the recorded `action.body_q_mj` +
+hand columns (v1 schema; auto-falls-back to `action.commanded_body_q_mj`
+for legacy v0 datasets). No Quest 3, no IK, no policy. See
 [Section 6.4](#64-kinematic-mujoco-replay-replay_x2_kinematicpy) for
 windowing + loop options.
 
@@ -675,11 +676,53 @@ The parquet rows contain (per frame, all `float64` unless noted):
 | `observation.state` | `(N_body + 2 * N_hand,)` | Pinocchio-ordered body + omnihand joints from the deploy's `x2_debug`. Falls back to the commanded body_q if the deploy hasn't published yet. |
 | `observation.projected_gravity` | `(3,)` | Body-frame gravity from the deploy's base quaternion. |
 | `observation.images.ego_view` | `(480, 640, 3)` uint8 | Off-screen render of the *observed* body_q (not the commanded one) — keeps image and proprio aligned to ground truth. |
-| `action.motion_token` | `(64,)` | The commanded SONIC FSQ token for this tick. |
-| `action.left_hand_joints` | `(10,)` | Commanded left OmniHand joints. |
-| `action.right_hand_joints` | `(10,)` | Commanded right OmniHand joints. |
+| `action.motion_token` | `(64,)` | Reserved for offline FSQ-labeling pass. The live recorder writes zeros. |
+| `action.body_q_mj` | `(N_body,)` | **Canonical training target.** Post-SONIC executed body q (MuJoCo joint order) — what the trained tracking policy actually achieved and what the MuJoCo viewer shows. In kinematic-only datasets this is just the commanded q (no policy in the loop). |
+| `action.left_hand_joints` | `(10,)` | Canonical post-deploy left OmniHand joints (URDF-clipped). |
+| `action.right_hand_joints` | `(10,)` | Canonical post-deploy right OmniHand joints. |
+| `action.body_q_mj_pre_sonic` | `(N_body,)` | **Debug-only sibling.** Operator's X2 joint command sent on the wire to the deploy, *before* SONIC and MuJoCo physics. SONIC-recorded datasets only. |
+| `action.left_hand_joints_pre_sonic` | `(10,)` | **Debug-only.** Pre-deploy left hand q (raw retargeter output). |
+| `action.right_hand_joints_pre_sonic` | `(10,)` | **Debug-only.** Pre-deploy right hand q. |
+| `action.sonic_correction_max_rad` | `(1,)` float32 | **Debug-only.** Per-frame `max_arms |body_q_mj − body_q_mj_pre_sonic|` summary scalar. |
 | `task` | string | The session's `--task` value. |
 | `timestamp`, `frame_index`, `episode_index`, `index`, `task_index` | scalars | LeRobot bookkeeping (filled in by `Gr00tDataExporter`). |
+
+```{admonition} Canonical action vs debug-only siblings
+:class: note
+The bare-canonical columns (`action.body_q_mj`, `action.left_hand_joints`,
+`action.right_hand_joints`) are the *only* action columns surfaced as
+training targets via `get_modality_config_x2_vla` (see
+[gear_sonic/data/features_x2_vla.py](../../../gear_sonic/data/features_x2_vla.py)).
+The `_pre_sonic` siblings + `action.sonic_correction_max_rad` live on
+disk for retargeter / SONIC-correction analysis but the GR00T trainer
+never pulls them into batches — they're invisible to the policy.
+```
+
+```{admonition} v0 → v1 schema migration
+:class: warning
+The v1 schema was introduced alongside the SONIC-loop recorder. It
+**renames** the body action column and **flips semantics** on the
+hand columns:
+
+| | v0 datasets | v1 datasets |
+|---|---|---|
+| Body action column name | `action.commanded_body_q_mj` | `action.body_q_mj` |
+| Body action semantics | Pre-SONIC operator command | **Post-SONIC executed q** (canonical); pre-SONIC preserved as `action.body_q_mj_pre_sonic` |
+| Hand action column names | `action.left_hand_joints` / `action.right_hand_joints` | Same names |
+| Hand action semantics | Pre-deploy operator retarget | **Post-deploy URDF-clipped q** (canonical); pre-deploy preserved as `_pre_sonic` siblings |
+| `meta/dataset_format_version.json` | absent | `{"version": 1, "post_sonic_canonical": true}` (SONIC) or `false` (kinematic) |
+
+**Do not mix v0 and v1 in a single training run.** The hand columns
+have the same name but different semantics, so a mixed-version
+training set silently teaches the model on inconsistent data. The
+GR00T trainer can safely consume either schema *individually* via
+the modality config; mixing happens at the dataset-aggregation step.
+
+The replay tools (`replay_x2_kinematic.py`,
+`inspect_sonic_correction.py`) auto-fall-back to the v0 column name
+when the v1 column is absent, so old recordings still play back
+without modification.
+```
 
 ```{admonition} Discarded episodes leave no on-disk trace
 :class: note
@@ -688,6 +731,36 @@ The `Y`-button path simply drops the in-memory buffer, so the
 on-disk dataset shape (parquet count, episode indices, video files)
 is unchanged.
 ```
+
+### 5.1 SONIC corrective-delta observability
+
+Two complementary tools surface the gap between operator intent and
+SONIC-stabilised output:
+
+* **Live operator log** — once-per-second print when the trained
+  policy pushes back on operator commands by more than
+  `--sonic-correction-warn-rad` (default 0.05 rad ≈ 2.9°). Suppress
+  with `--no-sonic-correction-log`. Helps the operator notice
+  unreachable poses in real time.
+* **Offline diagnostic** — `inspect_sonic_correction.py` runs
+  against any saved SONIC episode and prints a per-arm-joint
+  `|delta_q|` summary plus a 4-panel time-series PNG under
+  `<dataset>/debug/sonic_correction_ep<N>.png`. Frames where
+  `|delta_q|max > 0.15 rad` (~8.6°) are flagged as candidate
+  "infeasible" events worth reviewing in `replay_x2_kinematic.py`.
+
+Both signals derive from the same `|action.body_q_mj − action.body_q_mj_pre_sonic|`
+arm-joint subset (the lower body is pinned to the stand pose so its
+delta is uninteresting noise).
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.inspect_sonic_correction \
+    --dataset x2_quest3_sonic_v1 --episode 0
+```
+
+The diagnostic also recognises legacy v0 datasets (no `_pre_sonic`
+columns) and falls back to a per-joint range stat on the commanded
+trajectory itself, since there is nothing to compare against.
 
 ---
 
@@ -817,9 +890,10 @@ kinematic replay shipped in 6.4 below). Today, copy-paste the snippet.
 For everything except SONIC closed-loop verification, the
 purpose-built replay CLI is faster and more legible than the snippet
 above. It opens a passive MuJoCo viewer and faithfully replays the
-recorded `action.commanded_body_q_mj` plus `action.left_hand_joints` /
-`action.right_hand_joints` straight out of the parquet — no Quest 3,
-no IK, no policy, no ZMQ.
+recorded `action.body_q_mj` plus `action.left_hand_joints` /
+`action.right_hand_joints` straight out of the parquet (auto-falling-
+back to the legacy `action.commanded_body_q_mj` for pre-v1 datasets) —
+no Quest 3, no IK, no policy, no ZMQ.
 
 ```bash
 .venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
