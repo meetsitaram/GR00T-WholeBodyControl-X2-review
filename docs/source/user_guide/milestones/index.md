@@ -12,6 +12,7 @@ encountered + fixes applied, and what's left for the next session.
 2026-05-02_post_deploy_tuning
 2026-05-03_first_iter22000_powered_walk
 2026-05-08_live_vla_sonic_sim_v0
+2026-05-10_omnihand_finger_tuning
 ```
 
 ## At a glance
@@ -22,3 +23,4 @@ encountered + fixes applied, and what's left for the next session.
 | 2026-05-02 | Post-deploy tuning | Real X2 + SONIC | KP/KD sweep, target-LPF and clamp tuning gauntlet. |
 | 2026-05-03 | First iter-22000 powered walk | Real X2 + SONIC | First out-and-back walking cycle, 36.75 s wall-time, clean MC handoff. |
 | 2026-05-08 | Live VLA → SONIC sim (v0) | **Sim-only**, X2 + SONIC + N1.7 | Closed-loop VLA → SONIC pipeline runs end to end. Visible motion is mode-collapsed; full triage is documented in the milestone page. |
+| 2026-05-10 | OmniHand finger-tuning iteration | **Sim-only**, Quest 3 → X2 kinematic | Thumb-fingertip-touch gesture now closes correctly. Anchor expansion + 3-motor opposition fold-in. Topology mismatch on non-thumb tips filed for v1. |

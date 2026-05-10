@@ -23,17 +23,27 @@ from its action distribution while the operator drives the upper body.
 :class: warning
 * **Stationary robot only.** Lower body, waist, and head are pinned to
   the trained X2 stand pose for every frame. Only the 14 arm DOFs and
-  20 OmniHand DOFs follow operator input.
-* **Quest 3 controllers, not bare hands.** Trigger / grip drive a
-  uniform finger curl. Bare-hand XRHand skeleton retargeting is a v1
-  follow-up.
+  20 OmniHand DOFs follow operator input. **The X2 waist is held at
+  neutral**: torso pitch / roll / yaw are not driven from VR (3-point
+  Quest 3 tracking can't disambiguate operator torso tilt from arm
+  reach without an extra chest tracker or the Meta Movement SDK).
+  See [Section 8](#8-v0-limitations).
+* **Quest 3 controllers AND bare-hand XRHand are both supported.**
+  Trigger / grip drive a uniform finger curl per side. When the
+  WebXR `XRHand` skeleton is reported, per-finger curls retarget
+  the OmniHand on a per-finger basis with operator-specific affine
+  normalization (see [Section 2.3](#23-vr-operator-calibration) for
+  capture; [Section 8](#8-v0-limitations) for the hand-tracking
+  journey log). The two input sources are multimodal — operators
+  can pick up / set down a controller mid-session and the recorder
+  switches transparently.
 * **One `--task` string per session.** All episodes recorded by one
   recorder process share the same language instruction.
-* **Closed-loop "freeze-pose" tokenization.** Every tick we build an
-  11-frame virtual clip where every frame equals the current `body_q`
-  and feed it through the SONIC encoder + FSQ. The deploy chases that
-  "stay here" token until the next 50 Hz tick re-tokenizes against the
-  operator's new wrist position.
+* **Stateless head-relative wrist mapping.** Operator wrist positions
+  are converted into the head-yaw frame and passed through a per-arm
+  affine map fitted offline by `vr_operator_calibrate.py`. There is no
+  engage-anchor and the robot wrist target is invariant to operator
+  body rotation in place. See [Section 2.3](#23-vr-operator-calibration).
 ```
 
 ---
@@ -105,19 +115,294 @@ data-collection venv. Make sure:
 * `.venv/bin/python` resolves to the GR00T env with `zmq`, `mujoco`,
   `lerobot`, and `websockets` installed.
 
+  :::{tip}
+  **Optional dependencies are auto-installed on first launch.**
+  The teleop / calibration / record entry-points call
+  `ensure_runtime_deps()` before doing anything else, which
+  pip-installs any missing optional packages (`gtts` for Quest 3
+  audio prompts; `datasets` / `av` / `lerobot` for the recorder's
+  dataset writer). You'll see a one-line log on first run:
+  `[runtime-deps] N optional package(s) for ... missing: [...]. Auto-installing into /…/python.`
+  Subsequent runs are no-ops because the packages are already
+  importable.
+
+  Two opt-out paths if you don't want surprise pip mutations
+  (reproducible-build setups, locked Docker images):
+
+  1. Set `GEAR_SONIC_NO_AUTO_INSTALL=1`. The script will print which
+     packages are missing and exit with the degraded fallback (no
+     audio, or a hard ImportError for the recorder).
+  2. Pre-install everything with
+     `pip install -e gear_sonic[data_collection]`, OR
+     `pip install -r requirements-teleop-record.txt` for a thin
+     standalone install. Both lists are kept in sync with
+     `gear_sonic.utils.install.runtime_deps`.
+  :::
+
 ### 2.2 Quest 3 prerequisites
 
 * The Quest 3 is on the same LAN as the workstation.
 * The Meta Quest Browser trusts your workstation's self-signed cert
   (the recorder boots its own HTTPS server on port 8443 — see the
   initial banner output for the exact URL).
-* Operator wears the headset, holds **both** controllers, and starts
-  in a relaxed shoulder-down posture for the engage-time calibration.
+* Operator wears the headset, holds **both** controllers, and is
+  comfortable getting into the three calibration poses described
+  below.
 
 ```{tip}
 The recorder embeds its own Quest 3 WebSocket / HTTPS server, so you
 do **not** need to start `run_quest3_server.sh` separately.
 ```
+
+### 2.3 VR operator calibration
+
+The recorder retargets operator wrist motion to robot wrist targets via
+a **per-operator calibration YAML** that captures three things:
+
+* **Anatomy** — arm length, shoulder width, height all differ between
+  operators.
+* **Pose habits** — how relaxed the elbows are, whether the wrists
+  flex inward, etc.
+* **Reach envelope** — the working volume the operator can naturally
+  cover with comfortable arm motion.
+
+The calibration is fit from three static poses. You capture once per
+operator (or once per setup change) and reuse the same YAML for every
+subsequent session.
+
+#### Capture flow
+
+1. Boot only the calibration script (no MuJoCo, no deploy, no
+   recorder):
+
+   ```bash
+   .venv/bin/python -m gear_sonic.scripts.vr_operator_calibrate \
+       --operator-id stickbot
+   ```
+
+   The default output path is
+   `data/operator_calibrations/<operator-id>.yaml`. Override with
+   `--output PATH` if you want a different name.
+
+2. The Quest 3 WebXR URL prints in the banner. Open it on the headset,
+   accept the cert, hit **Connect WS**.
+
+   ##### Audio + UI sanity check (do this before entering VR)
+
+   Before you press **Start VR**, click the **Test audio** button on
+   the WebXR page. The headset should speak *"Audio test successful.
+   Calibration prompts will speak through this audio device."* If
+   you don't hear it:
+
+   * **Headset volume** is the most common culprit — turn it up using
+     the volume rocker on the right side of the headset.
+   * The browser status row at the bottom of the page logs
+     `TTS voices loaded: N` once the speech engine is ready, and
+     `TTS prime started` / `TTS prime ended` when the priming
+     utterance plays. If you see `TTS prime error: …`, the headset
+     browser blocked TTS — close the tab, reopen, click **Test
+     audio** *first*, then **Start VR**.
+   * Quest 3 Browser requires a real user gesture to "unlock"
+     `speechSynthesis`. The Test audio button provides exactly that
+     gesture. Subsequent server-driven prompts (during calibration)
+     reuse the unlocked engine, so once the test works the rest
+     speaks automatically.
+
+   The dom-overlay carrying the calibration UI is requested as a
+   WebXR feature in `requestSession()`; if the runtime denies it
+   (older browser, missing permissions), the page logs
+   `domOverlayState: …` in the status row. In that case, use a
+   hand-mirror or the desktop preview window to read the prompts
+   while wearing the headset.
+
+3. The headset browser shows a stick-figure overlay and **plays a
+   pre-rendered MP3 audio prompt** for **Pose 1 of 4 — Arms fully
+   straight down**:
+   *"Stand relaxed with both arms hanging fully straight down at your
+   sides. Do not bend your elbows. Press A on either controller when
+   ready."*
+   Get into the pose (no bent elbows), hold steady, press **A** on
+   either controller.
+
+   The audio is played via a regular `<audio>` element from
+   `/audio/show_<pose>.mp3` rather than the headset's built-in
+   `speechSynthesis` engine — Quest 3 Browser's TTS is unreliable in
+   immersive-ar (gesture-locked, sometimes silent even when it
+   reports success). MP3 playback travels the same plumbing as
+   YouTube/Spotify, which the headset always plumbs through to the
+   speakers. A `🔊 SPEAKING` badge pulses in the top-right of the
+   overlay every time a prompt plays, so you can tell at-a-glance
+   whether the client is actually firing audio (vs. the volume just
+   being muted).
+
+4. The script samples wrist positions for 1 second and gates the
+   capture on **cluster spread** — the 80th-percentile distance of
+   samples from the median wrist position must be ≤ 6 cm
+   (`--spread-threshold-m`, default `0.06`). The reported wrist mean
+   uses inliers only, so a stray Quest 3 tracking spike can't bias
+   your calibration.
+
+   :::{note}
+   Frame-to-frame **velocity is no longer used as a gate** (it's
+   logged as `mm/frame` jitter for diagnostics only). Quest 3
+   inside-out tracking has 1–3 mm of phantom drift at arm extension,
+   which a naïve `||p[i+1] - p[i]|| / dt` metric reports as 5–15 cm/s
+   "velocity" even when you're holding perfectly still — so we
+   measure the size of the cloud of samples instead.
+   :::
+
+5. Repeat for **Pose 2 — T-pose** (arms straight out sideways),
+   **Pose 3 — Arms forward** (parallel, at shoulder height,
+   *roughly shoulder-width apart — not wider*), and **Pose 4 —
+   Namaste** (palms together at chest, forearms vertical).
+
+   :::{note}
+   The 4th pose ("namaste") was added in v2 of the calibration schema
+   to anchor the y-axis fit at the body centerline. Without it, the
+   3-pose v1 calibration was structurally biased: even when the
+   operator brought their hands together right in front of their
+   chest, the per-axis affine fit predicted robot wrists ~50 cm apart
+   (because no calibration data point was near `op_y = 0`). The v2
+   namaste pose puts the robot's reference wrists 0.2 cm apart at
+   chest height, so the fit knows what "hands together" should map
+   to.
+
+   The arms-down robot reference also changed in v2: previously it
+   used the SONIC stand-pose default `(0.2, 0.2, 0, -0.6, ...)` which
+   has bent elbows, so even when the operator fully extended their
+   arms downward, the IK kept the robot's elbows bent to lift the
+   wrist up to the (incorrect) bent-arm target. v2 uses fully
+   straight arms (every joint at `0`) as both the calibration
+   reference *and* the IK null-space preferred posture, so full arm
+   extension on the operator now produces full arm extension on the
+   robot.
+   :::
+
+6. The script fits per-arm scale + translation (least squares,
+   per-axis) and prints residuals. Per-pose residuals must be under
+   the matching threshold (defaults: `arms_down`, `t_pose`,
+   `arms_forward` ≤ **10 cm**; `namaste` ≤ **18 cm**) or the fit
+   is rejected.
+
+   :::{note}
+   **Why namaste is looser**: the operator holds the controllers, so
+   the controller-grip is offset ~5–7 cm from the actual palm
+   position. A perfectly-executed namaste *with controllers in hand*
+   will already have several cm of residual baked into the
+   per-axis affine fit. The 18 cm gate exists so a clean
+   capture isn't rejected for a structural offset that has nothing
+   to do with how well the operator held the pose.
+
+   The other three poses use 10 cm because the X2's per-axis affine
+   model can't get below that on a typical human-vs-X2 anatomy
+   mapping anyway — the pre-v2 5 cm gate was unattainable in
+   practice and produced spurious rejections. If you want stricter
+   gates for a particular setup, use `--reject-m 0.08`
+   (uniform) or per-pose flags `--t-pose-reject-m 0.08`,
+   `--namaste-reject-m 0.12`, etc.
+   :::
+
+   On a rejection the script does **not** crash. Instead it identifies
+   the worst-contributing pose+arm (e.g. "T-pose right arm, residual
+   10.5 cm"), speaks a coaching line through the headset (e.g.
+   *"Recapture t pose (right arm): fit error was 11 cm. Stretch the
+   right arm STRAIGHT SIDEWAYS at shoulder height; do NOT angle it
+   forward."*), shows the same line in the dom-overlay, and lets the
+   operator press **A** to recapture only that pose. The fit retries
+   automatically. Up to `--max-fit-recaptures` (default `4`) retries
+   are allowed before the script gives up.
+
+7. On success, the YAML lands at the configured path. The teleop and
+   recorder scripts then load it via `--calibration <path>`.
+
+#### YAML contents (debugging-friendly)
+
+```yaml
+schema_version: 2
+operator_id: stickbot
+created_utc: "2026-05-09T22:30:11.512Z"
+units: meters
+poses:
+  arms_down:    {left_wrist: [...], right_wrist: [...], samples: 50, ...}
+  t_pose:       {...}
+  arms_forward: {...}
+  namaste:      {...}
+robot_reference_q_rad:
+  arms_down:    {left: [0,0,0,0,0,0,0],         right: [0,0,0,0,0,0,0]}        # v2: STRAIGHT arms (was bent stand pose)
+  t_pose:       {left: [...],                    right: [...]}
+  arms_forward: {left: [...],                    right: [...]}
+  namaste:      {left: [-1.1,0,-1.2,-1.6,0,0,0], right: [-1.1,0,1.2,-1.6,0,0,0]}  # v2: hands at centerline
+fit:
+  left:  {scale: [sx,sy,sz], translation: [tx,ty,tz], residual_m: 0.018}
+  right: {scale: [sx,sy,sz], translation: [tx,ty,tz], residual_m: 0.022}
+```
+
+The `poses` block + `robot_reference_q_rad` block let you re-fit the
+calibration later if the math evolves, without re-recording the
+operator.
+
+#### When to recalibrate
+
+* Every new operator (one YAML per person).
+* The operator gives radically different wrist heights — e.g. wearing
+  thicker gloves, standing on a riser.
+* You see > 10 cm IK pos_err in the recorded debug NPZ during T-pose
+  or arms-forward style motions.
+
+#### Inline calibration during teleop
+
+Both the kinematic teleop and the full recorder accept `--recalibrate`,
+which runs the same 4-pose flow inline before teleop starts. Useful
+the first time a new operator sits down.
+
+#### Tuning the stability gate
+
+The capture is gated on cluster spread. Defaults work for most
+setups; reach for these only if calibration keeps rejecting your
+poses or you want stricter quality.
+
+| Flag | Default | Effect |
+| ---- | ------- | ------ |
+| `--spread-threshold-m` | `0.06` (6 cm) | Per-arm 80th-pct distance from the median sample, in meters. Lower = stricter, higher = more permissive. |
+| `--sample-window-s` | `1.0` | Length of the sample window in seconds. Longer = more averaging, but operator has to hold the pose longer. |
+| `--max-retries-per-pose` | `3` | How many times the operator can retry a pose before the script gives up. |
+| `--reject-m` | unset | **Uniform** per-pose residual ceiling. When set, applies to every pose (overrides per-pose defaults). When unset, the per-pose defaults below are used instead. Use this for fast experimentation; per-pose flags below for production. |
+| `--arms-down-reject-m` | `0.10` (10 cm) | Residual ceiling for the arms-down pose only. |
+| `--t-pose-reject-m` | `0.10` (10 cm) | Residual ceiling for the T-pose only. |
+| `--arms-forward-reject-m` | `0.10` (10 cm) | Residual ceiling for the arms-forward pose only. |
+| `--namaste-reject-m` | `0.18` (18 cm) | Residual ceiling for the namaste pose only. **Looser than the others** to account for the ~5–7 cm controller-grip offset baked into every namaste capture (see the per-pose note in the workflow above). |
+
+Common tuning recipes:
+
+* **Shaky setup / bumping the headset / pets in the room**:
+  `--spread-threshold-m 0.10 --sample-window-s 0.7`.
+* **Lab-quality calibration**: `--spread-threshold-m 0.03`.
+* **Operator can't get T-pose to register**: most common cause is
+  holding only one controller, or one controller's batteries are dead
+  and it dropped out. The script's per-attempt log line shows
+  `dropouts skipped: N` — if `N > 20%` of the sample count, that's the
+  culprit, not the threshold.
+
+#### Why velocity isn't a gate
+
+Earlier versions of this script used a `--vel-threshold-mps` flag that
+tried to reject captures based on RMS frame-to-frame velocity. That
+flag is now silently ignored (a deprecation warning prints if you pass
+it) because the metric was fundamentally misleading at Quest 3's
+mm-level precision. Quick math:
+
+* Quest 3 reports controller pose at ~50 Hz → `dt = 20 ms`.
+* Inside-out tracking has **1–3 mm of phantom drift per frame** at arm
+  extension (T-pose, arms-forward), where the controller is at the
+  periphery of the camera FOV and sometimes occluded.
+* `||p[i+1] - p[i]|| / dt` for 1.5 mm jitter = `0.0015 / 0.02` =
+  **7.5 cm/s** of reported "velocity" while the operator is perfectly
+  still.
+
+The cluster-spread metric we use instead measures the actual size of
+the cloud of samples in 3D space — held wrists produce 1–3 cm clouds,
+moving wrists produce 10+ cm clouds, and a single jitter spike adds
+one outlier sample that barely moves the 80th-percentile distance.
 
 ---
 
@@ -181,7 +466,10 @@ forwards them to the Python recorder:
 | `--rate 50` | Publish + record cadence. Match `FPS` in the dataset features (default 50). |
 | `--no-omnihand` | Debug only. The trained M5/M6 datasets all carry the OmniHand mesh, so don't use this unless you know why. |
 | `--quest3-no-ssl` | Disable TLS on the WebXR server. WebXR refuses non-secure contexts so this is for debugging only on a trusted LAN. |
-| `--ik-damping 0.08`<br>`--ik-rotation-weight 0.5`<br>`--ik-position-scale 1.0`<br>`--ik-per-tick-step-rad 0.30` | DLS IK tuning. The defaults track ~5 cm/s wrist motions cleanly without joint-limit thrashing. |
+| `--ik-damping 0.08`<br>`--ik-rotation-weight 0.0`<br>`--ik-per-tick-step-rad 0.30` | DLS IK tuning. v0 default `rotation_weight=0` runs **position-only IK** since wrist orientation is not calibrated. |
+| `--calibration PATH` | YAML produced by `vr_operator_calibrate.py`. Required unless `--recalibrate` is passed. Defaults to `data/operator_calibrations/default.yaml`. |
+| `--recalibrate` | Run the 4-pose calibration inline before recording starts. Use for the first session with a new operator. Writes the YAML to `--calibration` (or the operator-id default). |
+| `--operator-id NAME` | Free-form operator label stamped into the calibration YAML when `--recalibrate` is set. |
 
 ---
 
@@ -191,7 +479,7 @@ forwards them to the Python recorder:
 
 | Button | Action |
 | ------ | ------ |
-| **A** | Engage / re-calibrate. Snapshots the current wrist anchors against the X2 neutral arm pose. Press once at session start, then any time your "rest" pose drifts (e.g. you took the headset off and put it back on). |
+| **A** | Toggle active arm tracking on / off. **Stateless** — calibration is loaded once at startup and applied every tick; A only gates whether the IK solver runs vs holds the last commanded q. Press once to start; press again to "park" the arms at their last pose without disconnecting. |
 | **B** | Start a fresh episode. No-op if one is already recording or if `--teleop-only` is set. |
 | **X** | Stop and *save* the current episode → writes a parquet shard + mp4 chunk to `--output-dir`. |
 | **Y** | Stop and *discard* the current episode → drops the in-memory frame buffer; on-disk dataset is unchanged. |
@@ -222,9 +510,11 @@ forwards them to the Python recorder:
 4. On the Quest 3, open the WebXR URL, accept the cert, hit
    **Connect WS** + **Start VR**.
 5. Recorder log shows `Quest 3 connected; first packet received`.
-6. Stand in your neutral pose, arms relaxed, then squeeze **A** on
-   either controller. The recorder logs `[A] engaged: wrist anchors
-   captured`.
+6. Squeeze **A** on either controller. The recorder logs
+   `[A] arm tracking -> ACTIVE`. There is no posture you need to be in
+   when you press A — the calibration was already loaded at startup.
+   Press A again any time you want to "park" the arms at their last
+   pose without disconnecting (`-> IDLE`).
 7. Move your arms. The MuJoCo X2 should follow within ~50 ms. Use the
    `--sim-viewer` window to confirm the policy is tracking and the
    gantry strap is keeping the robot upright (it should be).
@@ -424,10 +714,119 @@ not yet ship a one-line script for this, but the recipe is short:
 
 ```{admonition} Roadmap
 :class: note
-A `replay_x2_dataset.py` CLI that wraps recipe 6.3 + a
-multi-episode sequencer + a `--start-frame` / `--end-frame` window
-selector is on the v1 backlog. Today, copy-paste the snippet.
+A `replay_x2_sonic.py` CLI that wraps recipe 6.3 + a multi-episode
+sequencer is on the v1 backlog (it's the SONIC counterpart to the
+kinematic replay shipped in 6.4 below). Today, copy-paste the snippet.
 ```
+
+### 6.4 Kinematic MuJoCo replay (`replay_x2_kinematic.py`)
+
+For everything except SONIC closed-loop verification, the
+purpose-built replay CLI is faster and more legible than the snippet
+above. It opens a passive MuJoCo viewer and faithfully replays the
+recorded `action.commanded_body_q_mj` plus `action.left_hand_joints` /
+`action.right_hand_joints` straight out of the parquet — no Quest 3,
+no IK, no policy, no ZMQ.
+
+```bash
+.venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
+    --dataset x2_quest3_kinematic_v4 \
+    --episode 0
+```
+
+The first positional-style flag accepts either a short name (resolved
+under `data/lerobot/<name>/`) or any absolute / relative path to a
+LeRobot v2.1 dataset root. Useful options:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--dataset <name-or-path>` | — | Dataset root (name or path). Required unless `--parquet` is set. |
+| `--episode <int>` | — | Zero-indexed episode number. Required unless `--parquet` is set. |
+| `--parquet <path>` | — | Direct path to a parquet file. Bypasses `--dataset` / `--episode` resolution; useful for replaying re-derived variants (e.g. `episode_000000_hand_range_calibrated.parquet`) without renaming the canonical file. |
+| `--robot {x2,g1}` | `x2` | Embodiment dispatched through the registry. `g1` is a stub today. |
+| `--rate <Hz>` | `50.0` | Playback rate. Match the recorder's 50 Hz to see real-time motion. |
+| `--start-frame <int>` | `0` | First frame to play (inclusive). |
+| `--end-frame <int>` | `-1` | Last frame, exclusive. `-1` means end-of-episode. |
+| `--loop` | off | Restart from `--start-frame` after `--end-frame`. |
+| `--with-omnihand` / `--no-omnihand` | on | Augment the MJCF with OmniHand and apply hand columns. |
+| `--quiet` | off | Suppress per-second progress logs. |
+
+**What you see:** the exact joint trajectory the recorder wrote to
+disk. If the recording captured weird arm positions or twitchy hand
+commands, this viewer will faithfully reproduce them. Use it to
+diagnose retargeting and recording issues without strapping the
+headset back on.
+
+**What you do NOT see:** SONIC tracking-policy output. The commanded
+`body_q_mj` is what the operator told the lower body to do, not what
+a stabilised deploy would have actually executed. For SONIC-loop
+replay, see recipe 6.3 above (and the planned `replay_x2_sonic.py`).
+
+**Tips:**
+
+- The viewer never modifies the dataset. Quitting (close window or
+  `Ctrl-C`) leaves disk untouched.
+- Pair this with [`replay_recorded_dataset.py`](../../../gear_sonic/scripts/replay_recorded_dataset.py)
+  to first regenerate the parquet with new retargeting code, then
+  point `replay_x2_kinematic` at the new parquet to compare side-by-
+  side.
+- For a subset playback, `--start-frame` / `--end-frame` slice the
+  episode; `--loop` keeps it cycling.
+
+### 6.5 Architecture: teleop / record / replay matrix
+
+The X2 stack treats teleop, record, and replay as three distinct
+verbs that each have a kinematic and a SONIC backend. This is the
+current state of the matrix:
+
+| | **kinematic backend** | **SONIC backend** |
+|---|---|---|
+| **teleop** (no recording) | [`teleop_x2_kinematic.py`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | [`record_x2_dataset.py --teleop-only`](../../../gear_sonic/scripts/record_x2_dataset.py) |
+| **record** (with dataset writes) | [`teleop_x2_kinematic.py --output-dir <path>`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | [`record_x2_dataset.py`](../../../gear_sonic/scripts/record_x2_dataset.py) |
+| **replay** (no operator) | [`replay_x2_kinematic.py`](../../../gear_sonic/scripts/replay_x2_kinematic.py) (this section) | recipe 6.3 sketch only — `replay_x2_sonic.py` planned |
+
+Two scripts double-duty as both `teleop` and `record` today via a
+mode flag (`--output-dir` for the kinematic side, `--teleop-only` for
+the SONIC side). Splitting them into single-purpose files is on the
+v1 backlog; the public surface (CLI flags) will keep working through
+that refactor.
+
+The **kinematic** column has zero deploy / SONIC / ZMQ in the loop —
+just MuJoCo `mj_forward` writes from a passive viewer. The **SONIC**
+column runs the C++ deploy plus the SONIC tracking policy plus the
+motion-token publisher; expect a 30 s startup per session.
+
+### 6.6 Embodiment registry (`gear_sonic.utils.embodiment`)
+
+Both `teleop_x2_kinematic.py` and `replay_x2_kinematic.py` accept
+`--robot x2|g1` (default `x2`) and dispatch through a small
+registry under [`gear_sonic/utils/embodiment/`](../../../gear_sonic/utils/embodiment/).
+Today only `x2` resolves to a real
+[`EmbodimentConfig`](../../../gear_sonic/utils/embodiment/config.py);
+[`g1`](../../../gear_sonic/utils/embodiment/g1.py) registers a stub
+whose factories raise `NotImplementedError` so misuse fails fast at
+the point a real model would be needed.
+
+**Filename convention** for new scripts: `<verb>_<robot>_<backend>.py`.
+The X2 entries follow it (`teleop_x2_kinematic.py`,
+`replay_x2_kinematic.py`); `record_x2_dataset.py` keeps its legacy
+name to avoid breaking the bash wrapper but is the canonical
+"X2 + SONIC + record" path.
+
+**Adding a new embodiment** (e.g. when G1 lands):
+
+1. Edit [`gear_sonic/utils/embodiment/g1.py`](../../../gear_sonic/utils/embodiment/g1.py)
+   and replace the `_g1_build_kinematic_model` /
+   `_g1_apply_dexhand_fn` stubs with real implementations
+   (MJCF loader analogous to X2's `build_model_with_camera`, hand
+   applier analogous to `apply_active_hand_qpos`).
+2. Update the constants (`_G1_NUM_BODY_DOFS`, pelvis pose, stand
+   pose) to match the real G1 URDF / MJCF.
+3. Add `tests/test_embodiment_registry.py::test_g1_*` cases that
+   exercise the new factories with a real MuJoCo load.
+
+No CLI changes are needed: every existing `--robot g1` invocation
+will start working as soon as the stub is replaced.
 
 ---
 
@@ -438,6 +837,12 @@ Run these before merging any change to the recorder:
 ```bash
 .venv/bin/python -m pytest tests/test_x2_arm_ik_smoke.py -x
 .venv/bin/python -m pytest tests/test_record_x2_dataset_schema.py -x
+.venv/bin/python -m pytest tests/test_operator_calibration.py -x
+.venv/bin/python -m pytest tests/test_vr_arm_teleop_v2_smoke.py -x
+.venv/bin/python -m pytest tests/test_teleop_x2_kinematic_smoke.py -x
+.venv/bin/python -m pytest tests/test_embodiment_registry.py -x
+.venv/bin/python -m pytest tests/test_x2_kinematic_view.py -x
+.venv/bin/python -m pytest tests/test_replay_x2_kinematic.py -x
 ```
 
 * [`tests/test_x2_arm_ik_smoke.py`](../../../tests/test_x2_arm_ik_smoke.py)
@@ -445,47 +850,561 @@ Run these before merging any change to the recorder:
   within sub-mm) and the joint-limit clamp invariant for both the
   left and right 7-DOF arm chains.
 * [`tests/test_record_x2_dataset_schema.py`](../../../tests/test_record_x2_dataset_schema.py)
-  pins the hand-retargeter shapes, the `VRArmTeleop` step's
-  neutral-pose fallback (no Quest data ⇒ neutral arm `q`), the
-  LeRobot feature schema, and the
-  `OnlineSonicTokenizer` FSQ-lattice property (the encoded token
-  must lie on the FSQ codebook). The tokenizer test skips
-  cleanly when the SONIC checkpoint isn't on disk.
+  pins the hand-retargeter shapes, the LeRobot feature schema, and
+  the (legacy) `VRArmTeleop` step's neutral-pose fallback.
+* [`tests/test_operator_calibration.py`](../../../tests/test_operator_calibration.py)
+  pins the per-axis fit math, residual-reject threshold, YAML
+  round-trip, and head-yaw-frame transform.
+* [`tests/test_vr_arm_teleop_v2_smoke.py`](../../../tests/test_vr_arm_teleop_v2_smoke.py)
+  is the regression suite for the head-yaw-relative wrist mapping —
+  including the test that pinned the "operator rotates 90 deg in
+  place ⇒ robot wrist target stays put" invariant the engage-anchor
+  solver violated.
+* [`tests/test_teleop_x2_kinematic_smoke.py`](../../../tests/test_teleop_x2_kinematic_smoke.py)
+  pins `Gr00tDataExporter.create()` kwargs, the half-init preflight
+  cleanup paths, and the missing-calibration error message.
+* [`tests/test_embodiment_registry.py`](../../../tests/test_embodiment_registry.py)
+  pins the `--robot x2|g1` dispatch contract: registry lookup,
+  `EmbodimentConfig` shape validation, and the G1 stub's
+  `NotImplementedError` failure mode.
+* [`tests/test_x2_kinematic_view.py`](../../../tests/test_x2_kinematic_view.py)
+  pins the lifted `build_kinematic_model` / `set_kinematic_pose`
+  helpers shared by live teleop and offline replay.
+* [`tests/test_replay_x2_kinematic.py`](../../../tests/test_replay_x2_kinematic.py)
+  pins the kinematic-replay CLI's pure helpers (arg parsing, dataset
+  resolution, chunk-path math, parquet schema validation) without
+  launching the MuJoCo viewer.
 
 ---
 
-## 8. Pointers into the implementation
+## 8. v0 limitations
+
+### Torso tilt is not captured
+
+The X2 has a 3-DOF waist (`waist_pitch`, `waist_roll`, `waist_yaw`),
+but v0 holds it locked at neutral for every recorded frame. With only
+3 tracked rigid bodies (head + 2 wrists), it's mathematically
+impossible to disambiguate "operator bent forward at the waist" from
+"operator looked down with arms reaching" — both produce the same
+head-displacement + wrist-displacement signature.
+
+If you need to capture torso tilt for a task (e.g. picking from the
+floor, leaning over a table), the upgrade options are:
+
+1. **Joystick-driven waist control** — map the right thumbstick to
+   `waist_pitch` / `waist_roll`. Crude but immediate. Already streamed
+   over the WS as `axes.{rx, ry}`.
+2. **Meta Movement SDK / WebXR body tracking** — Quest 3 estimates
+   full-body keypoints from the headset + controllers via built-in
+   upper-body IK. Natural, no extra hardware, ~250 LOC of WebXR
+   work, reliability varies.
+3. **Vive Tracker on the chest** — best 6-DOF chest pose, but adds
+   SteamVR base-station setup time per session.
+
+For the same reason, **wrist orientation is also not calibrated** in
+v0 (`--ik-rotation-weight 0` by default). The IK runs position-only.
+Adding wrist orientation requires fitting an operator-to-robot
+rotation map alongside the position map; tracked as a v1 follow-up.
+
+### Hand retargeting journey log (v0 → v0.4)
+
+The next several subsections (`OmniHand vs human hand` through
+`Open: non-thumb fingertip-to-thumb touch`) describe the chain of
+problems we hit moving the OmniHand mapping from "vendored upstream
+constants + uniform trigger" to "per-finger XRHand retargeting
+that survives a thumb-fingertip touch gesture". Each subsection
+follows the same template — what the operator saw, what the data
+showed, what we changed, and what's still imperfect — so the log
+doubles as a debugging crib sheet for future hand work.
+
+The relevant code is in
+[`gear_sonic/utils/teleop/x2_hand_retarget.py`](../../../gear_sonic/utils/teleop/x2_hand_retarget.py)
+on the Python side and in
+[`gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html`](../../../gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html)
+(`computeHandCurls` / `computeThumbOpposition`) on the WebXR side.
+A self-contained session wrap-up of the May 10 iteration lives at
+[`milestones/2026-05-10_omnihand_finger_tuning.md`](../user_guide/milestones/2026-05-10_omnihand_finger_tuning.md).
+
+### OmniHand has fewer flexion DOFs than the human hand
+
+This is the foundational mismatch every retargeting decision in the
+following subsections has to work around: **a human hand has more
+finger joints than the X2 OmniHand can move**. The retargeting
+collapses 3 cascaded human knuckles per finger onto a single
+robot DOF that drives 2 mimic-coupled segments. Some of that lost
+geometric range is recoverable (anchor expansion, opposition
+fold-ins), some isn't.
+
+```text
+Operator finger (Quest 3 XRHand 25-joint chain, non-thumb):
+   metacarpal ── proximal ── intermediate ── distal ── tip
+                  ▲           ▲              ▲
+                MCP knuckle  PIP knuckle    DIP knuckle
+                ~80° max     ~80° max       ~80° max
+   total bend at full curl ≈ 240° = 1.33 π rad
+
+OmniHand finger (URDF, non-thumb):
+   *_abad ── *_pip ──────────── *_dip (mimic = 1.097 × pip) ── tip
+              ▲                  ▲
+            active flexion     coupled passive flexion
+            0..90°             0..~99° (when pip = 90°)
+   total bend at hardware-max pip ≈ 189° = 1.05 π rad
+```
+
+| | Operator (Quest 3) | OmniHand (URDF) |
+|---|---|---|
+| **Thumb knuckles** | 2 in chain (MCP, IP) — CMC at base is *not* in the XRHand chain | 1 active flexion DOF (`thumb_mcp`) drives 2 mimic-coupled segments (`thumb_pip = 1.33 × mcp`, `thumb_dip = 1.30 × mcp`) → effective multiplier ~3.6 |
+| **Index / ring / pinky** | 3 cascaded knuckles (MCP + PIP + DIP), each ~80° | 1 active flexion (`*_pip` 0..90°) + 1 mimic (`*_dip = 1.097 × pip`) — effective multiplier ~2.1 |
+| **Middle** | Same as above | 1 active flexion (`middle_pip`) + 1 mimic (`middle_dip`); `middle_abad` is **fixed in the URDF** (no lateral spread) |
+| **Lateral spread** | Real per-knuckle XRHand metacarpal-to-metacarpal angles | `*_abad` motors with very narrow ~5–12° hardware ranges; v0 lerps them on the same curl signal as the matching `_pip` |
+
+The thumb has a comfortable headroom (one input angle covers
+3.6× the angular span at the tip, very close to a fully-curled
+human thumb). The non-thumb fingers do not — at hardware-max pip
+the robot fingertip lands somewhere between where the operator's
+PIP and DIP would, never at the operator's tip. This is the
+underlying cause of the open issue documented at the bottom of
+this section.
+
+Joint hardware ranges (per
+[`gear_sonic/data/assets/robot_description/omnihand/omnihand_*.urdf`](../../../gear_sonic/data/assets/robot_description/omnihand/), live in `HAND_FINGER_NAMES_PER_SIDE` order):
+
+| # | Active joint    | Range (°)            | OPEN (°) | CLOSED (°)        |
+|--:|-----------------|----------------------|---------:|------------------:|
+| 1 | `thumb_roll`    | (-50, +10) L / (-10, +50) R | 0   | -40 L / +40 R |
+| 2 | `thumb_abad`    | (0, +100) L / (-100, 0) R   | ±10 | +80 L / -80 R |
+| 3 | `thumb_mcp`     | (-49, 0) L / (0, +49) R     | ∓5  | -40 L / +40 R |
+| 4 | `index_abad`    | (0, +12) L / (-12, 0) R     | 0   | ±6 |
+| 5 | `index_pip`     | (0, +90)             | 5    | 80                |
+| 6 | `middle_pip`    | (0, +90)             | 5    | 80                |
+| 7 | `ring_abad`     | (-10, 0) L / (0, +10) R     | 0   | ∓5 |
+| 8 | `ring_pip`      | (0, +90)             | 5    | 80                |
+| 9 | `pinky_abad`    | (-10, 0) L / (0, +10) R     | 0   | ∓5 |
+| 10| `pinky_pip`     | (0, +90)             | 5    | 80                |
+
+Where the CLOSED column has two values, left vs right is mirrored
+because the abad ranges are physically mirrored across the body
+midline. Where it has a single value, both sides are identical.
+
+### Thumb opposition: fingertip-proximity signal + anchor expansion
+
+This subsection covers three layered fixes that together let the
+robot's thumb actually meet the operator's thumb-pose during both
+fist gestures and thumb-fingertip touches:
+
+1. **Independent thumb-opposition signal** (the lateral CMC swing
+   isn't recoverable from per-finger curls).
+2. **Folding `oppose` into all three thumb motors** via
+   `max(thumb_oppose, thumb_flex_curl)` (the May 10 update extended
+   this from 2 motors to 3).
+3. **Pushing the thumb CLOSED anchors from 50 % to 80 % of hardware
+   travel** so the robot can physically reach the touch pose.
+
+#### 1. Why we need a separate opposition signal
+
+The thumb's CMC joint — the joint that swings the thumb laterally
+across the palm — is **not in the XRHand chain** (the chain starts
+at `thumb-metacarpal`, which sits *at* the CMC pivot). Driving
+`thumb_roll` and `thumb_abad` from the per-finger thumb curl alone
+only swings them to ~50 % of their travel during a thumb-finger
+touch, because Quest 3's chain only sees MCP + IP flexion (~30–50 °
+total during a touch) and that's all the curl signal can encode.
+
+The opposition signal is **fingertip proximity**: the minimum
+distance from the operator's `thumb-tip` to any of the four
+fingertips (index, middle, ring, pinky), normalized by palm width
+(distance from `index-finger-metacarpal` to
+`pinky-finger-metacarpal`). The mapping saturates at `s = 1` when
+`dMin / palm_width < 0.06` (≈0.5 cm, in contact) and falls to
+`s = 0` for `dMin / palm_width > 0.45` (≈3.5 cm, controller grip or
+hand neutral). It directly captures intent ("thumb is in contact
+with another finger"), saturates regardless of *which* finger is
+touched, and distinguishes a thumbs-up gesture (thumb extended away
+from palm) from a real touch.
+
+This proximity signal replaced an earlier *lateral-projection*
+signal (thumb-tip projected onto the index-MCP → pinky-MCP axis).
+That earlier signal saturated only when the thumb crossed *well
+past* palm centre toward the pinky-MCP — an anatomical extreme
+almost no operator reaches. Cross-correlation analysis on
+`data/lerobot/x2_quest3_kinematic_v3/debug/teleop_episode_000000.npz`
+showed **zero** frames out of 666 where `thumb_flex >= 0.85` while
+other fingers had average curl `<= 0.30` — Quest 3 effectively never
+reports a "thumb-only-curled" hand pose, so the lateral-projection
+fallback never triggered cleanly.
+
+#### 2. Folding `oppose` into all 3 thumb motors
+
+All three thumb motors (`thumb_roll`, `thumb_abad`, `thumb_mcp`)
+lerp on `max(thumb_oppose, thumb_flex_curl)` rather than picking
+one signal per motor.
+
+The asymmetry between the two source signals is what justifies the
+fold-in:
+
+| Gesture                       | Quest 3 `thumb_oppose` | Quest 3 `thumb_flex` | Robot needs |
+|-------------------------------|------------------------|----------------------|-------------|
+| Closed fist (thumb tucked)    | ~0.5 (palm centre)     | high (curl chain)    | All 3 thumb motors closed |
+| Thumb-fingertip touch         | high (proximity)       | low (IP doesn't fold) | All 3 thumb motors closed |
+| Thumbs-up                     | 0 (thumb far from tips)| ~0 (extended)         | All 3 thumb motors at OPEN |
+| Open palm                     | 0                      | 0                     | All 3 thumb motors at OPEN |
+
+`max()` reduces to whichever input is high. Concretely the May 10
+sweep (right-thumb-touch frames in v4 ep0, raw `oppose ≥ 0.4`,
+raw `thumb_flex ≤ 0.3`, n = 12) shows what each fix bought:
+
+| Variant | thumb_roll | thumb_abad | thumb_mcp |
+|---|---|---|---|
+| Recorded baseline (live) | 46 % / 66 % | 44 % / 63 % | **28 % / 30 %** |
+| `hand_range_calibrated` (per-finger normalization only) | 73 % / 75 % | 70 % / 71 % | **10 % / 13 %** |
+| **Anchor-expansion + 3-motor fold-in (live default)** | **98 % / 100 %** | **98 % / 100 %** | **98 % / 100 %** |
+
+(Format: mean / max % closure across the 12 touch frames.)
+
+The v0 → v0.3 path drove `thumb_mcp` from `thumb_flex` alone, which
+gave only ~22 % closure on touch frames — exactly what the operator
+saw as "the robot's thumb sweeps across the palm but stays straight
+and ends up alongside the fingers". v0.4 (May 10) folded `oppose`
+into `thumb_mcp` as well and the mean closure jumped to 98 %.
+
+The fold-in also serves as a robustness backstop: when XRHand
+momentarily drops the fingertip joints, the `thumb_oppose`
+proximity signal returns `None` for that frame, and `max()` falls
+back to driving all three motors from the flex curl alone.
+
+#### 3. Anchor expansion to 80 % hardware travel
+
+Even with both `thumb_oppose = 1` and `thumb_flex_curl = 1`, the
+upstream agitbot `quest3-bare-hand-control` constants stopped the
+thumb at half-travel:
+
+| Anchor | Pre-v0.4 (%travel) | v0.4 (%travel) |
+|---|---|---|
+| `thumb_roll` CLOSED | 50 % (LEFT -30°, RIGHT +30°) | 80 % (LEFT -40°, RIGHT +40°) |
+| `thumb_abad` CLOSED | 60 % (LEFT +60°, RIGHT -60°) | 80 % (LEFT +80°, RIGHT -80°) |
+
+20 % of additional travel was sitting unused on the URDF at every
+"closed thumb" frame. Pushing the anchors closer to the hardware
+extremes lets the robot's thumb actually swing across the palm so
+a thumb-to-fingertip gesture from the operator translates to a
+thumb-to-fingertip pose on the robot. The 80 % cap (rather than
+100 %) keeps a small mechanical margin for finger / thumb
+interference at extreme poses.
+
+The constants live as
+`HAND_GRASP_CLOSED_LEFT_DEG` / `HAND_GRASP_CLOSED_RIGHT_DEG`
+in `gear_sonic/utils/teleop/x2_hand_retarget.py` and are exercised
+by the `test_oppose_*` suite in
+`tests/test_teleop_v2_dropout_and_orientation.py`.
+
+### Per-finger curl normalization (the live default)
+
+Quest 3's hand-pose estimator has two structural quirks that the
+retargeter must compensate for:
+
+1. **Operator-specific resting and saturation values.** "Open hand"
+   doesn't read as raw 0 — Quest 3 reports a baseline curl of
+   roughly 0.05–0.20 per finger even when the operator's hand is
+   relaxed flat, with the exact value depending on hand size and
+   resting tone. "Full fist" caps at ~0.85–0.95, never quite 1.0,
+   because Quest 3's tracking under-estimates joint flexion when
+   the fingers occlude each other.
+2. **A "fingers move together" prior.** Pairwise correlations of
+   +0.99–+1.00 between index/middle/ring/pinky curls in v3 ep0
+   (666 hand-mode frames). When the operator curls a single finger
+   alone, the other three report partial curls too. Maximum
+   observed isolated curl was ~0.30 for index/middle/pinky and
+   0.30 for ring.
+
+The live retargeter handles both quirks via **per-finger affine
+normalization** parameterised by an operator-specific
+`HandRangeCalibration` baked into the calibration YAML.
+
+#### How it works
+
+For each finger `i ∈ {thumb, index, middle, ring, pinky}`, the
+calibration stores a `(floor[i], ceiling[i])` pair. A separate
+`(oppose_floor, oppose_ceiling)` pair handles the thumb-opposition
+signal. At runtime:
+
+```text
+normalized_curl[i] = clip( (raw_curl[i] - floor[i]) / (ceiling[i] - floor[i]),
+                            0.0, 1.0 )
+```
+
+Then the normalized curl drives a linear lerp between the OPEN and
+CLOSED anchors for each motor (with the thumb-motor fold-in
+described above). Concretely, with the v4 ep0 calibration:
+
+```text
+RIGHT calibration (operator: stickbot, v4 capture):
+  floor   = [thumb 0.198, index 0.055, middle 0.084, ring 0.062, pinky 0.095]
+  ceiling = [thumb 0.989, index 0.881, middle 0.894, ring 0.877, pinky 0.869]
+  oppose: floor=0.000  ceiling=0.544
+```
+
+So an operator who never quite reaches raw 1.0 still hits the
+robot's CLOSED anchor on a deliberate fist, and the relaxed-hand
+values map exactly to OPEN. No deadzone, no power curve — the
+mapping stays linear *between* the operator's actual extremes,
+which is what preserves smooth intermediate variation.
+
+#### Where the calibration values come from
+
+`gear_sonic/scripts/fit_hand_range_from_npz.py` reads a debug NPZ
+from a previous teleop session and writes the per-finger
+`(p05, p95)` percentiles plus the oppose `(p05, p95)` into the
+operator's calibration YAML under `hand_range:`. p05 / p95 (rather
+than min / max) absorb tracker noise and brief frame dropouts. The
+script enforces a minimum spread of 0.05 to prevent fingers that
+never closed during the capture session from collapsing to a
+single point.
+
+The fit is **operator-specific**: a different person, or even the
+same person on a different headset session, can have a 10–20 %
+shift in the resting / saturation values. Re-running
+`fit_hand_range_from_npz.py` after every meaningful change of
+operator or headset adjustment is the recommended workflow. See
+[Section 2.3](#23-vr-operator-calibration) for how the
+`HandRangeCalibration` block fits into the YAML schema.
+
+#### Why we abandoned the global power-curve compensation
+
+Through ~v0.2 the live default was a piecewise power-curve stretch
+(`stretch_finger_curls`) with five hand-tuned `(deadzone,
+full_threshold, gamma)` triples. It maximised bimodality (98.5–
+99.6 % of post-stretch outputs at <0.05 or >0.95) but operators
+consistently reported the same complaint: *"the robot's fingers
+just snap from open to closed; I lose all smooth variation."*
+
+The trade-off is structural: any compensation that pushes Quest 3's
+0.20–0.80 mid-range curls toward 0 or 1 also pushes deliberately
+intermediate gestures (a half-grasp, a soft pinch) into the same
+endpoints. The affine-normalization approach above instead targets
+the operator's *own* range without compressing what's between, so
+both endpoints saturate cleanly **and** intermediate gestures
+preserve their amplitude.
+
+`stretch_finger_curls` is still in `x2_hand_retarget.py` as an
+opt-in tool (`apply_curl_compensation=True`,
+`apply_oppose_compensation=True`) — useful when an operator
+wants explicit binary close/open feel for tasks like a tight
+power-grasp pick-and-place. The script
+`gear_sonic/scripts/tune_finger_curl_compensation.py` and the
+visualiser
+`gear_sonic/scripts/replay_finger_curl_comparison.py` still work
+against it. The defaults (`DEFAULT_APPLY_CURL_COMPENSATION = False`,
+`DEFAULT_APPLY_OPPOSE_COMPENSATION = False`) reflect the live
+linear path.
+
+### Re-tuning against fresh recordings
+
+The live path (per-operator affine normalization) re-fits from any
+recorded debug NPZ:
+
+```bash
+# Re-fit the operator's per-finger floor / ceiling from a recorded
+# debug NPZ and write into the calibration YAML. p05 / p95 by
+# default; --p-low / --p-high override.
+python -m gear_sonic.scripts.fit_hand_range_from_npz \
+    --calibration data/operator_calibrations/default.yaml \
+    --npz data/lerobot/x2_quest3_kinematic_v4/debug/teleop_episode_000000.npz
+```
+
+The opt-in `stretch_finger_curls` path still has its own tuning
+helpers (only useful if you've explicitly enabled curl
+compensation):
+
+```bash
+# Pool all available episodes, find best global stretch params:
+python -m gear_sonic.scripts.tune_finger_curl_compensation \
+    --mode global \
+    data/lerobot/x2_quest3_kinematic_v3/debug/teleop_episode_*.npz
+
+# Find best per-finger stretch params:
+python -m gear_sonic.scripts.tune_finger_curl_compensation \
+    --mode per-finger \
+    data/lerobot/x2_quest3_kinematic_v3/debug/teleop_episode_*.npz
+
+# Render visual before/after comparison plots:
+python -m gear_sonic.scripts.replay_finger_curl_comparison \
+    data/lerobot/x2_quest3_kinematic_v3/debug/teleop_episode_000000.npz
+```
+
+To explore "what would this NPZ look like with a different mapping
+config?" without re-recording, see
+`gear_sonic/scripts/replay_recorded_dataset.py`. It re-runs the
+current retargeting pipeline over a recorded NPZ and writes a new
+parquet alongside the original — useful for A/B-ing a calibration
+file or stretch parameter change before wiring it into the live
+defaults. The May 10 thumb-fix work used this loop to iterate
+without touching the headset.
+
+### Thumb-opposition rest-bleed suppression
+
+The same piecewise-power-curve stretch is also applied to the
+JS-side thumb-opposition signal (`computeThumbOpposition` in
+`index.html`). The opposition signal is a normalised
+thumb-tip-to-nearest-fingertip proximity score in [0, 1] with
+saturation at 1.0 for any clear thumb-finger touch. At rest hand
+pose the signal drifts to **0.05–0.25** because the thumb tip
+naturally sits a few cm from the index fingertip even when the
+operator isn't intentionally opposing. Without compensation,
+this leaks 5–25 % spurious closure into `thumb_roll` /
+`thumb_abad` at rest, which the operator perceives as "the
+robot's thumb starts moving by itself".
+
+Live defaults (`DEFAULT_OPPOSE_*`):
+
+| Param | Value |
+|-------|------:|
+| deadzone | 0.25 |
+| full_threshold | 0.40 |
+| gamma | 3.0 |
+
+This suppresses anything below 0.25 to 0 (covers rest-bleed) and
+saturates anything above 0.40 to 1.0 (covers any clear
+thumb-finger touch). Pass `apply_oppose_compensation=False` to
+`per_finger_grasp_command_from_curls_and_oppose(...)` to opt out
+(legacy direct-lerp behaviour).
+
+### Open: non-thumb fingertip-to-thumb touch
+
+This is the current edge of the quality envelope. The thumb fix
+above closed the **thumb side** of a thumb-fingertip touch
+gesture — but the **other finger's side** of the same gesture
+is still imperfect: when the operator brings their index pad to
+their thumb pad, the robot's index fingertip ends up roughly
+where the operator's PIP would be, not where their tip would be.
+
+Two factors stack:
+
+1. **Topology mismatch** (see "OmniHand has fewer flexion DOFs"
+   above): the operator has 3 cascaded knuckles bending ~80° each
+   for a total of ~240°; the OmniHand has one active flexion DOF
+   driving 2 mimic-coupled segments, with ~189° of total bend at
+   hardware-max pip. Even at `curl = 1.0` and `pip = 90°`, the
+   robot's tip arc is geometrically narrower than the operator's.
+2. **Quest 3 under-reports isolated finger curls.** Per the v4 ep0
+   data, the right pinky on dedicated thumb-to-pinky touch frames
+   reports raw `pinky_curl ≈ 0.37` — the "fingers move together"
+   prior caps a single-finger bend signal well below 1.0 even when
+   the operator's tip is clearly bent toward palm. After
+   normalization the signal reads ~0.36, so the robot pinky pip
+   only travels ~36 % of the way from OPEN to CLOSED while the
+   thumb has already been pushed to 100 %.
+
+The planned fix mirrors the thumb-opposition treatment: emit a
+**per-finger fingertip-to-thumb proximity** signal on the WebXR
+side (one scalar per non-thumb finger, same `dist / palm_width`
+formulation as the existing `thumb_oppose`), and on the Python side
+drive each `*_pip` motor on `max(curls[i], finger_tip_oppose[i])`.
+Effect: on any deliberate fingertip touch, the relevant pip closes
+to CLOSED regardless of whether Quest 3's per-finger curl signal
+saturates, while smooth variation is preserved everywhere else
+(non-touch frames have low oppose, so `max` reduces to the
+existing curl path). This is filed as a v1 follow-up rather than
+another v0 patch — it adds a JS payload field that has to land
+both on the WebXR client and in the Python parsing path.
+
+A more ambitious alternative (filed but not planned) would do
+**fingertip-position IK** on the per-finger 2-link chain: solve
+for the pip angle that lands the robot tip closest to the
+operator's tip in palm frame. Kinematically correct but a much
+larger change to live retargeting math and end-to-end timing
+budget.
+
+### Other v0 hand limitations
+
+1. **Quest 3 occludes the thumb when curled into the palm.** Tight
+   fists report a thumb-flex curl of ~0.5–0.6 even when the
+   operator's thumb is fully tucked. The opposition signal is
+   unaffected (it's a fingertip-proximity score, not flexional), but
+   the `thumb_mcp` knuckle still under-reports during a fist. In
+   practice the May 10 fold-in (`max(oppose, thumb_flex)` driving
+   all 3 thumb motors) absorbs most of the residual under-shoot,
+   because a tight fist still gives a moderate `oppose` (thumb-tip
+   sits near palm centre, close to fingertips).
+2. **Per-finger abduction is locked to per-finger flexion** (not
+   tracked independently). The X2 omnihand's `index_abad`,
+   `ring_abad`, `pinky_abad` motors have very narrow ~5–10° hardware
+   ranges and currently lerp from OPEN→CLOSED on the same curl as
+   the matching `_pip` motor. So on the robot, fingers spread/close
+   together with their flexion. Adding an independent finger-spread
+   signal from XRHand metacarpal-to-metacarpal angles is a v1
+   follow-up; the marginal gain is small given the hardware range.
+
+---
+
+## 9. Pointers into the implementation
 
 | File | Role |
 | ---- | ---- |
 | [`gear_sonic/utils/teleop/solver/arm/x2_arm_fk.py`](../../../gear_sonic/utils/teleop/solver/arm/x2_arm_fk.py) | Pure-numpy FK + analytical Jacobian for the 7-DOF X2 arm chain. |
 | [`gear_sonic/utils/teleop/solver/arm/x2_arm_ik.py`](../../../gear_sonic/utils/teleop/solver/arm/x2_arm_ik.py) | Single-step DLS IK solver, joint-limit clamped. |
-| [`gear_sonic/utils/teleop/vr_arm_teleop.py`](../../../gear_sonic/utils/teleop/vr_arm_teleop.py) | Engage-time calibration + per-tick IK over the Quest 3 3-pt pose. |
+| [`gear_sonic/utils/teleop/operator_calibration.py`](../../../gear_sonic/utils/teleop/operator_calibration.py) | Per-operator calibration: dataclass, fit, YAML I/O, head-yaw frame transform. |
+| [`gear_sonic/utils/teleop/vr_arm_teleop_v2.py`](../../../gear_sonic/utils/teleop/vr_arm_teleop_v2.py) | Stateless head-relative wrist retargeter that consumes `OperatorCalibration`. v0 default. |
+| [`gear_sonic/utils/teleop/vr_arm_teleop.py`](../../../gear_sonic/utils/teleop/vr_arm_teleop.py) | Legacy engage-anchor retargeter (deprecated; kept for tests + legacy recordings). |
 | [`gear_sonic/utils/teleop/x2_hand_retarget.py`](../../../gear_sonic/utils/teleop/x2_hand_retarget.py) | Trigger/grip → 10-DOF OmniHand command (open/closed motor anchors). |
-| [`gear_sonic/utils/teleop/online_sonic_tokenizer.py`](../../../gear_sonic/utils/teleop/online_sonic_tokenizer.py) | Per-frame `body_q` → 64-D motion token via the freeze-pose virtual clip. |
 | [`gear_sonic/utils/teleop/x2_dataset_recorder.py`](../../../gear_sonic/utils/teleop/x2_dataset_recorder.py) | Top-level orchestrator: ZMQ pub/sub, MuJoCo render, button state machine, LeRobot writer. |
-| [`gear_sonic/scripts/record_x2_dataset.py`](../../../gear_sonic/scripts/record_x2_dataset.py) | CLI shim. |
+| [`gear_sonic/data/dataset_output_dir.py`](../../../gear_sonic/data/dataset_output_dir.py) | Shared `--output-dir` preflight (auto-cleans empty / half-init stubs). |
+| [`gear_sonic/scripts/vr_operator_calibrate.py`](../../../gear_sonic/scripts/vr_operator_calibrate.py) | Standalone 4-pose calibration CLI. |
+| [`gear_sonic/utils/teleop/vr/quest3_audio_prompts.py`](../../../gear_sonic/utils/teleop/vr/quest3_audio_prompts.py) | Generates the calibration audio cache (gTTS-rendered MP3s served at `/audio/<key>.mp3`). |
+| [`gear_sonic/scripts/record_x2_dataset.py`](../../../gear_sonic/scripts/record_x2_dataset.py) | Recorder CLI shim. |
 | [`gear_sonic/scripts/record_x2_dataset.sh`](../../../gear_sonic/scripts/record_x2_dataset.sh) | Co-launches the deploy + recorder. |
+| [`gear_sonic/scripts/teleop_x2_kinematic.py`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | Pure-kinematic VR teleop (no SONIC, no deploy) — fastest debug loop. |
+| [`gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html`](../../../gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html) | WebXR client with calibration overlay + TTS. |
 | [`gear_sonic/scripts/process_dataset.py`](../../../gear_sonic/scripts/process_dataset.py) | Post-process / merge / clean LeRobot datasets. |
-| [`gear_sonic/scripts/mock_vla_publish_stand_token.py`](../../../gear_sonic/scripts/mock_vla_publish_stand_token.py) | Reference for "publish a constant stand-still token over `pose`" — same wire format the recorder's idle path uses. |
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | Recorder logs `waiting for first Quest 3 packet …` forever | Headset can't reach the WebXR HTTPS server | Open the URL in the Quest 3 browser, accept the self-signed cert, then tap **Connect WS** + **Start VR**. Verify the workstation's firewall allows ports 8443 (HTTPS) and 8765 (WebSocket). |
-| Robot jolts on engage | Operator wrists were far from the X2 neutral elbow pose at the **A** press | Stand with elbows relaxed at your sides before pressing **A**. Re-press any time you drift. |
+| `Error: calibration file not found at …` | No `--calibration` YAML on disk | Run `vr_operator_calibrate.py --operator-id <id>` to capture one, OR pass `--recalibrate` to capture inline before recording. See [Section 2.3](#23-vr-operator-calibration). |
+| `ValueError: Failed to resume from corrupted dataset …` | A previous run wrote `meta/info.json` and crashed before any episode finalized | The preflight in `gear_sonic/data/dataset_output_dir.py` should auto-clean half-init stubs on the next launch. If you still hit this, `rm -rf <output-dir>` and retry. |
+| Robot's hands end up "behind the body" when you turn your body | You're using the legacy engage-anchor solver (`vr_arm_teleop.py`). The current default is the calibrated head-yaw mapping which is rotation-invariant. | Verify the recorder banner says `loaded calibration …`. If it doesn't, your code path is still on `VRArmTeleop`; rebase / re-import. |
+| Calibration capture rejects every pose with "Wrist moved too much" | Cluster spread (80th-pct distance from median) > 6 cm — usually a controller dropping out mid-capture, or one controller not actually held. | First, **make sure you're holding both controllers** with the headset in line-of-sight of both. The script logs `dropouts skipped: N` per attempt; a healthy capture has `N` close to 0. If you genuinely need a looser gate (e.g. handheld walking-around setup), pass `--spread-threshold-m 0.10` (10 cm). Tighter (precise lab setup): `--spread-threshold-m 0.03`. Longer averaging window: `--sample-window-s 2.0`. |
+| Calibration captures all 4 poses fine but **fit residual exceeds the per-pose threshold** | One pose was captured at a geometrically inconsistent location (e.g. T-pose right arm angled forward by 17 cm instead of straight sideways), OR the operator's reach envelope is unusually different from the X2's. | The script no longer crashes here — it identifies the worst-contributing pose+arm, speaks a coaching line through the headset, and lets you press **A** to recapture only that pose. Just follow the prompt. Up to `--max-fit-recaptures` (default `4`) recaptures are allowed. If a particular pose legitimately needs a looser gate, pass the per-pose flag (e.g. `--t-pose-reject-m 0.15` for a 15 cm T-pose ceiling, or `--namaste-reject-m 0.22` for a 22 cm namaste ceiling). The default `namaste` gate is already looser (18 cm) than the others (10 cm) to absorb the controller-grip offset. |
+| Robot's hands stay shoulder-width apart even when operator brings their hands together | v1 calibration (3-pose, no centerline anchor) is loaded. | Re-run `vr_operator_calibrate.py` to regenerate the YAML with the v2 4-pose schema (now includes a **namaste** pose at `op_y = 0`). The recorder won't load v1 YAMLs; it logs `schema_version mismatch` if it sees one. |
+| Robot's elbows stay bent even when operator's arms are fully extended down | Same root cause as above — v1 used the bent-arm SONIC stand pose as the calibration `arms_down` reference, so the IK was instructed to keep elbows bent. | Re-calibrate. v2 uses fully-straight arms (`q = 0`) as both the calibration reference *and* the IK null-space preferred posture, so full operator extension produces full robot extension. |
+| No audio in the headset during calibration | Headset volume muted, or the gTTS audio cache failed to populate (no internet at first run, or `gtts` not installed). | (1) Click **Test audio** on the WebXR page *before* pressing **Start VR** — you should hear *"Audio test successful."* and see the `🔊 SPEAKING` badge pulse on the overlay. If you see the badge but hear nothing, **the headset volume is the issue** (use the side rocker). (2) If you hear silence AND see `Audio: audio/audio_test.mp3 failed to play, falling back to TTS` in the page status row, the MP3 cache is empty: run `pip install gtts && python -c "from gear_sonic.utils.teleop.vr.quest3_audio_prompts import ensure_prompt_audio_files; ensure_prompt_audio_files(force_regenerate=True)"` on the workstation, then refresh the page. (3) The `Quest3Reader` regenerates the cache on every server boot, so a stable installation only needs step 2 the first time. |
+| Calibration prompts not visible in immersive-ar view | The runtime denied the dom-overlay feature, or the page lost it during a session restart | The WebXR client requests the `dom-overlay` feature in `requestSession()` and the status row logs `domOverlayState: …`. If it says `not supported` or similar, close and reopen the WebXR page (cold session) and try again. |
 | MuJoCo viewer doesn't open | The deploy was launched headless | Pass `--sim-viewer` (default in the wrapper). If you used the wrapper and still don't see a window, ensure `DISPLAY` is set in the shell that launched the wrapper. |
 | Saved episode has 0 frames | Pressed **X** before any tick advanced (e.g. before VR connected) | Check the recorder log for `[X] dropping 0 frames (no frames)`. Press **B** again, wait for the recorder to log non-zero frame counts in its periodic status, then press **X**. |
-| Tracking policy lags by ~100 ms | The CPU-side encoder is too slow | Pass `--tokenizer-device cuda`. The recorder ships its own `OnlineSonicTokenizer` so this is a one-flag change. |
 | `[recorder] render warn (frame skipped): …` | EGL renderer hiccup; recorder drops the frame and continues | Safe to ignore unless it happens > 1 % of frames. If it does, drop the resolution (`--render-width 320 --render-height 240`) or move the renderer to a different GPU. |
 | Deploy log spams `tilt watchdog` errors | The recorded body_q drifted out of the trained distribution (e.g. lower body got modified) | The recorder pins legs/waist/head to `DEFAULT_STAND_POSE_MUJOCO_RAD`. If you patched that, revert. |
 
 ---
 
-## 10. Next steps
+## 11. Next steps
+
+### Hand-retargeting follow-ups
+
+* **Per-finger tip-to-thumb proximity** (the open issue from §8).
+  Mirror of the existing `thumb_oppose` plumbing, but per non-thumb
+  finger. Closes the gap on thumb-fingertip touches without
+  sacrificing smooth intermediate variation. Touches both the WebXR
+  client (`computeFingerTipOppose` in `index.html`) and the Python
+  retarget path (`per_finger_grasp_command_from_curls_and_oppose`
+  gains a `finger_tip_oppose: tuple[float, float, float, float]`
+  argument). Filed as a v1 task because it's a JS-payload schema
+  change.
+* **Sonic-enabled record + replay path.** The teleop / record /
+  replay matrix currently has only the kinematic backend wired
+  end-to-end. Add Sonic-backed variants of `record_x2_dataset.py`
+  and a Sonic replayer to fill out the 2 × 3 grid in
+  [Section 6.5](#65-architecture-teleop--record--replay-matrix).
+* **Wrist orientation in calibration.** v0 runs IK position-only
+  (`--ik-rotation-weight 0`). Adding an operator-to-robot rotation
+  map alongside the position map would let elbow circumduction and
+  wrist roll/yaw carry through cleanly, fixing the residual
+  "elbows facing in reverse" complaint when the operator switches
+  between controller and hand-tracking mid-session.
+
+### Downstream consumers of the recorded dataset
 
 * **Train Isaac-GR00T N1.7 on the recorded dataset.** See
   [VLA Training](vla_training.md) for the fine-tuning recipe — point

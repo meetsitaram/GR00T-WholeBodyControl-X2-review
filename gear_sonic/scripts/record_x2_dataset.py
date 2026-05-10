@@ -35,10 +35,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from gear_sonic.utils.teleop.x2_dataset_recorder import (  # noqa: E402
-    RecorderConfig,
-    X2DatasetRecorder,
-)
+# NOTE: ``X2DatasetRecorder`` transitively imports ``datasets`` (the
+# Hugging Face dataset library, used by the LeRobot writer). On a
+# fresh teleop venv that package may not be installed yet, so we
+# defer the import until AFTER ``ensure_runtime_deps`` has had a
+# chance to pip-install the recorder dependencies. The actual import
+# happens inside ``main()`` -- see the deferred-import comment below.
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -110,9 +112,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # IK
     parser.add_argument("--ik-damping", type=float, default=0.08)
-    parser.add_argument("--ik-rotation-weight", type=float, default=0.5)
-    parser.add_argument("--ik-position-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--ik-rotation-weight", type=float, default=0.3,
+        help="0.0 = position-only IK; >0 enables wrist orientation "
+             "tracking. Default 0.3 works once a v1+ calibration YAML "
+             "is in place (recapture with vr_operator_calibrate.py to "
+             "get wrist alignment quats). Legacy v0 calibrations are "
+             "auto-detected and force position-only.",
+    )
     parser.add_argument("--ik-per-tick-step-rad", type=float, default=0.30)
+
+    # Operator calibration (replaces engage-anchor wrist anchoring)
+    default_cal = (
+        Path(__file__).resolve().parent.parent.parent
+        / "data" / "operator_calibrations" / "default.yaml"
+    )
+    parser.add_argument(
+        "--calibration", type=Path, default=default_cal,
+        help="YAML produced by vr_operator_calibrate.py. Required "
+             "unless --recalibrate is set.",
+    )
+    parser.add_argument(
+        "--recalibrate", action="store_true",
+        help="Run the 3-pose calibration inline before recording starts. "
+             "Use for the first session with a new operator.",
+    )
+    parser.add_argument(
+        "--operator-id", type=str, default="default",
+        help="Free-form operator label stamped into the calibration YAML.",
+    )
 
     # Misc
     parser.add_argument("--quiet", action="store_true")
@@ -123,6 +151,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    # Auto-install optional packages needed by the recorder workflow.
+    # ``RECORDER_DEPS`` includes:
+    #   * gTTS (Quest 3 calibration audio prompts)
+    #   * datasets / av / lerobot (LeRobot v2.1 dataset writer)
+    # These can be ~200 MB on a clean venv; we install them on first
+    # launch instead of failing with a cryptic ImportError. The
+    # heavy deps are deferred behind a lazy import below so this
+    # ``ensure_runtime_deps`` call has a chance to materialise them
+    # before the dataset writer tries to ``import datasets``.
+    from gear_sonic.utils.install import (
+        RECORDER_DEPS,
+        ensure_runtime_deps,
+    )
+
+    ensure_runtime_deps(
+        RECORDER_DEPS,
+        purpose="X2 dataset recorder (LeRobot writer + Quest 3 audio)",
+    )
+
+    # Deferred import: pulling X2DatasetRecorder also pulls
+    # ``datasets`` and the LeRobot writer chain, which the
+    # ensure_runtime_deps() call above just guaranteed are present.
+    from gear_sonic.utils.teleop.x2_dataset_recorder import (
+        RecorderConfig,
+        X2DatasetRecorder,
+    )
 
     if not args.teleop_only:
         if args.output_dir is None or not args.task:
@@ -153,8 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         hand_input_mode=args.hand_input,
         ik_damping=args.ik_damping,
         ik_rotation_weight=args.ik_rotation_weight,
-        ik_position_scale=args.ik_position_scale,
         ik_per_tick_step_rad=args.ik_per_tick_step_rad,
+        calibration_path=args.calibration,
+        recalibrate=args.recalibrate,
+        operator_id=args.operator_id,
         embodiment_tag=args.embodiment_tag,
         verbose=(not args.quiet),
     )

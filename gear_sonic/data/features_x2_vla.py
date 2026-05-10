@@ -22,7 +22,12 @@ modality config). The 10-DOF dataset can be down-projected to 7-DOF
 on the fly during training via the modality registry alias loaded
 through ``--modality-config-path``.
 
-Reference: ``docs/source/references/x2_isaac_groot_data_contract.md``.
+The schema targets GR00T / ``unitree_g1_sonic``-compatible training.
+Raw Quest 3 inputs (per-finger curls, thumb opposition, full 3-point VR
+pose, IK diagnostics) are **not** duplicated here: they live in the
+side-channel **debug NPZ** written by :file:`teleop_x2_kinematic.py` /
+the recorder (``…/debug/teleop_episode_NNNNNN.npz``) for offline
+analysis and sim-to-real debugging.
 """
 
 from __future__ import annotations

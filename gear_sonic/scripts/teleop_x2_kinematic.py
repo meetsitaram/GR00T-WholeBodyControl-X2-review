@@ -28,9 +28,14 @@ Why a separate path?
   ``<output-dir>/debug/teleop_episode_NNNNNN.npz`` containing the
   raw VR 3-pt pose (head + L/R wrist xyz+quat), trigger/grip values,
   face-button held state, IK targets, IK position/rotation residuals,
-  and the commanded full-body / per-hand q. Use this to diagnose
-  retargeting issues (e.g. "hands going behind the body") offline
-  with numpy + matplotlib without re-running VR sessions.
+  the commanded full-body / per-hand joint commands in radians, and
+  (when XRHand is active) per-frame ``quest_*_hand_curls`` (5-float
+  vectors) plus ``quest_*_thumb_oppose`` scalars — the same Quest 3
+  signals that drive retargeting. Rows use NaN for curls/oppose when
+  that side falls back to uniform controller grasp. Use this to
+  diagnose retargeting offline with numpy + matplotlib without
+  re-running VR sessions. The 1 Hz stdout line also prints raw curls
+  for quick checks; it samples less often than the NPZ.
 
 Run from your interactive shell (the MuJoCo viewer needs ``DISPLAY``)::
 
@@ -41,7 +46,10 @@ Run from your interactive shell (the MuJoCo viewer needs ``DISPLAY``)::
 
 Quest 3 controller buttons:
 
-* **A** -- engage / re-calibrate wrist anchors against the X2 neutral pose.
+* **A** -- toggle active arm tracking on / off. Stateless: idle holds
+  the arms at neutral; active drives them through the calibrated
+  head-relative wrist mapping. Pressing A repeatedly does NOT recapture
+  any anchor (calibration is offline; see ``vr_operator_calibrate.py``).
 * **B** -- start a new episode (only if ``--output-dir`` was passed).
 * **X** -- stop and save.
 * **Y** -- stop and discard.
@@ -69,23 +77,38 @@ from gear_sonic.scripts.live_vla_publish_motion_token import (  # noqa: E402
     DEFAULT_STAND_POSE_MUJOCO_RAD,
     NUM_BODY_DOFS,
 )
+from gear_sonic.utils.teleop.operator_calibration import (  # noqa: E402
+    OperatorCalibration,
+)
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader  # noqa: E402
-from gear_sonic.utils.teleop.vr_arm_teleop import VRArmTeleop  # noqa: E402
+from gear_sonic.utils.teleop.vr_arm_teleop_v2 import (  # noqa: E402
+    VRArmTeleopCalibrated,
+)
 from gear_sonic.utils.teleop.x2_hand_retarget import (  # noqa: E402
+    DEFAULT_APPLY_CURL_COMPENSATION,
     NUM_HAND_DOF_PER_SIDE,
     controller_grasp_ratio,
     grasp_command_from_ratio,
+    per_finger_grasp_command_from_curls_and_oppose,
+    stretch_finger_curls,
+)
+
+
+_DEFAULT_CALIBRATION_PATH = (
+    REPO_ROOT / "data" / "operator_calibrations" / "default.yaml"
+)
+
+
+from gear_sonic.utils.teleop.x2_kinematic_view import (  # noqa: E402
+    DEFAULT_PELVIS_POS_XYZ as _DEFAULT_PELVIS_POS_XYZ,
+    DEFAULT_PELVIS_QUAT_WXYZ as _DEFAULT_PELVIS_QUAT_WXYZ,
+    build_kinematic_model as _build_kinematic_model,
+    set_kinematic_pose as _set_kinematic_pose,
 )
 
 
 _LEFT_ARM_MJ_SLICE = slice(15, 22)
 _RIGHT_ARM_MJ_SLICE = slice(22, 29)
-
-# Pinned floating-base pose. Matches the gantry_hang firmware-stand
-# entry in gear_sonic_deploy/config/sim_init_poses.yaml -- robot on its
-# feet, pelvis ~0.665 m above the floor, identity orientation.
-_DEFAULT_PELVIS_POS_XYZ: tuple[float, float, float] = (0.0, 0.0, 0.665)
-_DEFAULT_PELVIS_QUAT_WXYZ: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
 # Placeholder for action.motion_token written into recorded parquets.
 # Live kinematic teleop never runs the FSQ encoder online -- the offline
@@ -113,6 +136,19 @@ class _EpisodeBuffer:
     def reset(self) -> None:
         self.frames.clear()
         self.debug.clear()
+
+
+def _preflight_output_dir(path: Path) -> None:
+    """Validate or auto-clean an existing ``--output-dir`` before exporter init.
+
+    Thin wrapper around
+    :func:`gear_sonic.data.dataset_output_dir.preflight_dataset_output_dir`
+    so the existing test surface (``test_teleop_x2_kinematic_smoke``)
+    keeps importing the same name.
+    """
+    from gear_sonic.data.dataset_output_dir import preflight_dataset_output_dir
+
+    preflight_dataset_output_dir(path, log_prefix="teleop-kinematic")
 
 
 def _save_debug_npz(
@@ -151,47 +187,6 @@ def _save_debug_npz(
         **stacked,
     )
     return out_path
-
-
-def _build_kinematic_model(*, with_omnihand: bool) -> tuple[Any, Any, np.ndarray]:
-    """Build the X2 (+ optional OmniHand) MuJoCo model purely kinematically."""
-    from gear_sonic.scripts.render_smoketest_episode_video import (
-        build_model_with_camera,
-        resolve_camera_spec,
-    )
-
-    cam = resolve_camera_spec("ego_view")
-    model, layout, body_qposadr = build_model_with_camera(
-        cam, with_omnihand=with_omnihand
-    )
-    return model, layout, body_qposadr
-
-
-def _set_kinematic_pose(
-    *,
-    mujoco_mod: Any,
-    model: Any,
-    data: Any,
-    body_q_mj: np.ndarray,
-    body_qposadr: np.ndarray,
-    layout: Any,
-    apply_hand_fn: Optional[Any],
-    left_hand_q: np.ndarray,
-    right_hand_q: np.ndarray,
-) -> None:
-    """Write the floating base, body and hand DOFs into ``data.qpos``."""
-    data.qpos[0:3] = _DEFAULT_PELVIS_POS_XYZ
-    data.qpos[3:7] = _DEFAULT_PELVIS_QUAT_WXYZ
-    data.qpos[body_qposadr] = body_q_mj.astype(np.float64, copy=False)
-    if apply_hand_fn is not None and layout is not None:
-        apply_hand_fn(
-            data,
-            layout,
-            left_active=left_hand_q.astype(np.float64, copy=False),
-            right_active=right_hand_q.astype(np.float64, copy=False),
-        )
-    data.qvel[:] = 0.0
-    mujoco_mod.mj_forward(model, data)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -239,9 +234,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # IK
     p.add_argument("--ik-damping", type=float, default=0.08)
-    p.add_argument("--ik-rotation-weight", type=float, default=0.5)
-    p.add_argument("--ik-position-scale", type=float, default=1.0)
+    p.add_argument(
+        "--ik-rotation-weight", type=float, default=0.3,
+        help="0.0 = position-only IK; >0 enables wrist orientation "
+             "tracking. Default 0.3 works once a v1+ calibration YAML "
+             "is in place (recapture with vr_operator_calibrate.py to "
+             "get wrist alignment quats). Legacy v0 calibrations are "
+             "auto-detected and force position-only.",
+    )
     p.add_argument("--ik-per-tick-step-rad", type=float, default=0.30)
+
+    # Calibration (replaces the engage-anchor path)
+    p.add_argument(
+        "--calibration", type=Path, default=_DEFAULT_CALIBRATION_PATH,
+        help="Path to a YAML produced by vr_operator_calibrate.py. "
+             "Defines the per-arm head-relative -> torso-frame wrist "
+             "mapping. Required unless --recalibrate is set.",
+    )
+    p.add_argument(
+        "--recalibrate", action="store_true",
+        help="Run the 3-pose calibration inline before teleop starts, "
+             "then load the freshly-written YAML. Use this for the "
+             "first session with a new operator.",
+    )
+    p.add_argument(
+        "--operator-id", type=str, default="default",
+        help="Free-form operator label stamped into the calibration "
+             "YAML (only used with --recalibrate).",
+    )
 
     # Misc
     p.add_argument("--quiet", action="store_true")
@@ -249,15 +269,83 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _load_or_recalibrate(
+    quest: Quest3Reader,
+    args: argparse.Namespace,
+) -> OperatorCalibration:
+    """Resolve the operator calibration: load YAML, or run inline capture.
+
+    Centralised here so the recorder script can call it the same way.
+    """
+    cal_path = args.calibration
+
+    if args.recalibrate:
+        from gear_sonic.scripts.vr_operator_calibrate import (
+            run_inline_calibration,
+        )
+        print(
+            f"[teleop-kinematic] --recalibrate set; running guided "
+            f"calibration before teleop. Output: {cal_path}",
+            flush=True,
+        )
+        return run_inline_calibration(
+            quest,
+            output_path=cal_path,
+            operator_id=args.operator_id,
+        )
+
+    if not cal_path.is_file():
+        raise SystemExit(
+            f"Error: calibration file not found at {cal_path}. Either:\n"
+            f"  - Run `python -m gear_sonic.scripts.vr_operator_calibrate "
+            f"--operator-id {args.operator_id}` to capture one, OR\n"
+            f"  - Pass `--recalibrate` to capture it inline before "
+            f"teleop starts."
+        )
+    cal = OperatorCalibration.load_yaml(cal_path)
+    print(
+        f"[teleop-kinematic] loaded calibration {cal_path} "
+        f"(operator='{cal.operator_id}', "
+        f"L_residual={cal.fit['left'].residual_m*100:.1f} cm, "
+        f"R_residual={cal.fit['right'].residual_m*100:.1f} cm)",
+        flush=True,
+    )
+    return cal
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Auto-install optional teleop deps (currently just gTTS for the
+    # Quest 3 calibration audio cache used during --recalibrate).
+    # The kinematic-teleop entry point intentionally does NOT pull
+    # the heavy LeRobot / datasets stack -- that's reserved for
+    # record_x2_dataset.py.
+    from gear_sonic.utils.install import (
+        CALIBRATION_DEPS,
+        ensure_runtime_deps,
+    )
+
+    ensure_runtime_deps(
+        CALIBRATION_DEPS,
+        purpose="kinematic teleop (Quest 3 audio prompts during recalibrate)",
+    )
+
     record_to_disk = args.output_dir is not None
     if record_to_disk and not args.task:
         raise SystemExit(
             "Error: --task is required when --output-dir is set."
         )
     if record_to_disk:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        # Preflight FIRST, before we boot Quest 3 / MuJoCo. Catches the
+        # half-broken-output-dir case that traps Gr00tDataExporter.create()
+        # into the resume code path with no meta/info.json.
+        _preflight_output_dir(args.output_dir)
+        # Note: do NOT mkdir(parents=True, exist_ok=True) here -- the
+        # exporter's create() distinguishes "fresh" from "resume" purely
+        # by Path.exists(), so pre-creating an empty dir would land us
+        # in the resume code path with no metadata. Let the exporter
+        # create the leaf directory on its first frame.
+        args.output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     import mujoco  # noqa: E402  -- defer so --help doesn't need GL
     import mujoco.viewer  # noqa: E402
@@ -287,20 +375,61 @@ def main(argv: list[str] | None = None) -> int:
         right_hand_q=zero_hand,
     )
 
-    # VR + IK
+    # VR (Quest3 server starts first so --recalibrate has a live client).
     quest = Quest3Reader(
         ws_port=args.quest3_ws_port,
         http_port=args.quest3_http_port,
         use_ssl=(not args.quest3_no_ssl),
         quiet_periodic=True,
     )
-    teleop = VRArmTeleop(
+    quest.start()
+
+    # Resolve calibration BEFORE building the teleop. This may run an
+    # inline 3-pose capture flow if --recalibrate was set, in which case
+    # the operator should already have the headset on by the time we
+    # reach the teleop loop.
+    if args.recalibrate:
+        # The inline calibrator needs a connected client; block here
+        # until the WebXR session is up.
+        from gear_sonic.scripts.vr_operator_calibrate import (
+            _wait_for_first_packet,
+        )
+        _wait_for_first_packet(quest)
+    calibration = _load_or_recalibrate(quest, args)
+
+    teleop = VRArmTeleopCalibrated(
+        calibration=calibration,
         damping=args.ik_damping,
         rotation_weight=args.ik_rotation_weight,
         per_tick_step_rad=args.ik_per_tick_step_rad,
-        position_scale=args.ik_position_scale,
     )
-    quest.start()
+
+    if calibration.hand_range is not None:
+        hr = calibration.hand_range
+        print(
+            f"[teleop-kinematic] hand range loaded "
+            f"(source={hr.source!r} samples={hr.samples}); curl ranges:",
+            flush=True,
+        )
+        for side_name, side_fit in (("L", hr.left), ("R", hr.right)):
+            ranges = " ".join(
+                f"{n}=[{side_fit.floor[i]:.2f},{side_fit.ceiling[i]:.2f}]"
+                for i, n in enumerate(("thumb", "index", "middle", "ring", "pinky"))
+            )
+            print(
+                f"[teleop-kinematic]   {side_name}: {ranges}  "
+                f"oppose=[{side_fit.oppose_floor:.2f},{side_fit.oppose_ceiling:.2f}]",
+                flush=True,
+            )
+    else:
+        print(
+            "[teleop-kinematic] no hand_range in calibration -- using "
+            "linear pass-through (raw Quest curls drive the full motor "
+            "lerp). Add a hand_range section via "
+            "`gear_sonic.scripts.fit_hand_range_from_npz` to enable "
+            "per-operator finger normalization.",
+            flush=True,
+        )
 
     # Optional dataset exporter + ego renderer
     exporter: Any = None
@@ -332,7 +461,16 @@ def main(argv: list[str] | None = None) -> int:
             features=features,
             modality_config=modality_cfg,
             task=args.task,
-            embodiment_tag=args.embodiment_tag,
+            script_config={
+                "robot_type": "agibot_x2_ultra",
+                "embodiment_tag": args.embodiment_tag,
+                "hand_variant": "omnihand_10",
+                "num_body_joints": robot_model.num_joints,
+                "hand_dof_per_side": HAND_DOF_OMNI,
+                "fps": int(args.rate),
+                "teleop_mode": "kinematic",
+            },
+            robot_type="agibot_x2_ultra",
         )
         renderer = MujocoFrameRenderer(
             camera="ego_view",
@@ -362,7 +500,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  rate              : {args.rate} Hz", flush=True)
     print(f"  Quest 3 WebXR URL : https://{ip}:{args.quest3_http_port}", flush=True)
     print("─" * 60, flush=True)
-    print("  Press A on either Quest 3 controller to engage IK calibration.", flush=True)
+    print(
+        f"  calibration       : {args.calibration} "
+        f"(L_resid={calibration.fit['left'].residual_m*100:.1f} cm, "
+        f"R_resid={calibration.fit['right'].residual_m*100:.1f} cm)",
+        flush=True,
+    )
+    print("─" * 60, flush=True)
+    print("  Press A on either Quest 3 controller to toggle active arm tracking.", flush=True)
     if record_to_disk:
         print("  B = start episode  X = save  Y = discard", flush=True)
     print("  Ctrl-C to exit.", flush=True)
@@ -447,8 +592,9 @@ def main(argv: list[str] | None = None) -> int:
                             flush=True,
                         )
                         print(
-                            "[teleop-kinematic]   stand neutral with elbows at sides, "
-                            "then squeeze A on EITHER controller to engage IK.",
+                            "[teleop-kinematic]   press A on EITHER controller to "
+                            "activate arm tracking. The calibration is already "
+                            "loaded, so no engage pose is required.",
                             flush=True,
                         )
 
@@ -466,14 +612,15 @@ def main(argv: list[str] | None = None) -> int:
                                 flush=True,
                             )
 
-                    # A: engage / recalibrate
+                    # A: toggle active arm tracking. Stateless -- the
+                    # calibration is loaded once at startup and applied
+                    # every tick; A only gates whether IK runs or whether
+                    # the arms hold their last commanded q.
                     if buttons[0] and not prev_buttons[0]:
-                        teleop.engage(vr_pose)
-                        l_pos = vr_pose[0, :3]
-                        r_pos = vr_pose[1, :3]
+                        teleop.set_engaged(not teleop.is_engaged)
+                        state = "ACTIVE" if teleop.is_engaged else "IDLE"
                         print(
-                            f"[teleop-kinematic] [A] engaged: anchored "
-                            f"L_wrist={_fmt3(l_pos)} R_wrist={_fmt3(r_pos)}",
+                            f"[teleop-kinematic] [A] arm tracking -> {state}",
                             flush=True,
                         )
 
@@ -533,40 +680,107 @@ def main(argv: list[str] | None = None) -> int:
 
                     prev_buttons = buttons
 
-                    # Hand from triggers
-                    l_ratio, r_ratio = controller_grasp_ratio(
-                        left_trigger=triggers[0],
-                        right_trigger=triggers[1],
-                        left_grip=triggers[2],
-                        right_grip=triggers[3],
-                        mode=args.hand_input,
-                    )
-                    left_hand = grasp_command_from_ratio("left", l_ratio)
-                    right_hand = grasp_command_from_ratio("right", r_ratio)
+                    # Hand command: prefer XRHand 5-finger curls + thumb
+                    # opposition WHENEVER they are reported (which is on
+                    # every frame the headset has hand-tracking enabled,
+                    # including multimodal mode where the operator is
+                    # also holding controllers). Fall back to the
+                    # controller trigger/grip scalar only when XRHand is
+                    # not available at all (e.g. hand-tracking disabled
+                    # in Quest 3 settings, or the hand has briefly left
+                    # the camera FOV).
+                    #
+                    # IMPORTANT: do NOT gate on ``l_src``. In multimodal
+                    # the WebXR client tags ``source = "controller"``
+                    # because gripSpace wins for IK pose, but the same
+                    # frame still carries XRHand curls + the thumb
+                    # opposition signal. Gating on source kind would
+                    # spuriously route us to the uniform-trigger path
+                    # in multimodal and throw away the per-finger detail
+                    # AND the thumb opposition correction.
+                    l_curls, r_curls, l_src, r_src = quest.get_hand_curls()
+                    l_oppose, r_oppose = quest.get_thumb_opposition()
+                    hr = calibration.hand_range
+                    l_hr = hr.left if hr is not None else None
+                    r_hr = hr.right if hr is not None else None
+                    if l_curls is not None:
+                        left_hand = per_finger_grasp_command_from_curls_and_oppose(
+                            "left", l_curls, l_oppose,
+                            curl_floor=l_hr.floor if l_hr is not None else None,
+                            curl_ceiling=l_hr.ceiling if l_hr is not None else None,
+                            oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
+                            oppose_ceiling=l_hr.oppose_ceiling if l_hr is not None else None,
+                        )
+                        l_ratio = float(np.mean(l_curls))
+                    else:
+                        l_ratio_only, _ = controller_grasp_ratio(
+                            left_trigger=triggers[0],
+                            right_trigger=triggers[1],
+                            left_grip=triggers[2],
+                            right_grip=triggers[3],
+                            mode=args.hand_input,
+                        )
+                        l_ratio = l_ratio_only
+                        left_hand = grasp_command_from_ratio("left", l_ratio)
+
+                    if r_curls is not None:
+                        right_hand = per_finger_grasp_command_from_curls_and_oppose(
+                            "right", r_curls, r_oppose,
+                            curl_floor=r_hr.floor if r_hr is not None else None,
+                            curl_ceiling=r_hr.ceiling if r_hr is not None else None,
+                            oppose_floor=r_hr.oppose_floor if r_hr is not None else None,
+                            oppose_ceiling=r_hr.oppose_ceiling if r_hr is not None else None,
+                        )
+                        r_ratio = float(np.mean(r_curls))
+                    else:
+                        _, r_ratio_only = controller_grasp_ratio(
+                            left_trigger=triggers[0],
+                            right_trigger=triggers[1],
+                            left_grip=triggers[2],
+                            right_grip=triggers[3],
+                            mode=args.hand_input,
+                        )
+                        r_ratio = r_ratio_only
+                        right_hand = grasp_command_from_ratio("right", r_ratio)
 
                     # Grasp threshold edge logging
                     l_closed = l_ratio >= GRASP_THRESH
                     r_closed = r_ratio >= GRASP_THRESH
+
+                    def _hand_path_tag(curls: Optional[np.ndarray], oppose: Optional[float]) -> str:
+                        # Single-line tag describing which path is in use
+                        # this frame. Helps debug "thumb not closing" /
+                        # "abad not moving" issues by surfacing the raw
+                        # XRHand signals next to the close/open events.
+                        if curls is None:
+                            return "ctrl-uniform"
+                        op_str = "no-oppose" if oppose is None else f"oppose={oppose:.2f}"
+                        return f"xrhand thumb={curls[0]:.2f} {op_str}"
+
                     if l_closed and not prev_left_grasp_closed:
                         print(
                             f"[teleop-kinematic] hand:L close  ratio={l_ratio:.2f} "
-                            f"(trig={triggers[0]:.2f} grip={triggers[2]:.2f})",
+                            f"({_hand_path_tag(l_curls, l_oppose)} "
+                            f"trig={triggers[0]:.2f} grip={triggers[2]:.2f})",
                             flush=True,
                         )
                     elif not l_closed and prev_left_grasp_closed:
                         print(
-                            f"[teleop-kinematic] hand:L open   ratio={l_ratio:.2f}",
+                            f"[teleop-kinematic] hand:L open   ratio={l_ratio:.2f} "
+                            f"({_hand_path_tag(l_curls, l_oppose)})",
                             flush=True,
                         )
                     if r_closed and not prev_right_grasp_closed:
                         print(
                             f"[teleop-kinematic] hand:R close  ratio={r_ratio:.2f} "
-                            f"(trig={triggers[1]:.2f} grip={triggers[3]:.2f})",
+                            f"({_hand_path_tag(r_curls, r_oppose)} "
+                            f"trig={triggers[1]:.2f} grip={triggers[3]:.2f})",
                             flush=True,
                         )
                     elif not r_closed and prev_right_grasp_closed:
                         print(
-                            f"[teleop-kinematic] hand:R open   ratio={r_ratio:.2f}",
+                            f"[teleop-kinematic] hand:R open   ratio={r_ratio:.2f} "
+                            f"({_hand_path_tag(r_curls, r_oppose)})",
                             flush=True,
                         )
                     prev_left_grasp_closed = l_closed
@@ -679,10 +893,48 @@ def main(argv: list[str] | None = None) -> int:
                             "ik_right_rot_err_rad": np.float32(
                                 last_tick_result.right_ik.rot_err_rad if last_tick_result else 0.0
                             ),
+                            # Calibration diagnostics: operator wrist in
+                            # the head-yaw frame (input to the affine
+                            # mapping) + head yaw used for the rotation.
+                            "op_left_wrist_head_yaw": (
+                                np.asarray(last_tick_result.left_op_wrist_head_yaw, dtype=np.float32)
+                                if last_tick_result is not None
+                                else np.zeros(3, dtype=np.float32)
+                            ),
+                            "op_right_wrist_head_yaw": (
+                                np.asarray(last_tick_result.right_op_wrist_head_yaw, dtype=np.float32)
+                                if last_tick_result is not None
+                                else np.zeros(3, dtype=np.float32)
+                            ),
+                            "head_yaw_rad": np.float32(
+                                last_tick_result.head_yaw_rad if last_tick_result is not None else 0.0
+                            ),
                             # Commanded full-body output
                             "commanded_body_q_mj": np.asarray(body_q_mj, dtype=np.float32),
                             "commanded_left_hand_q": np.asarray(left_hand, dtype=np.float32),
                             "commanded_right_hand_q": np.asarray(right_hand, dtype=np.float32),
+                            # Quest 3 XRHand inputs (same signals as live retargeting).
+                            # NaN when that side uses uniform controller grasp (no per-finger curls).
+                            "quest_left_hand_curls": (
+                                np.asarray(l_curls, dtype=np.float32)
+                                if l_curls is not None
+                                else np.full(5, np.nan, dtype=np.float32)
+                            ),
+                            "quest_right_hand_curls": (
+                                np.asarray(r_curls, dtype=np.float32)
+                                if r_curls is not None
+                                else np.full(5, np.nan, dtype=np.float32)
+                            ),
+                            "quest_left_thumb_oppose": (
+                                np.float32(l_oppose)
+                                if l_oppose is not None
+                                else np.float32(np.nan)
+                            ),
+                            "quest_right_thumb_oppose": (
+                                np.float32(r_oppose)
+                                if r_oppose is not None
+                                else np.float32(np.nan)
+                            ),
                         }
                         episode_buffer.push_debug(debug_row)
 
@@ -695,6 +947,31 @@ def main(argv: list[str] | None = None) -> int:
                         if is_recording
                         else "idle"
                     )
+
+                    def _hand_diag(side: str, curls, oppose) -> str:
+                        if curls is None:
+                            return f"{side}:ctrl"
+                        # RAW Quest 3 per-finger curls in
+                        # [thumb, index, middle, ring, pinky]. Second value is
+                        # the effective lerp ratio driving motors: identical to
+                        # raw when linear mapping is enabled (default); when
+                        # ``apply_curl_compensation`` is True it shows post-
+                        # stretch values from ``stretch_finger_curls``.
+                        op_str = "--" if oppose is None else f"{oppose:+.2f}"
+                        curls_arr = np.asarray(curls, dtype=np.float64)
+                        if DEFAULT_APPLY_CURL_COMPENSATION:
+                            st = stretch_finger_curls(curls_arr)
+                        else:
+                            st = curls_arr
+                        return (
+                            f"{side}:T{curls_arr[0]:.2f}->{st[0]:.2f}/"
+                            f"I{curls_arr[1]:.2f}->{st[1]:.2f}/"
+                            f"M{curls_arr[2]:.2f}->{st[2]:.2f}/"
+                            f"R{curls_arr[3]:.2f}->{st[3]:.2f}/"
+                            f"P{curls_arr[4]:.2f}->{st[4]:.2f} "
+                            f"oppose={op_str}"
+                        )
+
                     if vr_pose is None:
                         print(
                             f"[teleop-kinematic] VR=no-pkt | {eng} | {rec}",
@@ -703,7 +980,11 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         print(
                             f"[teleop-kinematic] VR=ok | {eng} | {rec} | "
-                            + _format_vr_snapshot(vr_pose, triggers, buttons),
+                            + _format_vr_snapshot(vr_pose, triggers, buttons)
+                            + " | "
+                            + _hand_diag("L", l_curls, l_oppose)
+                            + " | "
+                            + _hand_diag("R", r_curls, r_oppose),
                             flush=True,
                         )
                     last_log_t = now

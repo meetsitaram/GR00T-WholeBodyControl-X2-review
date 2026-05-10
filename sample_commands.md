@@ -1,3 +1,20 @@
+
+### teleop  or record episode
+```sh
+ .venv/bin/python -m gear_sonic.scripts.teleop_x2_kinematic     --output-dir data/lerobot/x2_quest3_kinematic_v4     --task "yaw-sweep diagnostic"     --rate 50     --hand-input max
+```
+
+### replay episode
+```sh
+.venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
+    --dataset x2_quest3_kinematic_v4 \
+    --episode 0
+
+# Body-only (skip OmniHand augmentation)
+.venv/bin/python -m gear_sonic.scripts.replay_x2_kinematic \
+    --dataset x2_quest3_kinematic_v4 --episode 0 --no-omnihand
+```
+
 ### build bones seed motion lib files
 ```sh
 cd /home/stickbot/Projects/GR00T-WholeBodyControl && \

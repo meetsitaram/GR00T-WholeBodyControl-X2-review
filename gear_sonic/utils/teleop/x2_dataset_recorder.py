@@ -51,7 +51,9 @@ publishes the resulting body / hand / pelvis state back over
 Recording lifecycle (Quest 3 controller buttons)
 -------------------------------------------------
 
-* ``A``  — engage / re-calibrate: snapshots current wrist anchors.
+* ``A``  — toggle active arm tracking on / off. Stateless: idle holds
+  the arms at neutral; active drives them through the calibrated
+  head-relative wrist mapping (see ``operator_calibration.py``).
 * ``B``  — start a fresh episode (ignored if an episode is already
   recording).
 * ``X``  — stop and *save* the current episode.
@@ -110,12 +112,14 @@ from gear_sonic.scripts.live_vla_publish_motion_token import (  # noqa: E402
     _quat_wxyz_to_projected_gravity,
     _x2_debug_subscriber,
 )
+from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader
-from gear_sonic.utils.teleop.vr_arm_teleop import VRArmTeleop
+from gear_sonic.utils.teleop.vr_arm_teleop_v2 import VRArmTeleopCalibrated
 from gear_sonic.utils.teleop.x2_hand_retarget import (
     NUM_HAND_DOF_PER_SIDE,
     controller_grasp_ratio,
     grasp_command_from_ratio,
+    per_finger_grasp_command_from_curls_and_oppose,
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
@@ -165,9 +169,18 @@ class RecorderConfig:
 
     # IK / VR teleop
     ik_damping: float = 0.08
-    ik_rotation_weight: float = 0.5
-    ik_position_scale: float = 1.0
+    # v0 default 0.0 = position-only IK. Wrist orientation is not
+    # calibrated yet, so feeding the raw VR quaternion in confuses the
+    # solver more than it helps.
+    ik_rotation_weight: float = 0.3
     ik_per_tick_step_rad: float = 0.30
+
+    # Operator calibration (per-arm head-relative wrist mapping). One
+    # of the two MUST be supplied: either a pre-captured YAML or
+    # --recalibrate to capture inline before recording starts.
+    calibration_path: Optional[Path] = None
+    recalibrate: bool = False
+    operator_id: str = "default"
 
     # Dataset
     embodiment_tag: str = "new_embodiment"
@@ -207,7 +220,17 @@ class X2DatasetRecorder:
                     "output_dir is required unless teleop_only=True"
                 )
             self._cfg.output_dir = Path(cfg.output_dir)
-            self._cfg.output_dir.mkdir(parents=True, exist_ok=True)
+            # Preflight FIRST so a half-init stub from a previous
+            # crashed run gets auto-cleaned (otherwise exporter.create
+            # falls into the HF-Hub resume path and 404s on
+            # tmp/tmp_dataset). Don't pre-create the leaf dir; the
+            # exporter does that on first write, and pre-creating would
+            # itself trip the same trap.
+            from gear_sonic.data.dataset_output_dir import preflight_dataset_output_dir
+            preflight_dataset_output_dir(
+                self._cfg.output_dir, log_prefix="recorder"
+            )
+            self._cfg.output_dir.parent.mkdir(parents=True, exist_ok=True)
         # The recorder drives the SONIC *tracking policy* via ``joint_pos_mj``
         # on the wire; the C++ deploy's actor consumes the reference motion,
         # not the FSQ-encoded ``motion_token``. So the tokenizer is only
@@ -248,12 +271,12 @@ class X2DatasetRecorder:
             "joint_pos_mj; motion_token=zeros, ignored by deploy actor)",
             flush=True,
         )
-        self._teleop = VRArmTeleop(
-            damping=cfg.ik_damping,
-            rotation_weight=cfg.ik_rotation_weight,
-            per_tick_step_rad=cfg.ik_per_tick_step_rad,
-            position_scale=cfg.ik_position_scale,
-        )
+        # Calibration is loaded lazily after Quest 3 boot in case
+        # --recalibrate is set (the inline capture flow needs a live
+        # WebXR client). The teleop is created in start() once we have
+        # the calibration in hand.
+        self._calibration: Optional[OperatorCalibration] = None
+        self._teleop: Optional[VRArmTeleopCalibrated] = None
 
         # Quest 3 reader
         self._quest = Quest3Reader(
@@ -321,6 +344,63 @@ class X2DatasetRecorder:
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
+        # Calibration is loaded *after* Quest 3 boot in case the operator
+        # passed --recalibrate (which needs a connected WebXR client).
+        self._calibration = self._resolve_calibration()
+        self._teleop = VRArmTeleopCalibrated(
+            calibration=self._calibration,
+            damping=self._cfg.ik_damping,
+            rotation_weight=self._cfg.ik_rotation_weight,
+            per_tick_step_rad=self._cfg.ik_per_tick_step_rad,
+        )
+
+    def _resolve_calibration(self) -> OperatorCalibration:
+        """Load the operator calibration YAML, or capture inline."""
+        cfg = self._cfg
+        cal_path = cfg.calibration_path
+        if cal_path is not None:
+            cal_path = Path(cal_path)
+
+        if cfg.recalibrate:
+            from gear_sonic.scripts.vr_operator_calibrate import (
+                _wait_for_first_packet,
+                run_inline_calibration,
+            )
+            if cal_path is None:
+                cal_path = (
+                    Path(__file__).resolve().parent.parent.parent.parent
+                    / "data" / "operator_calibrations"
+                    / f"{cfg.operator_id}.yaml"
+                )
+            print(
+                f"[recorder] --recalibrate set; running guided calibration "
+                f"before recording. Output: {cal_path}",
+                flush=True,
+            )
+            _wait_for_first_packet(self._quest)
+            return run_inline_calibration(
+                self._quest,
+                output_path=cal_path,
+                operator_id=cfg.operator_id,
+            )
+
+        if cal_path is None or not cal_path.is_file():
+            raise SystemExit(
+                f"Error: calibration file not found at {cal_path}. Either:\n"
+                f"  - Run `python -m gear_sonic.scripts.vr_operator_calibrate "
+                f"--operator-id {cfg.operator_id}` to capture one, OR\n"
+                f"  - Pass `recalibrate=True` (or --recalibrate) to capture "
+                f"it inline before recording starts."
+            )
+        cal = OperatorCalibration.load_yaml(cal_path)
+        print(
+            f"[recorder] loaded calibration {cal_path} "
+            f"(operator='{cal.operator_id}', "
+            f"L_residual={cal.fit['left'].residual_m*100:.1f} cm, "
+            f"R_residual={cal.fit['right'].residual_m*100:.1f} cm)",
+            flush=True,
+        )
+        return cal
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -388,17 +468,62 @@ class X2DatasetRecorder:
                     continue
 
                 self._handle_buttons(buttons, vr_pose)
-                # Hand commands derive directly from this frame's
-                # trigger/grip values.
-                left_ratio, right_ratio = controller_grasp_ratio(
-                    left_trigger=triggers[0],
-                    right_trigger=triggers[1],
-                    left_grip=triggers[2],
-                    right_grip=triggers[3],
-                    mode=self._cfg.hand_input_mode,
-                )
-                left_hand_q = grasp_command_from_ratio("left", left_ratio)
-                right_hand_q = grasp_command_from_ratio("right", right_ratio)
+                # Hand command: prefer XRHand 5-finger curls + thumb
+                # opposition WHENEVER they are reported (which is on
+                # every frame the headset has hand-tracking enabled,
+                # including multimodal mode where the operator is also
+                # holding controllers). Fall back to the controller
+                # trigger/grip scalar only when XRHand is not available.
+                #
+                # IMPORTANT: do NOT gate on ``l_src``. In multimodal the
+                # WebXR client tags ``source = "controller"`` because
+                # gripSpace wins for IK pose, but the same frame still
+                # carries XRHand curls + the thumb opposition signal.
+                # Gating on source kind would spuriously route us to the
+                # uniform-trigger path in multimodal and throw away the
+                # per-finger detail AND the thumb opposition correction.
+                l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
+                l_oppose, r_oppose = self._quest.get_thumb_opposition()
+                hr = self._calibration.hand_range if self._calibration is not None else None
+                l_hr = hr.left if hr is not None else None
+                r_hr = hr.right if hr is not None else None
+                if l_curls is not None:
+                    left_hand_q = per_finger_grasp_command_from_curls_and_oppose(
+                        "left", l_curls, l_oppose,
+                        curl_floor=l_hr.floor if l_hr is not None else None,
+                        curl_ceiling=l_hr.ceiling if l_hr is not None else None,
+                        oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
+                        oppose_ceiling=l_hr.oppose_ceiling if l_hr is not None else None,
+                    )
+                    left_ratio = float(np.mean(l_curls))
+                else:
+                    left_ratio, _ = controller_grasp_ratio(
+                        left_trigger=triggers[0],
+                        right_trigger=triggers[1],
+                        left_grip=triggers[2],
+                        right_grip=triggers[3],
+                        mode=self._cfg.hand_input_mode,
+                    )
+                    left_hand_q = grasp_command_from_ratio("left", left_ratio)
+
+                if r_curls is not None:
+                    right_hand_q = per_finger_grasp_command_from_curls_and_oppose(
+                        "right", r_curls, r_oppose,
+                        curl_floor=r_hr.floor if r_hr is not None else None,
+                        curl_ceiling=r_hr.ceiling if r_hr is not None else None,
+                        oppose_floor=r_hr.oppose_floor if r_hr is not None else None,
+                        oppose_ceiling=r_hr.oppose_ceiling if r_hr is not None else None,
+                    )
+                    right_ratio = float(np.mean(r_curls))
+                else:
+                    _, right_ratio = controller_grasp_ratio(
+                        left_trigger=triggers[0],
+                        right_trigger=triggers[1],
+                        left_grip=triggers[2],
+                        right_grip=triggers[3],
+                        mode=self._cfg.hand_input_mode,
+                    )
+                    right_hand_q = grasp_command_from_ratio("right", right_ratio)
 
                 # Run IK; if not engaged, this returns the neutral q
                 # (the recorder still publishes a token so the deploy
@@ -469,8 +594,11 @@ class X2DatasetRecorder:
         prev_a, prev_b, prev_x, prev_y = self._prev_buttons
         # Edge-trigger so we only act once per press.
         if a and not prev_a:
-            self._teleop.engage(vr_pose)
-            print("[recorder] [A] engaged: wrist anchors captured", flush=True)
+            # Stateless: A only toggles whether IK runs. Calibration is
+            # loaded once at startup; there's no per-press anchor.
+            self._teleop.set_engaged(not self._teleop.is_engaged)
+            state = "ACTIVE" if self._teleop.is_engaged else "IDLE"
+            print(f"[recorder] [A] arm tracking -> {state}", flush=True)
         if b and not prev_b:
             self._start_episode()
         if x and not prev_x:

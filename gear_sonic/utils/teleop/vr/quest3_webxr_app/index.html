@@ -62,11 +62,97 @@
   #logArea .log-ws  { color: #2196f3; }
   #logArea .log-xr  { color: #ff9800; }
   #logArea .log-err { color: #f44336; }
+
+  /* Calibration overlay (operator-facing prompt; rendered as the WebXR
+   * DOM-Overlay root inside immersive-ar, OR as a regular full-screen
+   * div in the 2D Quest 3 Browser before VR is started). */
+  #calibOverlay {
+    /* Hidden by default. The WebXR runtime always sees this element
+     * (we passed it as domOverlay.root), but only renders it when
+     * the JS toggles ``.show``. */
+    display: none;
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.85);
+    z-index: 9999; flex-direction: column; align-items: center;
+    justify-content: center; padding: 24px; text-align: center;
+    color: #fff;
+    /* Don't intercept controller select-rays when hidden. */
+    pointer-events: none;
+    /* DOM-Overlay v1 requires the root to be opaque against a
+     * transparent passthrough background — solid alpha == 1.0 sub-region
+     * via the inner panel; the .show state below handles that. */
+  }
+  #calibOverlay.show { display: flex; pointer-events: auto; }
+  #calibOverlay .title {
+    font-size: 1.6rem; color: #76b900; margin-bottom: 8px; font-weight: 700;
+  }
+  #calibOverlay .pose-name {
+    font-size: 1.1rem; color: #aaa; margin-bottom: 18px;
+  }
+  #calibOverlay svg {
+    width: min(60vw, 320px); height: auto; max-height: 50vh;
+    margin-bottom: 18px;
+  }
+  #calibOverlay .instructions {
+    font-size: 1.15rem; line-height: 1.5; max-width: 540px; color: #eee;
+    margin-bottom: 12px;
+  }
+  #calibOverlay .hint {
+    font-size: 0.9rem; color: #888;
+  }
+  #calibOverlay .progress {
+    margin-top: 18px; font-family: monospace; color: #76b900;
+    font-size: 1rem;
+  }
+  #calibOverlay.captured {
+    background: rgba(15, 80, 30, 0.92);
+  }
+  #calibOverlay.captured .title { color: #b6ff80; }
+  #calibOverlay svg .stick-line { stroke: #76b900; stroke-width: 6; fill: none; stroke-linecap: round; }
+  #calibOverlay svg .stick-head { fill: #76b900; }
+  #calibOverlay svg .stick-joint { fill: #fff; }
+  /* Visual "🔊 NOW SPEAKING" indicator. Displayed when an audio prompt
+   * is firing so the operator can confirm at-a-glance whether the
+   * client is actually trying to speak (vs. the headset volume just
+   * being muted). The pulse keeps it visible even when the prompt is
+   * short. */
+  #calibOverlay::after {
+    content: '🔊 SPEAKING';
+    position: absolute;
+    top: 16px;
+    right: 24px;
+    background: rgba(118, 185, 0, 0.95);
+    color: #000;
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    opacity: 0;
+    transition: opacity 0.15s ease-out;
+    pointer-events: none;
+  }
+  #calibOverlay.speaking::after {
+    opacity: 1;
+    animation: speak-pulse 0.9s ease-in-out infinite;
+  }
+  @keyframes speak-pulse {
+    0%, 100% { transform: scale(1.0); }
+    50%      { transform: scale(1.06); }
+  }
 </style>
 </head>
 <body>
 
 <h1>Quest 3 Teleop</h1>
+
+<div id="calibOverlay" aria-live="polite">
+  <div class="title" id="calibTitle">Calibration</div>
+  <div class="pose-name" id="calibPoseName">—</div>
+  <div id="calibFigure"></div>
+  <div class="instructions" id="calibInstructions">—</div>
+  <div class="hint">Press <strong>A</strong> on either Quest 3 controller when you're in the pose. Hold steady ~1 second.</div>
+  <div class="progress" id="calibProgress"></div>
+</div>
 
 <div class="status-grid">
   <span class="label">WebSocket</span>
@@ -88,6 +174,7 @@
 <div class="row">
   <button id="btnWS" onclick="toggleWS()">Connect WS</button>
   <button id="btnVR" disabled onclick="toggleVR()">Start VR</button>
+  <button id="btnTestAudio" onclick="testAudio()">Test audio</button>
 </div>
 
 <small>Open this page in the Quest 3 browser. Enter the workstation IP.</small>
@@ -153,12 +240,421 @@ function toggleWS() {
     document.getElementById('btnWS').textContent = 'Connect WS';
     document.getElementById('btnVR').disabled = true;
     debugLog('WebSocket closed (code=' + e.code + ')', 'log-ws');
+    hideCalibrationOverlay();
   };
   ws.onerror = () => {
     document.getElementById('wsStatus').textContent = 'error';
     document.getElementById('wsStatus').className = 'value err';
     debugLog('WebSocket error', 'log-err');
   };
+  ws.onmessage = (ev) => {
+    let payload = null;
+    try { payload = JSON.parse(ev.data); }
+    catch (e) { debugLog('non-JSON server message', 'log-ws'); return; }
+    handleServerMessage(payload);
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Calibration overlay (operator-facing, driven by server messages)    */
+/* ------------------------------------------------------------------ */
+
+/* SVG stick figures for the three calibration poses.
+ * Coordinate system: 200x300 viewBox, head near top, feet at bottom.
+ * Drawn as a green silhouette so it's readable through the Quest 3
+ * passthrough. */
+const POSE_SVGS = {
+  arms_down: `
+    <svg viewBox="0 0 200 300" xmlns="http://www.w3.org/2000/svg">
+      <circle class="stick-head" cx="100" cy="40" r="22"/>
+      <line class="stick-line" x1="100" y1="62" x2="100" y2="200"/>
+      <line class="stick-line" x1="100" y1="90" x2="70"  y2="200"/>
+      <line class="stick-line" x1="100" y1="90" x2="130" y2="200"/>
+      <line class="stick-line" x1="100" y1="200" x2="70"  y2="290"/>
+      <line class="stick-line" x1="100" y1="200" x2="130" y2="290"/>
+      <circle class="stick-joint" cx="70"  cy="200" r="5"/>
+      <circle class="stick-joint" cx="130" cy="200" r="5"/>
+    </svg>`,
+  t_pose: `
+    <svg viewBox="0 0 200 300" xmlns="http://www.w3.org/2000/svg">
+      <circle class="stick-head" cx="100" cy="40" r="22"/>
+      <line class="stick-line" x1="100" y1="62" x2="100" y2="200"/>
+      <line class="stick-line" x1="100" y1="95" x2="20"  y2="95"/>
+      <line class="stick-line" x1="100" y1="95" x2="180" y2="95"/>
+      <line class="stick-line" x1="100" y1="200" x2="70"  y2="290"/>
+      <line class="stick-line" x1="100" y1="200" x2="130" y2="290"/>
+      <circle class="stick-joint" cx="20"  cy="95" r="6"/>
+      <circle class="stick-joint" cx="180" cy="95" r="6"/>
+    </svg>`,
+  arms_forward: `
+    <svg viewBox="0 0 200 300" xmlns="http://www.w3.org/2000/svg">
+      <!-- top-down view: head circle at center, arms reaching forward (up
+           in this view), torso a small line behind, hips two dots. -->
+      <circle class="stick-head" cx="100" cy="120" r="22"/>
+      <line class="stick-line" x1="100" y1="142" x2="100" y2="200"/>
+      <line class="stick-line" x1="80"  y1="120" x2="80"  y2="20"/>
+      <line class="stick-line" x1="120" y1="120" x2="120" y2="20"/>
+      <circle class="stick-joint" cx="80"  cy="20" r="6"/>
+      <circle class="stick-joint" cx="120" cy="20" r="6"/>
+      <text x="100" y="240" font-size="14" fill="#aaa" text-anchor="middle">(top-down view)</text>
+    </svg>`,
+  namaste: `
+    <svg viewBox="0 0 200 300" xmlns="http://www.w3.org/2000/svg">
+      <!-- Front view: head, torso, arms angled inward from shoulders to
+           palms together at chest, forearms vertical. -->
+      <circle class="stick-head" cx="100" cy="40" r="22"/>
+      <line class="stick-line" x1="100" y1="62" x2="100" y2="200"/>
+      <!-- shoulders -->
+      <circle class="stick-joint" cx="70"  cy="95" r="5"/>
+      <circle class="stick-joint" cx="130" cy="95" r="5"/>
+      <!-- upper arm: shoulder down + slightly inward to elbow -->
+      <line class="stick-line" x1="70"  y1="95"  x2="60"  y2="150"/>
+      <line class="stick-line" x1="130" y1="95"  x2="140" y2="150"/>
+      <!-- elbow -->
+      <circle class="stick-joint" cx="60"  cy="150" r="5"/>
+      <circle class="stick-joint" cx="140" cy="150" r="5"/>
+      <!-- forearm: vertical inward toward chest centerline -->
+      <line class="stick-line" x1="60"  y1="150" x2="98"  y2="120"/>
+      <line class="stick-line" x1="140" y1="150" x2="102" y2="120"/>
+      <!-- palms together at chest -->
+      <line class="stick-line" stroke-width="6" x1="98" y1="120" x2="102" y2="120"/>
+      <text x="100" y="240" font-size="14" fill="#aaa" text-anchor="middle">palms together at chest</text>
+    </svg>`,
+};
+const POSE_TITLES = {
+  arms_down:    'Pose 1 of 4 — Arms fully straight down',
+  t_pose:       'Pose 2 of 4 — T-pose',
+  arms_forward: 'Pose 3 of 4 — Arms forward',
+  namaste:      'Pose 4 of 4 — Namaste (palms together at chest)',
+};
+
+/* Map from server-side pose IDs to the audio-file basenames generated
+ * by gear_sonic.utils.teleop.vr.quest3_audio_prompts. The MP3 files
+ * are served from /audio/ on the same HTTPS server as this page.
+ * Falls back to speechSynthesis if a file is missing or 404s. */
+const POSE_AUDIO_KEYS = {
+  arms_down:      'show_arms_down',
+  t_pose:         'show_t_pose',
+  arms_forward:   'show_arms_forward',
+  namaste:        'show_namaste',
+};
+const STATUS_AUDIO_KEYS = {
+  captured:                 'captured',
+  moved_too_much:           'moved_too_much',
+  recapture_arms_down:      'recapture_arms_down',
+  recapture_t_pose:         'recapture_t_pose',
+  recapture_arms_forward:   'recapture_arms_forward',
+  recapture_namaste:        'recapture_namaste',
+  calibration_saved:        'calibration_saved',
+  calibration_failed:       'calibration_failed',
+  audio_test:               'audio_test',
+};
+
+/* ─── Audio playback ────────────────────────────────────────────────
+ * Calibration prompts play through a regular HTML <audio> element with
+ * a pre-rendered MP3 served from /audio/<key>.mp3. This is the most
+ * reliable path on Quest 3 -- the speechSynthesis engine on the
+ * headset is flaky in immersive-ar (gesture-locked + sometimes silent
+ * even when it reports success). Pre-rendered MP3s playback through
+ * the same audio plumbing as YouTube / Spotify which always reaches
+ * the headset speakers.
+ *
+ * If the MP3 is missing (e.g., gTTS wasn't available at server boot),
+ * the WebXR client falls back to speechSynthesis.speak() with the
+ * text payload provided by the server.
+ *
+ * The Quest 3 Browser still requires a user gesture to unlock audio
+ * playback, so the first <audio>.play() call must happen inside an
+ * onclick handler (Start VR / Test audio). primeAudio() does this on
+ * gesture so subsequent server-driven plays succeed even after the
+ * immersive-ar session takes over. */
+
+let _audioPrimed = false;
+let _speechPrimed = false;
+let _voicesReady = false;
+
+/* The single <audio> element used for prompt playback. Created lazily
+ * so we don't need a hidden tag in the HTML. */
+let _promptAudio = null;
+function _getPromptAudio() {
+  if (_promptAudio === null) {
+    _promptAudio = new Audio();
+    _promptAudio.preload = 'auto';
+    _promptAudio.volume = 1.0;
+    _promptAudio.addEventListener('error', () => {
+      debugLog('Audio playback error for ' + _promptAudio.src, 'log-err');
+    });
+  }
+  return _promptAudio;
+}
+
+/* Play /audio/<key>.mp3, with onended/onerror callbacks for sequencing.
+ * Returns true if playback was attempted, false if no key. */
+function playPromptAudio(key, onEnd) {
+  if (!key) return false;
+  const audio = _getPromptAudio();
+  audio.src = `audio/${key}.mp3`;
+  audio.onended = () => { setSpeakingIndicator(false); if (onEnd) onEnd(true); };
+  audio.onerror = () => {
+    setSpeakingIndicator(false);
+    debugLog('Audio: ' + audio.src + ' failed to play, falling back to TTS', 'log-err');
+    if (onEnd) onEnd(false);
+  };
+  setSpeakingIndicator(true, key);
+  /* Always start from the beginning -- otherwise the same prompt
+   * key played twice in a row only emits silence on the second call. */
+  audio.currentTime = 0;
+  const p = audio.play();
+  if (p && p.catch) {
+    p.catch(err => {
+      debugLog('Audio.play() rejected: ' + err.message, 'log-err');
+      setSpeakingIndicator(false);
+      if (onEnd) onEnd(false);
+    });
+  }
+  return true;
+}
+
+/* Visual "🔊 SPEAKING" indicator on the calibration overlay. Even if
+ * the headset audio is muted the operator at least sees that the
+ * client is firing prompts, so they know the issue is volume rather
+ * than the page being broken. */
+function setSpeakingIndicator(active, key) {
+  const overlay = document.getElementById('calibOverlay');
+  if (!overlay) return;
+  if (active) {
+    overlay.classList.add('speaking');
+    overlay.setAttribute('data-audio-key', key || '');
+  } else {
+    overlay.classList.remove('speaking');
+    overlay.removeAttribute('data-audio-key');
+  }
+}
+
+/* Voice list often loads asynchronously; cache once it arrives so we
+ * can pick a sensible default voice for utterances. */
+function _loadVoices() {
+  if (!('speechSynthesis' in window)) return;
+  const v = window.speechSynthesis.getVoices();
+  if (v && v.length > 0) {
+    _voicesReady = true;
+    debugLog('TTS voices loaded: ' + v.length, 'log-xr');
+  }
+}
+if ('speechSynthesis' in window) {
+  _loadVoices();
+  if (window.speechSynthesis.onvoiceschanged !== undefined) {
+    window.speechSynthesis.onvoiceschanged = _loadVoices;
+  }
+}
+
+/* Prime BOTH audio paths from a user gesture. */
+function primeSpeech() {
+  primeAudio();
+  if (!('speechSynthesis' in window)) {
+    debugLog('TTS prime: speechSynthesis API not available in this browser', 'log-err');
+    return;
+  }
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance('Audio ready.');
+    u.volume = 1.0;
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    u.onstart = () => debugLog('TTS prime started', 'log-xr');
+    u.onend = () => debugLog('TTS prime ended', 'log-xr');
+    u.onerror = (ev) => debugLog('TTS prime error: ' + ev.error, 'log-err');
+    window.speechSynthesis.speak(u);
+    _speechPrimed = true;
+    debugLog('TTS primed for WebXR session', 'log-xr');
+  } catch (e) {
+    debugLog('TTS prime failed: ' + e.message, 'log-err');
+  }
+}
+
+/* Prime <audio> playback. Quest 3 Browser requires user-gesture to
+ * unlock auto-play, so we call audio.play() once inside the gesture
+ * handler. */
+function primeAudio() {
+  try {
+    const audio = _getPromptAudio();
+    audio.src = 'audio/audio_test.mp3';
+    /* Set muted briefly and play() to satisfy the gesture-unlock
+     * requirement without making noise on the prime call. */
+    const wasMuted = audio.muted;
+    audio.muted = true;
+    const p = audio.play();
+    if (p && p.then) {
+      p.then(() => {
+        audio.pause();
+        audio.muted = wasMuted;
+        _audioPrimed = true;
+        debugLog('Audio element primed', 'log-xr');
+      }).catch(err => {
+        audio.muted = wasMuted;
+        debugLog('Audio prime failed (will rely on subsequent gestures): ' + err.message, 'log-err');
+      });
+    }
+  } catch (e) {
+    debugLog('Audio prime exception: ' + e.message, 'log-err');
+  }
+}
+
+function testAudio() {
+  /* Operator-facing "Test audio" button. Plays the audio_test.mp3 file
+   * BEFORE entering VR so the operator can confirm the headset volume
+   * is up and the audio plumbing works. Also primes both audio paths
+   * so the first calibration prompt fires even if the operator delays
+   * pressing Start VR. */
+  debugLog('Test audio button pressed', 'log-xr');
+  primeAudio();
+  /* Wait briefly for prime to settle, then play the actual test. */
+  setTimeout(() => {
+    playPromptAudio('audio_test', (ok) => {
+      if (!ok) {
+        /* Fallback to speechSynthesis. */
+        primeSpeech();
+        setTimeout(() => {
+          speak('Audio test successful. Calibration prompts will speak through this audio device.');
+        }, 800);
+      }
+    });
+  }, 400);
+}
+
+/* speechSynthesis fallback used only when the MP3 fails. Quest 3's
+ * speech engine is unreliable but better than silence. */
+function speak(text) {
+  if (!('speechSynthesis' in window)) return;
+  try {
+    if (window.speechSynthesis.speaking && _speechPrimed) {
+      window.speechSynthesis.cancel();
+    }
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.95;
+    u.pitch = 1.0;
+    u.volume = 1.0;
+    u.onstart = () => setSpeakingIndicator(true, 'tts');
+    u.onend = () => setSpeakingIndicator(false);
+    u.onerror = (ev) => {
+      setSpeakingIndicator(false);
+      debugLog('TTS error: ' + ev.error + ' on "' + text.slice(0,30) + '"', 'log-err');
+    };
+    window.speechSynthesis.speak(u);
+    if (!_speechPrimed) {
+      debugLog('WARN: speak() before primeSpeech(); Quest 3 may swallow this utterance', 'log-err');
+    }
+  } catch (e) {
+    debugLog('TTS error: ' + e.message, 'log-err');
+    setSpeakingIndicator(false);
+  }
+}
+
+/* speakPrompt(key, fallbackText) -- play /audio/<key>.mp3 if available,
+ * else fall back to speechSynthesis. This is the entry point from
+ * server-driven calibration messages. */
+function speakPrompt(key, fallbackText) {
+  if (!key && !fallbackText) return;
+  if (!key) {
+    speak(fallbackText);
+    return;
+  }
+  const ok = playPromptAudio(key, (success) => {
+    if (!success && fallbackText) {
+      speak(fallbackText);
+    }
+  });
+  if (!ok && fallbackText) {
+    speak(fallbackText);
+  }
+}
+
+function showCalibrationPose(payload) {
+  const overlay = document.getElementById('calibOverlay');
+  const figure = document.getElementById('calibFigure');
+  const title = document.getElementById('calibTitle');
+  const poseName = document.getElementById('calibPoseName');
+  const instructions = document.getElementById('calibInstructions');
+  const progress = document.getElementById('calibProgress');
+
+  const poseId = payload.pose || 'arms_down';
+  overlay.classList.remove('captured');
+  title.textContent = 'VR Operator Calibration';
+  poseName.textContent = POSE_TITLES[poseId] || poseId;
+  figure.innerHTML = POSE_SVGS[poseId] || '';
+  instructions.textContent = payload.instructions || '';
+  progress.textContent = payload.progress || '';
+  overlay.classList.add('show');
+
+  if (payload.tts !== false && payload.instructions) {
+    /* Pick the right MP3 key. The server can also pass an explicit
+     * ``audio_key`` to override (used for recapture prompts that
+     * should play "recapture_*" rather than "show_*"). */
+    const key = payload.audio_key || POSE_AUDIO_KEYS[poseId];
+    speakPrompt(key, payload.instructions);
+  }
+  debugLog('calibration: show pose ' + poseId, 'log-xr');
+}
+
+function flashCalibrationCaptured(payload) {
+  const overlay = document.getElementById('calibOverlay');
+  const title = document.getElementById('calibTitle');
+  const instructions = document.getElementById('calibInstructions');
+  const progress = document.getElementById('calibProgress');
+
+  overlay.classList.add('captured');
+  title.textContent = 'Captured';
+  instructions.textContent = payload.message || 'Hold position …';
+  progress.textContent = payload.progress || '';
+  if (payload.tts !== false) {
+    /* The server tags moved-too-much rejections with audio_key
+     * 'moved_too_much'; everything else is the success "Captured." */
+    const key = payload.audio_key
+      || (payload.captured === false ? STATUS_AUDIO_KEYS.moved_too_much : STATUS_AUDIO_KEYS.captured);
+    speakPrompt(key, payload.message || 'Captured');
+  }
+  debugLog('calibration: captured ' + (payload.pose || ''), 'log-xr');
+}
+
+function hideCalibrationOverlay() {
+  const overlay = document.getElementById('calibOverlay');
+  overlay.classList.remove('show');
+  overlay.classList.remove('captured');
+}
+
+function calibrationDone(payload) {
+  const overlay = document.getElementById('calibOverlay');
+  const title = document.getElementById('calibTitle');
+  const instructions = document.getElementById('calibInstructions');
+  const poseName = document.getElementById('calibPoseName');
+  const progress = document.getElementById('calibProgress');
+  const figure = document.getElementById('calibFigure');
+
+  overlay.classList.add('show');
+  overlay.classList.add('captured');
+  title.textContent = 'Calibration complete';
+  poseName.textContent = '';
+  figure.innerHTML = '';
+  instructions.textContent = payload.message || 'Calibration saved. You can take off the headset.';
+  progress.textContent = payload.progress || '';
+  /* Server tags failures with audio_key 'calibration_failed'. */
+  const key = payload.audio_key || STATUS_AUDIO_KEYS.calibration_saved;
+  speakPrompt(key, payload.message || 'Calibration complete.');
+  /* Auto-hide after 5 seconds so the operator can resume teleop. */
+  setTimeout(hideCalibrationOverlay, 5000);
+}
+
+function handleServerMessage(payload) {
+  const t = payload && payload._type;
+  switch (t) {
+    case 'calibration_show_pose':    showCalibrationPose(payload); break;
+    case 'calibration_pose_captured': flashCalibrationCaptured(payload); break;
+    case 'calibration_done':         calibrationDone(payload); break;
+    case 'calibration_hide':         hideCalibrationOverlay(); break;
+    default:
+      /* Unknown server messages are not an error -- forward-compat. */
+      debugLog('server msg: ' + JSON.stringify(payload).slice(0, 80), 'log-ws');
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,11 +686,31 @@ async function toggleVR() {
   }
   debugLog('Using ' + sessionMode + ' (passthrough=' + (sessionMode === 'immersive-ar') + ')', 'log-xr');
 
+  /* Prime speechSynthesis on the user gesture that started VR. The
+   * Quest 3 Browser refuses to speak unless TTS has been touched once
+   * inside a recent gesture; once primed it will keep speaking even
+   * after the immersive-ar session takes over audio focus. */
+  primeSpeech();
+
   try {
+    /* Request the WebXR DOM-Overlay feature so the calibration card
+     * (a regular <div>) is composited on top of the passthrough scene
+     * inside the headset. Without this, DOM is invisible the moment
+     * we enter immersive-ar. */
+    const overlayRoot = document.getElementById('calibOverlay');
     xrSession = await navigator.xr.requestSession(sessionMode, {
-      optionalFeatures: ['local-floor', 'local', 'passthrough'],
+      /* hand-tracking is required for analog finger control. The Quest 3
+       * supplies XRHand 25-joint poses when this feature is granted; we
+       * fall back to controller buttons when only a controller is held. */
+      optionalFeatures: ['local-floor', 'local', 'passthrough', 'dom-overlay', 'hand-tracking'],
+      domOverlay: { root: overlayRoot },
     });
     debugLog('XR session created', 'log-xr');
+    if (xrSession.domOverlayState && xrSession.domOverlayState.type) {
+      debugLog('DOM overlay active: ' + xrSession.domOverlayState.type, 'log-xr');
+    } else {
+      debugLog('WARN: DOM overlay not granted; calibration UI will not show in headset.', 'log-err');
+    }
 
     /* Try reference spaces in order of preference */
     const refTypes = ['local-floor', 'local', 'viewer'];
@@ -274,7 +790,15 @@ async function toggleVR() {
     xrSession.addEventListener('inputsourceschange', (ev) => {
       debugLog('Input sources changed! Now: ' + xrSession.inputSources.length, 'log-xr');
       for (const src of xrSession.inputSources) {
-        const type = src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown');
+        /* Quest 3 multimodal mode (default v55+) reports a single
+         * source carrying BOTH hand-tracking AND gripSpace. Label
+         * those as 'multimodal' so the operator-facing logs don't
+         * spuriously warn "no controllers" while the gamepad is
+         * actually connected on the same source. */
+        const type = (src.hand && src.gripSpace) ? 'multimodal'
+                   : src.hand ? 'hand-tracking'
+                   : src.gripSpace ? 'controller'
+                   : 'unknown';
         debugLog('  ' + src.handedness + ': ' + type +
           (src.gamepad ? ' (buttons=' + src.gamepad.buttons.length + ' axes=' + src.gamepad.axes.length + ')' : ''), 'log-xr');
       }
@@ -284,9 +808,13 @@ async function toggleVR() {
         for (const src of xrSession.inputSources) {
           sources.push({
             handedness: src.handedness,
-            type: src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown'),
+            type: (src.hand && src.gripSpace) ? 'multimodal'
+                : src.hand ? 'hand-tracking'
+                : src.gripSpace ? 'controller'
+                : 'unknown',
             has_gamepad: !!src.gamepad,
             has_grip: !!src.gripSpace,
+            has_hand: !!src.hand,
           });
         }
         ws.send(JSON.stringify({
@@ -300,7 +828,10 @@ async function toggleVR() {
 
     /* Log initial input sources */
     for (const src of xrSession.inputSources) {
-      const type = src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown');
+      const type = (src.hand && src.gripSpace) ? 'multimodal'
+                 : src.hand ? 'hand-tracking'
+                 : src.gripSpace ? 'controller'
+                 : 'unknown';
       debugLog('Initial input: ' + src.handedness + ' = ' + type, 'log-xr');
     }
 
@@ -311,6 +842,264 @@ async function toggleVR() {
     debugLog('XR request failed: ' + e.message, 'log-err');
     console.error(e);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-finger curl from XRHand 25-joint poses                          */
+/* ------------------------------------------------------------------ */
+/* Computes per-finger curl in [0, 1] from the WebXR Hand Input API.
+ *
+ * Curl is the sum of bend angles at each knuckle along a finger,
+ * normalized by an empirical max (~3π/2 for a 4-segment finger curling
+ * into a fist, ~π for the thumb's 3-segment chain). 0 = fully extended,
+ * 1 = fully flexed. Returns ``null`` if the hand is not currently
+ * tracked, otherwise an array
+ *   [thumb, index, middle, ring, pinky]
+ * matching the order the Python side expects.
+ */
+const FINGER_JOINT_CHAINS = {
+  'thumb': [
+    'thumb-metacarpal',
+    'thumb-phalanx-proximal',
+    'thumb-phalanx-distal',
+    'thumb-tip',
+  ],
+  'index-finger': [
+    'index-finger-metacarpal',
+    'index-finger-phalanx-proximal',
+    'index-finger-phalanx-intermediate',
+    'index-finger-phalanx-distal',
+    'index-finger-tip',
+  ],
+  'middle-finger': [
+    'middle-finger-metacarpal',
+    'middle-finger-phalanx-proximal',
+    'middle-finger-phalanx-intermediate',
+    'middle-finger-phalanx-distal',
+    'middle-finger-tip',
+  ],
+  'ring-finger': [
+    'ring-finger-metacarpal',
+    'ring-finger-phalanx-proximal',
+    'ring-finger-phalanx-intermediate',
+    'ring-finger-phalanx-distal',
+    'ring-finger-tip',
+  ],
+  'pinky-finger': [
+    'pinky-finger-metacarpal',
+    'pinky-finger-phalanx-proximal',
+    'pinky-finger-phalanx-intermediate',
+    'pinky-finger-phalanx-distal',
+    'pinky-finger-tip',
+  ],
+};
+const FINGER_ORDER = ['thumb', 'index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'];
+
+/* Empirical max-curl angle per finger (radians).
+ *
+ * The curl metric sums the bend angles between consecutive segments
+ * along the finger chain (see computeHandCurls). To convert that
+ * accumulated bend into a [0, 1] curl coefficient we divide by an
+ * empirical "fully-closed" total bend.
+ *
+ * Why thumb is so much smaller than the other fingers:
+ *
+ *  * The other-finger chains have 5 joints (metacarpal, proximal,
+ *    intermediate, distal, tip) -> 3 bend points. Each knuckle has
+ *    ~80-90 deg of flexion when the hand makes a fist; total
+ *    ~3 * 80 deg ~= 1.4 pi rad. We use 1.5 pi as the divisor.
+ *
+ *  * The thumb chain has 4 joints (metacarpal, phalanx-proximal,
+ *    phalanx-distal, tip) -> only 2 bend points (MCP + IP). The
+ *    CMC joint at the base of the thumb is NOT in the chain
+ *    (XRHand reports `thumb-metacarpal` AT the CMC pivot, so the
+ *    metacarpal segment doesn't contribute a bend). MCP flexion
+ *    maxes at ~50 deg, IP flexion at ~80 deg, total ~130 deg.
+ *
+ *  * Earlier we used Math.PI (180 deg) as the thumb divisor, which
+ *    meant the thumb curl could never exceed ~130/180 = 0.72 even
+ *    when the operator made a tight fist. Empirically (see the
+ *    debug NPZ from x2_quest3_kinematic_v3) the thumb curl topped
+ *    out at 0.47 because Quest 3's hand tracking under-estimates
+ *    thumb bend when the thumb is partially occluded by the other
+ *    fingers (a fist). 0.47 propagates to the X2 omnihand thumb
+ *    DOFs as ~50% of their travel, leaving the robot's thumb
+ *    sticking out instead of curled into the palm. Lowering the
+ *    divisor to 0.5 * Math.PI scales the same input curl up to
+ *    ~0.94 -- the robot's thumb closes properly, and we still cap
+ *    at 1.0 so we don't over-shoot the omnihand's joint limits. */
+const FINGER_MAX_CURL_ANGLE = {
+  'thumb': 0.5 * Math.PI,        /* ~90 deg: realistic MCP+IP envelope */
+  'index-finger': 1.5 * Math.PI,
+  'middle-finger': 1.5 * Math.PI,
+  'ring-finger': 1.5 * Math.PI,
+  'pinky-finger': 1.5 * Math.PI,
+};
+
+/* Thumb opposition score in [0, 1] independent of finger curl.
+ *
+ * Why we need this in addition to the finger-curl array
+ * -----------------------------------------------------
+ * Touching thumb-tip to each fingertip (a "thumb-finger touch") is
+ * dominated by motion at the THUMB CMC joint, which is between the
+ * trapezium (a wrist bone, NOT in the XRHand chain) and the
+ * thumb-metacarpal. CMC abduction/opposition swings the thumb
+ * laterally across the palm. The MCP+IP knuckles barely flex during
+ * a touch -- maybe 30-50 deg total, which gives a "thumb curl" of
+ * 0.4-0.6 in our existing chain-bend metric.
+ *
+ * If we drive `thumb_roll` and `thumb_abad` (the X2 omnihand's
+ * opposition motors) from that 0.4-0.6 curl signal, the robot's
+ * thumb only swings to ~50% of its opposition range -- nowhere near
+ * the other fingers. Result: the operator's thumb-finger touches
+ * never reach the robot's other fingers.
+ *
+ * Solution: compute opposition INDEPENDENTLY of curl by looking at
+ * where thumb-tip is in the palm coordinate frame, then drive the
+ * roll/abad motors from this signal while leaving thumb_mcp on the
+ * existing curl signal.
+ *
+ * Definition
+ * ----------
+ * The opposition score is the proximity of thumb-tip to the closest
+ * fingertip (index / middle / ring / pinky), normalized by palm
+ * width to make the signal operator-anatomy-independent:
+ *
+ *   dMinNorm = min_i ||thumb_tip - fingertip_i|| / ||pinky_MCP - index_MCP||
+ *   s = clamp((farNorm - dMinNorm) / (farNorm - touchNorm), 0, 1)
+ *
+ * Calibration thresholds (verified analytically against typical
+ * adult hand anthropometry; palm width 7-9 cm):
+ *
+ *   * dMinNorm < 0.06 (~0.5 cm, contact)             -> s = 1.0
+ *   * dMinNorm = 0.20 (~1.5 cm, near touch)          -> s = 0.64
+ *   * dMinNorm = 0.45 (~3.5 cm, controller grip)     -> s = 0.0
+ *   * dMinNorm > 0.60 (~5+ cm, open palm or thumb up) -> s = 0.0
+ *
+ * Why a proximity signal rather than the lateral palm-axis
+ * projection that this function used through 2026-05-09:
+ *
+ * The projection only saturated when the operator's thumb-tip
+ * crossed *well past* palm centre toward the pinky-MCP -- an
+ * extreme anatomical pose that almost no operator hits in normal
+ * use. Typical thumb-finger touches land the thumb-tip *near* palm
+ * centre (projUlnarNorm in [-0.05, +0.10]), so the projection
+ * topped out at ~0.85 even on unambiguous "thumb-pad-touches-
+ * index-pad" gestures. Combined with the Python-side
+ * ``max(oppose, thumb_flex)`` fold-in we use to drive
+ * ``thumb_roll / thumb_abad``, this meant the X2's CMC abduction
+ * motors only fully closed when *all* fingers curled (so
+ * ``thumb_flex`` could saturate via Quest 3's hand-prior coupling)
+ * -- never on a "thumb-touches-finger with the rest of the hand
+ * extended" gesture. See the v3 ep0 cross-correlation analysis:
+ * across 666 hand-mode frames there were ZERO frames where
+ * thumb_flex >= 0.85 while other fingers <= 0.30, i.e., Quest 3
+ * effectively never reports a "thumb-only-curled" hand pose.
+ *
+ * Proximity directly captures the operator's intent ("thumb is in
+ * contact with another finger"), saturates cleanly on any
+ * thumb-finger touch regardless of which finger is touched, and
+ * naturally distinguishes a "thumbs up" gesture (thumb extended
+ * away from the palm; far from all fingertips) from a real
+ * thumb-finger touch.
+ *
+ * Returns ``null`` if any of the required joints (thumb-tip, four
+ * fingertips, two MCP anchors for palm width) is not tracked this
+ * frame -- the Python side then falls back to the thumb-flex curl
+ * via ``max(oppose, thumb_flex)``. */
+const _OPPOSE_TOUCH_NORM = 0.06;
+const _OPPOSE_FAR_NORM   = 0.45;
+
+const _OPPOSE_FINGERTIP_JOINTS = [
+  'index-finger-tip',
+  'middle-finger-tip',
+  'ring-finger-tip',
+  'pinky-finger-tip',
+];
+
+function computeThumbOpposition(hand, frame, refSpace) {
+  if (!hand) return null;
+  const thumbTipSpace = hand.get('thumb-tip');
+  const indexMcSpace  = hand.get('index-finger-metacarpal');
+  const pinkyMcSpace  = hand.get('pinky-finger-metacarpal');
+  if (!thumbTipSpace || !indexMcSpace || !pinkyMcSpace) return null;
+  const tp = frame.getJointPose(thumbTipSpace, refSpace);
+  const ip = frame.getJointPose(indexMcSpace, refSpace);
+  const pp = frame.getJointPose(pinkyMcSpace, refSpace);
+  if (!tp || !ip || !pp) return null;
+
+  /* Anatomy-normalising scale: distance from index-MCP to pinky-MCP. */
+  const i = ip.transform.position;
+  const p = pp.transform.position;
+  const palmWidth = Math.hypot(p.x - i.x, p.y - i.y, p.z - i.z);
+  if (palmWidth < 1e-3) return null;
+
+  /* Minimum thumb-tip distance to any of the four fingertips. */
+  const tt = tp.transform.position;
+  let dMin = Infinity;
+  let tipsTracked = 0;
+  for (const jointName of _OPPOSE_FINGERTIP_JOINTS) {
+    const space = hand.get(jointName);
+    if (!space) continue;
+    const pose = frame.getJointPose(space, refSpace);
+    if (!pose) continue;
+    const fp = pose.transform.position;
+    const dx = tt.x - fp.x, dy = tt.y - fp.y, dz = tt.z - fp.z;
+    const d = Math.hypot(dx, dy, dz);
+    if (d < dMin) dMin = d;
+    tipsTracked += 1;
+  }
+  /* Need at least one fingertip tracked to compute a proximity. */
+  if (tipsTracked === 0) return null;
+
+  const dMinNorm = dMin / palmWidth;
+  let s = (_OPPOSE_FAR_NORM - dMinNorm)
+        / (_OPPOSE_FAR_NORM - _OPPOSE_TOUCH_NORM);
+  if (s < 0) s = 0;
+  if (s > 1) s = 1;
+  return s;
+}
+
+function computeHandCurls(hand, frame, refSpace) {
+  if (!hand) return null;
+  const curls = [];
+  for (const fingerName of FINGER_ORDER) {
+    const jointNames = FINGER_JOINT_CHAINS[fingerName];
+    const positions = [];
+    let ok = true;
+    for (const jn of jointNames) {
+      const jSpace = hand.get(jn);
+      if (!jSpace) { ok = false; break; }
+      const jPose = frame.getJointPose(jSpace, refSpace);
+      if (!jPose) { ok = false; break; }
+      const p = jPose.transform.position;
+      positions.push([p.x, p.y, p.z]);
+    }
+    if (!ok || positions.length < 3) {
+      curls.push(0);
+      continue;
+    }
+    let total = 0;
+    for (let i = 1; i < positions.length - 1; i++) {
+      const a = positions[i - 1];
+      const b = positions[i];
+      const c = positions[i + 1];
+      const v1 = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
+      const v2 = [c[0]-b[0], c[1]-b[1], c[2]-b[2]];
+      const m1 = Math.hypot(v1[0], v1[1], v1[2]);
+      const m2 = Math.hypot(v2[0], v2[1], v2[2]);
+      if (m1 < 1e-6 || m2 < 1e-6) continue;
+      let cosA = (v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]) / (m1 * m2);
+      if (cosA < -1) cosA = -1;
+      if (cosA > 1) cosA = 1;
+      total += Math.acos(cosA);
+    }
+    let c = total / FINGER_MAX_CURL_ANGLE[fingerName];
+    if (c < 0) c = 0;
+    if (c > 1) c = 1;
+    curls.push(c);
+  }
+  return curls;
 }
 
 /* ------------------------------------------------------------------ */
@@ -367,41 +1156,216 @@ function onXRFrame(time, frame) {
   const axes = { lx: 0, ly: 0, rx: 0, ry: 0 };
 
   let numControllers = 0;
+  /* hands payload: per-side analog finger curls + thumb opposition +
+   * the source kind that supplied this frame. ``source`` is 'hand',
+   * 'controller', or null; ``curls`` is null when no XRHand data is
+   * available; ``oppose`` is the thumb-tip-relative-to-palm
+   * opposition score in [0, 1] (see computeThumbOpposition), null
+   * when not tracked. */
+  const hands = {
+    left:  { source: null, curls: null, oppose: null, pinch: 0 },
+    right: { source: null, curls: null, oppose: null, pinch: 0 },
+  };
+
+  /* Two-pass collection: first gather BOTH controller and hand poses
+   * for each side, then deterministically prefer the controller pose
+   * when present.
+   *
+   * Why CONTROLLER wins
+   * -------------------
+   * Quest 3 reports controllers AND hands as SEPARATE input sources
+   * simultaneously (multimodal mode, default on for Meta software
+   * v55+). Earlier versions of this loop took pose from whichever
+   * source `xrSession.inputSources` listed first, which is
+   * implementation-defined -- some frames picked `gripSpace`,
+   * others picked XRHand `wrist`. Those use different conventions,
+   * so a phantom flip showed up as a 30-150 deg apparent wrist
+   * rotation in a single frame even though the hand wasn't moving.
+   *
+   * We could reasonably prefer EITHER source as long as the choice
+   * is deterministic. Controllers win for one critical reason:
+   *
+   *   ** The 4 calibration poses include positions where the hands
+   *      are OUTSIDE the Quest 3 camera FOV. **
+   *
+   *   - ``arms_down``: arms hanging at sides, wrists below the
+   *     headset's downward FOV.
+   *   - ``t_pose``: arms straight out sideways at shoulder height,
+   *     wrists at +/-90 deg azimuth, well outside the headset's
+   *     ~130 deg horizontal FOV.
+   *   - ``arms_forward`` / ``namaste``: in FOV, OK.
+   *
+   *   XRHand cannot track joints outside the camera's view --
+   *   ``frame.getJointPose()`` returns null in those poses. If we
+   *   preferred hand pose, the calibration would mix XRHand-frame
+   *   data (arms_forward, namaste) with controller-gripSpace
+   *   fallback data (arms_down, t_pose). That's strictly worse
+   *   than either pure source: per-pose residuals get a
+   *   convention-mismatch component on top of the actual fit
+   *   error, and the wrist orientation alignment quat is fitted
+   *   against a hybrid that doesn't correspond to either mode at
+   *   runtime.
+   *
+   * Controllers, by contrast, are tracked continuously (optical +
+   * IMU) regardless of FOV. So the calibration captures uniformly
+   * gripSpace data across all 4 poses, and runtime stays in the
+   * same convention.
+   *
+   * Per-finger curls are still taken from XRHand when reporting
+   * (independent of pose source) so analog finger control gets the
+   * full XRHand 5-finger detail when hands are in FOV, and falls
+   * back to the controller trigger/grip scalar when they aren't.
+   * That's an independent decision from pose source. */
+  let leftCtrlPose = null, rightCtrlPose = null;
+  let leftHandPose = null, rightHandPose = null;
+  let leftCurls = null, rightCurls = null;
+  let leftOppose = null, rightOppose = null;
+
   for (const src of xrSession.inputSources) {
-    if (!src.gripSpace) continue;
-    const gp = frame.getPose(src.gripSpace, refSpace);
-    if (!gp) continue;
-    numControllers++;
+    /* IMPORTANT: process .hand and .gripSpace as INDEPENDENT
+     * capabilities of the same source, NOT a mutually-exclusive
+     * switch. In Quest 3 multimodal mode (default v55+) a single
+     * XRInputSource carries .hand AND .gripSpace AND .gamepad
+     * simultaneously -- if we early-out after collecting the hand
+     * pose, leftCtrlPose / rightCtrlPose stay null and the
+     * "controller > hand" priority below has nothing to choose,
+     * so we fall back to XRHand wrist convention and the wrist
+     * orientation flips by 30-150 deg between holding the
+     * controllers and putting them down. */
 
-    const pp = gp.transform.position;
-    const po = gp.transform.orientation;
-    const poseArr = {
-      position: [pp.x, pp.y, pp.z],
-      orientation: [po.x, po.y, po.z, po.w]
-    };
+    /* --- XRHand capability: capture pose + curls + thumb oppose --- */
+    if (src.hand) {
+      /* Palm-center landmark, NOT the anatomical wrist joint.
+       *
+       * WebXR Hand Input's `wrist` joint is at the back of the
+       * wrist crease, ~7-10 cm BEHIND the user's palm. The
+       * controller's `gripSpace` is at the palm grip centre. To
+       * make falls-back-to-controller mode produce a
+       * position-compatible pose, we compute the palm centre as
+       * the midpoint between `wrist` (back of palm) and
+       * `middle-finger-metacarpal` (front of palm at the base of
+       * the middle finger). Within 1-2 cm of `gripSpace` for the
+       * same hand. Orientation is taken from the wrist joint
+       * (the metacarpal joints' orientations are noisier and
+       * less stable). */
+      const wristSpace = src.hand.get('wrist');
+      const midMcSpace = src.hand.get('middle-finger-metacarpal');
+      if (wristSpace) {
+        const wp = frame.getJointPose(wristSpace, refSpace);
+        const mp = midMcSpace ? frame.getJointPose(midMcSpace, refSpace) : null;
+        if (wp) {
+          const wpp = wp.transform.position;
+          const wpo = wp.transform.orientation;
+          let palmX = wpp.x, palmY = wpp.y, palmZ = wpp.z;
+          if (mp) {
+            const mpp = mp.transform.position;
+            palmX = 0.5 * (wpp.x + mpp.x);
+            palmY = 0.5 * (wpp.y + mpp.y);
+            palmZ = 0.5 * (wpp.z + mpp.z);
+          }
+          const handPose = {
+            position: [palmX, palmY, palmZ],
+            orientation: [wpo.x, wpo.y, wpo.z, wpo.w],
+          };
+          if (src.handedness === 'left') leftHandPose = handPose;
+          else if (src.handedness === 'right') rightHandPose = handPose;
+        }
+      }
+      const curls = computeHandCurls(src.hand, frame, refSpace);
+      const oppose = computeThumbOpposition(src.hand, frame, refSpace);
+      if (src.handedness === 'left') {
+        leftCurls = curls;
+        leftOppose = oppose;
+      } else if (src.handedness === 'right') {
+        rightCurls = curls;
+        rightOppose = oppose;
+      }
+      /* NO `continue` here -- fall through to also collect the
+       * gripSpace pose + gamepad buttons if this same source has
+       * them (multimodal). */
+    }
 
-    const gpad = src.gamepad;
-    if (src.handedness === 'left') {
-      leftData = poseArr;
-      if (gpad) {
-        buttons.leftTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
-        buttons.leftGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
-        buttons.x           = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
-        buttons.y           = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
-        axes.lx = gpad.axes[2] || 0;
-        /* Invert Y so that forward = positive */
-        axes.ly = -(gpad.axes[3] || 0);
+    /* --- Controller capability: capture pose + buttons --- */
+    if (src.gripSpace) {
+      const gp = frame.getPose(src.gripSpace, refSpace);
+      if (gp) {
+        numControllers++;
+        const pp = gp.transform.position;
+        const po = gp.transform.orientation;
+        const poseArr = {
+          position: [pp.x, pp.y, pp.z],
+          orientation: [po.x, po.y, po.z, po.w]
+        };
+        const gpad = src.gamepad;
+        if (src.handedness === 'left') {
+          leftCtrlPose = poseArr;
+          if (gpad) {
+            buttons.leftTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
+            buttons.leftGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
+            buttons.x           = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
+            buttons.y           = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
+            axes.lx = gpad.axes[2] || 0;
+            /* Invert Y so that forward = positive */
+            axes.ly = -(gpad.axes[3] || 0);
+          }
+        } else if (src.handedness === 'right') {
+          rightCtrlPose = poseArr;
+          if (gpad) {
+            buttons.rightTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
+            buttons.rightGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
+            buttons.a            = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
+            buttons.b            = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
+            axes.rx = gpad.axes[2] || 0;
+            axes.ry = -(gpad.axes[3] || 0);
+          }
+        }
       }
-    } else if (src.handedness === 'right') {
-      rightData = poseArr;
-      if (gpad) {
-        buttons.rightTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
-        buttons.rightGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
-        buttons.a            = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
-        buttons.b            = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
-        axes.rx = gpad.axes[2] || 0;
-        axes.ry = -(gpad.axes[3] || 0);
-      }
+    }
+  }
+
+  /* Pose priority: CONTROLLER > HAND. Curls always from XRHand
+   * when reporting (independent of pose source) so the omnihand
+   * gets per-finger detail when hands are in FOV, and falls back
+   * to controller-trigger uniform curl when they aren't. */
+  if (leftCtrlPose) {
+    leftData = leftCtrlPose;
+    hands.left.source = 'controller';
+    if (leftCurls) {
+      hands.left.curls = leftCurls;
+      hands.left.pinch = leftCurls[1];
+      /* Override gamepad trigger/grip with hand curls only if the
+       * controller's analog readings are zero. Preserves physical
+       * trigger feel when the operator squeezes, while still
+       * letting bare-hand finger curls drive an analog signal. */
+      if (buttons.leftTrigger === 0) buttons.leftTrigger = leftCurls[1];
+      if (buttons.leftGrip === 0) buttons.leftGrip = (leftCurls[2] + leftCurls[3] + leftCurls[4]) / 3;
+    }
+    if (leftOppose !== null) hands.left.oppose = leftOppose;
+  } else if (leftHandPose) {
+    leftData = leftHandPose;
+    hands.left = { source: 'hand', curls: leftCurls, oppose: leftOppose, pinch: leftCurls ? leftCurls[1] : 0 };
+    if (leftCurls) {
+      buttons.leftTrigger = Math.max(buttons.leftTrigger, leftCurls[1]);
+      buttons.leftGrip = Math.max(buttons.leftGrip, (leftCurls[2] + leftCurls[3] + leftCurls[4]) / 3);
+    }
+  }
+
+  if (rightCtrlPose) {
+    rightData = rightCtrlPose;
+    hands.right.source = 'controller';
+    if (rightCurls) {
+      hands.right.curls = rightCurls;
+      hands.right.pinch = rightCurls[1];
+      if (buttons.rightTrigger === 0) buttons.rightTrigger = rightCurls[1];
+      if (buttons.rightGrip === 0) buttons.rightGrip = (rightCurls[2] + rightCurls[3] + rightCurls[4]) / 3;
+    }
+    if (rightOppose !== null) hands.right.oppose = rightOppose;
+  } else if (rightHandPose) {
+    rightData = rightHandPose;
+    hands.right = { source: 'hand', curls: rightCurls, oppose: rightOppose, pinch: rightCurls ? rightCurls[1] : 0 };
+    if (rightCurls) {
+      buttons.rightTrigger = Math.max(buttons.rightTrigger, rightCurls[1]);
+      buttons.rightGrip = Math.max(buttons.rightGrip, (rightCurls[2] + rightCurls[3] + rightCurls[4]) / 3);
     }
   }
 
@@ -418,11 +1382,14 @@ function onXRFrame(time, frame) {
 
   /* Update live input state display */
   document.getElementById('controllerCount').textContent = numControllers;
+  const fmtCurls = (c) => c ? c.map(x => x.toFixed(2)).join(',') : 'none';
   const stateLines = [
     `Buttons: A=${buttons.a?'ON':'--'}  B=${buttons.b?'ON':'--'}  X=${buttons.x?'ON':'--'}  Y=${buttons.y?'ON':'--'}`,
     `Sticks:  L(${axes.lx.toFixed(2)}, ${axes.ly.toFixed(2)})  R(${axes.rx.toFixed(2)}, ${axes.ry.toFixed(2)})`,
     `Trigger: L=${buttons.leftTrigger.toFixed(2)}  R=${buttons.rightTrigger.toFixed(2)}`,
     `Grip:    L=${buttons.leftGrip.toFixed(2)}  R=${buttons.rightGrip.toFixed(2)}`,
+    `Hands:   L=${hands.left.source||'none'} (${fmtCurls(hands.left.curls)})`,
+    `         R=${hands.right.source||'none'} (${fmtCurls(hands.right.curls)})`,
     `Head:    (${hp.x.toFixed(2)}, ${hp.y.toFixed(2)}, ${hp.z.toFixed(2)})`,
   ];
   document.getElementById('inputState').textContent = stateLines.join('\n');
@@ -433,6 +1400,7 @@ function onXRFrame(time, frame) {
     right: rightData,
     buttons: buttons,
     axes: axes,
+    hands: hands,
     timestamp: time
   };
 

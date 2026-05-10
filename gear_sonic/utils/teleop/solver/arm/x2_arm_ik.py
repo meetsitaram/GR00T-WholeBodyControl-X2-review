@@ -204,6 +204,8 @@ class ArmIKSolver:
         position_weight: float = 1.0,
         rotation_weight: float = 0.5,
         max_per_tick_step_rad: float = 0.30,
+        null_space_gain: float = 0.0,
+        q_preferred: np.ndarray | None = None,
     ):
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
@@ -220,6 +222,29 @@ class ArmIKSolver:
             limits = X2_ARM_JOINT_LIMITS_RAD[7:]
         self._lo = np.array([lo for lo, _ in limits], dtype=np.float64)
         self._hi = np.array([hi for _, hi in limits], dtype=np.float64)
+
+        # Null-space bias toward a preferred posture. For 7-DOF arms,
+        # there is at least one redundant DOF (the elbow-swivel about
+        # the shoulder->wrist axis) even when both position AND
+        # orientation are tracked. Without a bias, the DLS solver picks
+        # whichever swivel minimises ``||dq||``, which produces visible
+        # branch flips ("elbow flips backward") whenever the IK target
+        # is unreachable or the operator brushes a singularity.
+        #
+        # The standard fix is task-priority kinematic control: project
+        # the bias ``(q_pref - q)`` into the null space of J and add it
+        # to the primary task velocity. ``null_space_gain == 0`` (the
+        # default) disables it for backward compatibility with the
+        # legacy engage-anchor solver path; the calibrated v2 solver
+        # opts in with ~0.1.
+        self.null_space_gain = float(null_space_gain)
+        if q_preferred is None:
+            q_preferred = np.zeros(7, dtype=np.float64)
+        self.q_preferred = np.asarray(q_preferred, dtype=np.float64).copy()
+        if self.q_preferred.shape != (7,):
+            raise ValueError(
+                f"q_preferred must be (7,); got {self.q_preferred.shape}"
+            )
 
     def fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Forward kinematics. Returns (xyz, R_3x3) of the wrist."""
@@ -288,6 +313,24 @@ class ArmIKSolver:
             except np.linalg.LinAlgError:
                 inv = np.linalg.lstsq(JJt + damp, err, rcond=None)[0]
             dq = J.T @ inv
+
+            # Null-space task: bias toward ``q_preferred`` in the
+            # subspace that does NOT affect the end-effector. For a
+            # 7-DOF arm this is at minimum a 1-D swivel; for
+            # position-only IK it's 4-D. Standard task-priority form:
+            #     dq_total = dq_primary + (I - J^+ J) * dq_null
+            # where ``dq_primary = J.T @ (J J^T + λ²I)^-1 * err`` and
+            # ``J^+ = J^T (J J^T + λ²I)^-1``. We project the bias by
+            # subtracting the J-image of dq_null, which is equivalent
+            # and avoids forming the explicit (7,7) projector.
+            if self.null_space_gain != 0.0:
+                dq_null = self.null_space_gain * (self.q_preferred - q)
+                try:
+                    null_inv = np.linalg.solve(JJt + damp, J @ dq_null)
+                except np.linalg.LinAlgError:
+                    null_inv = np.linalg.lstsq(JJt + damp, J @ dq_null, rcond=None)[0]
+                dq_null_proj = dq_null - J.T @ null_inv
+                dq = dq + dq_null_proj
 
             np.clip(dq, -self.max_per_tick_step_rad,
                     self.max_per_tick_step_rad, out=dq)

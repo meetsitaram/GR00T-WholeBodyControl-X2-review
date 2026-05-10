@@ -528,6 +528,20 @@ def test_omnihand_composer_is_not_imported_by_trainer_or_deploy():
         "gear_sonic/scripts/render_smoketest_episode_video.py",
         "gear_sonic/scripts/clip_x2_wrist_for_omnihand.py",
         "gear_sonic/scripts/compose_x2_with_omnihand.py",
+        # Kinematic-viewer paths (live teleop + offline replay). These
+        # only consume the augmented MJCF inside an interactive
+        # ``mujoco.viewer.launch_passive`` loop, never as input to the
+        # 31-DOF training / deploy surfaces. Keeping them allowlisted
+        # means the augmented model never reaches a trainer or the C++
+        # deploy.
+        "gear_sonic/scripts/teleop_x2_kinematic.py",
+        "gear_sonic/scripts/replay_x2_kinematic.py",
+        "gear_sonic/utils/teleop/x2_kinematic_view.py",
+        "gear_sonic/utils/embodiment/x2.py",
+        # MuJoCo<->ROS bridge for the C++ deploy's kinematic-stand
+        # bootstrap (offline visualization only; never feeds the
+        # training pipeline).
+        "gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py",
         # Tests.
         "tests/test_x2_omnihand_renderer.py",
     )

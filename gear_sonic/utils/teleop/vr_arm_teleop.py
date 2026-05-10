@@ -1,4 +1,15 @@
-"""VR-driven arm teleoperation for the X2 dataset recorder.
+"""VR-driven arm teleoperation for the X2 dataset recorder (legacy).
+
+.. deprecated::
+   This engage-anchor implementation has been superseded by
+   :mod:`gear_sonic.utils.teleop.vr_arm_teleop_v2`, which uses an
+   offline 3-pose calibration to compute a stateless head-relative
+   wrist mapping. The engage-anchor approach below couples retargeting
+   to the play-area frame and to controller tracking quality at
+   A-press time, which produced the "hands behind the body" symptom
+   when the operator turned in place. New code should use
+   :class:`vr_arm_teleop_v2.VRArmTeleopCalibrated`. This module is
+   retained for tests + reproducing pre-calibration recordings.
 
 Closed-loop pipeline that turns Quest 3 ``(3, 7)`` 3-point pose data
 (left wrist, right wrist, head, all in robot frame) into 7-DOF arm
