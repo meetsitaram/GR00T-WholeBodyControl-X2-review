@@ -546,6 +546,7 @@ bash gear_sonic/scripts/record_x2_dataset.sh \
 | `--sim-viewer` / `--no-sim-viewer` | `--sim-viewer` | Open / suppress the MuJoCo passive viewer in the deploy. |
 | `--deploy-model-dir DIR` | `dirname(--sonic-checkpoint)` | Override the ONNX bundle dir for the deploy. |
 | `--sim-duration SECS` | `3600` | Auto-stop the deploy after N seconds. |
+| `--wrist-bypass {off,ik}` | `ik` | Override the C++ deploy's wrist target with the IK reference. See [Section 3.5](#35-wrist-bypass-honest-vr-wrist-tracking-on-top-of-sonic). |
 | anything else | — | Forwarded verbatim to `record_x2_dataset.py`. |
 
 ### 3.4 Useful pass-through flags
@@ -564,6 +565,109 @@ forwards them to the Python recorder:
 | `--calibration PATH` | YAML produced by `vr_operator_calibrate.py`. Required unless `--recalibrate` is passed. Defaults to `data/operator_calibrations/default.yaml`. |
 | `--recalibrate` | Run the 4-pose calibration inline before recording starts. Use for the first session with a new operator. Writes the YAML to `--calibration` (or the operator-id default). |
 | `--operator-id NAME` | Free-form operator label stamped into the calibration YAML when `--recalibrate` is set. |
+
+### 3.5 Wrist bypass — honest VR wrist tracking on top of SONIC
+
+```{admonition} TL;DR
+:class: important
+The default `--wrist-bypass ik` overwrites SONIC's `wrist_pitch` and
+`wrist_roll` targets with the operator's IK reference. Keep it on for
+**every VLA dataset recording**. Pass `--wrist-bypass off` only if you
+are running a sim-to-real fidelity probe and want the policy's own
+commands to reach every joint.
+```
+
+#### Why the bypass exists
+
+Empirical analysis of `data/lerobot/x2_quest3_sonic_v2/data/chunk-000/episode_000001.parquet`
+(recorded with the iter-25k checkpoint, then re-confirmed with iter-2k):
+
+* `*_wrist_pitch` (`x2_action_scale = 0.0715`, ~8.8x smaller than the
+  rest of the arm): correlation between commanded and executed is
+  ~0.0; the executed angle sits in the -8 to -20 deg comfort band the
+  policy learned to converge to, regardless of operator input.
+* `*_wrist_roll` (asymmetric joint range): pinned at the +/-41 deg
+  tight-side limit in 98-99% of frames.
+
+`wrist_yaw` tracks fine (correlation ~0.8) and is left under SONIC.
+
+Root cause is SONIC's training distribution (no diverse wrist motion)
+combined with the smallmotor `x2_action_scale`, **not** an axis-sign
+mismatch nor a deploy regression — see
+`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp`
+for the full audit trail. Re-fine-tuning SONIC on diverse wrist motion
+is the long-term fix; the bypass is the unblocker for VLA dataset
+recording in the meantime.
+
+#### What the bypass does
+
+When `--wrist-bypass ik` is set (and `--vla` so the deploy is
+subscribed to the recorder's ZMQ pose feed), the C++ deploy
+`OnControl()` step calls
+[`ApplyWristBypass`](https://github.com/agibot/gear_sonic_deploy/blob/main/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp)
+on `target_pos_mj` BEFORE the safety stack:
+
+```text
+target_pos_mj[20]  ← ref.joint_pos_mj[20]   # left_wrist_pitch
+target_pos_mj[21]  ← ref.joint_pos_mj[21]   # left_wrist_roll
+target_pos_mj[27]  ← ref.joint_pos_mj[27]   # right_wrist_pitch
+target_pos_mj[28]  ← ref.joint_pos_mj[28]   # right_wrist_roll
+```
+
+Every other DOF (legs, waist, shoulders, elbows, `wrist_yaw`, head,
+hand fingers) is still 100% under SONIC. The override sits **before**
+soft-start blending, the `--max-target-dev` clamp, and the
+tilt-watchdog force-to-default branch, so all existing safety
+behaviour applies uniformly to the IK-driven targets.
+
+The tokenizer observation is unchanged — SONIC still sees the IK
+reference for all 31 DOFs as the future window. We only swap the
+final per-tick PD target. SONIC therefore continues to drive a
+self-consistent whole-body posture; only the wrist motors are
+released from its attractor.
+
+#### Operator-visible signals
+
+The deploy logs two extra counters on the periodic `CONTROL tick=...`
+status line so you can see the bypass firing:
+
+```text
+CONTROL tick=500 policy_t=10.00s alpha=1.00 grav_z=-1.00
+        act_clip_ticks=0 max_pre_clip=2.31
+        wrist_bypass_ticks=500 wrist_bypass_max_dev_rad=0.842
+```
+
+* `wrist_bypass_ticks` — number of OnControl steps where the override
+  fired (== total ticks while a body-bearing ZMQ frame was available).
+* `wrist_bypass_max_dev_rad` — running max of
+  `|policy_target - ik_target|` across the bypassed DOFs. Large
+  numbers (~0.5-1.0 rad) are normal; they're exactly why the bypass
+  exists. Compare against an `--wrist-bypass off` baseline to quantify.
+
+#### When to use which mode
+
+| Scenario | Recommended setting |
+| -------- | ------------------- |
+| VR teleop / dataset recording for VLA fine-tune | `--wrist-bypass ik` (default) |
+| Sim-to-real fidelity probe — want every joint to follow SONIC | `--wrist-bypass off` |
+| Hand-only / no-wrist tasks where the policy is fine | either; default still safe |
+| `--no-vla` kinematic loop (no SONIC) | flag is suppressed automatically (it would be a no-op) |
+
+#### Validating a session
+
+After a recording made with `--wrist-bypass ik`, regenerate the wrist
+correlation table:
+
+```bash
+python /tmp/wrist_sign_probe.py \
+    --parquet data/lerobot/<your_dataset>/data/chunk-000/episode_000000.parquet
+```
+
+Expect `corr(commanded, executed) > 0.9` and `alpha ~ 1.0` for both
+`*_wrist_pitch` and `*_wrist_roll`, with no pinning at the joint-range
+limits. Sanity-check by re-running the same trajectory under
+`--wrist-bypass off` — you should reproduce the v2 baseline (~0.0
+correlation on pitch, ~98% pinning on roll).
 
 ---
 
@@ -1072,6 +1176,145 @@ For the same reason, **wrist orientation is also not calibrated** in
 v0 (`--ik-rotation-weight 0` by default). The IK runs position-only.
 Adding wrist orientation requires fitting an operator-to-robot
 rotation map alongside the position map; tracked as a v1 follow-up.
+
+### SONIC pins the wrist DOFs — and why we bypass them in C++
+
+```{admonition} Status
+:class: note
+Landed May 10, 2026. Default `ik` mode in
+`record_x2_dataset.sh`. Quick reference + operator workflow lives
+in [Section 3.5](#35-wrist-bypass-honest-vr-wrist-tracking-on-top-of-sonic);
+this section is the longer-form post-mortem so the next person
+investigating "why don't my wrists move?" doesn't have to redo the
+diagnostic loop.
+```
+
+#### The symptom
+
+When we first ran VR teleop with the SONIC 25k checkpoint in the loop
+(`x2_quest3_sonic_v2`), the operator could move shoulders / elbows /
+wrist_yaw freely on the robot, but `wrist_pitch` and `wrist_roll`
+**did not respond**. The IK output looked correct in the recorder
+debug log; the executed angles in the parquet did not.
+
+#### What the data said
+
+Two diagnostic scripts on `data/lerobot/x2_quest3_sonic_v2/data/chunk-000/episode_000001.parquet`
+([`/tmp/wrist_sign_probe.py`](/tmp/wrist_sign_probe.py),
+[`/tmp/wrist_diagnostic_plot.py`](/tmp/wrist_diagnostic_plot.py),
+both pure-pandas, run against any v1+ recording):
+
+| DOF | `corr(commanded, executed)` | `alpha` (linear fit slope) | Pinning |
+| --- | --------------------------- | -------------------------- | ------- |
+| `*_wrist_yaw`   | ~0.8 | ~1.0 | none |
+| `*_wrist_pitch` | ~0.0 | undefined (executed flat at -8 to -20°) | n/a |
+| `*_wrist_roll`  | ~0.0 | undefined | **98–99% of frames at the asymmetric tight-side limit (±41°)** |
+
+Re-running with the **iter-2k** checkpoint reproduced the same numbers,
+confirming this is **not** a late-training regression — the policy
+has been pinning these DOFs since iteration 2000. The other 27 DOFs
+(legs, waist, shoulders, elbows, `wrist_yaw`, head) all track the IK
+reference cleanly.
+
+#### What we ruled out
+
+* **Axis sign / convention mismatch.** Walked through
+  [`gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml`](../../../gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml)
+  and the URDF on both sides; joint axes match between deploy and
+  recorder. Swapping the `corr+` / `corr-` columns in
+  `wrist_sign_probe.py` produces mirror-image numbers (both ~0), so
+  there's no hidden sign flip — the executed signal just doesn't
+  move with the input regardless of polarity.
+* **`default_angles` mismatch between deploy and recorder.** Identical
+  per [`gear_sonic_deploy/.../include/policy_parameters.hpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/policy_parameters.hpp);
+  both pitches and both rolls have `default_angles == 0.0`.
+* **Joint-range clipping in the recorder.** Wrists in the parquet
+  reach ±40°+ during operator sweeps. They get clipped at the joint
+  range *after* SONIC, not before.
+
+#### What's actually wrong
+
+Two compounding factors in the SONIC training distribution:
+
+1. **`x2_action_scale` is ~8.8× smaller for wrist DOFs.** From
+   [`policy_parameters.hpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/policy_parameters.hpp):
+
+   ```cpp
+   x2_action_scale[20] = 0.0715;   // left_wrist_pitch
+   x2_action_scale[21] = 0.0715;   // left_wrist_roll
+   x2_action_scale[27] = 0.0715;   // right_wrist_pitch
+   x2_action_scale[28] = 0.0715;   // right_wrist_roll
+   // vs ~0.42 for shoulders / elbows / wrist_yaw
+   ```
+
+   So even at maximum policy authority (action_il = ±action_clip ≈
+   ±20), the wrist target can only deviate ~1.4 rad from
+   `default_angles[mj]`. The other arm joints get ~8.4 rad of authority.
+
+2. **The training motion library has almost no diverse wrist motion.**
+   The X2M2 PKL clips that fed SONIC training are dominated by
+   stand-still / locomotion / standing-gestures — none of which
+   exercise wrist pitch or roll through their full range. With low
+   per-tick authority *and* a thin training distribution, the policy
+   learned to converge to a single comfort pose and ignore the
+   reference window for those four DOFs. The asymmetric `wrist_roll`
+   joint range (`(-41°, +57°)` left, `(-57°, +41°)` right) means that
+   single comfort pose lands directly on the tight-side limit, which
+   is why the executed angle reads as "pinned at the limit" rather
+   than "stuck at zero."
+
+`wrist_yaw` survives both of these — its `action_scale` is the same
+0.42 as the rest of the arm, *and* the training motions exercise it
+because it tracks head turns through the kinematic tree.
+
+#### Solution alternatives we considered
+
+| Option | Idea | Why we didn't pick it |
+| ------ | ---- | --------------------- |
+| **A. Kinematic-only mode** | Run VR teleop without SONIC; pin lower body to stand pose by hand. | Loses every other benefit of SONIC (joint-limit feasibility, collision avoidance, balance). Also disconnects the data from the deployment loop, so VLA fine-tunes on a different distribution from inference. |
+| **B. Fine-tune SONIC on diverse wrist motion** | Augment the training motion library with full wrist sweeps; bump `x2_action_scale` for wrist DOFs; retrain. | Days of compute. Right thing to do long-term but blocks VLA recording today. |
+| **C. Surgical bypass in the C++ deploy** (chosen) | Inside `OnControl()`, after SONIC produces `target_pos_mj` but **before** the safety stack, overwrite the four wrist DOF targets with the IK reference from the ZMQ pose feed. | Conceptually simple, ~30 lines of C++, no model retraining. SONIC keeps full authority over every other joint and over the tokenizer observation; the bypass only swaps the final per-tick PD targets for `{20, 21, 27, 28}`. Stability risk is low because wrist mass is negligible compared to the upper arm. |
+
+#### Why not "spoof the proprioception too"?
+
+A second variant we considered (Option 2 in the planning doc): not
+just override `target_pos_mj` but *also* lie to the policy about
+where the wrists are by replacing `joint_pos_mj` in the proprio
+observation. That would keep the policy's internal state self-
+consistent — it would never see a wrist position that disagrees
+with what it commanded.
+
+We rejected this because:
+
+* **Honest observation matters more than commanded-vs-executed
+  consistency** for the policy's body planning. SONIC reasons about
+  the upper-arm posture from the *full* joint vector; if we lied
+  about the wrist, the elbow / shoulder controller could plan
+  motions that assume a wrist orientation that doesn't exist.
+* **Wrist mass is tiny.** Even a 30° wrist deviation from the policy
+  expectation contributes negligible torque to the rest of the body.
+  Empirically: in the v3 wrist-bypass session, gravity z-component
+  stays at -1.00 ± 0.005 throughout (no torso tilt response from the
+  wrist disagreement).
+* **Domain randomization in training already covers it.** SONIC was
+  trained with joint-position perturbations on the order of ±5°
+  (kinematics noise) and physics-side mass scaling, so a few tens of
+  degrees of "I commanded one thing but observed another" on a low-
+  mass DOF is well inside its robustness envelope.
+
+If a future task surfaces torso twitchiness when the bypass fires,
+revisit this trade-off. Until then, simple-bypass wins on
+cognitive load.
+
+#### Where it lives
+
+| File | Role |
+| ---- | ---- |
+| [`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp) | The override loop and the `kBypassedWristMjDofs = {20, 21, 27, 28}` constant. Inline so the unit test can call it without ROS / ONNX. |
+| [`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp) | `CliArgs::WristBypass` enum, `--wrist-bypass {off,ik}` parser, the `OnControl()` call site, and the periodic `wrist_bypass_ticks` / `wrist_bypass_max_dev_rad` log line. |
+| [`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/test/test_obs_builder.cpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/test/test_obs_builder.cpp) | `TestWristBypassOverridesExactly4Slots` + `TestWristBypassZeroDeltaWhenAligned`. |
+| [`gear_sonic_deploy/deploy_x2.sh`](../../../gear_sonic_deploy/deploy_x2.sh) | `--wrist-bypass` passthrough plumbing. |
+| [`gear_sonic/scripts/record_x2_dataset.sh`](../../../gear_sonic/scripts/record_x2_dataset.sh) | Default `--wrist-bypass ik` for VLA dataset recording; suppressed automatically under `--no-vla` (would be a no-op). |
 
 ### Hand retargeting journey log (v0 → v0.4)
 
@@ -1790,6 +2033,8 @@ matching robot fingers should curl in within ~50 ms.
 | [`gear_sonic/scripts/process_dataset.py`](../../../gear_sonic/scripts/process_dataset.py) | Post-process / merge / clean LeRobot datasets. |
 | [`gear_sonic/scripts/compose_x2_with_omnihand.py`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py) | Programmatically composes `x2_ultra.xml` with the OmniHand URDFs at runtime. Owns `LOCKED_PASSIVE_JOINTS`, `_FINGER_ARMATURE`, `_FINGER_DAMPING`, and the mimic-equality solver. |
 | [`gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py`](../../../gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py) | Bridges the C++ deploy to the MuJoCo sim. Subscribes to the OmniHand ZMQ command topic; runtime-installs `pyzmq` if missing. |
+| [`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp) | The `--wrist-bypass ik` override loop and `kBypassedWristMjDofs` constant. |
+| [`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp) | C++ deploy main: SONIC inference loop, safety stack, wrist-bypass call site, periodic status log. |
 
 ---
 
@@ -1811,6 +2056,8 @@ matching robot fingers should curl in within ~50 ms.
 | Saved episode has 0 frames | Pressed **X** before any tick advanced (e.g. before VR connected) | Check the recorder log for `[X] dropping 0 frames (no frames)`. Press **B** again, wait for the recorder to log non-zero frame counts in its periodic status, then press **X**. |
 | `[recorder] render warn (frame skipped): …` | EGL renderer hiccup; recorder drops the frame and continues | Safe to ignore unless it happens > 1 % of frames. If it does, drop the resolution (`--render-width 320 --render-height 240`) or move the renderer to a different GPU. |
 | Deploy log spams `tilt watchdog` errors | The recorded body_q drifted out of the trained distribution (e.g. lower body got modified) | The recorder pins legs/waist/head to `DEFAULT_STAND_POSE_MUJOCO_RAD`. If you patched that, revert. |
+| Wrists don't move on the robot even though IK ref does | SONIC pins `wrist_pitch` / `wrist_roll` at its trained comfort pose / asymmetric joint-range limit. See [§8 deep dive](#sonic-pins-the-wrist-dofs--and-why-we-bypass-them-in-c). | Use `--wrist-bypass ik` (default in `record_x2_dataset.sh`). Verify `wrist_bypass_ticks` increments on the deploy log's periodic `CONTROL tick=…` line. If you explicitly passed `--wrist-bypass off`, drop the flag. |
+| Deploy refuses to start with `--wrist-bypass=ik requires --input-type=zmq` | You passed the bypass flag without `--vla` / on the motion-file replay path. The bypass would be a no-op there. | Either add `--vla` (so the deploy subscribes to the recorder's ZMQ pose feed) or drop the bypass flag. The recorder wrapper auto-suppresses the flag under `--no-vla`. |
 | Middle finger spins through the palm collision shell | Vestigial `middle_abad` hinge in the upstream OmniHand URDF was free-floating + unranged. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §1. | Should be fixed for you by the equality lock in `compose_x2_with_omnihand.py::LOCKED_PASSIVE_JOINTS`. If a future OmniHand revision adds a similar joint, append it to that tuple. |
 | Fingers jitter / wiggle constantly even with no operator input (`--sim-omnihand` mode) | Tiny URDF link inertias + soft mimic equality solver inject constraint forces with no joint damping to absorb. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §2. | Verify `_FINGER_ARMATURE` and `_FINGER_DAMPING` are non-zero in `compose_x2_with_omnihand.py`. The `mj_forward`-only kinematic renderer hides this — only `mj_step` paths (the SONIC bridge) expose it. |
 | `--sim-omnihand` runs but fingers never move with operator input | `pyzmq` missing in the bridge container; the OmniHand ZMQ SUB silently failed to bind. | `cd gear_sonic_deploy/docker_x2 && docker compose build` to bake the dependency in permanently. The bridge has a runtime `pip3 install pyzmq` fallback that should auto-recover; check the log for `[bridge] OmniHand ZMQ subscriber: pyzmq not present …` lines. |

@@ -237,6 +237,16 @@ VLA_ZMQ_PORT="5556"
 VLA_ZMQ_TOPIC="pose"
 VLA_DEBUG_PORT="5557"
 VLA_DEBUG_TOPIC="x2_debug"
+
+# Wrist bypass: forwarded to the deploy binary as --wrist-bypass {off,ik}.
+# When set to "ik" (and --vla is also set), the C++ deploy overwrites
+# target_pos_mj for the 4 broken wrist DOFs (left/right wrist_pitch +
+# wrist_roll, MJ indices {20,21,27,28}) with the latest IK reference from
+# the ZMQ pose feed. wrist_yaw is left under SONIC because it tracks fine.
+# Empty string = leave it disabled (legacy behaviour); the C++ binary
+# defaults to "off" so sim-to-real fidelity tests are unchanged. See
+# x2_deploy_onnx_ref.cpp::CliArgs::WristBypass for the full rationale.
+WRIST_BYPASS=""
 # Set when --motion is a PKL or YAML and we bake an x2m2 on the fly. Holds
 # the absolute path to the original PKL/YAML so the wrapper can route it to
 # the MuJoCo bridge as --sim-motion (matching what eval_x2_mujoco_onnx.py
@@ -732,6 +742,19 @@ docs/source/references/x2_zmq_protocol.md):
                               dump_x2_debug.py is the reference subscriber.
   --vla-debug-topic TOPIC     Topic prefix for x2_debug frames
                               (default: $VLA_DEBUG_TOPIC).
+  --wrist-bypass MODE         {off, ik}. Forwarded to the deploy binary as
+                              --wrist-bypass. When 'ik' (and --vla is set),
+                              the deploy overwrites target_pos_mj for the
+                              4 broken wrist DOFs (left/right wrist_pitch +
+                              wrist_roll) with the latest IK reference from
+                              the ZMQ pose feed BEFORE the safety stack.
+                              SONIC still drives every other DOF including
+                              wrist_yaw (which tracks correctly today).
+                              Use 'ik' for VR teleop / VLA dataset recording
+                              where SONIC's wrist attractor masks the
+                              operator's hand pose; keep unset / 'off' for
+                              sim-to-real fidelity tests. Default: empty
+                              (= binary default of 'off').
 
 Pre-flight + behaviour toggles:
   --no-stop-mc                Skip the stop_app POST (assume MC is already
@@ -886,6 +909,7 @@ while [[ $# -gt 0 ]]; do
         --vla-zmq-topic)      VLA_ZMQ_TOPIC="$2"; shift 2 ;;
         --vla-debug-port)     VLA_DEBUG_PORT="$2"; shift 2 ;;
         --vla-debug-topic)    VLA_DEBUG_TOPIC="$2"; shift 2 ;;
+        --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
         local|onbot|sim)      MODE="$1"; shift ;;
         *)
             echo -e "${RED}Error: unknown argument: $1${NC}" >&2
@@ -1365,6 +1389,7 @@ fi
 [[ -n "$IMU_TOPIC" ]]         && ROS2_ARGS+=("--imu-topic" "$IMU_TOPIC")
 [[ -n "$INTRA_OP_THREADS" ]]  && ROS2_ARGS+=("--intra-op-threads" "$INTRA_OP_THREADS")
 [[ -n "$OBS_DUMP" ]]          && ROS2_ARGS+=("--obs-dump" "$OBS_DUMP")
+[[ -n "$WRIST_BYPASS" ]]      && ROS2_ARGS+=("--wrist-bypass" "$WRIST_BYPASS")
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
 
 # ────────────────────────────────────────────────────────────────────────

@@ -21,13 +21,49 @@ bash gear_sonic/scripts/record_x2_dataset.sh \
     --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
 ```
 
-### Full record session
+### Full record session (recommended VLA recipe)
+
+`--sim-omnihand` loads the OmniHand-augmented MJCF so the fingers are
+in scope for the dataset; `--wrist-bypass ik` overrides SONIC's wrist
+attractor with the operator's IK reference (the policy pins those
+four DOFs without it). Both flags are made explicit here for
+discoverability — `--wrist-bypass ik` is the wrapper default.
 
 ```sh
 cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
 bash gear_sonic/scripts/record_x2_dataset.sh \
-    --output-dir data/lerobot/x2_quest3_sonic_v1 \
+    --output-dir data/lerobot/x2_quest3_sonic_v3 \
     --task "wave hello with both hands" \
+    --sim-omnihand \
+    --wrist-bypass ik \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+Sanity-check the bypass is firing once SONIC reaches `CONTROL` state:
+the deploy log's periodic status line should end with
+`wrist_bypass_ticks=<N> wrist_bypass_max_dev_rad=<X.XXX>`, with `N`
+incrementing every second. After the session, run
+`/tmp/wrist_sign_probe.py` against the resulting parquet — both
+`*_wrist_pitch` and `*_wrist_roll` should show `corr > 0.9` and no
+limit-pinning. See
+[tutorial §3.5](docs/source/tutorials/x2_dataset_record_and_replay.md#35-wrist-bypass-honest-vr-wrist-tracking-on-top-of-sonic)
+for the operator workflow and
+[§8 SONIC pins the wrist DOFs](docs/source/tutorials/x2_dataset_record_and_replay.md#sonic-pins-the-wrist-dofs--and-why-we-bypass-them-in-c)
+for the root-cause post-mortem.
+
+### Sim-to-real fidelity probe (wrist bypass OFF)
+
+Reproduces the v2 baseline (pinned `wrist_roll`, flat `wrist_pitch`)
+so you can numerically diff against a wrist-bypass-on recording. Use
+this when validating SONIC behaviour, not for VLA training data.
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_quest3_sonic_baseline \
+    --task "wrist bypass OFF baseline" \
+    --sim-omnihand \
+    --wrist-bypass off \
     --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
 ```
 
@@ -35,6 +71,7 @@ The wrapper forwards every flag below to `record_x2_dataset.py`:
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
+| `--wrist-bypass {off,ik}` | `ik` | Override SONIC's wrist target with the operator's IK reference for the 4 broken DOFs (`*_wrist_pitch`, `*_wrist_roll`). Keep `ik` for VLA recordings; flip to `off` only for sim-to-real fidelity probes. See [tutorial Section 3.5](docs/source/tutorials/x2_dataset_record_and_replay.md#35-wrist-bypass-honest-vr-wrist-tracking-on-top-of-sonic). |
 | `--sonic-correction-warn-rad FLOAT` | `0.05` | Threshold for the once-per-second log when SONIC pushes back on operator commands. |
 | `--no-sonic-correction-log` | off | Suppress that log. The `action.sonic_correction_max_rad` parquet column is still populated. |
 | `--no-finger-filter` / `--finger-filter-*` | filter ON | Same v0.6 finger-smoothing knobs as kinematic teleop. |

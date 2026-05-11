@@ -19,6 +19,39 @@
 #                               Quest 3 still drives the policy live.
 #   --sim-viewer                Open MuJoCo passive viewer (default ON).
 #   --no-sim-viewer             Run the deploy bridge headless.
+#   --no-vla                    Run the deploy in motion-replay mode (the
+#                               policy tracks StandStillReference for the
+#                               body); the recorder still publishes IK arm
+#                               targets + finger setpoints, but the deploy
+#                               ignores the ZMQ pose stream. Use this when
+#                               the live-VLA reference produces OOD policy
+#                               actions and you just want a stable robot
+#                               to debug VR input / finger teleop.
+#   --sim-omnihand              [opt-in, default OFF] Load the OmniHand-
+#                               augmented MJCF (24+ finger DOFs replace
+#                               the wrist stubs) so the bridge can drive
+#                               fingers from VR. Requires (a) a checkpoint
+#                               trained against the OmniHand-augmented
+#                               dynamics -- the 25k *_g1 checkpoint goes
+#                               OOD on this MJCF and triggers QACC NaN
+#                               within 0.5 s -- and (b) pyzmq installed in
+#                               the bridge's python env, otherwise fingers
+#                               just sit at MJCF rest pose. Default OFF
+#                               keeps you on the bare x2_ultra.xml the
+#                               25k checkpoint was trained on.
+#   --wrist-bypass MODE         {off, ik} (default ik). When 'ik', the C++
+#                               deploy overwrites target_pos_mj for the 4
+#                               broken wrist DOFs (left/right wrist_pitch
+#                               + wrist_roll) with the IK reference from
+#                               the recorder's ZMQ pose feed BEFORE the
+#                               safety stack. wrist_yaw stays under SONIC.
+#                               Empirical: SONIC pins wrist_pitch/roll at
+#                               its trained comfort pose for both the 2k
+#                               and 25k checkpoints, so an honest VR teleop
+#                               session needs this override on. Set 'off'
+#                               for sim-to-real fidelity probes where you
+#                               want every joint to follow the policy. See
+#                               x2_deploy_onnx_ref.cpp::CliArgs::WristBypass.
 #   --deploy-model-dir DIR      Override the ONNX model dir
 #                               (default: dirname of --sonic-checkpoint).
 #   --sim-duration SECONDS      Auto-stop the deploy after N seconds (default 3600).
@@ -30,9 +63,23 @@
 #   --quest3-no-ssl             (only on a trusted local network)
 #   --rate 50
 #
-# Sim deploy uses ``--sim-profile gantry --sim-with-omnihand`` so the
-# robot stays band-supported throughout the session and the OmniHand
-# mesh matches the trained visual configuration.
+# Sim deploy spawns the robot upright (``--sim-init-pose default``,
+# pelvis_z~0.95m) and lets the bridge auto-release the elastic band 1.0s
+# after the first deploy command (the bridge's default ``--band-release-
+# after-s 1.0``). The band is just a brief safety net during the policy's
+# 2 s alpha ramp-up; once it auto-drops, the robot stands on its feet
+# under full policy authority and is ready to walk / teleop arms.
+#
+# We deliberately do NOT use ``--sim-profile gantry`` -- that boots the
+# bridge in a bent-knee crouch (pelvis_z=0.665m) which is OOD for the
+# 25k tracking policy and triggers extreme |action_il| -> sim QACC NaN
+# within a few hundred ms. We also do NOT pass
+# ``--sim-band-release-after-s -1`` (band-on-forever) because that
+# leaves the robot suspended in mid-air and forces the operator to hit
+# key 9 to drop it -- not what we want for pure-sim teleop.
+#
+# The OmniHand-augmented MJCF is loaded via ``--sim-with-omnihand`` so
+# the finger meshes match the trained visual configuration.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +94,14 @@ EXTRA_ARGS=()
 SIM_DURATION="${SIM_DURATION:-3600}"
 SIM_VIEWER="${SIM_VIEWER:-true}"
 TELEOP_ONLY=false
+USE_VLA=true
+SIM_OMNIHAND=false
+# Default to 'ik' so VR teleop / dataset recording produces honest wrist
+# tracking out of the box. Operators can pass --wrist-bypass off to fall
+# back to pure SONIC for sim-to-real fidelity probes. Bridge safety:
+# this only takes effect when --vla is also set, which the wrapper does
+# unless --no-vla is passed (in which case the bypass is a no-op anyway).
+WRIST_BYPASS="ik"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,6 +112,9 @@ while [[ $# -gt 0 ]]; do
         --sim-duration)       SIM_DURATION="$2"; shift 2 ;;
         --sim-viewer)         SIM_VIEWER=true; shift ;;
         --no-sim-viewer)      SIM_VIEWER=false; shift ;;
+        --no-vla)             USE_VLA=false; shift ;;
+        --sim-omnihand)       SIM_OMNIHAND=true; shift ;;
+        --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
         --teleop-only)        TELEOP_ONLY=true; shift ;;
         -h|--help)
             grep -E "^# " "$0" | sed -e 's/^# //; s/^#//'
@@ -65,6 +123,14 @@ while [[ $# -gt 0 ]]; do
         *)                    EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
+
+case "${WRIST_BYPASS}" in
+    off|ik) ;;
+    *)
+        echo "Error: --wrist-bypass must be 'off' or 'ik' (got '${WRIST_BYPASS}')" >&2
+        exit 1
+        ;;
+esac
 
 if ! ${TELEOP_ONLY}; then
     if [[ -z "${OUTPUT_DIR}" || -z "${TASK}" ]]; then
@@ -133,22 +199,64 @@ DEPLOY_LOG="$(mktemp -t deploy_x2_record_XXXXXX.log)"
 
 cleanup() {
     local rc=$?
+    # 1) SIGINT the host-side bash that runs ``deploy_x2.sh`` so its
+    #    own cleanup paths (e.g. RAMP_OUT, MuJoCo viewer teardown) get
+    #    a chance to fire.
     if [[ -n "${DEPLOY_PID:-}" ]] && kill -0 "${DEPLOY_PID}" 2>/dev/null; then
         echo "[record_x2_dataset.sh] stopping deploy (pid=${DEPLOY_PID})"
         kill -INT "${DEPLOY_PID}" 2>/dev/null || true
         wait "${DEPLOY_PID}" 2>/dev/null || true
+    fi
+    # 2) ``deploy_x2.sh`` auto-relaunches inside the ``docker_x2-x2sim``
+    #    container (via ``docker compose run``). Signals from the host
+    #    bash do *not* reliably propagate into the container -- the
+    #    compose-run shell can race with our SIGINT and exit before
+    #    delivering the signal to PID 1 inside the container, leaking
+    #    the deploy + bridge as a host-visible orphan that holds
+    #    ports 5556/5557 forever (and won't accept ``pkill`` from the
+    #    invoking UID because the container processes run as root).
+    #    Find the container by parsing the ``Container <name> Creating``
+    #    line that ``docker compose`` writes to our deploy log on bring-
+    #    up, then ``docker stop`` it explicitly. This succeeds even if
+    #    the host-side bash already exited.
+    if command -v docker >/dev/null 2>&1; then
+        local deploy_container
+        deploy_container="$(grep -oE 'docker_x2-x2sim-run-[a-f0-9]+' "${DEPLOY_LOG}" 2>/dev/null | tail -1 || true)"
+        if [[ -n "${deploy_container}" ]] && \
+           docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${deploy_container}"; then
+            echo "[record_x2_dataset.sh] stopping deploy container ${deploy_container}"
+            docker stop --timeout 5 "${deploy_container}" >/dev/null 2>&1 || true
+        fi
     fi
     echo "[record_x2_dataset.sh] deploy log preserved at: ${DEPLOY_LOG}"
     exit "${rc}"
 }
 trap cleanup EXIT INT TERM
 
+if ${USE_VLA}; then
+    DEPLOY_MODE_LABEL="VLA mode (recorder drives reference via ZMQ)"
+else
+    DEPLOY_MODE_LABEL="motion-replay mode (StandStillReference; --no-vla)"
+fi
+if ${SIM_OMNIHAND}; then
+    DEPLOY_MJCF_LABEL="OmniHand-augmented MJCF (--sim-omnihand)"
+else
+    DEPLOY_MJCF_LABEL="bare x2_ultra.xml (no OmniHand fingers in sim)"
+fi
+case "${WRIST_BYPASS}" in
+    ik)  WRIST_BYPASS_LABEL="ik (deploy honours IK wrist refs; SONIC drives the rest)" ;;
+    off) WRIST_BYPASS_LABEL="off (pure SONIC; expect wrist_pitch/roll to be pinned)" ;;
+esac
+
 echo "──────────────────────────────────────────────────────────────"
 if ${TELEOP_ONLY}; then
-    echo "  X2 VR Teleop + MuJoCo Deploy (VLA mode, no recording)"
+    echo "  X2 VR Teleop + MuJoCo Deploy"
 else
-    echo "  X2 Dataset Recorder + MuJoCo Deploy (VLA mode)"
+    echo "  X2 Dataset Recorder + MuJoCo Deploy"
 fi
+echo "    deploy mode    : ${DEPLOY_MODE_LABEL}"
+echo "    deploy MJCF    : ${DEPLOY_MJCF_LABEL}"
+echo "    wrist bypass   : ${WRIST_BYPASS_LABEL}"
 echo "──────────────────────────────────────────────────────────────"
 if ! ${TELEOP_ONLY}; then
     echo "  output_dir        : ${OUTPUT_DIR}"
@@ -169,11 +277,31 @@ if ${SIM_VIEWER}; then
     DEPLOY_VIEWER_ARGS+=("--sim-viewer")
 fi
 
+DEPLOY_MODE_ARGS=()
+if ${USE_VLA}; then
+    DEPLOY_MODE_ARGS+=("--vla")
+fi
+
+DEPLOY_OMNIHAND_ARGS=()
+if ${SIM_OMNIHAND}; then
+    DEPLOY_OMNIHAND_ARGS+=("--sim-with-omnihand")
+fi
+
+# Wrist bypass: only meaningful when the deploy is in VLA mode (the
+# bypass reads from the ZMQ pose source). In --no-vla mode the override
+# would be a no-op AND the C++ binary would refuse to start because of
+# the "needs --input-type=zmq" guard, so suppress the flag entirely.
+DEPLOY_WRIST_BYPASS_ARGS=()
+if ${USE_VLA}; then
+    DEPLOY_WRIST_BYPASS_ARGS+=("--wrist-bypass" "${WRIST_BYPASS}")
+fi
+
 echo "[record_x2_dataset.sh] starting deploy in background …"
 "${DEPLOY_SH}" sim \
-    --vla \
-    --sim-profile gantry \
-    --sim-with-omnihand \
+    "${DEPLOY_MODE_ARGS[@]}" \
+    --sim-init-pose default \
+    "${DEPLOY_OMNIHAND_ARGS[@]}" \
+    "${DEPLOY_WRIST_BYPASS_ARGS[@]}" \
     --no-confirm \
     --autostart-after 0 \
     "${DEPLOY_VIEWER_ARGS[@]}" \
