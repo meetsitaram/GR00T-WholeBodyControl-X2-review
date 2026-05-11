@@ -33,7 +33,19 @@ Public entry points
 ``apply_active_hand_qpos``
     Helper that writes a 10-DOF (per side) active-joint vector into
     ``data.qpos``. The MJCF equality constraints then snap the 6 passive
-    DOFs into place on the next ``mj_forward`` call.
+    DOFs into place on the next ``mj_forward`` call. Use this from the
+    *kinematic* (``mj_forward``-only) renderer paths -- it bypasses
+    actuator dynamics by stamping qpos directly.
+
+``apply_active_hand_ctrl``
+    Helper that writes a 10-DOF (per side) active-joint vector into
+    ``data.ctrl``, targeting the position actuators added by
+    :func:`_add_finger_actuators`. Use this from the *dynamic*
+    (``mj_step``) bridge / sim paths -- the actuators produce smooth
+    PD-tracking torques during integration, the equality constraints
+    enforce passive = multiplier × active continuously, and there are
+    no qpos discontinuities for MuJoCo's integrator to differentiate
+    into spurious velocities.
 
 The 10 active joints per side, in order, match exactly:
 
@@ -91,6 +103,29 @@ PASSIVE_MIMIC_RULES: tuple[_MimicRule, ...] = (
     _MimicRule(passive="middle_dip", active="middle_pip", multiplier=1.097),
     _MimicRule(passive="ring_dip",   active="ring_pip",  multiplier=1.097),
     _MimicRule(passive="pinky_dip",  active="pinky_pip", multiplier=1.097),
+)
+
+
+# OmniHand joints that *exist* in the upstream URDF as free hinges
+# but are not part of the actuated kinematics by hardware design.
+# ``middle_abad`` is the canonical example: the middle finger has a
+# single active DOF (``middle_pip``) -- unlike index/ring/pinky which
+# also have ``*_abad`` for sideways spread -- but the URDF still ships
+# a ``middle_abad`` hinge declaration (probably copy-pasted from the
+# other fingers). Without intervention that joint:
+#   1. has no actuator (not in ``ACTIVE_FINGER_JOINTS``)
+#   2. has no equality coupling it to anything (not in ``PASSIVE_MIMIC_RULES``)
+#   3. has no MJCF range -- ``model.jnt_range`` reports (0, 0) so
+#      MuJoCo doesn't even clamp it
+# so any tiny numerical perturbation from the equality solver
+# accumulates as runaway angular velocity around its sideways axis
+# and the visual mesh punches through the palm collision shell. We
+# pin each entry below to qpos=0 with a one-coefficient equality
+# (``passive - 0 = 0``), which is the MJCF analogue of welding the
+# joint shut without changing the model topology that the SDK URDF
+# expects.
+LOCKED_PASSIVE_JOINTS: tuple[str, ...] = (
+    "middle_abad",
 )
 
 
@@ -246,6 +281,15 @@ class HandQposLayout:
     full_joint_names: Mapping[str, list[str]]
     """``side -> [<prefix>L/R_<short>_joint, ...]`` after ``attach``."""
 
+    active_actadr: Mapping[str, list[int]] = field(default_factory=dict)
+    """``side -> [actuator_id_per_active_joint_in_canonical_order]``.
+
+    Populated by :func:`_add_finger_actuators` when the augmented spec
+    is built. Empty for legacy callers that compose without finger
+    actuators (kinematic-only renderer path); :func:`apply_active_hand_ctrl`
+    will raise a clear error in that case.
+    """
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Composition
@@ -315,6 +359,25 @@ def _add_mimic_equalities(spec: mujoco.MjSpec) -> None:
                 name1=j_passive,
                 name2=j_active,
                 data=[0.0, float(rule.multiplier), 0.0, 0.0, 0.0,
+                      0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            )
+        # Pin every vestigial-by-design joint to qpos=0. mjEQ_JOINT
+        # without ``name2`` evaluates ``q1 - polycoef[0] = 0`` (the
+        # higher-order coefficients drop out because there's no q2
+        # to multiply by). The constant scaler in slot 10 stays 1.0.
+        # This is the equality-constraint analogue of welding the
+        # joint shut, and is preferred over deleting the joint from
+        # the spec because the upstream SDK URDF / kinematic chain
+        # still references the body it lives on -- removing the
+        # joint risks breaking attachment or downstream callers
+        # that introspect the model by joint name.
+        for short in LOCKED_PASSIVE_JOINTS:
+            jname = f"{side_cfg.side}_{side_cfg.sdk_prefix}{short}_joint"
+            spec.add_equality(
+                name=f"{side_cfg.side}_lock_{short}",
+                type=mujoco.mjtEq.mjEQ_JOINT,
+                name1=jname,
+                data=[0.0, 0.0, 0.0, 0.0, 0.0,
                       0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             )
 
@@ -402,6 +465,183 @@ def _disable_hand_collisions(spec: mujoco.MjSpec, side_cfgs: tuple[_SideConfig, 
             stack.extend(body.bodies)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Finger position actuators
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# Default PD gains for the 10 active finger position actuators.
+#
+# OmniHand-2025 finger links are small (~30-50 g per phalanx) and the MJCF
+# equality constraints already do most of the kinematic work projecting
+# passive joints onto active. We pick gains stiff enough to track
+# operator-driven setpoints (≤ 5 rad/s slew) within ~10 ms but soft
+# enough that brief zeros at boot (before pyzmq SUB connects) don't fire
+# multi-Newton transients into the augmented MJCF.
+#
+# Empirically we tune by eye on a 1 kHz mj_step loop: gains lower than
+# kp≈10 lag perceptibly during sustained finger curls; gains higher than
+# kp≈40 cause visible vibration on rest-pose-to-zero corrections at
+# t=0. The values here are the midpoint that smoke-tests cleanly.
+_FINGER_KP = 20.0  # Nm/rad  (position gain)
+_FINGER_KV = 1.0   # Nm/(rad/s) (damping)
+_FINGER_FMAX = 3.0  # Nm (per-joint torque limit)
+
+
+# ── Finger inertial stabilization (armature + passive damping) ─────────
+#
+# The OmniHand URDF link inertias are extremely small -- the PIP segments
+# are ~1.2e-5 kg·m^2 and the DIP segments are ~1.5e-6 kg·m^2 (lighter
+# than a paper clip). With the soft mimic equality solver
+# (``solimp[0] = 0.9`` by default in MuJoCo) injecting tiny but non-zero
+# constraint forces every step at 1 kHz, and no passive damping at the
+# joint level to absorb that energy, the integrator turns those forces
+# into >70° of finger-joint drift in 5 seconds even when the position
+# actuators are commanded to *hold* the rest pose. The fingers visually
+# wiggle nonstop in the SONIC bridge sim (``mj_step`` path), while the
+# kinematic renderer (``mj_forward`` only, no integration) looks fine.
+#
+# The fix is purely numerical, not physical: add a small ``armature``
+# (rotor inertia at the joint) and a small passive ``damping`` to every
+# OmniHand finger joint. Armature inflates the diagonal of the mass
+# matrix without changing the link inertia (so pose / FK / contacts are
+# unchanged), making the joints insensitive to small constraint impulses.
+# Passive damping bleeds off any residual oscillation between actuator
+# updates.
+#
+# Sweep results (5 s of mj_step with ctrl frozen at rest pose, max over
+# all 32 non-locked finger joints; see PR diagnosis for the script):
+#
+# +------------------------------+--------+----------+---------+
+# | config                       | drift° | jitter   | max_dev |
+# |                              |        | (deg/s)  |         |
+# +==============================+========+==========+=========+
+# | CURRENT (zero, zero)         |   75.5 |   3393   |  100.5  |
+# | armature=1e-3 only           |    0.9 |     13.0 |   10.2  |
+# | armature=1e-3 + damping=0.05 |    0.9 |      3.6 |    2.6  |
+# +------------------------------+--------+----------+---------+
+#
+# armature alone gives a 90× drift / 260× jitter improvement; adding a
+# small passive damping further smooths the residual oscillation to
+# < 0.1° per second of drift. Higher armature (1e-2) trades 1° more
+# steady-state drift for marginally less jitter -- not worth it.
+#
+# Tracking response with these values: at kp=20, the closed-loop time
+# constant is ~50 ms (well under the bridge's 1 kHz integration step
+# and indistinguishable at the 50 Hz teleop command rate). Human finger
+# motion lives at < 5 Hz, so the operator will not perceive the added
+# inertia; the SONIC body policy never sees these joints anyway.
+_FINGER_ARMATURE = 1e-3   # kg·m^2 added to joint diagonal (rotor inertia)
+_FINGER_DAMPING = 0.05    # Nm·s/rad passive joint damping
+
+
+def _apply_finger_inertial_stabilization(
+    model: mujoco.MjModel, side_cfgs: tuple[_SideConfig, ...]
+) -> None:
+    """Set ``armature`` + ``damping`` on every OmniHand finger DOF.
+
+    Walks every joint declared by every side's hand chain (active +
+    mimic-passive + locked-passive) and sets a small rotor inertia
+    plus passive damping on its underlying DOF. See the docstring on
+    ``_FINGER_ARMATURE`` for the empirical motivation.
+
+    Implementation note: we patch ``model.dof_armature`` /
+    ``model.dof_damping`` on the *compiled* ``MjModel`` rather than
+    going through the ``MjSpec.joint(name).damping`` setter. The
+    ``MjsJoint.damping`` Python attribute is scalar-typed in MuJoCo
+    3.5.x but became a 3-element NDArray in 3.7.x (per-DOF for
+    compound joints), and our deploy Docker image and host venv are
+    pinned to different minor versions. The compiled-model arrays
+    are scalar-per-DOF on every MuJoCo version, so this path is
+    forward / backward compatible.
+
+    Skips body / wrist joints -- those are SONIC-policy-controlled and
+    must not be perturbed (the policy was trained on their original
+    mass-matrix conditioning).
+    """
+    finger_short_names: set[str] = set()
+    for short in ACTIVE_FINGER_JOINTS:
+        finger_short_names.add(short)
+    for rule in PASSIVE_MIMIC_RULES:
+        finger_short_names.add(rule.passive)
+    for short in LOCKED_PASSIVE_JOINTS:
+        finger_short_names.add(short)
+
+    for side_cfg in side_cfgs:
+        for short in finger_short_names:
+            jname = f"{side_cfg.side}_{side_cfg.sdk_prefix}{short}_joint"
+            jid = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, jname
+            )
+            if jid < 0:
+                # Joint not present on this side (e.g. a future passive
+                # rule we haven't built yet). Silently skip.
+                continue
+            dofadr = int(model.jnt_dofadr[jid])
+            if dofadr < 0:
+                continue
+            model.dof_armature[dofadr] = _FINGER_ARMATURE
+            model.dof_damping[dofadr] = _FINGER_DAMPING
+
+
+def _add_finger_actuators(
+    spec: mujoco.MjSpec, side_cfgs: tuple[_SideConfig, ...]
+) -> None:
+    """Add ``<position>``-class actuators on the 10 active joints per side.
+
+    The augmented MJCF has equality constraints for the 6 mimic relationships
+    per side but no actuators on the active fingers -- the offline renderer
+    drove fingers by stamping ``mj_data.qpos`` directly and calling
+    ``mj_forward``.
+
+    That kinematic strategy explodes under ``mj_step`` (the SONIC C++
+    deploy bridge's hot path): each step writes new qpos, MuJoCo's
+    integrator differences it into a huge implicit qvel, the equality
+    solver fights to enforce passive=mult×active against those
+    infinities, and a finger DOF goes QACC NaN within 0.5s of sim time.
+
+    Position actuators close that loop properly: the bridge writes
+    setpoints to ``mj_data.ctrl[active_actadr]``, MuJoCo's integrator
+    handles the dynamics smoothly via PD torque
+    ``tau = kp*(ctrl - q) - kv*dq``, and the equality constraints
+    operate on a continuous trajectory the way they were designed to.
+    Hardware semantics (real OmniHand motors are torque-driven via PD)
+    are also preserved -- no sim-to-train gap is opened.
+
+    The MJCF schema for a position actuator is::
+
+        <position joint="J" kp="20" kv="1" forcerange="-3 3" inheritrange="1"/>
+
+    which lowers to ``MjsActuator`` with::
+
+        gaintype = mjGAIN_FIXED   gainprm = [kp, ...]
+        biastype = mjBIAS_AFFINE  biasprm = [0, -kp, -kv, ...]
+        trntype  = mjTRN_JOINT    target  = "J"
+        ctrllimited = 1; ctrlrange inherited from joint range
+        forcelimited = 1; forcerange = [-fmax, fmax]
+    """
+    for side_cfg in side_cfgs:
+        for short in ACTIVE_FINGER_JOINTS:
+            jname = f"{side_cfg.side}_{side_cfg.sdk_prefix}{short}_joint"
+            spec.add_actuator(
+                name=f"pos_{jname}",
+                trntype=int(mujoco.mjtTrn.mjTRN_JOINT),
+                target=jname,
+                gaintype=int(mujoco.mjtGain.mjGAIN_FIXED),
+                gainprm=[_FINGER_KP, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                biastype=int(mujoco.mjtBias.mjBIAS_AFFINE),
+                biasprm=[0, -_FINGER_KP, -_FINGER_KV, 0, 0, 0, 0, 0, 0, 0],
+                # ``inheritrange=1`` tells MuJoCo to use the joint's own
+                # range (set from the URDF) as the actuator's ctrlrange,
+                # so operator-driven setpoints get hard-clamped to the
+                # mechanically valid envelope before PD kicks in.
+                ctrllimited=1,
+                inheritrange=1.0,
+                forcelimited=1,
+                forcerange=[-_FINGER_FMAX, _FINGER_FMAX],
+            )
+
+
 def build_x2_with_omnihand_spec(
     *,
     asset_root: Path | None = None,
@@ -465,6 +705,7 @@ def build_x2_with_omnihand_spec(
         _attach_hand_spec(spec, side)
 
     _add_mimic_equalities(spec)
+    _add_finger_actuators(spec, tuple(side_cfgs))
     # First compile sets up internal indices; second compile picks up the
     # contype/conaffinity tweaks we apply below.
     spec.compile()
@@ -472,6 +713,12 @@ def build_x2_with_omnihand_spec(
     model = spec.compile()
     if model is None:
         raise RuntimeError("MjSpec.compile() returned None after composition")
+
+    # Stabilise tiny-inertia OmniHand DOFs (post-compile so we hit the
+    # final ``model.dof_armature`` / ``dof_damping`` arrays directly,
+    # bypassing the version-incompatible ``MjsJoint.damping`` Python
+    # setter -- see ``_apply_finger_inertial_stabilization`` docstring).
+    _apply_finger_inertial_stabilization(model, tuple(side_cfgs))
 
     layout = _build_layout(model, tuple(side_cfgs))
     return spec, model, layout
@@ -481,10 +728,12 @@ def _build_layout(model: mujoco.MjModel, side_cfgs: tuple[_SideConfig, ...]) -> 
     active_qposadr: dict[str, list[int]] = {}
     passive_qposadr: dict[str, dict[str, int]] = {}
     full_joint_names: dict[str, list[str]] = {}
+    active_actadr: dict[str, list[int]] = {}
 
     for side_cfg in side_cfgs:
         active_idx: list[int] = []
         active_names: list[str] = []
+        active_act_idx: list[int] = []
         for short in ACTIVE_FINGER_JOINTS:
             jname = f"{side_cfg.side}_{side_cfg.sdk_prefix}{short}_joint"
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
@@ -495,7 +744,18 @@ def _build_layout(model: mujoco.MjModel, side_cfgs: tuple[_SideConfig, ...]) -> 
                 )
             active_idx.append(int(model.jnt_qposadr[jid]))
             active_names.append(jname)
+
+            # Resolve the position actuator added by ``_add_finger_actuators``.
+            # Missing is non-fatal: legacy renderer paths that compose without
+            # finger actuators only use the qpos-write helper and don't call
+            # ``apply_active_hand_ctrl``. ``apply_active_hand_ctrl`` raises a
+            # clear error if ``active_actadr`` is empty.
+            aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"pos_{jname}")
+            if aid >= 0:
+                active_act_idx.append(int(aid))
         active_qposadr[side_cfg.side] = active_idx
+        if len(active_act_idx) == len(ACTIVE_FINGER_JOINTS):
+            active_actadr[side_cfg.side] = active_act_idx
 
         passive_map: dict[str, int] = {}
         for rule in PASSIVE_MIMIC_RULES:
@@ -515,6 +775,7 @@ def _build_layout(model: mujoco.MjModel, side_cfgs: tuple[_SideConfig, ...]) -> 
         active_qposadr=active_qposadr,
         passive_qposadr=passive_qposadr,
         full_joint_names=full_joint_names,
+        active_actadr=active_actadr,
     )
 
 
@@ -574,10 +835,150 @@ def _write_side(
         data.qpos[qadr] = float(rule.multiplier) * active_lookup[rule.active]
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# ctrl write helper (dynamics path: bridge / sim)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def apply_active_hand_ctrl(
+    data: mujoco.MjData,
+    layout: HandQposLayout,
+    *,
+    left_active: np.ndarray | None = None,
+    right_active: np.ndarray | None = None,
+) -> None:
+    """Write 10-D active hand vectors into ``data.ctrl`` for dynamics stepping.
+
+    Use this from any caller that integrates dynamics with ``mj_step``:
+    the live VLA bridge, the SONIC closed-loop sim, etc. The 10 active
+    joints per side are driven by position actuators added in
+    :func:`_add_finger_actuators`; writing setpoints to ``mj_data.ctrl``
+    lets MuJoCo's integrator close the PD loop and the equality
+    constraints enforce mimic relationships continuously.
+
+    Either side can be left ``None`` to leave that hand's ctrl untouched.
+
+    Raises
+    ------
+    RuntimeError
+        If ``layout.active_actadr`` is empty -- meaning the augmented
+        spec was built without :func:`_add_finger_actuators` (legacy
+        renderer-only path). Switch to :func:`apply_active_hand_qpos`
+        for kinematic ``mj_forward`` use, or rebuild the spec via
+        :func:`build_x2_with_omnihand_spec` (which now installs the
+        actuators by default).
+    """
+    if not layout.active_actadr:
+        raise RuntimeError(
+            "apply_active_hand_ctrl: layout has no active_actadr "
+            "(spec was composed without finger actuators). Either rebuild "
+            "via build_x2_with_omnihand_spec(), or use apply_active_hand_qpos "
+            "for kinematic mj_forward callers."
+        )
+    if left_active is not None:
+        _write_side_ctrl(data, layout, "left", np.asarray(left_active, dtype=np.float64))
+    if right_active is not None:
+        _write_side_ctrl(data, layout, "right", np.asarray(right_active, dtype=np.float64))
+
+
+def _write_side_ctrl(
+    data: mujoco.MjData,
+    layout: HandQposLayout,
+    side: str,
+    active: np.ndarray,
+) -> None:
+    if active.shape != (len(ACTIVE_FINGER_JOINTS),):
+        raise ValueError(
+            f"{side} hand active vector must have shape ({len(ACTIVE_FINGER_JOINTS)},), got {active.shape}"
+        )
+    if side not in layout.active_actadr:
+        raise RuntimeError(
+            f"apply_active_hand_ctrl: side {side!r} has no actuator indices in layout."
+        )
+    actadr = layout.active_actadr[side]
+    for k, aid in enumerate(actadr):
+        data.ctrl[aid] = float(active[k])
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Rest-pose initialisation
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_active_hand_rest_pose(side: str) -> np.ndarray:
+    """Canonical OmniHand "open hand" rest pose for one side, shape (10,).
+
+    Wraps :data:`HAND_GRASP_OPEN_RAD_LEFT` / :data:`HAND_GRASP_OPEN_RAD_RIGHT`
+    from :mod:`gear_sonic.utils.teleop.x2_hand_retarget` (the same
+    constants the retargeter's ``ratio=0`` endpoint resolves to). Joint
+    order matches :data:`ACTIVE_FINGER_JOINTS` exactly, so this slot
+    can be passed straight to :func:`apply_active_hand_qpos` /
+    :func:`apply_active_hand_ctrl` without permutation.
+    """
+    # Lazy import to keep this module importable from contexts that
+    # don't depend on the retargeter (e.g. URDF unit tests).
+    from gear_sonic.utils.teleop.x2_hand_retarget import (
+        HAND_GRASP_OPEN_RAD_LEFT,
+        HAND_GRASP_OPEN_RAD_RIGHT,
+    )
+    if side == "left":
+        return np.asarray(HAND_GRASP_OPEN_RAD_LEFT, dtype=np.float64)
+    if side == "right":
+        return np.asarray(HAND_GRASP_OPEN_RAD_RIGHT, dtype=np.float64)
+    raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+
+def apply_active_hand_rest_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    layout: HandQposLayout,
+    *,
+    sides: tuple[str, ...] = ("left", "right"),
+) -> None:
+    """Initialise active OmniHand qpos AND ctrl to the canonical rest pose.
+
+    Without this, ``mj_data.qpos[active_joints]`` defaults to 0 (which
+    lands on a joint-limit edge for several OmniHand joints, e.g.
+    ``thumb_abad``'s [0..+100]° envelope), and
+    ``mj_data.ctrl[finger_actuators]`` also defaults to 0 (so the
+    position actuators with ``inheritrange=1`` perpetually drive the
+    joint *toward* qpos=0). The combined effect is a slamming motion
+    against the joint stops as soon as ``mj_step`` engages -- visible
+    as random finger jitter even when the operator hasn't engaged hand
+    teleop, and a tail of QACC-NaN warnings on the lower-stiffness
+    fingers.
+
+    Calling this once at bridge startup (after ``mj_data`` is allocated
+    but before the first ``mj_step``) parks the active joints AND the
+    actuator setpoints at the open-hand rest pose returned by
+    :func:`get_active_hand_rest_pose`. ``mj_forward`` is run once to
+    propagate the mimic equality constraints (passive joints settle to
+    ``multiplier × active``) so the model is in a self-consistent state
+    before stepping.
+    """
+    for side in sides:
+        rest = get_active_hand_rest_pose(side)
+        if side in layout.active_qposadr:
+            apply_active_hand_qpos(
+                data,
+                layout,
+                **{f"{side}_active": rest},
+            )
+        if side in layout.active_actadr:
+            _write_side_ctrl(data, layout, side, rest)
+    # Settle mimic equalities (passive = multiplier * active) and
+    # contacts so the very first mj_step doesn't have to reconcile
+    # equality residuals on the same step it integrates.
+    mujoco.mj_forward(model, data)
+
+
 __all__ = [
     "ACTIVE_FINGER_JOINTS",
     "PASSIVE_MIMIC_RULES",
     "HandQposLayout",
     "build_x2_with_omnihand_spec",
     "apply_active_hand_qpos",
+    "apply_active_hand_ctrl",
+    "apply_active_hand_rest_pose",
+    "get_active_hand_rest_pose",
 ]

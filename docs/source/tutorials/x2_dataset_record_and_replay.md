@@ -1603,6 +1603,170 @@ in
    signal from XRHand metacarpal-to-metacarpal angles is a v1
    follow-up; the marginal gain is small given the hardware range.
 
+### OmniHand sim stability (armature + damping + locked passives)
+
+```{admonition} Status
+:class: note
+Landed May 10, 2026 alongside the `--sim-omnihand` deploy support.
+Lives entirely in
+[`gear_sonic/scripts/compose_x2_with_omnihand.py`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py)
+— the bare `x2_ultra.xml` is unchanged so the host SONIC training
+distribution is preserved.
+```
+
+The OmniHand-augmented MJCF (`--sim-omnihand`) glues the OmniHand
+URDFs onto `x2_ultra.xml` at runtime, adding 24+ finger DOFs to the
+22-DOF body. The first integrations exposed three independent sim-
+stability bugs that all show up as "fingers go crazy in MuJoCo":
+
+#### 1. `middle_abad` was a free-floating, unranged hinge
+
+The middle finger has only one active flexion DOF (`middle_pip`) by
+hardware design — unlike index / ring / pinky, it has no abduction
+motor. But the upstream URDF still ships a `middle_abad` hinge
+declaration (looks copy-pasted from the other fingers). With:
+
+* **No actuator** (not in `ACTIVE_FINGER_JOINTS`)
+* **No equality coupling** (not in `PASSIVE_MIMIC_RULES`)
+* **No range** (`model.jnt_range[middle_abad] == (0, 0)` so MuJoCo
+  doesn't even clamp it)
+
+…any tiny numerical perturbation from the equality solver accumulates
+as runaway angular velocity around the sideways axis, and the visual
+mesh punches through the palm collision shell. Visually: the middle
+finger spins in a plane that no human finger can.
+
+**Fix.** [`compose_x2_with_omnihand.py`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py)
+declares
+[`LOCKED_PASSIVE_JOINTS`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py)
+and adds a one-coefficient `mjEQ_JOINT` equality (`passive - 0 = 0`)
+for every entry. This is the equality-constraint analogue of welding
+the joint shut without changing the URDF topology the SDK expects.
+
+```python
+LOCKED_PASSIVE_JOINTS: tuple[str, ...] = (
+    "middle_abad",
+)
+```
+
+If a future OmniHand revision adds a similar vestigial hinge, just
+append it to the tuple and the compose script will pin it on the
+next sim launch.
+
+#### 2. Finger joints had no armature, no passive damping
+
+Even with `middle_abad` welded shut, all 32 remaining finger joints
+(active + mimic-passive) **continued to wiggle nonstop** in the
+SONIC bridge sim (`mj_step` path), while the kinematic renderer
+(`mj_forward` only, no integration) looked fine. Smoking gun: the
+problem was numerical, not retargeting.
+
+The OmniHand URDF link inertias are extremely small — PIP segments
+are ~1.2e-5 kg·m², DIP segments are ~1.5e-6 kg·m² (lighter than a
+paper clip). With:
+
+* The **soft mimic equality solver** (`solimp[0] = 0.9`) injecting
+  tiny but non-zero constraint forces every step at 1 kHz, AND
+* **Zero passive joint damping** to absorb that energy at the
+  joint level,
+
+…the integrator turns those forces into 70°+ of finger drift in 5
+seconds even when the position actuators are commanded to *hold*
+the rest pose.
+
+**Fix.** Add a small armature (rotor inertia at the joint) and a
+small passive damping to every OmniHand finger joint. Armature
+inflates the diagonal of the mass matrix without changing the link
+inertia, so pose / FK / contacts are unchanged but the joints become
+insensitive to small constraint impulses. Passive damping bleeds off
+any residual oscillation between actuator updates.
+
+Empirical sweep (5 s of `mj_step` with `ctrl` frozen at rest pose,
+max over all 32 non-locked finger joints):
+
+| config | drift (°) | jitter (°/s) | max deviation (°) |
+| ------ | --------: | -----------: | ----------------: |
+| baseline (zero, zero) | 75.5 | 3393 | 100.5 |
+| `armature=1e-3` only | 0.9 | 13.0 | 10.2 |
+| `armature=1e-3` + `damping=0.05` | 0.9 | **3.6** | **2.6** |
+
+Armature alone gives a 90× drift / 260× jitter improvement; adding
+the damping further smooths residual oscillation to <0.1° per
+second. The chosen values live as
+[`_FINGER_ARMATURE = 1e-3`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py)
+and `_FINGER_DAMPING = 0.05` in the compose script. Tracking
+response with these values: at `kp=20`, the closed-loop time
+constant is ~50 ms — well under the bridge's 1 kHz integration step
+and indistinguishable at the 50 Hz teleop command rate. Human
+finger motion lives at <5 Hz; the operator does not perceive the
+added inertia.
+
+```{admonition} MuJoCo 3.5 vs 3.7 gotcha
+:class: warning
+The fix patches `model.dof_armature[dofadr]` and
+`model.dof_damping[dofadr]` on the *compiled* `MjModel` rather than
+going through the `MjSpec.joint(name).damping` setter. The
+`MjsJoint.damping` Python attribute is **scalar-typed in MuJoCo
+3.5.x** but became a **3-element NDArray in 3.7.x** (per-DOF for
+compound joints). Our deploy Docker image and host venv are pinned
+to different minor versions; the compiled-model arrays are scalar-
+per-DOF on every MuJoCo version, so the patch is forward / backward
+compatible.
+```
+
+#### 3. `pyzmq` was missing in the bridge container
+
+With the dynamics fixes in place, fingers held the rest pose
+cleanly — but **didn't respond to operator input**. Symptom: every
+finger sat at its rest angle, no matter what the operator did with
+the controller triggers or hand-tracking curl.
+
+Root cause: the OmniHand finger commands flow over a separate ZMQ
+SUB socket from the recorder to the bridge (see
+[`x2_mujoco_ros_bridge.py`](../../../gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py)
+`apply_active_hand_rest_pose`). The bridge ran as `python3` inside
+the `docker_x2/x2sim` container, which historically didn't have
+`pyzmq` baked in. The `import zmq` raised, the bridge silently fell
+through to "rest pose forever", and the only signal in the deploy
+log was the absence of the SUB-online line.
+
+**Fix.** Two layers:
+
+1. **Permanently bake `pyzmq` into the Dockerfile.** On the next
+   `cd gear_sonic_deploy/docker_x2 && docker compose build` of
+   `x2sim`, the dependency is cached.
+2. **Best-effort runtime install fallback** in
+   [`x2_mujoco_ros_bridge.py`](../../../gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py).
+   If `import zmq` fails at bridge startup (older container layer),
+   the bridge runs `pip3 install pyzmq` once and retries. Logs:
+
+   ```text
+   [bridge] OmniHand ZMQ subscriber: pyzmq not present in this
+   container; attempting one-shot 'pip3 install pyzmq' …
+   [bridge] pyzmq installed at runtime; OmniHand SUB online.
+   ```
+
+   If the install also fails (no network, container immutable, etc.)
+   the bridge prints a loud single-line warning and continues with
+   fingers stuck at rest pose — useful so the rest of the loop still
+   exercises the body policy.
+
+#### Smoke test
+
+After all three fixes, run:
+
+```bash
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --teleop-only --sim-omnihand --no-vla \
+    --sonic-checkpoint <path> \
+    --sim-duration 30
+```
+
+Watch the MuJoCo viewer with no operator engagement: every finger
+should sit at its rest pose for the full 30 s with no visible
+oscillation. Then engage VR and squeeze a controller trigger — the
+matching robot fingers should curl in within ~50 ms.
+
 ---
 
 ## 9. Pointers into the implementation
@@ -1624,6 +1788,8 @@ in
 | [`gear_sonic/scripts/teleop_x2_kinematic.py`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | Pure-kinematic VR teleop (no SONIC, no deploy) — fastest debug loop. |
 | [`gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html`](../../../gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html) | WebXR client with calibration overlay + TTS. |
 | [`gear_sonic/scripts/process_dataset.py`](../../../gear_sonic/scripts/process_dataset.py) | Post-process / merge / clean LeRobot datasets. |
+| [`gear_sonic/scripts/compose_x2_with_omnihand.py`](../../../gear_sonic/scripts/compose_x2_with_omnihand.py) | Programmatically composes `x2_ultra.xml` with the OmniHand URDFs at runtime. Owns `LOCKED_PASSIVE_JOINTS`, `_FINGER_ARMATURE`, `_FINGER_DAMPING`, and the mimic-equality solver. |
+| [`gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py`](../../../gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py) | Bridges the C++ deploy to the MuJoCo sim. Subscribes to the OmniHand ZMQ command topic; runtime-installs `pyzmq` if missing. |
 
 ---
 
@@ -1645,6 +1811,9 @@ in
 | Saved episode has 0 frames | Pressed **X** before any tick advanced (e.g. before VR connected) | Check the recorder log for `[X] dropping 0 frames (no frames)`. Press **B** again, wait for the recorder to log non-zero frame counts in its periodic status, then press **X**. |
 | `[recorder] render warn (frame skipped): …` | EGL renderer hiccup; recorder drops the frame and continues | Safe to ignore unless it happens > 1 % of frames. If it does, drop the resolution (`--render-width 320 --render-height 240`) or move the renderer to a different GPU. |
 | Deploy log spams `tilt watchdog` errors | The recorded body_q drifted out of the trained distribution (e.g. lower body got modified) | The recorder pins legs/waist/head to `DEFAULT_STAND_POSE_MUJOCO_RAD`. If you patched that, revert. |
+| Middle finger spins through the palm collision shell | Vestigial `middle_abad` hinge in the upstream OmniHand URDF was free-floating + unranged. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §1. | Should be fixed for you by the equality lock in `compose_x2_with_omnihand.py::LOCKED_PASSIVE_JOINTS`. If a future OmniHand revision adds a similar joint, append it to that tuple. |
+| Fingers jitter / wiggle constantly even with no operator input (`--sim-omnihand` mode) | Tiny URDF link inertias + soft mimic equality solver inject constraint forces with no joint damping to absorb. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §2. | Verify `_FINGER_ARMATURE` and `_FINGER_DAMPING` are non-zero in `compose_x2_with_omnihand.py`. The `mj_forward`-only kinematic renderer hides this — only `mj_step` paths (the SONIC bridge) expose it. |
+| `--sim-omnihand` runs but fingers never move with operator input | `pyzmq` missing in the bridge container; the OmniHand ZMQ SUB silently failed to bind. | `cd gear_sonic_deploy/docker_x2 && docker compose build` to bake the dependency in permanently. The bridge has a runtime `pip3 install pyzmq` fallback that should auto-recover; check the log for `[bridge] OmniHand ZMQ subscriber: pyzmq not present …` lines. |
 
 ---
 

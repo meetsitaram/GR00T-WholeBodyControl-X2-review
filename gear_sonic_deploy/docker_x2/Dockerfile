@@ -102,10 +102,19 @@ RUN source /opt/ros/humble/setup.bash && \
 #   torch (CPU)      -- imported at module level by eval_x2_mujoco. The
 #                       bridge does not run the policy; CPU build keeps the
 #                       image ~1.5 GB lighter than the CUDA one.
+#   pyzmq            -- Python bindings for libzmq3 (already installed
+#                       below as a system dep). The bridge's OmniHand
+#                       finger SUB needs this; without it, hand
+#                       commands published by the recorder on tcp://5556
+#                       are silently dropped and ``mj_data.ctrl`` for
+#                       the fingers stays at the rest-pose seed --
+#                       visible to the operator as "fingers don't move
+#                       and just have noise on them" during teleop.
 RUN pip3 install --no-cache-dir --upgrade pip setuptools && \
     pip3 install --no-cache-dir \
         mujoco \
         numpy \
+        pyzmq \
         scipy \
         joblib && \
     pip3 install --no-cache-dir \

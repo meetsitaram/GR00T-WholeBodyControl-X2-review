@@ -392,6 +392,25 @@ class X2MujocoRosBridge:
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = float(args.sim_dt)
 
+        # When the OmniHand-augmented MJCF is loaded, park active hand
+        # qpos AND ctrl at the canonical open-hand rest pose *before*
+        # the first ``mj_step``. Without this, both default to 0, which
+        # (a) lands several active joints on a joint-limit edge, and
+        # (b) makes the position actuators -- ``inheritrange=1`` so the
+        # ctrl envelope matches joint range -- perpetually drive
+        # toward qpos=0. The combined effect is a slamming motion vs.
+        # the joint stops the moment dynamics start, observed by the
+        # operator as random finger jitter even when no VR commands
+        # are flowing. The retargeter's ``ratio=0`` open-hand pose is
+        # the natural target for a "rest" / "no input yet" state.
+        if self._omnihand_layout is not None:
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                apply_active_hand_rest_pose,
+            )
+            apply_active_hand_rest_pose(
+                self.mj_model, self.mj_data, self._omnihand_layout
+            )
+
         # Resolve per-joint qpos / qvel / actuator indices from joint NAMES,
         # so we don't have to trust the MJCF actuator order. Falls back to
         # eval_x2's JOINT_TO_ACTUATOR if name lookup fails (older MJCFs).
@@ -571,8 +590,22 @@ class X2MujocoRosBridge:
         # it into ``mj_data.qpos`` every sim step. Held under a lock so
         # the SUB thread and the sim thread can race without tearing.
         self._hand_lock = threading.Lock()
-        self._hand_left_active = np.zeros(10, dtype=np.float64)
-        self._hand_right_active = np.zeros(10, dtype=np.float64)
+        # Seed the silent-stream cache with the canonical open-hand
+        # rest pose (matches what we just wrote into ``mj_data.qpos``
+        # / ``mj_data.ctrl`` above). With this seed, the recurring
+        # ``_apply_omnihand_qpos`` -> ``apply_active_hand_ctrl`` write
+        # at sim cadence keeps the actuator targets parked at rest
+        # until a real ZMQ packet arrives -- not at qpos=0, which
+        # would otherwise unwind everything we did at init.
+        if self._omnihand_layout is not None:
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                get_active_hand_rest_pose,
+            )
+            self._hand_left_active = get_active_hand_rest_pose("left")
+            self._hand_right_active = get_active_hand_rest_pose("right")
+        else:
+            self._hand_left_active = np.zeros(10, dtype=np.float64)
+            self._hand_right_active = np.zeros(10, dtype=np.float64)
         self._hand_first_msg_logged = False
         self._hand_msg_count = 0
 
@@ -730,17 +763,24 @@ class X2MujocoRosBridge:
     # OmniHand finger drive
     # ----------------------------------------------------------------
     def _apply_omnihand_qpos(self):
-        """Write the latest hand setpoints into ``mj_data.qpos``.
+        """Write the latest hand setpoints into ``mj_data.ctrl``.
 
-        Cheap qpos-direct write rather than PD: the OmniHand actuators
-        on the augmented spec are kinematic (no feedback gains tuned),
-        and the live VLA stream already sends *target* joint positions
-        rather than torques. This matches what the offline video
-        recorder does in
-        :func:`gear_sonic.scripts.compose_x2_with_omnihand.apply_active_hand_qpos`.
+        Despite the legacy method name (kept for callsite stability),
+        this drives the augmented spec's position actuators rather than
+        stamping qpos directly. Position actuators implement
+        ``tau = kp*(ctrl - q) - kv*dq``; the integrator handles finger
+        dynamics smoothly during ``mj_step`` and the equality constraints
+        enforce mimic relationships continuously. The earlier qpos-stamp
+        approach used by the offline renderer
+        (:func:`gear_sonic.scripts.compose_x2_with_omnihand.apply_active_hand_qpos`)
+        triggered QACC NaN within 0.5 s of sim time because each tick's
+        qpos jump differentiated into infinite implicit qvel that the
+        equality solver couldn't reconcile. The ctrl-driven path is
+        also semantically equivalent to how the real OmniHand motors
+        operate (PD on torque), closing a sim-to-hardware gap.
 
         No-op when ``--with-omnihand`` is off (``_omnihand_layout`` is
-        None) -- the bare X2 has no hand qpos to write.
+        None) -- the bare X2 has no hand actuators to drive.
         """
         if self._omnihand_layout is None:
             return
@@ -750,9 +790,9 @@ class X2MujocoRosBridge:
         # Lazy import to keep this module importable on the bare-X2
         # path (where compose_x2_with_omnihand is never needed).
         from gear_sonic.scripts.compose_x2_with_omnihand import (
-            apply_active_hand_qpos,
+            apply_active_hand_ctrl,
         )
-        apply_active_hand_qpos(
+        apply_active_hand_ctrl(
             self.mj_data,
             self._omnihand_layout,
             left_active=left,
@@ -772,19 +812,46 @@ class X2MujocoRosBridge:
         harness reading the same port.
 
         Connection setup is best-effort: if pyzmq isn't installed (the
-        Docker base image doesn't always carry it) we log once and exit
-        the thread. The viewer then shows OmniHand fingers at their MJCF
-        rest pose -- still better than the dummy stubs.
+        pre-2026-05-10 Docker base image didn't carry it) we attempt
+        a one-shot ``pip3 install pyzmq`` into the running container,
+        then re-import. If the auto-install fails we log once and exit
+        the thread; the viewer then shows OmniHand fingers at their
+        MJCF rest pose -- still better than the dummy stubs. The
+        Dockerfile now bakes pyzmq in permanently so on the next
+        ``docker compose build`` of ``x2sim`` this fallback becomes a
+        no-op cached import.
         """
         try:
             import zmq
         except ImportError:
+            import subprocess  # local: only when pyzmq is missing
             self.node.get_logger().warn(
-                "[bridge] OmniHand ZMQ subscriber: pyzmq not installed; "
-                "fingers will stay at the MJCF rest pose. Install pyzmq "
-                "in the bridge env to drive the fingers."
+                "[bridge] OmniHand ZMQ subscriber: pyzmq not present in "
+                "this container; attempting one-shot 'pip3 install pyzmq' "
+                "to unblock finger teleop. Rebuild the docker_x2 image "
+                "(``cd gear_sonic_deploy/docker_x2 && docker compose "
+                "build x2sim``) to bake this dependency in permanently."
             )
-            return
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install",
+                     "--quiet", "--no-input", "--disable-pip-version-check",
+                     "pyzmq"],
+                    timeout=60,
+                )
+                import zmq  # noqa: F401  -- import side-effect after install
+                self.node.get_logger().info(
+                    "[bridge] pyzmq installed at runtime; OmniHand SUB online."
+                )
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    ImportError) as exc:
+                self.node.get_logger().warn(
+                    f"[bridge] runtime pip install pyzmq failed ({exc}); "
+                    f"fingers will stay at MJCF rest pose. Install "
+                    f"pyzmq manually in the bridge env to drive the fingers."
+                )
+                return
         # The decoder lives under gear_sonic which is already on sys.path
         # (we inserted REPO_ROOT earlier when --with-omnihand resolved
         # compose_x2_with_omnihand). Be defensive in case of an exotic

@@ -599,14 +599,32 @@ class X2DatasetRecorder:
                     )
                     right_hand_q = grasp_command_from_ratio("right", right_ratio)
 
-                # Run IK; if not engaged, this returns the neutral q
-                # (the recorder still publishes a token so the deploy
-                # has something to track).
+                # Run IK; if not engaged, this returns the operator's
+                # calibrated neutral q (a posture that is *not* the
+                # SONIC-trained stand-pose arm slice).
                 tick_result = self._teleop.step(vr_pose)
-                body_q_mj = self._compose_body_q(
-                    left_arm_q=tick_result.left_q,
-                    right_arm_q=tick_result.right_q,
-                )
+                if self._teleop.is_engaged:
+                    body_q_mj = self._compose_body_q(
+                        left_arm_q=tick_result.left_q,
+                        right_arm_q=tick_result.right_q,
+                    )
+                else:
+                    # IDLE -> publish the trained stand pose verbatim.
+                    # Overlaying the operator's "neutral" arm pose onto
+                    # DEFAULT_STAND_POSE_MUJOCO_RAD pushes the SONIC
+                    # tracking policy OOD (the trained attractor and the
+                    # operator's idle pose disagree by tens of degrees
+                    # at every arm joint), which generates large action
+                    # corrections that ripple into the lower body and
+                    # eventually flip the robot. Surrender the body
+                    # channel to the trained stand pose until A is
+                    # pressed; finger commands above still flow so the
+                    # bridge's hand position actuators don't slam to
+                    # qpos=0. This is a stopgap until the X2 Heuristic
+                    # Motion Planner takes over reference generation.
+                    body_q_mj = np.array(
+                        DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64
+                    )
 
                 # ``motion_token`` is a forward-compat wire field; the
                 # current C++ deploy actor consumes only ``joint_pos_mj``
@@ -720,11 +738,30 @@ class X2DatasetRecorder:
                 self._exporter.add_frame(frame)
             self._exporter.save_episode()
             self._episode_count += 1
+            # Resolve and print the on-disk paths so the operator
+            # doesn't have to ``find data/lerobot/<dataset> -newer ...``
+            # to locate what they just recorded. Layout matches
+            # :class:`Gr00tDataExporter` v2.1: parquet under
+            # ``data/chunk-000/`` and the ego-view mp4 under
+            # ``videos/chunk-000/observation.images.ego_view/``.
+            saved_idx = self._episode_count - 1
+            out_root = self._cfg.output_dir
+            parquet_path = (
+                out_root / "data" / "chunk-000"
+                / f"episode_{saved_idx:06d}.parquet"
+            )
+            mp4_path = (
+                out_root / "videos" / "chunk-000"
+                / "observation.images.ego_view"
+                / f"episode_{saved_idx:06d}.mp4"
+            )
             print(
                 f"[recorder] [X] episode saved: {n} frames "
                 f"(total saved={self._episode_count})",
                 flush=True,
             )
+            print(f"[recorder]     parquet -> {parquet_path}", flush=True)
+            print(f"[recorder]     mp4     -> {mp4_path}", flush=True)
         else:
             kind = "X" if save else "Y"
             reason = "no frames" if save else "discarded by operator"

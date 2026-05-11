@@ -59,12 +59,18 @@ mujoco = pytest.importorskip("mujoco")
 
 from gear_sonic.scripts.compose_x2_with_omnihand import (  # noqa: E402
     ACTIVE_FINGER_JOINTS,
+    LOCKED_PASSIVE_JOINTS,
     PASSIVE_MIMIC_RULES,
     _DEFAULT_MOUNT_QUAT_WXYZ,
+    _FINGER_ARMATURE,
+    _FINGER_DAMPING,
     _LEFT_MOUNT_QUAT_WXYZ,
     _RIGHT_MOUNT_QUAT_WXYZ,
+    apply_active_hand_ctrl,
     apply_active_hand_qpos,
+    apply_active_hand_rest_pose,
     build_x2_with_omnihand_spec,
+    get_active_hand_rest_pose,
 )
 from gear_sonic.data.robot_model.supplemental_info.x2_ultra.x2_ultra_supplemental_info import (  # noqa: E402
     OMNIHAND_FINGER_NAMES_PER_SIDE,
@@ -95,10 +101,13 @@ def test_augmented_model_shape(augmented):
       * 5 thumb joints (roll, abad, mcp, pip, dip)
       * 3 index joints (abad, pip, dip)
       * 3 middle joints (abad-placeholder, pip, dip) -- the abad joint is a
-        zero-range hinge added in the vendored URDF to prevent MuJoCo's
-        URDF parser from re-parenting middle_pip onto index_abad when it
-        collapses the upstream fixed joint (see omnihand_{left,right}.urdf
-        gear_sonic patch).
+        free hinge that the upstream OmniHand URDF declares (probably
+        copy-pasted from index/ring/pinky which DO have an active abad)
+        but the middle finger is single-DOF by hardware design. We pin
+        it to qpos=0 with a constant-form ``mjEQ_JOINT`` equality at
+        compose time (see ``LOCKED_PASSIVE_JOINTS``); without that
+        pin any equality-solver noise spins it open-loop and the
+        finger visually punches through the palm collision shell.
       * 3 ring joints (abad, pip, dip)
       * 3 pinky joints (abad, pip, dip)
       = 17 per side, 34 across both hands.
@@ -113,11 +122,17 @@ def test_augmented_model_shape(augmented):
     )
     assert model.nq == 72, f"expected 72 qpos slots, got {model.nq}"
 
-    # 6 mimic rules per side × 2 sides = 12 equality constraints. The
-    # zero-range middle_abad placeholders are NOT mimics -- they have
-    # ``range=(0,0)`` enforced by MuJoCo's joint-range solver, not by an
-    # ``<equality>``.
-    assert model.neq == 12, f"expected 12 mimic equality constraints, got {model.neq}"
+    # Equality constraints:
+    #   * 6 mimic rules per side × 2 sides = 12 mimic
+    #   * len(LOCKED_PASSIVE_JOINTS) per side × 2 sides = 2 lock pins
+    # = 14 total. Each lock pin is a constant-form ``mjEQ_JOINT``
+    # (``q1 = polycoef[0] = 0``), validated separately in
+    # ``test_locked_passive_joints_have_zero_pin_equality``.
+    expected_neq = 12 + 2 * len(LOCKED_PASSIVE_JOINTS)
+    assert model.neq == expected_neq, (
+        f"expected {expected_neq} equality constraints "
+        f"(12 mimic + {2 * len(LOCKED_PASSIVE_JOINTS)} lock pins), got {model.neq}"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -204,6 +219,449 @@ def test_apply_active_hand_qpos_rejects_wrong_shape(augmented):
         apply_active_hand_qpos(data, layout, left_active=np.zeros(7))
     with pytest.raises(ValueError, match=r"shape \(10,\)"):
         apply_active_hand_qpos(data, layout, right_active=np.zeros(11))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3b. Position actuators on active fingers (dynamics path)
+#
+# These guards lock in the fix that lets the augmented MJCF be stepped with
+# ``mj_step`` (live VLA bridge / SONIC closed-loop sim). The earlier
+# qpos-stamp approach -- still used by the offline renderer via
+# ``apply_active_hand_qpos`` + ``mj_forward`` -- caused QACC NaN within
+# 0.5 s of sim time when paired with ``mj_step`` because the equality
+# solver couldn't reconcile the per-tick qpos discontinuities. Position
+# actuators close that loop properly: the bridge writes setpoints to
+# ``mj_data.ctrl`` and MuJoCo's integrator handles finger motion as
+# continuous physics.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_augmented_model_has_position_actuators_on_active_fingers(augmented):
+    """20 position actuators (10 per side) named ``pos_<jname>`` exist."""
+    _, model, layout = augmented
+    # 31 body actuators (motor_*_joint) + 20 finger actuators (pos_*_joint).
+    assert model.nu == 51, (
+        f"expected 51 actuators (31 body motor_* + 20 finger pos_*), got {model.nu}"
+    )
+
+    for side in ("left", "right"):
+        sdk_prefix = "L_" if side == "left" else "R_"
+        assert side in layout.active_actadr, (
+            f"layout.active_actadr missing side={side!r}"
+        )
+        actadr = layout.active_actadr[side]
+        assert len(actadr) == 10
+        for k, aid in enumerate(actadr):
+            short = ACTIVE_FINGER_JOINTS[k]
+            jname = f"{side}_{sdk_prefix}{short}_joint"
+            expected_name = f"pos_{jname}"
+            actual_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid)
+            assert actual_name == expected_name, (
+                f"side={side} k={k} ({short}): actuator name {actual_name!r} != {expected_name!r}"
+            )
+            # Each actuator must be a position actuator: gain=FIXED, bias=AFFINE.
+            assert int(model.actuator_gaintype[aid]) == int(mujoco.mjtGain.mjGAIN_FIXED), (
+                f"{expected_name} gaintype != mjGAIN_FIXED"
+            )
+            assert int(model.actuator_biastype[aid]) == int(mujoco.mjtBias.mjBIAS_AFFINE), (
+                f"{expected_name} biastype != mjBIAS_AFFINE"
+            )
+
+
+def test_apply_active_hand_ctrl_writes_ctrl(augmented):
+    """``apply_active_hand_ctrl`` writes the 10-D vector into ``mj_data.ctrl``."""
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+
+    rng = np.random.default_rng(42)
+    left_active = rng.uniform(-0.1, 0.1, size=10)
+    right_active = rng.uniform(-0.1, 0.1, size=10)
+    apply_active_hand_ctrl(
+        data, layout, left_active=left_active, right_active=right_active,
+    )
+
+    for side, vec in (("left", left_active), ("right", right_active)):
+        for k, aid in enumerate(layout.active_actadr[side]):
+            assert data.ctrl[aid] == pytest.approx(vec[k], abs=1e-12), (
+                f"{side} actuator #{k} ({ACTIVE_FINGER_JOINTS[k]}) ctrl write round-trip mismatch"
+            )
+
+
+def test_augmented_mjcf_steps_dynamics_without_nan(augmented):
+    """``mj_step`` on the augmented MJCF stays finite for 250 ms with zero ctrl.
+
+    This is the regression guard for the bug that took down the live
+    VLA bridge with ``--sim-with-omnihand``: stamping finger qpos every
+    sim tick drove the equality solver into QACC NaN at sim t≈0.5 s,
+    on a finger DOF (DOF 54), even with no operator input. With proper
+    position actuators in place, the same scenario must run cleanly.
+    """
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    # Lift the floating base off the floor so we don't trigger ground
+    # contact NaNs unrelated to the fingers.
+    if model.nq >= 7:
+        data.qpos[2] = 1.5  # pelvis_z
+    apply_active_hand_ctrl(
+        data, layout,
+        left_active=np.zeros(10), right_active=np.zeros(10),
+    )
+
+    # Step ~250 ms at 1 kHz (model.opt.timestep is typically 0.001 in
+    # the bridge; whatever the spec defaults to is fine for this
+    # finiteness check).
+    for i in range(250):
+        mujoco.mj_step(model, data)
+        assert np.isfinite(data.qpos).all(), (
+            f"qpos went non-finite at step {i}; finger actuator path regressed"
+        )
+        assert np.isfinite(data.qvel).all(), (
+            f"qvel went non-finite at step {i}; finger actuator path regressed"
+        )
+
+
+def test_apply_active_hand_ctrl_rejects_wrong_shape(augmented):
+    """Helper raises a clear error for shape-mismatched ctrl vectors."""
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    with pytest.raises(ValueError, match=r"shape \(10,\)"):
+        apply_active_hand_ctrl(data, layout, left_active=np.zeros(7))
+    with pytest.raises(ValueError, match=r"shape \(10,\)"):
+        apply_active_hand_ctrl(data, layout, right_active=np.zeros(11))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Rest-pose initialisation (Patch B for the silent-stream slamming bug)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_rest_pose_constants_match_retargeter_open_endpoint():
+    """``get_active_hand_rest_pose`` returns the retargeter's
+    ``ratio=0`` open-hand pose verbatim, in canonical motor order."""
+    from gear_sonic.utils.teleop.x2_hand_retarget import (
+        HAND_GRASP_OPEN_RAD_LEFT,
+        HAND_GRASP_OPEN_RAD_RIGHT,
+        grasp_command_from_ratio,
+    )
+    left_rest = get_active_hand_rest_pose("left")
+    right_rest = get_active_hand_rest_pose("right")
+    assert left_rest.shape == (10,)
+    assert right_rest.shape == (10,)
+    np.testing.assert_allclose(left_rest, np.asarray(HAND_GRASP_OPEN_RAD_LEFT))
+    np.testing.assert_allclose(right_rest, np.asarray(HAND_GRASP_OPEN_RAD_RIGHT))
+    np.testing.assert_allclose(left_rest, grasp_command_from_ratio("left", 0.0))
+    np.testing.assert_allclose(right_rest, grasp_command_from_ratio("right", 0.0))
+    with pytest.raises(ValueError, match="must be 'left' or 'right'"):
+        get_active_hand_rest_pose("middle")
+
+
+def test_apply_active_hand_rest_pose_writes_qpos_and_ctrl(augmented):
+    """``apply_active_hand_rest_pose`` parks both qpos and ctrl on the
+    canonical open-hand rest pose, in canonical motor order, for both
+    sides. Mimic equalities are propagated by the internal
+    ``mj_forward`` so passive joints land on ``multiplier × active``.
+    """
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+
+    apply_active_hand_rest_pose(model, data, layout)
+
+    left_rest = get_active_hand_rest_pose("left")
+    right_rest = get_active_hand_rest_pose("right")
+    for k, qadr in enumerate(layout.active_qposadr["left"]):
+        assert data.qpos[qadr] == pytest.approx(left_rest[k]), (
+            f"left active joint #{k} qpos != rest pose at qposadr {qadr}"
+        )
+    for k, qadr in enumerate(layout.active_qposadr["right"]):
+        assert data.qpos[qadr] == pytest.approx(right_rest[k]), (
+            f"right active joint #{k} qpos != rest pose at qposadr {qadr}"
+        )
+    for k, aid in enumerate(layout.active_actadr["left"]):
+        assert data.ctrl[aid] == pytest.approx(left_rest[k]), (
+            f"left actuator #{k} ctrl != rest pose at actuator id {aid}"
+        )
+    for k, aid in enumerate(layout.active_actadr["right"]):
+        assert data.ctrl[aid] == pytest.approx(right_rest[k]), (
+            f"right actuator #{k} ctrl != rest pose at actuator id {aid}"
+        )
+
+
+def test_locked_passive_joints_have_zero_pin_equality(augmented):
+    """Each ``LOCKED_PASSIVE_JOINTS`` entry must have an
+    ``mjEQ_JOINT`` equality with no second joint and ``polycoef[0]=0``,
+    on both sides. This pins ``q1 = 0`` permanently.
+
+    Without this, joints like ``middle_abad`` -- which exist in the
+    upstream OmniHand URDF as free hinges but are NOT actuated by
+    hardware design (the middle finger has only 1 active DOF) and NOT
+    mimic-coupled -- accumulate runaway angular velocity from any
+    numerical noise and visually rotate out of the palm collision
+    mesh within a couple of seconds of sim time.
+    """
+    _, model, _ = augmented
+    assert len(LOCKED_PASSIVE_JOINTS) >= 1, (
+        "LOCKED_PASSIVE_JOINTS must include at least middle_abad; the test "
+        "is paranoia against an empty tuple silently passing"
+    )
+    expected_lock_count = 2 * len(LOCKED_PASSIVE_JOINTS)
+    lock_eqs = []
+    for eid in range(model.neq):
+        ename = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_EQUALITY, eid)
+        if ename and ename.endswith(tuple(f"_lock_{j}" for j in LOCKED_PASSIVE_JOINTS)):
+            lock_eqs.append(eid)
+    assert len(lock_eqs) == expected_lock_count, (
+        f"expected {expected_lock_count} lock equalities (per side x "
+        f"{len(LOCKED_PASSIVE_JOINTS)} joints), got {len(lock_eqs)}"
+    )
+    for eid in lock_eqs:
+        assert int(model.eq_type[eid]) == int(mujoco.mjtEq.mjEQ_JOINT), (
+            "lock equality must be mjEQ_JOINT type"
+        )
+        assert int(model.eq_obj2id[eid]) < 0, (
+            "lock equality must NOT have a second joint (constant pin form: q1 = polycoef[0])"
+        )
+        assert float(model.eq_data[eid][0]) == pytest.approx(0.0), (
+            "lock equality polycoef[0] must be 0 so q1 is pinned to 0"
+        )
+
+
+def test_locked_joints_stay_near_zero_through_two_seconds_of_stepping(augmented):
+    """End-to-end regression for the runaway middle_abad bug. With the
+    lock equality in place, ``middle_abad`` (and any other entry in
+    ``LOCKED_PASSIVE_JOINTS``) must stay within ~5° of zero through
+    2 s of dynamic stepping with no actuation pressure on it -- the
+    soft-constraint solver's residual envelope on a properly pinned
+    DOF is on the order of milliradians, not the open-loop runaway we
+    saw at integration time before this fix.
+    """
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    if model.nq >= 7:
+        data.qpos[2] = 1.5
+    apply_active_hand_rest_pose(model, data, layout)
+
+    locked_qadrs: dict[str, int] = {}
+    for jid in range(model.njnt):
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
+        if jname is None:
+            continue
+        for short in LOCKED_PASSIVE_JOINTS:
+            if jname.endswith(f"_{short}_joint"):
+                locked_qadrs[jname] = int(model.jnt_qposadr[jid])
+    assert locked_qadrs, (
+        "no locked joints resolved by name; LOCKED_PASSIVE_JOINTS / "
+        "URDF naming must have drifted apart"
+    )
+
+    n_steps = int(round(2.0 / float(model.opt.timestep)))
+    max_abs_per_joint = {n: 0.0 for n in locked_qadrs}
+    for _ in range(n_steps):
+        mujoco.mj_step(model, data)
+        for n, qadr in locked_qadrs.items():
+            v = float(data.qpos[qadr])
+            if abs(v) > max_abs_per_joint[n]:
+                max_abs_per_joint[n] = abs(v)
+
+    threshold_rad = np.deg2rad(5.0)
+    for jname, max_abs in max_abs_per_joint.items():
+        assert max_abs < threshold_rad, (
+            f"locked joint {jname} drifted to {np.rad2deg(max_abs):.2f}° "
+            f"during 2 s of dynamics (threshold 5°); the equality lock "
+            f"is not effective"
+        )
+    assert np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()
+
+
+def test_finger_joints_have_inertial_stabilization(augmented):
+    """Every OmniHand finger joint (active + mimic-passive + locked) must
+    have ``armature == _FINGER_ARMATURE`` and ``damping == _FINGER_DAMPING``
+    after compose. This is the cheap structural check; the dynamic
+    regression below verifies the chosen values actually stop the runaway.
+
+    Body / wrist joints must NOT be touched -- those are SONIC-policy
+    inputs and were trained on the upstream mass-matrix conditioning.
+    """
+    _, model, _ = augmented
+
+    # Build the set of finger joint short names we expect to be patched.
+    finger_short_names: set[str] = set()
+    for short in ACTIVE_FINGER_JOINTS:
+        finger_short_names.add(short)
+    for rule in PASSIVE_MIMIC_RULES:
+        finger_short_names.add(rule.passive)
+    for short in LOCKED_PASSIVE_JOINTS:
+        finger_short_names.add(short)
+
+    expected_full_names: set[str] = set()
+    for side, sdk in (("left", "L_"), ("right", "R_")):
+        for short in finger_short_names:
+            expected_full_names.add(f"{side}_{sdk}{short}_joint")
+
+    seen_finger_joints: set[str] = set()
+    for jid in range(model.njnt):
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
+        if jname is None:
+            continue
+        dofadr = int(model.jnt_dofadr[jid])
+        arm = float(model.dof_armature[dofadr])
+        dmp = float(model.dof_damping[dofadr])
+        if jname in expected_full_names:
+            seen_finger_joints.add(jname)
+            assert arm == pytest.approx(_FINGER_ARMATURE, abs=1e-9), (
+                f"finger joint {jname} has armature={arm}; "
+                f"expected {_FINGER_ARMATURE} from "
+                f"_apply_finger_inertial_stabilization"
+            )
+            assert dmp == pytest.approx(_FINGER_DAMPING, abs=1e-9), (
+                f"finger joint {jname} has damping={dmp}; "
+                f"expected {_FINGER_DAMPING}"
+            )
+        elif "wrist" in jname or "shoulder" in jname or "elbow" in jname:
+            # Body / arm joints must keep their original (zero by default
+            # for the X2 MJCF) armature / damping. Allow either zero or
+            # whatever the upstream MJCF specifies, but reject our
+            # finger value bleeding into them.
+            assert arm != _FINGER_ARMATURE or arm == 0.0, (
+                f"body joint {jname} got finger-side armature={arm}; "
+                f"the inertial-stabilization patch leaked outside the "
+                f"OmniHand chain"
+            )
+
+    missing = expected_full_names - seen_finger_joints
+    assert not missing, (
+        f"expected finger joints not present in augmented model: {missing}"
+    )
+
+
+def test_finger_joints_stay_still_with_frozen_ctrl(augmented):
+    """End-to-end regression for the constant-jitter / wide-range-wiggle
+    bug. With ctrl held at the rest pose for 5 s, no finger joint may
+    drift more than 5° from rest, oscillate with > 50 deg/s of frame-
+    to-frame jitter, or wander more than 10° peak-to-peak.
+
+    Pre-fix numbers (no armature, no damping) on the same model:
+        worst drift   = 75.5°
+        worst jitter  = 3393 deg/s
+        worst max-dev = 100.5°
+    Post-fix (armature=1e-3, damping=0.05):
+        worst drift   = 0.05°
+        worst jitter  = 3.4 deg/s
+        worst max-dev = 0.91°
+
+    Thresholds below are set ~10x the post-fix worst case, leaving
+    plenty of headroom for solver / integrator changes between MuJoCo
+    versions while still catching any future regression on the order
+    of 1°+ of finger drift.
+    """
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    if model.nq >= 7:
+        data.qpos[2] = 1.5  # lift pelvis off the floor
+    apply_active_hand_rest_pose(model, data, layout)
+    mujoco.mj_forward(model, data)
+
+    q_rest = data.qpos.copy()
+    ctrl_rest = data.ctrl.copy()
+
+    n_steps = int(round(5.0 / float(model.opt.timestep)))
+    qpos_log = np.zeros((n_steps, model.njnt), dtype=np.float64)
+    for s in range(n_steps):
+        data.ctrl[:] = ctrl_rest
+        mujoco.mj_step(model, data)
+        qpos_log[s] = data.qpos[model.jnt_qposadr]
+    dt = float(model.opt.timestep)
+
+    # Aggregate over every OmniHand finger joint (active + mimic + locked).
+    finger_short_names: set[str] = set()
+    for short in ACTIVE_FINGER_JOINTS:
+        finger_short_names.add(short)
+    for rule in PASSIVE_MIMIC_RULES:
+        finger_short_names.add(rule.passive)
+    for short in LOCKED_PASSIVE_JOINTS:
+        finger_short_names.add(short)
+
+    DRIFT_DEG = 5.0
+    JITTER_DPS = 50.0
+    MAX_DEV_DEG = 10.0
+    failures: list[str] = []
+    n_finger_checked = 0
+    for jid in range(model.njnt):
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
+        if jname is None:
+            continue
+        if not any(jname.endswith(f"_{s}_joint") for s in finger_short_names):
+            continue
+        n_finger_checked += 1
+        qa = int(model.jnt_qposadr[jid])
+        rest_val = float(q_rest[qa])
+        final_val = float(qpos_log[-1, jid])
+        drift = float(np.rad2deg(abs(final_val - rest_val)))
+        jitter = float(np.rad2deg(np.std(np.diff(qpos_log[:, jid])) / dt))
+        max_dev = float(np.rad2deg(qpos_log[:, jid].ptp()))
+        if drift > DRIFT_DEG:
+            failures.append(
+                f"  {jname}: drifted {drift:.2f}° "
+                f"(threshold {DRIFT_DEG}°)"
+            )
+        if jitter > JITTER_DPS:
+            failures.append(
+                f"  {jname}: frame-to-frame jitter {jitter:.1f} deg/s "
+                f"(threshold {JITTER_DPS} deg/s)"
+            )
+        if max_dev > MAX_DEV_DEG:
+            failures.append(
+                f"  {jname}: peak-to-peak deviation {max_dev:.2f}° "
+                f"(threshold {MAX_DEV_DEG}°)"
+            )
+
+    assert n_finger_checked >= 30, (
+        f"expected to check >= 30 finger joints (17 per side × 2), "
+        f"only checked {n_finger_checked}; the joint-name pattern may "
+        f"have drifted"
+    )
+    assert np.isfinite(qpos_log).all(), (
+        "non-finite qpos during the frozen-ctrl run -- the augmented "
+        "MJCF went unstable; check armature / damping / actuator gains"
+    )
+    if failures:
+        msg = "Finger joints drifted under frozen ctrl (this is the "
+        msg += "wide-range-wiggle regression):\n" + "\n".join(failures)
+        pytest.fail(msg)
+
+
+def test_rest_pose_init_holds_silent_stream_finite_for_one_second(augmented):
+    """End-to-end Patch B regression. With qpos and ctrl both seeded
+    to the rest pose, ``mj_step`` on the augmented MJCF must stay
+    finite for >=1 s of sim time *without* any further ctrl writes.
+
+    This is the test that fails on the broken (zero-init) path: ctrl=0
+    drives every active joint toward qpos=0, several joints land on
+    a joint-limit edge, the equality solver builds up integration
+    error, and QACC blows up at a finger DOF within a few hundred ms.
+    With Patch B, ctrl and qpos start in agreement at the rest pose
+    so the actuators idle at zero force and the sim is stable
+    indefinitely.
+    """
+    _, model, layout = augmented
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    if model.nq >= 7:
+        data.qpos[2] = 1.5  # lift pelvis off the floor
+
+    apply_active_hand_rest_pose(model, data, layout)
+
+    n_steps = int(round(1.0 / float(model.opt.timestep)))
+    for i in range(n_steps):
+        mujoco.mj_step(model, data)
+        if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+            pytest.fail(
+                f"non-finite state at step {i}/{n_steps} with rest-pose init; "
+                f"Patch B regressed (silent-stream slamming returned)"
+            )
 
 
 # ────────────────────────────────────────────────────────────────────────────
