@@ -265,6 +265,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "rest-state Quest 3 noise).",
     )
 
+    # Per-finger / thumb-oppose stretch (opt-in binarisation).
+    # Default live path is affine-normalisation only (smooth +
+    # operator-specific). These knobs ADDITIONALLY apply
+    # ``stretch_finger_curls`` / ``stretch_thumb_oppose`` so mid-range
+    # curls saturate toward the OPEN/CLOSED endpoints -- the right
+    # choice for tight power-grasp pick-and-place where the operator's
+    # natural max-squeeze (~70-85 % of calibration) otherwise leaves
+    # the OmniHand fingers ~15-30 % short of CLOSED. See
+    # docs/source/tutorials/x2_dataset_record_and_replay.md
+    # § "Why we abandoned the global power-curve compensation".
+    p.add_argument(
+        "--apply-curl-compensation", action="store_true",
+        help="Push mid-range Quest 3 curls toward CLOSED so the "
+             "OmniHand fingers fully wrap small objects on a power-"
+             "grasp gesture. Trade-off: deliberate intermediate "
+             "gestures (half-grasp, soft pinch) snap closer to the "
+             "endpoints.",
+    )
+    p.add_argument(
+        "--apply-oppose-compensation", action="store_true",
+        help="Push mid-range thumb-opposition toward closed so "
+             "thumb-finger touch behaves crisply binary. Pair with "
+             "--apply-curl-compensation.",
+    )
+
     # IK
     p.add_argument("--ik-damping", type=float, default=0.08)
     p.add_argument(
@@ -826,6 +851,8 @@ def main(argv: list[str] | None = None) -> int:
                         left_hand = per_finger_grasp_command_from_curls_and_oppose(
                             "left", l_curls, l_oppose,
                             finger_tip_oppose=l_finger_tip_oppose,
+                            apply_curl_compensation=bool(args.apply_curl_compensation),
+                            apply_oppose_compensation=bool(args.apply_oppose_compensation),
                             curl_floor=l_hr.floor if l_hr is not None else None,
                             curl_ceiling=l_hr.ceiling if l_hr is not None else None,
                             oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
@@ -847,6 +874,8 @@ def main(argv: list[str] | None = None) -> int:
                         right_hand = per_finger_grasp_command_from_curls_and_oppose(
                             "right", r_curls, r_oppose,
                             finger_tip_oppose=r_finger_tip_oppose,
+                            apply_curl_compensation=bool(args.apply_curl_compensation),
+                            apply_oppose_compensation=bool(args.apply_oppose_compensation),
                             curl_floor=r_hr.floor if r_hr is not None else None,
                             curl_ceiling=r_hr.ceiling if r_hr is not None else None,
                             oppose_floor=r_hr.oppose_floor if r_hr is not None else None,

@@ -461,7 +461,20 @@ class MujocoFrameRenderer:
         height: int = 480,
         with_omnihand: bool = True,
         egl: bool = True,
+        scene_xml_path: str | os.PathLike | None = None,
     ) -> None:
+        """Construct the renderer.
+
+        ``scene_xml_path`` (Phase-1 robocasa addition): when set, load
+        the MJCF from disk via :func:`mujoco.MjModel.from_xml_path`
+        instead of programmatically composing X2 + OmniHand. The static
+        XML must already include the camera named *camera* (the build
+        script in ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``
+        bakes ``ego_view`` in by default). This path lets the recorder
+        render against the same scene the deploy bridge sees -- including
+        table + cube + bowl -- without rebuilding the spec on the
+        recorder side.
+        """
         if egl:
             os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -474,12 +487,51 @@ class MujocoFrameRenderer:
         )
         self._with_omnihand = bool(with_omnihand)
 
-        self._model, self._hand_layout, self._body_qposadr = build_model_with_camera(
-            self._cam_spec,
-            with_omnihand=self._with_omnihand,
-            offwidth=int(width),
-            offheight=int(height),
-        )
+        if scene_xml_path is not None:
+            # Static-MJCF path. Resolve body/hand qposadrs by joint name
+            # so the rest of the renderer (which addresses qpos by
+            # logical name) still works regardless of how the scene XML
+            # numbered things.
+            self._model = mujoco.MjModel.from_xml_path(str(scene_xml_path))
+            # Bump the offscreen framebuffer to match the requested
+            # output size (the build script may have left it at MuJoCo's
+            # 640x480 default).
+            try:
+                if int(width) > self._model.vis.global_.offwidth:
+                    self._model.vis.global_.offwidth = int(width)
+                if int(height) > self._model.vis.global_.offheight:
+                    self._model.vis.global_.offheight = int(height)
+            except Exception:
+                pass
+            from gear_sonic.data.robot_model.supplemental_info.x2_ultra.x2_ultra_supplemental_info import (
+                X2_BODY_JOINT_NAMES,
+            )
+            self._body_qposadr = np.empty(len(X2_BODY_JOINT_NAMES), dtype=np.int64)
+            for i, jname in enumerate(X2_BODY_JOINT_NAMES):
+                jid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                if jid < 0:
+                    raise RuntimeError(
+                        f"X2 body joint {jname!r} missing from scene MJCF "
+                        f"{scene_xml_path}"
+                    )
+                self._body_qposadr[i] = int(self._model.jnt_qposadr[jid])
+            self._hand_layout = None
+            if self._with_omnihand:
+                from gear_sonic.scripts.compose_x2_with_omnihand import (
+                    _build_layout, _default_side_configs,
+                )
+                self._hand_layout = _build_layout(
+                    self._model, _default_side_configs()
+                )
+        else:
+            self._model, self._hand_layout, self._body_qposadr = (
+                build_model_with_camera(
+                    self._cam_spec,
+                    with_omnihand=self._with_omnihand,
+                    offwidth=int(width),
+                    offheight=int(height),
+                )
+            )
         self._data = mujoco.MjData(self._model)
         self._cam_id = mujoco.mj_name2id(
             self._model, mujoco.mjtObj.mjOBJ_CAMERA, self._cam_spec.name

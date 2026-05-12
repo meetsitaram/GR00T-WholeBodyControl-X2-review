@@ -132,6 +132,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "held-pose latch. Default 0.005.",
     )
 
+    # Per-finger / thumb-oppose stretch (opt-in binarisation). See
+    # docs/source/tutorials/x2_dataset_record_and_replay.md
+    # § "Why we abandoned the global power-curve compensation". The
+    # affine normalisation from the operator-calibration window is
+    # always on; these knobs ADDITIONALLY apply the piecewise power-
+    # curve from ``stretch_finger_curls`` / ``stretch_thumb_oppose``
+    # which pushes mid-range curls toward the OPEN/CLOSED endpoints.
+    parser.add_argument(
+        "--apply-curl-compensation", action="store_true",
+        help="Enable the per-finger curl stretch curve on top of the "
+             "operator's affine normalisation. Use for tight power-"
+             "grasp pick-and-place tasks where the OmniHand fingers "
+             "need to fully wrap a small object even when the operator "
+             "only squeezes ~70-85%% of their calibrated max. Trade-off: "
+             "deliberately intermediate gestures (half-grasp, soft "
+             "pinch) snap closer to OPEN/CLOSED.",
+    )
+    parser.add_argument(
+        "--apply-oppose-compensation", action="store_true",
+        help="Enable the thumb-opposition stretch curve. Pair with "
+             "--apply-curl-compensation when fingers need to fully "
+             "close on small objects.",
+    )
+
     # SONIC corrective-delta observability (v1 schema)
     parser.add_argument(
         "--sonic-correction-warn-rad", type=float, default=0.05,
@@ -177,6 +201,65 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--operator-id", type=str, default="default",
         help="Free-form operator label stamped into the calibration YAML.",
     )
+
+    # ── Robocasa scene mode (G1: deploy stays in the loop, recorder
+    #    just learns about the static scene XML the deploy is loading).
+    #    See gear_sonic/utils/teleop/x2_dataset_recorder.py
+    #    RecorderConfig docs for the full plumbing diagram.
+    _scenes_dir = (
+        Path(__file__).resolve().parent.parent
+        / "data" / "assets" / "robocasa_scenes"
+    )
+    parser.add_argument(
+        "--robocasa-env",
+        choices=("none", "X2PickPlaceCube", "X2PickPlaceBowl"),
+        default="none",
+        help="When != 'none', the recorder switches into robocasa scene "
+             "mode: it loads "
+             "data/assets/robocasa_scenes/<env>.xml + .json so the ego "
+             "renderer shows the table + objects, instantiates a "
+             "RobocasaTaskMirror for per-tick success/reward/subtask "
+             "labels, and PUB/SUBs scene-state with the deploy bridge. "
+             "The matching .xml must be built ahead of time via "
+             "gear_sonic/scripts/build_x2_robocasa_scene_xml.py. "
+             "The companion record_x2_dataset.sh forwards --sim-mjcf "
+             "to deploy_x2.sh so the deploy loads the same scene.",
+    )
+    parser.add_argument(
+        "--scene-xml-path", type=Path, default=None,
+        help="Override the scene MJCF path resolved from --robocasa-env. "
+             "Use this only when developing custom robocasa scenes that "
+             "live outside data/assets/robocasa_scenes/.",
+    )
+    parser.add_argument(
+        "--scene-state-sub-host", default="localhost",
+        help="Host for the scene_state ZMQ SUB (bridge -> recorder). "
+             "Match the deploy bridge's --scene-state-pub-host.",
+    )
+    parser.add_argument(
+        "--scene-state-sub-port", type=int, default=5559,
+        help="Port for the scene_state ZMQ SUB. Default matches the "
+             "bridge's --scene-state-pub-port.",
+    )
+    parser.add_argument(
+        "--scene-reset-pub-host", default="*",
+        help="Bind iface for the scene_reset ZMQ PUB "
+             "(recorder -> bridge).",
+    )
+    parser.add_argument(
+        "--scene-reset-pub-port", type=int, default=5560,
+        help="Port for the scene_reset ZMQ PUB. Default matches the "
+             "bridge's --scene-reset-sub-port.",
+    )
+    parser.add_argument(
+        "--episode-seed", type=int, default=None,
+        help="Optional RNG seed for the RobocasaTaskMirror's per-episode "
+             "reset (object placement randomization). Useful for "
+             "reproducible smoke tests.",
+    )
+    # Stash the resolved scenes dir on the parser so the resolver in
+    # main() can find scene XMLs without recomputing the path.
+    parser.set_defaults(_robocasa_scenes_dir=_scenes_dir)
 
     # Misc
     parser.add_argument("--quiet", action="store_true")
@@ -230,8 +313,43 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.teleop_only:
         if args.output_dir is None or not args.task:
+            # Robocasa mode auto-fills the task string from the scene
+            # metadata (the env's canonical instruction is what the
+            # mirror's success oracle is grading against), so the
+            # operator only needs to pass --output-dir.
+            if args.robocasa_env != "none" and args.output_dir is not None:
+                pass
+            else:
+                raise SystemExit(
+                    "Error: --output-dir and --task are required unless "
+                    "--teleop-only is set "
+                    "(robocasa mode auto-fills --task from the env's "
+                    "instruction; --output-dir is still required)."
+                )
+
+    # Resolve --robocasa-env -> scene XML path. The recorder + the deploy
+    # bridge both need to load the SAME .xml so their MuJoCo replicas
+    # stay in lock-step; we surface a clear error here when the asset
+    # is missing instead of letting the recorder try to subscribe to a
+    # bridge that's loading something different.
+    scene_xml_path: Path | None = None
+    robocasa_env_name: str | None = None
+    if args.scene_xml_path is not None:
+        scene_xml_path = args.scene_xml_path
+        if args.robocasa_env != "none":
+            robocasa_env_name = args.robocasa_env
+    elif args.robocasa_env != "none":
+        scene_xml_path = (
+            args._robocasa_scenes_dir / f"{args.robocasa_env}.xml"
+        )
+        robocasa_env_name = args.robocasa_env
+        if not scene_xml_path.is_file():
             raise SystemExit(
-                "Error: --output-dir and --task are required unless --teleop-only is set."
+                f"Error: scene MJCF for --robocasa-env "
+                f"{args.robocasa_env!r} not found at {scene_xml_path}.\n"
+                "       Build it via:\n"
+                "         python -m gear_sonic.scripts.build_x2_robocasa_scene_xml "
+                f"--env {args.robocasa_env}"
             )
 
     cfg = RecorderConfig(
@@ -263,8 +381,17 @@ def main(argv: list[str] | None = None) -> int:
         operator_id=args.operator_id,
         embodiment_tag=args.embodiment_tag,
         finger_filter_params=finger_filter_params,
+        apply_curl_compensation=bool(args.apply_curl_compensation),
+        apply_oppose_compensation=bool(args.apply_oppose_compensation),
         sonic_correction_warn_rad=args.sonic_correction_warn_rad,
         log_sonic_correction=(not args.no_sonic_correction_log),
+        scene_xml_path=scene_xml_path,
+        robocasa_env=robocasa_env_name,
+        scene_state_sub_host=args.scene_state_sub_host,
+        scene_state_sub_port=args.scene_state_sub_port,
+        scene_reset_pub_host=args.scene_reset_pub_host,
+        scene_reset_pub_port=args.scene_reset_pub_port,
+        episode_seed=args.episode_seed,
         verbose=(not args.quiet),
     )
 

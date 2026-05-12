@@ -646,6 +646,7 @@ def build_x2_with_omnihand_spec(
     *,
     asset_root: Path | None = None,
     mount_offset_z: float | None = None,
+    disable_hand_collisions: bool = True,
 ) -> tuple[mujoco.MjSpec, mujoco.MjModel, HandQposLayout]:
     """Compose the X2 + OmniHand augmented model.
 
@@ -657,6 +658,19 @@ def build_x2_with_omnihand_spec(
     mount_offset_z:
         Override the wrist→palm Z offset in the wrist_roll local frame
         (defaults to ``-0.182m`` -- the bottom of the wrist_roll mesh bbox).
+    disable_hand_collisions:
+        If True (default), every OmniHand finger geom is stripped of its
+        ``contype`` / ``conaffinity`` after composition so the dynamics
+        engine ignores fingertip-vs-anything contacts. This matches the
+        SONIC pure-kinematic recording use case where finger-vs-body /
+        finger-vs-floor / finger-vs-finger contacts would inject spurious
+        forces into the proprio stream and slow the sim. Pass ``False``
+        when you want the fingers to physically interact with scene
+        objects (e.g. robocasa pick-and-place tasks). With ``False`` the
+        URDF-derived collision primitives (boxes on the thumb MCP/PIP and
+        cylinders on every fingertip) keep their default
+        ``contype=1, conaffinity=1`` and the contact pair
+        (finger, scene-object) becomes live.
 
     Returns
     -------
@@ -709,7 +723,8 @@ def build_x2_with_omnihand_spec(
     # First compile sets up internal indices; second compile picks up the
     # contype/conaffinity tweaks we apply below.
     spec.compile()
-    _disable_hand_collisions(spec, tuple(side_cfgs))
+    if disable_hand_collisions:
+        _disable_hand_collisions(spec, tuple(side_cfgs))
     model = spec.compile()
     if model is None:
         raise RuntimeError("MjSpec.compile() returned None after composition")

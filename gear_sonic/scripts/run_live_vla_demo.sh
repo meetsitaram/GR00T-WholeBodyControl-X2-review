@@ -157,6 +157,24 @@ stop_all() {
     pkill -f "x2_deploy_onnx_ref" 2>/dev/null || true
     # Deploy runs as root inside the x2sim container; pkill from host can't
     # reach it. Kill the container by image filter.
+    #
+    # ⚠️  CROSS-PROCESS HAZARD ⚠️
+    # ``--filter ancestor=x2sim`` matches **every** running container built
+    # from the x2sim image -- including ones owned by other workflows
+    # (e.g. ``gear_sonic/scripts/record_x2_dataset.sh`` while it is in the
+    # middle of a recording session). ``docker kill`` is SIGKILL; the
+    # victim container's MuJoCo viewer will vanish instantly with no log
+    # flush, which from the operator's seat looks identical to a viewer
+    # crash. Symptoms in the *other* terminal: viewer window disappears,
+    # deploy log goes silent mid-CONTROL-tick line with no goodbye, and
+    # (since v1.7) the recorder prints a red ``[recorder] !! deploy went
+    # silent`` warning citing this script by name.
+    #
+    # If you only want to clean up *your own* run, prefer:
+    #   docker stop "$(cat "$RUN_DIR/.deploy_container" 2>/dev/null)"
+    # i.e. write the container name to a sidecar on ``start`` and target
+    # it explicitly on ``stop``. The broad filter below is kept for the
+    # legacy "nuke everything" reset when nothing else is running.
     local cid
     cid="$(docker ps -q --filter ancestor=x2sim 2>/dev/null || true)"
     [[ -n "$cid" ]] && docker kill $cid 2>/dev/null || true

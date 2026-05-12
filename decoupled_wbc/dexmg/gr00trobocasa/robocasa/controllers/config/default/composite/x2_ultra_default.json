@@ -1,0 +1,78 @@
+{
+    "_comment": "Default composite controller config for the AgiBot X2 Ultra.  Uses JointPositionController in absolute mode for arms / torso / head so the recorded action vector matches the real-robot dataset format (joint angles in radians).  Grippers use SimpleGripController with use_action_scaling=false so the 10-D OmniHand command vector is written through verbatim.  See robocasa/controllers/config/default/composite/basic.json for the OSC-based default we override.",
+    "type": "BASIC",
+    "body_parts": {
+        "left": {
+            "type": "JOINT_POSITION",
+            "input_max": 100,
+            "input_min": -100,
+            "input_type": "absolute",
+            "output_max": 100,
+            "output_min": -100,
+            "kp": [100, 100, 40, 40, 20, 20, 20],
+            "kd": [5.0, 5.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+            "velocity_limits": [-1, 1],
+            "kp_limits": [0, 1000],
+            "interpolation": null,
+            "ramp_ratio": 0.2,
+            "gripper": {
+                "type": "GRIP",
+                "use_action_scaling": false
+            },
+            "use_torque_compensation": false,
+            "desired_torque_as_acceleration": false
+        },
+        "right": {
+            "type": "JOINT_POSITION",
+            "input_max": 100,
+            "input_min": -100,
+            "input_type": "absolute",
+            "output_max": 100,
+            "output_min": -100,
+            "kp": [100, 100, 40, 40, 20, 20, 20],
+            "kd": [5.0, 5.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+            "velocity_limits": [-1, 1],
+            "kp_limits": [0, 1000],
+            "interpolation": null,
+            "ramp_ratio": 0.2,
+            "gripper": {
+                "type": "GRIP",
+                "use_action_scaling": false
+            },
+            "use_torque_compensation": false,
+            "desired_torque_as_acceleration": false
+        },
+        "torso": {
+            "type": "JOINT_POSITION",
+            "input_max": 100,
+            "input_min": -100,
+            "input_type": "absolute",
+            "output_max": 100,
+            "output_min": -100,
+            "kp": [200, 80, 80],
+            "kd": [4.0, 3.0, 3.0],
+            "velocity_limits": [-1, 1],
+            "kp_limits": [0, 1000],
+            "interpolation": null,
+            "ramp_ratio": 0.2,
+            "use_torque_compensation": false,
+            "desired_torque_as_acceleration": false
+        },
+        "head": {
+            "type": "JOINT_POSITION",
+            "input_max": 100,
+            "input_min": -100,
+            "input_type": "absolute",
+            "output_max": 100,
+            "output_min": -100,
+            "kp": [10, 4],
+            "kd": [1.0, 0.5],
+            "velocity_limits": [-1, 1],
+            "kp_limits": [0, 1000],
+            "interpolation": null,
+            "ramp_ratio": 0.2,
+            "use_torque_compensation": false,
+            "desired_torque_as_acceleration": false
+        }
+    }
+}

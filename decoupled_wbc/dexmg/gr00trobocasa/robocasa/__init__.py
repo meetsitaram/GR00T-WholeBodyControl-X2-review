@@ -39,6 +39,12 @@ from robocasa.environments.locomanipulation.locomanip_dc import (
     LMPnPAppleToPlateDC,
 )
 
+from robocasa.environments.locomanipulation.x2_tabletop_pnp import (
+    LMTabletopFixedBase,
+    X2PickPlaceCube,
+    X2PickPlaceBowl,
+)
+
 # from robosuite.controllers import ALL_CONTROLLERS, load_controller_config
 from robosuite.controllers import ALL_PART_CONTROLLERS, load_composite_controller_config
 from robosuite.environments import ALL_ENVIRONMENTS
@@ -48,9 +54,12 @@ from robosuite.robots import ALL_ROBOTS
 
 import mujoco
 
-assert (
-    mujoco.__version__ == "3.2.6" or mujoco.__version__ == "3.3.2"
-), "MuJoCo version must be 3.2.6 or 3.3.2. Please install the correct version."
+_SUPPORTED_MUJOCO = ("3.2.6", "3.3.2", "3.3.7", "3.5.0", "3.7.0")
+assert mujoco.__version__ in _SUPPORTED_MUJOCO, (
+    f"MuJoCo version must be one of {_SUPPORTED_MUJOCO}; "
+    f"got {mujoco.__version__}. (Add yours to _SUPPORTED_MUJOCO in "
+    f"robocasa/__init__.py once you've smoke-tested it.)"
+)
 
 import numpy
 
@@ -65,10 +74,14 @@ assert numpy.__version__ in [
 
 import robosuite
 
+# Upstream pins to 1.5.{0,1}; 1.5.2 ships a bug-fix release with a compatible
+# API surface for the X2 + tabletop scenes we use. Smoke-tested via
+# tests/test_x2_robocasa_scene_mode.py before adding to this list.
 assert robosuite.__version__ in [
     "1.5.0",
     "1.5.1",
-], "robosuite version must be 1.5.{0,1}. Please install the correct version"
+    "1.5.2",
+], "robosuite version must be one of 1.5.{0,1,2}. Please install the correct version"
 
 __version__ = "0.2.0"
 __logo__ = """

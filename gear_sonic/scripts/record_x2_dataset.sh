@@ -39,6 +39,23 @@
 #                               just sit at MJCF rest pose. Default OFF
 #                               keeps you on the bare x2_ultra.xml the
 #                               25k checkpoint was trained on.
+#   --robocasa-env ENV          {none, X2PickPlaceCube, X2PickPlaceBowl}
+#                               Default: none. When != none, switches
+#                               both the deploy and the recorder into
+#                               "robocasa scene" mode (G1 architecture):
+#                               the deploy is launched with --sim-mjcf
+#                               pointing at the pre-built robocasa scene
+#                               XML, and the recorder loads the same XML
+#                               so its ego renderer + RobocasaTaskMirror
+#                               (per-tick success/reward/subtask labels)
+#                               see the same table + objects. Forwards
+#                               --robocasa-env to record_x2_dataset.py
+#                               so it can resolve the matching scene
+#                               metadata. Implies --sim-omnihand because
+#                               every bundled scene is built on top of
+#                               the OmniHand-augmented robot. Build
+#                               scenes via
+#                               gear_sonic/scripts/build_x2_robocasa_scene_xml.py.
 #   --wrist-bypass MODE         {off, ik} (default ik). When 'ik', the C++
 #                               deploy overwrites target_pos_mj for the 4
 #                               broken wrist DOFs (left/right wrist_pitch
@@ -96,6 +113,7 @@ SIM_VIEWER="${SIM_VIEWER:-true}"
 TELEOP_ONLY=false
 USE_VLA=true
 SIM_OMNIHAND=false
+ROBOCASA_ENV="none"
 # Default to 'ik' so VR teleop / dataset recording produces honest wrist
 # tracking out of the box. Operators can pass --wrist-bypass off to fall
 # back to pure SONIC for sim-to-real fidelity probes. Bridge safety:
@@ -114,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         --no-sim-viewer)      SIM_VIEWER=false; shift ;;
         --no-vla)             USE_VLA=false; shift ;;
         --sim-omnihand)       SIM_OMNIHAND=true; shift ;;
+        --robocasa-env)       ROBOCASA_ENV="$2"; shift 2 ;;
         --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
         --teleop-only)        TELEOP_ONLY=true; shift ;;
         -h|--help)
@@ -132,9 +151,43 @@ case "${WRIST_BYPASS}" in
         ;;
 esac
 
+ROBOCASA_SCENE_XML=""
+case "${ROBOCASA_ENV}" in
+    none) ;;
+    X2PickPlaceCube|X2PickPlaceBowl)
+        ROBOCASA_SCENE_XML="${REPO_ROOT}/gear_sonic/data/assets/robocasa_scenes/${ROBOCASA_ENV}.xml"
+        if [[ ! -f "${ROBOCASA_SCENE_XML}" ]]; then
+            echo "Error: scene MJCF for --robocasa-env ${ROBOCASA_ENV}" >&2
+            echo "       not found at ${ROBOCASA_SCENE_XML}." >&2
+            echo "       Build it via:" >&2
+            echo "         python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env ${ROBOCASA_ENV}" >&2
+            exit 1
+        fi
+        # Robocasa scenes are always built on top of the OmniHand-
+        # augmented robot, so the deploy bridge MUST load them with
+        # --sim-with-omnihand or its hand controller plumbing will
+        # never bind to the finger actuators.
+        SIM_OMNIHAND=true
+        ;;
+    *)
+        echo "Error: --robocasa-env must be one of 'none', 'X2PickPlaceCube', 'X2PickPlaceBowl' (got '${ROBOCASA_ENV}')" >&2
+        exit 1
+        ;;
+esac
+
 if ! ${TELEOP_ONLY}; then
-    if [[ -z "${OUTPUT_DIR}" || -z "${TASK}" ]]; then
-        echo "Error: --output-dir and --task are required (omit by passing --teleop-only)" >&2
+    if [[ -z "${OUTPUT_DIR}" ]]; then
+        echo "Error: --output-dir is required (omit by passing --teleop-only)" >&2
+        grep -E "^# " "$0" | sed -e 's/^# //; s/^#//'
+        exit 1
+    fi
+    if [[ -z "${TASK}" && "${ROBOCASA_ENV}" == "none" ]]; then
+        # Robocasa mode auto-fills TASK from the scene metadata via
+        # RobocasaTaskMirror.task_string, so the operator can omit it
+        # there. Outside robocasa mode we still demand an explicit
+        # instruction so the LeRobot ``task`` column isn't empty.
+        echo "Error: --task is required outside --robocasa-env mode" >&2
+        echo "       (omit --task only when --robocasa-env != none, or pass --teleop-only)." >&2
         grep -E "^# " "$0" | sed -e 's/^# //; s/^#//'
         exit 1
     fi
@@ -197,6 +250,56 @@ fi
 
 DEPLOY_LOG="$(mktemp -t deploy_x2_record_XXXXXX.log)"
 
+# ----------------------------------------------------------------------
+# Pre-flight cleanup
+# ----------------------------------------------------------------------
+# A previous deploy run can leave behind a ``docker_x2-x2sim-run-*``
+# container (or a host bridge process) holding the bridge's ZMQ ports:
+#   5557 -> x2_debug PUB (the recorder's deploy-alive heartbeat)
+#   5559 -> scene_state PUB (RobocasaTaskMirror's per-tick observation)
+#   5570 -> robot_pose PUB
+# When that happens, the new bridge silently fails the bind on the
+# colliding port (visible in the deploy log as
+# ``[ERROR] ... x2_debug PUB failed to bind on port 5557: Address
+# already in use``) but keeps running with a degraded socket set. The
+# recorder then sees ``deploy_alive=False`` for the entire session and
+# the operator is left teleoping into the void.
+#
+# The wrapper's EXIT trap normally tears the deploy container down, but
+# a SIGKILL (e.g. a previous ``docker kill --filter ancestor=x2sim``
+# from ``run_live_vla_demo.sh``) bypasses the trap, so we cannot
+# assume the host is clean. Sweep here.
+preflight_cleanup() {
+    if command -v docker >/dev/null 2>&1; then
+        local stale_containers
+        stale_containers="$(docker ps --filter ancestor=x2sim --format '{{.Names}}' 2>/dev/null || true)"
+        if [[ -n "${stale_containers}" ]]; then
+            echo "[record_x2_dataset.sh] WARNING: stale x2sim container(s) detected; stopping:"
+            while IFS= read -r c; do
+                [[ -z "$c" ]] && continue
+                echo "  - ${c}"
+                docker stop --timeout 5 "${c}" >/dev/null 2>&1 || true
+            done <<< "${stale_containers}"
+        fi
+    fi
+    # Sanity-check the ZMQ ports the bridge needs to bind. ``ss`` is in
+    # iproute2 on every modern linux; if it's missing we silently skip.
+    if command -v ss >/dev/null 2>&1; then
+        local busy
+        busy="$(ss -tln 'sport = :5557 or sport = :5559 or sport = :5570' 2>/dev/null \
+                | awk 'NR>1 {print $4}' \
+                | sed 's/.*://g' \
+                | sort -u | tr '\n' ' ')"
+        if [[ -n "${busy// /}" ]]; then
+            echo "Error: bridge ZMQ ports still bound by another process: ${busy}" >&2
+            echo "       Free them (e.g. ``docker ps`` then ``docker stop <name>``;" >&2
+            echo "       or ``lsof -i :5557 -i :5559 -i :5570``) and retry." >&2
+            exit 1
+        fi
+    fi
+}
+preflight_cleanup
+
 cleanup() {
     local rc=$?
     # 1) SIGINT the host-side bash that runs ``deploy_x2.sh`` so its
@@ -243,6 +346,9 @@ if ${SIM_OMNIHAND}; then
 else
     DEPLOY_MJCF_LABEL="bare x2_ultra.xml (no OmniHand fingers in sim)"
 fi
+if [[ "${ROBOCASA_ENV}" != "none" ]]; then
+    DEPLOY_MJCF_LABEL="robocasa scene ${ROBOCASA_ENV}.xml (${ROBOCASA_SCENE_XML})"
+fi
 case "${WRIST_BYPASS}" in
     ik)  WRIST_BYPASS_LABEL="ik (deploy honours IK wrist refs; SONIC drives the rest)" ;;
     off) WRIST_BYPASS_LABEL="off (pure SONIC; expect wrist_pitch/roll to be pinned)" ;;
@@ -287,6 +393,16 @@ if ${SIM_OMNIHAND}; then
     DEPLOY_OMNIHAND_ARGS+=("--sim-with-omnihand")
 fi
 
+# Robocasa scene mode forwards --sim-mjcf to deploy_x2.sh so the bridge
+# loads the same static scene XML the recorder will mirror via the
+# RobocasaTaskMirror. The bridge auto-discovers the .json sidecar next
+# to the .xml and uses it to resolve scene-object freejoint qpos
+# addresses for its scene_state PUB / scene_reset SUB plumbing.
+DEPLOY_SCENE_ARGS=()
+if [[ -n "${ROBOCASA_SCENE_XML}" ]]; then
+    DEPLOY_SCENE_ARGS+=("--sim-mjcf" "${ROBOCASA_SCENE_XML}")
+fi
+
 # Wrist bypass: only meaningful when the deploy is in VLA mode (the
 # bypass reads from the ZMQ pose source). In --no-vla mode the override
 # would be a no-op AND the C++ binary would refuse to start because of
@@ -301,6 +417,7 @@ echo "[record_x2_dataset.sh] starting deploy in background …"
     "${DEPLOY_MODE_ARGS[@]}" \
     --sim-init-pose default \
     "${DEPLOY_OMNIHAND_ARGS[@]}" \
+    "${DEPLOY_SCENE_ARGS[@]}" \
     "${DEPLOY_WRIST_BYPASS_ARGS[@]}" \
     --no-confirm \
     --autostart-after 0 \
@@ -312,14 +429,56 @@ echo "[record_x2_dataset.sh] starting deploy in background …"
 DEPLOY_PID=$!
 echo "[record_x2_dataset.sh] deploy pid=${DEPLOY_PID}; tailing log:"
 
-(tail -F "${DEPLOY_LOG}" 2>/dev/null | sed -e 's/^/[deploy] /' ) &
+# Throttle the deploy log on the way to stdout. Two reasons:
+#  1) The C++ deploy publishes a "[INFO] ... CONTROL tick=N policy_t=..."
+#     heartbeat at ~1 Hz. On a 5 minute teleop session that's 300 lines
+#     of nearly-identical chatter that drown out the throttled recorder
+#     status and the truly interesting events (scene_reset queued,
+#     scene_reset applied, deploy_alive flips, etc).
+#  2) Operators have asked for "one line per 5 s" on the screen; the
+#     awk filter below keeps every non-tick line verbatim and admits
+#     a CONTROL tick line only if at least 5 s have elapsed since the
+#     last one. Full unmodified log still lives at $DEPLOY_LOG for
+#     postmortem.
+DEPLOY_LOG_THROTTLE_S="${DEPLOY_LOG_THROTTLE_S:-5}"
+(
+    tail -F "${DEPLOY_LOG}" 2>/dev/null \
+    | awk -v throttle="${DEPLOY_LOG_THROTTLE_S}" '
+        /CONTROL tick=/ {
+            now = systime();
+            if (now - last_tick >= throttle) {
+                print "[deploy] " $0;
+                last_tick = now;
+            }
+            next;
+        }
+        { print "[deploy] " $0 }
+    '
+) &
 TAIL_PID=$!
 
-# Wait for the deploy to print its 'Launching ...' line, with a hard
+# Wait for the deploy to actually be online and stepping, with a hard
 # cap. Docker bring-up + ros2 startup can easily take 30-60 s the first
-# time, so 5 s was much too short.
+# time.
+#
+# IMPORTANT: do NOT grep for ``Launching ...``. ``deploy_x2.sh`` prints
+# that string from its own banner BEFORE forking the ros2 / bridge /
+# MuJoCo process, so a match on iteration 0 would short-circuit the
+# wait and hand off to the recorder while docker is still spinning.
+# We instead wait for the C++ deploy's first ``CONTROL tick=N`` line,
+# which is only printed after:
+#   (1) the bridge has bound all of its PUB sockets,
+#   (2) the bridge has handed PD authority over to the deploy,
+#   (3) the policy is actually running and emitting commands.
+# That is the earliest moment at which the recorder will see a fresh
+# x2_debug heartbeat (``deploy_alive=True``).
+#
+# We also abort on any ``failed to bind`` line in the bridge log,
+# because a port collision means the recorder will silently get a
+# half-degraded deploy (e.g. scene_state up, x2_debug down) -- exactly
+# the failure mode that left the operator teleoping into the void.
 DEPLOY_BOOT_TIMEOUT_S="${DEPLOY_BOOT_TIMEOUT_S:-180}"
-echo "[record_x2_dataset.sh] waiting up to ${DEPLOY_BOOT_TIMEOUT_S}s for deploy to start …"
+echo "[record_x2_dataset.sh] waiting up to ${DEPLOY_BOOT_TIMEOUT_S}s for deploy to come online …"
 DEPLOY_READY=false
 for ((i = 0; i < DEPLOY_BOOT_TIMEOUT_S; i++)); do
     if ! kill -0 "${DEPLOY_PID}" 2>/dev/null; then
@@ -327,7 +486,20 @@ for ((i = 0; i < DEPLOY_BOOT_TIMEOUT_S; i++)); do
         kill "${TAIL_PID}" 2>/dev/null || true
         exit 1
     fi
-    if grep -q "Launching ..." "${DEPLOY_LOG}" 2>/dev/null; then
+    if grep -qE "failed to bind on port|PUB failed to bind|Address already in use" "${DEPLOY_LOG}" 2>/dev/null; then
+        echo "" >&2
+        echo "Error: bridge failed to bind one of its ZMQ PUB sockets." >&2
+        echo "       This usually means a previous deploy/container is still" >&2
+        echo "       holding the port. Offending lines from ${DEPLOY_LOG}:" >&2
+        grep -nE "failed to bind on port|PUB failed to bind|Address already in use" "${DEPLOY_LOG}" >&2 | head -5
+        echo "" >&2
+        echo "       Stop the offender (``docker ps`` then ``docker stop <name>``)" >&2
+        echo "       and rerun. The wrapper's preflight should normally catch this." >&2
+        kill -INT "${DEPLOY_PID}" 2>/dev/null || true
+        kill "${TAIL_PID}" 2>/dev/null || true
+        exit 1
+    fi
+    if grep -q "CONTROL tick=" "${DEPLOY_LOG}" 2>/dev/null; then
         DEPLOY_READY=true
         break
     fi
@@ -335,7 +507,7 @@ for ((i = 0; i < DEPLOY_BOOT_TIMEOUT_S; i++)); do
 done
 
 if ! ${DEPLOY_READY}; then
-    echo "Error: deploy didn't print 'Launching ...' in ${DEPLOY_BOOT_TIMEOUT_S}s. See ${DEPLOY_LOG}" >&2
+    echo "Error: deploy didn't reach its first CONTROL tick in ${DEPLOY_BOOT_TIMEOUT_S}s. See ${DEPLOY_LOG}" >&2
     kill -INT "${DEPLOY_PID}" 2>/dev/null || true
     kill "${TAIL_PID}" 2>/dev/null || true
     exit 1
@@ -343,6 +515,41 @@ fi
 
 # Brief settle for the ZMQ pose SUB to bind before we start blasting.
 sleep 2
+
+# ----------------------------------------------------------------------
+# Deploy watchdog
+# ----------------------------------------------------------------------
+# The recorder doesn't have a handle on the deploy PID, so when the
+# deploy crashes mid-session (segfault, mujoco viewer close-button,
+# external ``docker kill``, ``--max-duration`` trip, etc) the recorder
+# just keeps publishing IK targets into a dead socket and the operator
+# stares at a frozen viewer wondering if Quest 3 is broken. Spawn a
+# small watcher in the background that polls ``kill -0`` on the deploy
+# PID once a second and, the first time it disappears, prints a loud
+# red banner on stderr AND signals the recorder to shut down so the
+# operator gets immediate feedback instead of a silent dead loop.
+deploy_watchdog() {
+    local pid="$1"
+    local recorder_pgid="$2"
+    while kill -0 "${pid}" 2>/dev/null; do
+        sleep 1
+    done
+    # Use raw ANSI here -- the recorder's own banner uses the same.
+    local R=$'\033[1;31m'; local NC=$'\033[0m'
+    {
+        echo ""
+        echo "${R}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+        echo "${R}║  [deploy-watch] DEPLOY PROCESS EXITED                                ║${NC}"
+        echo "${R}║  pid=${pid}  log=${DEPLOY_LOG}${NC}"
+        echo "${R}║  Last 20 lines of the deploy log:                                    ║${NC}"
+        echo "${R}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+        tail -n 20 "${DEPLOY_LOG}" 2>/dev/null | sed "s/^/[deploy-watch] /"
+        echo ""
+    } >&2
+    # SIGINT the recorder process group so its own clean shutdown path
+    # (which flushes the LeRobot dataset) gets a chance to fire.
+    kill -INT -- "-${recorder_pgid}" 2>/dev/null || true
+}
 
 echo "[record_x2_dataset.sh] launching recorder …"
 RECORDER_ARGS=()
@@ -352,16 +559,46 @@ fi
 if ${TELEOP_ONLY}; then
     RECORDER_ARGS+=("--teleop-only")
 else
-    RECORDER_ARGS+=("--output-dir" "${OUTPUT_DIR}" "--task" "${TASK}")
+    RECORDER_ARGS+=("--output-dir" "${OUTPUT_DIR}")
+    if [[ -n "${TASK}" ]]; then
+        RECORDER_ARGS+=("--task" "${TASK}")
+    fi
+fi
+if [[ "${ROBOCASA_ENV}" != "none" ]]; then
+    # Recorder resolves the scene XML from this name (same lookup as
+    # the bridge wiring above) and pulls the canonical task instruction
+    # from the .json sidecar, so the LeRobot task column matches the
+    # scene the deploy is rendering.
+    RECORDER_ARGS+=("--robocasa-env" "${ROBOCASA_ENV}")
 fi
 
+# Run the recorder in its own session so the deploy watchdog can
+# target the whole subtree with a single ``kill -INT -- -pgid``
+# without risking that we INT our own shell. We deliberately do NOT
+# pass ``setsid -w``: with -w setsid stays alive as a parent and
+# ``$!`` would be the setsid PID, not the recorder. Without -w,
+# setsid execs into the recorder, so ``$!`` IS the recorder PID
+# AND the new session leader (== PGID).
+#
+# We also forward the recorder's stdin from the controlling tty so
+# Quest 3 isn't the only input source -- the operator can still
+# Ctrl-C this wrapper and SIGINT propagates via the EXIT trap.
 set +e
-"${VENV_PY}" -m gear_sonic.scripts.record_x2_dataset \
+setsid "${VENV_PY}" -m gear_sonic.scripts.record_x2_dataset \
     "${RECORDER_ARGS[@]}" \
-    "${EXTRA_ARGS[@]}"
+    "${EXTRA_ARGS[@]}" </dev/null &
+RECORDER_PID=$!
+RECORDER_PGID="${RECORDER_PID}"
+
+deploy_watchdog "${DEPLOY_PID}" "${RECORDER_PGID}" &
+WATCHDOG_PID=$!
+
+wait "${RECORDER_PID}"
 RC=$?
 set -e
 
+# Stop the watchdog so it doesn't fire after a clean recorder exit.
+kill "${WATCHDOG_PID}" 2>/dev/null || true
 kill "${TAIL_PID}" 2>/dev/null || true
 
 echo "[record_x2_dataset.sh] recorder exited with rc=${RC}"

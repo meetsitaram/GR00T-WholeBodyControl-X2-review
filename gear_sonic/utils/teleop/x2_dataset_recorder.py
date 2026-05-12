@@ -135,6 +135,12 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 _LEFT_ARM_MJ_SLICE = slice(15, 22)   # left shoulder/elbow/wrist (7 joints)
 _RIGHT_ARM_MJ_SLICE = slice(22, 29)  # right arm (7 joints)
 
+# How often to re-print the dead-deploy warning when proprio stays
+# silent. The first warning fires immediately on the alive->stale
+# transition; subsequent re-warnings are gated to once per
+# ``_DEPLOY_SILENT_REWARN_S`` seconds so a long crash doesn't spam.
+_DEPLOY_SILENT_REWARN_S: float = 30.0
+
 
 @dataclass
 class RecorderConfig:
@@ -196,6 +202,33 @@ class RecorderConfig:
         default_factory=FingerFilterParams
     )
 
+    # ── Curl / opposition stretch (opt-in binarisation) ───────────────
+    # Default live path is affine normalisation only -- the operator's
+    # raw Quest 3 curls get linearly mapped through their per-operator
+    # ``(floor[i], ceiling[i])`` calibration window so deliberate full-
+    # squeeze hits the OmniHand CLOSED anchor and rest hits OPEN. That
+    # preserves smooth intermediate gestures (half-grasp, soft pinch)
+    # but on a tight power-grasp pick-and-place the operator usually
+    # squeezes only ~70-85 % of their calibrated max which lands
+    # commanded q at ~70-85 % of the way to CLOSED -- the OmniHand
+    # fingers don't quite wrap the cube. Setting these knobs to True
+    # threads ``apply_curl_compensation`` / ``apply_oppose_compensation``
+    # into ``per_finger_grasp_command_from_curls_and_oppose`` so the
+    # per-finger / per-thumb-oppose stretch curve (defined in
+    # :mod:`gear_sonic.utils.teleop.x2_hand_retarget`) pushes mid-range
+    # curls toward CLOSED and saturates touch-onset oppose more
+    # aggressively. The ``finger_tip_oppose`` proximity drive (May 11
+    # milestone) still fires on actual fingertip touches independently
+    # of these two flags.
+    #
+    # When you flip these on you trade smooth-intermediate fidelity for
+    # reliable full closure. The docs reference (with calibration
+    # rationale): docs/source/tutorials/x2_dataset_record_and_replay.md
+    # § "Why we abandoned the global power-curve compensation" and the
+    # follow-up "opt-in tool" paragraph immediately below it.
+    apply_curl_compensation: bool = False
+    apply_oppose_compensation: bool = False
+
     # SONIC corrective-delta observability (v1 schema).
     # ``sonic_correction_warn_rad`` is the threshold over which the
     # operator log fires once per second; ``log_sonic_correction``
@@ -204,8 +237,56 @@ class RecorderConfig:
     sonic_correction_warn_rad: float = 0.05
     log_sonic_correction: bool = True
 
+    # ── Phase-1 robocasa scene plumbing (G1 architecture) ──────────────
+    # When ``scene_xml_path`` is set, the recorder:
+    #   (a) loads the static MJCF for ego-view rendering so frames show
+    #       the table + cube + bowl the deploy bridge is simulating;
+    #   (b) instantiates a :class:`RobocasaTaskMirror` so per-tick
+    #       success / reward / subtask signals can be appended to each
+    #       LeRobot frame as ``task.success`` / ``task.reward`` /
+    #       ``task.subtask_<name>`` columns;
+    #   (c) opens a SUB on the bridge's ``scene_state`` topic to receive
+    #       cube / bowl freejoint qpos at state-rate;
+    #   (d) opens a PUB on the bridge's ``scene_reset`` topic so episode
+    #       starts can push fresh per-episode object poses sampled by
+    #       the matching robocasa env's placement_initializer.
+    #
+    # All four behaviours are silent no-ops on a "no scene" recording so
+    # existing flat-floor data collection keeps working unchanged.
+    scene_xml_path: Optional[Path] = None
+    """Path to the static scene MJCF (built by
+    ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``). When None
+    the recorder runs in legacy flat-floor mode."""
+
+    robocasa_env: Optional[str] = None
+    """Robocasa env name (e.g. ``"X2PickPlaceCube"``). Falls back to the
+    metadata sidecar's ``env_name`` field when not set explicitly."""
+
+    scene_state_sub_host: str = "localhost"
+    scene_state_sub_port: int = 5559
+    scene_reset_pub_host: str = "*"
+    scene_reset_pub_port: int = 5560
+    """Defaults match
+    :data:`gear_sonic.utils.teleop.zmq.scene_state_zmq.SCENE_STATE_DEFAULT_PUB_PORT`
+    and the bridge's ``--scene-state-pub-port`` / ``--scene-reset-sub-port``
+    defaults. Override on both sides if you're running multiple bridges
+    on the same host."""
+
+    episode_seed: Optional[int] = None
+    """Optional RNG seed for the mirror's per-episode reset. ``None``
+    delegates to numpy's global RNG (default behaviour). Set this for
+    reproducible test recordings."""
+
     # Misc
     verbose: bool = True
+
+    # Operator-log cadence. Status print and SONIC-override print share
+    # this period (wall-clock seconds). Lower = chattier; raise to keep
+    # the terminal quiet during long recording sessions. The deploy-
+    # silence warning fires *independently* of this throttle (within
+    # ~``DEPLOY_ALIVE_STALE_THRESHOLD_S`` of the bridge going quiet),
+    # so cranking this up does not delay failure visibility.
+    status_log_period_s: float = 5.0
 
 
 @dataclass
@@ -297,11 +378,16 @@ class X2DatasetRecorder:
         self._calibration: Optional[OperatorCalibration] = None
         self._teleop: Optional[VRArmTeleopCalibrated] = None
 
-        # Quest 3 reader
+        # Quest 3 reader. ``quiet_periodic=True`` suppresses the per-100-msg
+        # ``[Quest3Reader] msgs=N fps=X idle`` heartbeat (otherwise once-per-
+        # second flood that drowns out the throttled recorder/deploy logs).
+        # First-packet snapshot and one-shot XR / source-changed events
+        # still fire.
         self._quest = Quest3Reader(
             ws_port=cfg.quest3_ws_port,
             http_port=cfg.quest3_http_port,
             use_ssl=cfg.quest3_use_ssl,
+            quiet_periodic=True,
         )
 
         # ZMQ
@@ -332,6 +418,127 @@ class X2DatasetRecorder:
         # loop spins up.
         self._renderer: Any | None = None
 
+        # ── Robocasa scene plumbing (G1) ───────────────────────────────
+        # Mirror is constructed eagerly here (its underlying robosuite
+        # env is built lazily on the first reset(), so this is cheap).
+        # The scene_state SUB thread + scene_reset PUB are armed only
+        # when a scene XML was supplied.
+        self._task_mirror = None
+        self._scene_state_thread: Optional[threading.Thread] = None
+        self._scene_reset_pub_sock = None
+        self._latest_scene_state = None
+        self._scene_state_lock = threading.Lock()
+        self._scene_metadata: Optional[dict[str, Any]] = None
+        if cfg.scene_xml_path is not None:
+            scene_xml = Path(cfg.scene_xml_path)
+            if not scene_xml.is_file():
+                raise FileNotFoundError(
+                    f"scene_xml_path does not exist: {scene_xml}"
+                )
+            meta_path = scene_xml.with_suffix(".json")
+            if not meta_path.is_file():
+                raise FileNotFoundError(
+                    f"scene metadata sidecar missing: {meta_path}. "
+                    f"Build it via gear_sonic/scripts/build_x2_robocasa_scene_xml.py."
+                )
+            import json as _json
+            self._scene_metadata = _json.loads(meta_path.read_text())
+            from gear_sonic.utils.teleop.robocasa_task_mirror import (
+                RobocasaTaskMirror,
+            )
+            print(
+                f"[recorder] robocasa scene mode: env="
+                f"{cfg.robocasa_env or self._scene_metadata.get('env_name')!r} "
+                f"xml={scene_xml}",
+                flush=True,
+            )
+            self._task_mirror = RobocasaTaskMirror(
+                scene_xml_path=scene_xml,
+                scene_metadata=self._scene_metadata,
+                env_name=cfg.robocasa_env,
+            )
+            # Override the operator-supplied task string with the env's
+            # canonical instruction so the LeRobot ``task`` column
+            # matches what the deploy is actually presenting.
+            if not cfg.task:
+                self._cfg.task = self._task_mirror.task_string
+            elif cfg.task != self._task_mirror.task_string:
+                print(
+                    f"[recorder] NOTE: cfg.task={cfg.task!r} differs from "
+                    f"scene metadata task_string="
+                    f"{self._task_mirror.task_string!r}; using cfg.task.",
+                    flush=True,
+                )
+
+            # scene_reset PUB (recorder -> bridge).
+            self._scene_reset_pub_sock = ctx.socket(zmq.PUB)
+            self._scene_reset_pub_sock.setsockopt(zmq.LINGER, 0)
+            self._scene_reset_pub_sock.bind(
+                f"tcp://{cfg.scene_reset_pub_host}:{cfg.scene_reset_pub_port}"
+            )
+            print(
+                f"[recorder] scene_reset PUB bound at "
+                f"tcp://{cfg.scene_reset_pub_host}:{cfg.scene_reset_pub_port}",
+                flush=True,
+            )
+
+            # scene_state SUB (bridge -> recorder, runs in its own thread
+            # so the main loop never blocks on ZMQ recv).
+            self._scene_state_thread = threading.Thread(
+                target=self._scene_state_subscriber,
+                name="scene-state-sub",
+                daemon=True,
+            )
+
+            # Extend the LeRobot features schema with the per-frame
+            # task.* columns the recorder will produce. Must be done
+            # before :meth:`_ensure_exporter` runs (i.e. before the
+            # first ``_start_episode``), otherwise the exporter's
+            # ``add_frame`` validator rejects the unknown keys.
+            self._features["task.success"] = {
+                "dtype": "int32",
+                "shape": (1,),
+                "names": ["success"],
+            }
+            self._features["task.reward"] = {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["reward"],
+            }
+            # Pre-register every subtask signal advertised by the mirror's
+            # oracle so the per-episode schema is stable. Prefer the
+            # mirror's static name list (introspectable without a synced
+            # state) to keep startup deterministic; fall back to a live
+            # ``subtask_signals()`` call when the env doesn't expose the
+            # static list (older mirrors).
+            sig_names: tuple[str, ...]
+            try:
+                sig_names = tuple(self._task_mirror.static_subtask_names)
+            except AttributeError:
+                sig_names = ()
+            if not sig_names:
+                try:
+                    sig_names = tuple(self._task_mirror.subtask_signals().keys())
+                except Exception as exc:
+                    sig_names = ()
+                    print(
+                        f"[recorder] WARN: could not introspect mirror "
+                        f"subtask signals ({exc}); subtask columns will be "
+                        f"dropped from frames.",
+                        flush=True,
+                    )
+            for sig_name in sig_names:
+                self._features[f"task.subtask_{sig_name}"] = {
+                    "dtype": "int32",
+                    "shape": (1,),
+                    "names": [sig_name],
+                }
+            print(
+                f"[recorder] task.subtask_* columns registered: "
+                f"{[f'task.subtask_{n}' for n in sig_names]}",
+                flush=True,
+            )
+
         # Exporter (created on first episode start to avoid empty
         # dataset directories when the operator never records anything).
         self._exporter: Optional[Gr00tDataExporter] = None
@@ -343,10 +550,25 @@ class X2DatasetRecorder:
         self._prev_buttons = (False, False, False, False)
 
         # SONIC corrective-delta logging state. ``_last_correction_log_t``
-        # throttles the operator log to once per second.
+        # throttles the operator log; cadence is ``cfg.status_log_period_s``.
         self._last_correction_log_t: float = 0.0
         self._frame_correction_max_seen: float = 0.0
         self._frame_correction_max_idx: int = -1
+
+        # Periodic status print throttle (wall clock; same cadence as
+        # the SONIC log). Initialised to 0.0 so the first status fires
+        # immediately on the first tick rather than after one period.
+        self._last_status_log_t: float = 0.0
+
+        # Dead-deploy detector. Once we have *ever* seen the deploy
+        # alive (``_deploy_was_alive=True``) and the latest snapshot
+        # reports stale, we print a one-shot red warning so operators
+        # don't sit and stare at a dead viewer thinking the recording
+        # is healthy. Re-warns are rate-limited (see
+        # ``_DEPLOY_SILENT_REWARN_S``) so a long crash doesn't spam
+        # the console either.
+        self._deploy_was_alive: bool = False
+        self._last_deploy_silent_warn_t: float = 0.0
 
         if cfg.teleop_only:
             print(
@@ -366,6 +588,9 @@ class X2DatasetRecorder:
     def start(self) -> None:
         self._quest.start()
         self._sub_thread.start()
+        # Robocasa scene_state subscriber (no-op when not in scene mode).
+        if self._scene_state_thread is not None:
+            self._scene_state_thread.start()
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
@@ -471,10 +696,25 @@ class X2DatasetRecorder:
             self._sub_thread.join(timeout=1.0)
         except Exception:
             pass
+        if self._scene_state_thread is not None:
+            try:
+                self._scene_state_thread.join(timeout=1.0)
+            except Exception:
+                pass
         try:
             self._pub_sock.close(linger=0)
         except Exception:
             pass
+        if self._scene_reset_pub_sock is not None:
+            try:
+                self._scene_reset_pub_sock.close(linger=0)
+            except Exception:
+                pass
+        if self._task_mirror is not None:
+            try:
+                self._task_mirror.close()
+            except Exception:
+                pass
         try:
             self._quest.stop()
         except Exception:
@@ -491,6 +731,7 @@ class X2DatasetRecorder:
         """Blocking 50 Hz publish + record loop. Returns total ticks."""
         if not self._cfg.teleop_only:
             self._build_renderer()
+        self._print_startup_banner()
         period = 1.0 / max(self._cfg.publish_rate_hz, 1e-6)
         next_tick = time.monotonic()
         tick = 0
@@ -563,6 +804,8 @@ class X2DatasetRecorder:
                     left_hand_q = per_finger_grasp_command_from_curls_and_oppose(
                         "left", l_curls, l_oppose,
                         finger_tip_oppose=l_finger_tip_oppose,
+                        apply_curl_compensation=self._cfg.apply_curl_compensation,
+                        apply_oppose_compensation=self._cfg.apply_oppose_compensation,
                         curl_floor=l_hr.floor if l_hr is not None else None,
                         curl_ceiling=l_hr.ceiling if l_hr is not None else None,
                         oppose_floor=l_hr.oppose_floor if l_hr is not None else None,
@@ -583,6 +826,8 @@ class X2DatasetRecorder:
                     right_hand_q = per_finger_grasp_command_from_curls_and_oppose(
                         "right", r_curls, r_oppose,
                         finger_tip_oppose=r_finger_tip_oppose,
+                        apply_curl_compensation=self._cfg.apply_curl_compensation,
+                        apply_oppose_compensation=self._cfg.apply_oppose_compensation,
                         curl_floor=r_hr.floor if r_hr is not None else None,
                         curl_ceiling=r_hr.ceiling if r_hr is not None else None,
                         oppose_floor=r_hr.oppose_floor if r_hr is not None else None,
@@ -653,10 +898,20 @@ class X2DatasetRecorder:
                         commanded_token=token,
                     )
 
+                # Two independent operator-visibility hooks:
+                #   1. dead-deploy warning (one-shot, fires within
+                #      ``DEPLOY_ALIVE_STALE_THRESHOLD_S`` of the bridge
+                #      going silent regardless of status throttle),
+                #   2. periodic status print (wall-clock cadence so it
+                #      doesn't drift with control rate).
+                now_log = time.monotonic()
+                self._maybe_warn_deploy_silent(now=now_log)
                 if (
                     self._cfg.verbose
-                    and tick % int(max(self._cfg.publish_rate_hz, 1)) == 0
+                    and (now_log - self._last_status_log_t)
+                        >= self._cfg.status_log_period_s
                 ):
+                    self._last_status_log_t = now_log
                     self._print_status(tick=tick, tick_result=tick_result)
 
                 tick += 1
@@ -719,6 +974,32 @@ class X2DatasetRecorder:
             self._finger_filter_left.reset()
         if self._finger_filter_right is not None:
             self._finger_filter_right.reset()
+
+        # Robocasa: re-randomise scene objects via the task mirror's
+        # placement_initializer, then push the new poses to the deploy.
+        if self._task_mirror is not None and self._scene_reset_pub_sock is not None:
+            from gear_sonic.utils.teleop.zmq.scene_state_zmq import (
+                serialize_reset_objects,
+            )
+            try:
+                payload = self._task_mirror.reset(
+                    seed=self._cfg.episode_seed
+                    if self._cfg.episode_seed is None
+                    else int(self._cfg.episode_seed) + self._episode_count
+                )
+                self._scene_reset_pub_sock.send(serialize_reset_objects(payload))
+                print(
+                    f"[recorder] [B] scene_reset sent: "
+                    f"freejoints={list(payload.object_freejoint_qpos)} "
+                    f"welded={list(payload.mutable_body_pos)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[recorder] [B] WARNING: scene_reset failed: {exc}",
+                    flush=True,
+                )
+
         self._is_recording = True
         print(
             f"[recorder] [B] episode start (task={self._cfg.task!r}, "
@@ -950,9 +1231,134 @@ class X2DatasetRecorder:
             "observation.images.ego_view": ego_view,
             "task": self._episode_buffer.task,
         }
+        # Robocasa mode: append per-frame success / reward / subtask
+        # signals from the task mirror. The mirror's mj_data has been
+        # synced from the deploy bridge's most recent ``scene_state``
+        # publish (see :meth:`_drain_scene_state_into_mirror`), so these
+        # match the deploy's view of the scene at this tick. We ALWAYS
+        # populate the task.* columns when the mirror exists -- even
+        # on mirror eval failure -- because the LeRobot exporter's
+        # ``validate_frame`` is strict about schema completeness and
+        # would reject frames missing keys we registered upfront.
+        if self._task_mirror is not None:
+            success_val = 0
+            reward_val = 0.0
+            subtask_vals: dict[str, int] = {}
+            try:
+                self._drain_scene_state_into_mirror()
+                success_val = int(bool(self._task_mirror.check_success()))
+                reward_val = float(self._task_mirror.compute_reward())
+                subtask_vals = {
+                    name: int(v)
+                    for name, v in self._task_mirror.subtask_signals().items()
+                }
+            except Exception as exc:
+                if self._cfg.verbose:
+                    print(
+                        f"[recorder] task mirror eval failed: {exc}; "
+                        "writing zero labels for this frame.",
+                        flush=True,
+                    )
+            frame_data["task.success"] = np.array(
+                [success_val], dtype=np.int32
+            )
+            frame_data["task.reward"] = np.array(
+                [reward_val], dtype=np.float32
+            )
+            for name in [
+                k.removeprefix("task.subtask_")
+                for k in self._features
+                if k.startswith("task.subtask_")
+            ]:
+                frame_data[f"task.subtask_{name}"] = np.array(
+                    [subtask_vals.get(name, 0)], dtype=np.int32
+                )
         self._episode_buffer.push(frame_data)
 
     # -- helpers --------------------------------------------------------------
+
+    def _scene_state_subscriber(self) -> None:
+        """Background SUB on the bridge's scene_state topic.
+
+        Stores the most recent :class:`SceneState` under
+        :attr:`_scene_state_lock` so the main loop can read it without
+        racing the ZMQ recv. The bridge sends at state-rate (default
+        200 Hz) so we use ``CONFLATE=1`` to avoid building up a queue.
+        """
+        try:
+            from gear_sonic.utils.teleop.zmq.scene_state_zmq import (
+                parse_scene_state, SCENE_STATE_TOPIC,
+            )
+        except ImportError as exc:
+            print(f"[recorder] scene_state SUB import failed: {exc}",
+                  flush=True)
+            return
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.SUBSCRIBE, SCENE_STATE_TOPIC.encode())
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        endpoint = (
+            f"tcp://{self._cfg.scene_state_sub_host}:"
+            f"{self._cfg.scene_state_sub_port}"
+        )
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            print(f"[recorder] scene_state SUB connect to {endpoint} "
+                  f"failed: {exc}", flush=True)
+            sock.close(linger=0)
+            return
+        print(f"[recorder] scene_state SUB connected at {endpoint}",
+              flush=True)
+        first = True
+        while not self._stop_event.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                print(f"[recorder] scene_state SUB recv error: {exc}",
+                      flush=True)
+                continue
+            try:
+                state = parse_scene_state(raw)
+            except ValueError as exc:
+                print(f"[recorder] scene_state decode error: {exc}",
+                      flush=True)
+                continue
+            with self._scene_state_lock:
+                self._latest_scene_state = state
+            if first:
+                first = False
+                print(
+                    f"[recorder] scene_state SUB: first message "
+                    f"(t={state.sim_time:.3f} freejoints="
+                    f"{list(state.object_freejoint_qpos)})",
+                    flush=True,
+                )
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+    def _drain_scene_state_into_mirror(self) -> None:
+        """Pull the latest scene_state snapshot and apply it to the mirror.
+
+        Idempotent: calling repeatedly with the same latest state writes
+        the same qpos/body_pos values into the mirror, which is fine
+        (mj_forward is cheap and the geometry doesn't change). Returns
+        immediately if no scene_state has been received yet.
+        """
+        if self._task_mirror is None:
+            return
+        with self._scene_state_lock:
+            state = self._latest_scene_state
+        if state is None:
+            return
+        self._task_mirror.sync_from_state(state)
 
     def _build_renderer(self) -> None:
         if self._renderer is not None:
@@ -960,6 +1366,11 @@ class X2DatasetRecorder:
         from gear_sonic.scripts.render_smoketest_episode_video import (
             MujocoFrameRenderer,
         )
+        # In robocasa mode we want the renderer to load the SAME static
+        # scene XML the deploy bridge sees so the recorded ego_view
+        # frames show the table + cube + bowl. Otherwise fall back to
+        # the legacy compose-only flat-floor model.
+        scene_xml_path = self._cfg.scene_xml_path
         print("[recorder] building MuJoCo ego renderer …", flush=True)
         self._renderer = MujocoFrameRenderer(
             camera="ego_view",
@@ -967,6 +1378,7 @@ class X2DatasetRecorder:
             height=self._cfg.render_height,
             with_omnihand=self._cfg.with_omnihand,
             egl=True,
+            scene_xml_path=scene_xml_path,
         )
         print(
             f"[recorder] renderer ready ({self._renderer.width}x"
@@ -1010,6 +1422,65 @@ class X2DatasetRecorder:
         }, indent=2) + "\n")
         print(f"[recorder] exporter ready -> {self._cfg.output_dir}", flush=True)
 
+    def _print_startup_banner(self) -> None:
+        """One-shot operator cheat-sheet printed before the main loop.
+
+        Surfaces the things you need to remember mid-session that aren't
+        visible anywhere else: the Quest 3 button map, the MuJoCo viewer
+        shortcuts (especially the new ``obj_left`` / ``obj_right``
+        workspace cameras), and the current scene + output paths. Kept
+        terse so the rest of the throttled per-5s status lines remain
+        readable.
+        """
+        scene = self._cfg.robocasa_env or "(no robocasa env -- pinned base only)"
+        out = self._cfg.output_dir if not self._cfg.teleop_only else "(teleop-only, no dataset)"
+        finger_filter = "ON" if self._cfg.finger_filter_params is not None else "OFF"
+        curl_comp = "ON" if self._cfg.apply_curl_compensation else "OFF (linear)"
+        oppose_comp = "ON" if self._cfg.apply_oppose_compensation else "OFF (linear)"
+        bar = "─" * 72
+        print(
+            "\n".join([
+                "",
+                bar,
+                "  X2 dataset recorder ready",
+                bar,
+                f"  scene       : {scene}",
+                f"  output      : {out}",
+                f"  task        : {self._cfg.task!r}",
+                "",
+                "  Finger control:",
+                f"    smoothing filter (v0.6) : {finger_filter}",
+                f"    curl compensation       : {curl_comp}  "
+                "(--apply-curl-compensation)",
+                f"    oppose compensation     : {oppose_comp}  "
+                "(--apply-oppose-compensation)",
+                "    > Turn ON both compensations if fingers don't fully",
+                "      close on a power-grasp pick-and-place. Default OFF",
+                "      preserves smooth intermediate gestures.",
+                "",
+                "  Quest 3 buttons:",
+                "    A   toggle arm tracking (engage / disengage IK)",
+                "    B   start a new episode (re-randomises scene objects)",
+                "    X   save current episode to disk",
+                "    Y   discard current episode",
+                "",
+                "  MuJoCo viewer (the GLFW window):",
+                "    Tab        cycle fixed cameras (obj_left, obj_right,",
+                "               rgbd_head_front, then free orbit camera)",
+                "    [ / ]      previous / next fixed camera",
+                "    H or F1    show / hide the help overlay (full keymap)",
+                "    Ctrl-L     toggle contact-point visualisation",
+                "    Ctrl-F     toggle contact-force vectors",
+                "    Mouse      orbit / pan / zoom (only when on free camera)",
+                "",
+                "  Status lines below are throttled to one every "
+                f"{self._cfg.status_log_period_s:.0f} s.",
+                bar,
+                "",
+            ]),
+            flush=True,
+        )
+
     def _print_status(self, *, tick: int, tick_result: Any) -> None:
         (
             _, _, _, _, _, alive
@@ -1026,6 +1497,67 @@ class X2DatasetRecorder:
             flush=True,
         )
 
+    def _maybe_warn_deploy_silent(self, *, now: float) -> None:
+        """Loud one-shot warning when the deploy bridge stops publishing.
+
+        Called every tick from the main loop. The check is cheap (a
+        single ``snapshot``-style read of ``last_update_monotonic``)
+        and *independent* of the ``status_log_period_s`` throttle so
+        operators see the failure within ~1.5 s of the bridge dying
+        regardless of how quiet the status log is.
+
+        The most common cause is an external process killing the
+        deploy's docker container (``docker kill`` from
+        ``run_live_vla_demo.sh stop`` or a parallel test cleanup hook
+        that filters by ``ancestor=x2sim`` -- see the comment in
+        ``run_live_vla_demo.sh`` ``stop_all`` for details). When that
+        happens the MuJoCo viewer vanishes and the deploy log stops
+        mid-stream with no goodbye message; without this hook the
+        recorder happily keeps buffering frames against a stale stand
+        pose for as long as the operator stays put.
+
+        Re-warnings are gated to once per
+        :data:`_DEPLOY_SILENT_REWARN_S` so a sustained outage doesn't
+        spam the terminal.
+        """
+        if not self._cfg.verbose:
+            return
+        with self._latest_state.cv:
+            received_any = self._latest_state.received_any
+            last_rx = self._latest_state.last_update_monotonic
+        if not received_any:
+            return
+        # Once we've seen at least one packet, latch ``_deploy_was_alive``
+        # so the warning only fires on a *transition* from alive -> stale,
+        # not during the legitimate startup window.
+        self._deploy_was_alive = True
+        silent_for = now - last_rx
+        if silent_for <= DEPLOY_ALIVE_STALE_THRESHOLD_S:
+            # Healthy: clear any prior warning state so a recovery + new
+            # outage will re-warn immediately.
+            self._last_deploy_silent_warn_t = 0.0
+            return
+        # Stale. Print once on the transition, then re-warn at most
+        # every ``_DEPLOY_SILENT_REWARN_S`` while it stays silent.
+        if (
+            self._last_deploy_silent_warn_t == 0.0
+            or (now - self._last_deploy_silent_warn_t) >= _DEPLOY_SILENT_REWARN_S
+        ):
+            self._last_deploy_silent_warn_t = now
+            # ANSI red to the terminal; harmless if redirected to a file.
+            red = "\033[31m"
+            reset = "\033[0m"
+            print(
+                f"{red}[recorder] !! deploy went silent (no x2_debug "
+                f"proprio for {silent_for:.2f}s) -- the MuJoCo "
+                f"viewer/container most likely died. Common cause: an "
+                f"external script ran ``docker kill`` on every container "
+                f"matching ``ancestor=x2sim`` (see "
+                f"``run_live_vla_demo.sh`` stop_all). Stop the recorder "
+                f"with X (save) or Ctrl-C (drop), then relaunch.{reset}",
+                flush=True,
+            )
+
     @staticmethod
     def _sleep_until(target_monotonic: float) -> None:
         slack = target_monotonic - time.monotonic()
@@ -1039,11 +1571,14 @@ class X2DatasetRecorder:
         commanded_body_q: np.ndarray,
         arm_delta_max: float,
     ) -> None:
-        """Once-per-second print when SONIC is overriding operator commands.
+        """Periodic print when SONIC is overriding operator commands.
 
-        Tracks the worst arm-joint delta seen in the last second and
+        Tracks the worst arm-joint delta seen in the throttle window and
         emits one line if it exceeds ``cfg.sonic_correction_warn_rad``.
-        Suppressed entirely when ``cfg.log_sonic_correction`` is False.
+        Cadence is shared with the status print
+        (``cfg.status_log_period_s``, default 5 s) so the operator
+        terminal stays quiet during long sessions. Suppressed entirely
+        when ``cfg.log_sonic_correction`` is False.
         """
         if not self._cfg.log_sonic_correction or not self._cfg.verbose:
             return
@@ -1056,7 +1591,7 @@ class X2DatasetRecorder:
             self._frame_correction_max_seen = arm_delta_max
             self._frame_correction_max_idx = int(np.argmax(full_delta))
         now = time.monotonic()
-        if now - self._last_correction_log_t < 1.0:
+        if (now - self._last_correction_log_t) < self._cfg.status_log_period_s:
             return
         self._last_correction_log_t = now
         if self._frame_correction_max_seen >= self._cfg.sonic_correction_warn_rad:

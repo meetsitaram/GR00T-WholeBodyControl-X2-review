@@ -184,6 +184,19 @@ class LocoManipulationEnv(ManipulationEnv, metaclass=LocoManipulationEnvMeta):
         "G1ArmsOnlyFloating": [0, 0, 0.793],
         "G1FloatingBody": [0, 0, 0.793],
         "G1FloatingBodyWithVertical": [0, 0, 0.793],
+        # AgiBot X2 Ultra: ROBOT_POS_OFFSETS[2] is "robot bottom height"
+        # in robosuite (``set_base_xpos`` writes ``pos - bottom_offset``
+        # to the root body).  The X2 MJCF root pelvis sits at
+        # ``pos="0 0 0.68"`` so robosuite reads ``bottom_offset = 0.68``;
+        # combined with the deploy idle-stand pose (legs straightened
+        # to ~0.67 m pelvis-to-sole drop) we need ``0.67 + 0.68 = 1.35``
+        # to put the soles flush on the arena floor.  The extra 0.005 m
+        # is a small clearance so MuJoCo doesn't start in penetration.
+        "X2Ultra": [0, 0, 1.355],
+        "X2UltraFixedBase": [0, 0, 1.355],
+        "X2UltraFixedLowerBody": [0, 0, 1.355],
+        "X2UltraArmsOnly": [0, 0, 1.355],
+        "X2UltraFloatingBody": [0, 0, 1.355],
     }
 
     def __init__(

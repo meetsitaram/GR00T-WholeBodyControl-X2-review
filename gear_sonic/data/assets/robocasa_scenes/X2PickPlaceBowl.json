@@ -1,0 +1,80 @@
+{
+  "env_name": "X2PickPlaceBowl",
+  "task_string": "pick up the blue bowl and place it on the green target zone",
+  "scene_body_names": [
+    "table_body_main",
+    "bowl_body",
+    "target_body"
+  ],
+  "object_freejoint_map": {
+    "bowl": "bowl_joint"
+  },
+  "object_welded_map": {
+    "target": "target_body",
+    "table": "table_body_main"
+  },
+  "object_contact_geoms": {
+    "bowl": [
+      "bowl_floor",
+      "bowl_wall_xp",
+      "bowl_wall_xn",
+      "bowl_wall_yp",
+      "bowl_wall_yn"
+    ],
+    "target": [
+      "target_collider"
+    ]
+  },
+  "hand_root_bodies": {
+    "left": "left_wrist_roll_link",
+    "right": "right_wrist_roll_link"
+  },
+  "fingertip_bodies": {
+    "left": [
+      "left_L_thumb_dip",
+      "left_L_index_dip",
+      "left_L_middle_dip",
+      "left_L_ring_dip",
+      "left_L_pinky_dip"
+    ],
+    "right": [
+      "right_R_thumb_dip",
+      "right_R_index_dip",
+      "right_R_middle_dip",
+      "right_R_ring_dip",
+      "right_R_pinky_dip"
+    ]
+  },
+  "object_initial_qpos": {
+    "bowl": [
+      0.5417478657400057,
+      -0.14682704480075812,
+      0.691446,
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "object_welded_pos": {
+    "target": [
+      0.5343353287409046,
+      0.1755735133639667,
+      0.684446
+    ],
+    "table": [
+      0.62,
+      0.0,
+      0.0
+    ]
+  },
+  "scene_asset_names": [
+    "bowl_mat",
+    "bowl_tex",
+    "table_body_Image_0",
+    "table_body_PBR_Material",
+    "table_body_lab_table",
+    "target"
+  ],
+  "scene_xml_path": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/assets/robocasa_scenes/X2PickPlaceBowl.xml"
+}

@@ -526,6 +526,28 @@ class Quest3Reader:
             elif event == "input_sources_changed":
                 count = data.get("count", 0)
                 sources = data.get("sources", [])
+                # The WebXR client emits an ``input_sources_changed``
+                # event every time the headset toggles between hand-only
+                # / controller / multimodal -- which on Quest 3 happens
+                # constantly as the operator rests the controllers and
+                # picks them back up. Build a stable signature of
+                # (handedness, has_grip, has_hand) tuples so we only log
+                # when the *actual* configuration changes, not on
+                # idempotent re-broadcasts. Knocks the per-session log
+                # volume from hundreds of lines down to a handful.
+                sig = tuple(sorted(
+                    (
+                        s.get("handedness", "?"),
+                        bool(s.get("has_gamepad", False)),
+                        bool(s.get("has_grip", False)),
+                        bool(s.get("has_hand", s.get("type") == "hand-tracking")),
+                    )
+                    for s in sources
+                ))
+                prev_sig = getattr(self, "_last_sources_sig", None)
+                if sig == prev_sig:
+                    return
+                self._last_sources_sig = sig
                 print(f"[Quest3Reader] Input sources changed: {count} detected")
                 # Quest 3 multimodal: a single source can carry BOTH
                 # hand-tracking and a gripSpace controller. Inspect
