@@ -1,0 +1,514 @@
+primitives:
+- bin_name: back_step_half_ft
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__Loop_Backward_Walk_001__A019
+  start_frame: 1326
+  n_frames: 70
+  fps: 30.0
+  measured_xy_m:
+  - -0.16663889355368644
+  - -0.008714252763956822
+  measured_yaw_deg: -0.7278194689645002
+  measured_waist_pitch_deg: 1.679189920425415
+  measured_waist_yaw_deg: 19.404430389404297
+  end_at_square_score: 0.614
+  end_at_apex_score: 0.1248
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6866
+  pelvis_z_max_m: 0.6971
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: back_step_quarter_ft
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_backward_loop_007__A026
+  start_frame: 658
+  n_frames: 58
+  fps: 30.0
+  measured_xy_m:
+  - -0.03881650087167746
+  - 0.0109651198993671
+  measured_yaw_deg: -3.2152790710284687
+  measured_waist_pitch_deg: 3.0579216480255127
+  measured_waist_yaw_deg: 6.066640853881836
+  end_at_square_score: 0.763
+  end_at_apex_score: 0.2605
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6773
+  pelvis_z_max_m: 0.6843
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: fwd_step_1ft
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_180_R_003__A333_M
+  start_frame: 240
+  n_frames: 50
+  fps: 30.0
+  measured_xy_m:
+  - 0.32322882183941987
+  - -0.006570602643940328
+  measured_yaw_deg: -2.2192131290407846
+  measured_waist_pitch_deg: 5.582137584686279
+  measured_waist_yaw_deg: 18.9725341796875
+  end_at_square_score: 0.7898
+  end_at_apex_score: 0.5605
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6781
+  pelvis_z_max_m: 0.7075
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: fwd_step_half_ft
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_forward_confident_impro_001__A002_M
+  start_frame: 629
+  n_frames: 70
+  fps: 30.0
+  measured_xy_m:
+  - 0.14129404715799246
+  - -0.06948398770408595
+  measured_yaw_deg: -3.3063132491502767
+  measured_waist_pitch_deg: 11.573750495910645
+  measured_waist_yaw_deg: 12.617141723632812
+  end_at_square_score: 0.6878
+  end_at_apex_score: 0.3669
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6836
+  pelvis_z_max_m: 0.6971
+  stride_count: 1
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: fwd_step_quarter_ft
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_backward_loop_007__A028
+  start_frame: 470
+  n_frames: 42
+  fps: 30.0
+  measured_xy_m:
+  - 0.04811570647710487
+  - -0.02118356881041356
+  measured_yaw_deg: 0.9910967609584935
+  measured_waist_pitch_deg: 1.6459414958953857
+  measured_waist_yaw_deg: 7.737509250640869
+  end_at_square_score: 0.8104
+  end_at_apex_score: 0.5955
+  feet_planted_score: 0.0002
+  pelvis_z_min_m: 0.6786
+  pelvis_z_max_m: 0.683
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: fwd_walk_standard
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_180_R_001__A331
+  start_frame: 242
+  n_frames: 90
+  fps: 30.0
+  measured_xy_m:
+  - 0.48711832247968845
+  - -0.006499771175637793
+  measured_yaw_deg: 0.23797566944637402
+  measured_waist_pitch_deg: 10.589550971984863
+  measured_waist_yaw_deg: 32.8203239440918
+  end_at_square_score: 0.4777
+  end_at_apex_score: 0.4507
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6657
+  pelvis_z_max_m: 0.7145
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: idle_stand
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__idle_vigilance_start_R_001__A502
+  start_frame: 33
+  n_frames: 45
+  fps: 30.0
+  measured_xy_m:
+  - -0.0011571726153704715
+  - -0.000303910210699464
+  measured_yaw_deg: -0.041563296528056515
+  measured_waist_pitch_deg: 0.062002744525671005
+  measured_waist_yaw_deg: 0.0815022736787796
+  end_at_square_score: 0.4324
+  end_at_apex_score: 1.0
+  feet_planted_score: 0.9314
+  pelvis_z_min_m: 0.6853
+  pelvis_z_max_m: 0.6854
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: lean_fwd_large
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_forward_weakend_sick_impro_002__A001_M
+  start_frame: 0
+  n_frames: 50
+  fps: 30.0
+  measured_xy_m:
+  - 0.01865032231161598
+  - -0.023646002594263745
+  measured_yaw_deg: 2.0566858528263707
+  measured_waist_pitch_deg: 8.17210865020752
+  measured_waist_yaw_deg: 2.122168779373169
+  end_at_square_score: 0.3238
+  end_at_apex_score: 1.0
+  feet_planted_score: 0.1468
+  pelvis_z_min_m: 0.6976
+  pelvis_z_max_m: 0.6996
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: lean_fwd_medium
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__medium_big_heavy_two_hands_pick_up_front_high_R_001__A523_M
+  start_frame: 72
+  n_frames: 50
+  fps: 30.0
+  measured_xy_m:
+  - -0.012270330022990201
+  - 0.008968125116773638
+  measured_yaw_deg: -0.12946152051339455
+  measured_waist_pitch_deg: 16.0
+  measured_waist_yaw_deg: 2.1194262504577637
+  end_at_square_score: 0.0102
+  end_at_apex_score: 0.9419
+  feet_planted_score: 0.1117
+  pelvis_z_min_m: 0.6754
+  pelvis_z_max_m: 0.6813
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: lean_fwd_small
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__walk_forward_relax_003__A006_M
+  start_frame: 0
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - -0.0002937549712026038
+  - 0.007275566469665023
+  measured_yaw_deg: -1.148449218117559
+  measured_waist_pitch_deg: 5.900445461273193
+  measured_waist_yaw_deg: 2.7372422218322754
+  end_at_square_score: 0.2043
+  end_at_apex_score: 1.0
+  feet_planted_score: 0.4631
+  pelvis_z_min_m: 0.6872
+  pelvis_z_max_m: 0.6888
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+# NOTE: side_left_step / side_right_step are now produced exclusively
+# from x2_planner_primitives_recipes.yaml (mocap source
+# walk_sideway_045_stop_001__A038_M frames [0,90]). The 4 old curator
+# auto-picks (side_left_half_ft, side_left_quarter_ft, side_right_half_ft,
+# side_right_quarter_ft) were dropped 2026-05-11 -- they did not match
+# what the user wanted (continuous gait with scissor + waist twist) and
+# the bin schema collapsed to a single canonical step per direction.
+# When the curator next runs it will re-pick from the current bin
+# schema (single side_left_step / side_right_step bins).
+- bin_name: torso_left_15deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__mosquito_squash_neck_left_R_001__A502_M
+  start_frame: 126
+  n_frames: 75
+  fps: 30.0
+  measured_xy_m:
+  - 0.00349875967372049
+  - -0.0018842839507978056
+  measured_yaw_deg: 1.3159012536808328
+  measured_waist_pitch_deg: 0.9417665004730225
+  measured_waist_yaw_deg: 8.099522590637207
+  end_at_square_score: 0.2437
+  end_at_apex_score: 0.9171
+  feet_planted_score: 0.3935
+  pelvis_z_min_m: 0.6839
+  pelvis_z_max_m: 0.6843
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: torso_left_30deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__arc_walk_left_stop_004__A037
+  start_frame: 245
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - 0.03029254338279786
+  - -0.03627584095456539
+  measured_yaw_deg: -19.396842858713043
+  measured_waist_pitch_deg: 4.989733695983887
+  measured_waist_yaw_deg: 30.981592178344727
+  end_at_square_score: 0.7755
+  end_at_apex_score: 0.9232
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6799
+  pelvis_z_max_m: 0.6905
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: torso_left_45deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__arc_walk_left_stop_004__A037
+  start_frame: 245
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - 0.03029254338279786
+  - -0.03627584095456539
+  measured_yaw_deg: -19.396842858713043
+  measured_waist_pitch_deg: 4.989733695983887
+  measured_waist_yaw_deg: 30.981592178344727
+  end_at_square_score: 0.7755
+  end_at_apex_score: 0.9232
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6799
+  pelvis_z_max_m: 0.6905
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: torso_right_15deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__small_heavy_one_hand_right_side_high_to_front_high_R_001__A526
+  start_frame: 126
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - 0.012942510440141053
+  - -0.0061451278065289446
+  measured_yaw_deg: 0.1531339544467018
+  measured_waist_pitch_deg: 3.8381874561309814
+  measured_waist_yaw_deg: 14.058158874511719
+  end_at_square_score: 0.471
+  end_at_apex_score: 0.9266
+  feet_planted_score: 0.4746
+  pelvis_z_min_m: 0.6852
+  pelvis_z_max_m: 0.6855
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: torso_right_30deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__small_heavy_one_hand_right_side_high_to_front_high_R_001__A526
+  start_frame: 108
+  n_frames: 50
+  fps: 30.0
+  measured_xy_m:
+  - 0.00560065946109368
+  - 0.004927607047746846
+  measured_yaw_deg: -1.2691377068025707
+  measured_waist_pitch_deg: 4.877589702606201
+  measured_waist_yaw_deg: 17.692678451538086
+  end_at_square_score: 0.4755
+  end_at_apex_score: 0.9167
+  feet_planted_score: 0.3503
+  pelvis_z_min_m: 0.6852
+  pelvis_z_max_m: 0.6858
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: torso_right_45deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__small_heavy_two_hands_put_down_right_side_medium_R_001__A508_M
+  start_frame: 70
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - 0.02436974331817486
+  - 0.005319741053055999
+  measured_yaw_deg: -10.991451875230014
+  measured_waist_pitch_deg: 3.747728109359741
+  measured_waist_yaw_deg: 25.739110946655273
+  end_at_square_score: 0.5356
+  end_at_apex_score: 1.0
+  feet_planted_score: 0.002
+  pelvis_z_min_m: 0.6806
+  pelvis_z_max_m: 0.6831
+  stride_count: 0
+  partial: true
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_left_15deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__Step_Rotate_Reaction_Idle_0360_002__A019_M
+  start_frame: 1350
+  n_frames: 60
+  fps: 30.0
+  measured_xy_m:
+  - 0.004180398287706053
+  - -0.0036134293694683167
+  measured_yaw_deg: 15.555808252048374
+  measured_waist_pitch_deg: 2.785614013671875
+  measured_waist_yaw_deg: 5.907536029815674
+  end_at_square_score: 0.7896
+  end_at_apex_score: 0.9959
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6753
+  pelvis_z_max_m: 0.6815
+  stride_count: 0
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_left_30deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__idle_turn_360_R_003__A265_M
+  start_frame: 85
+  n_frames: 70
+  fps: 30.0
+  measured_xy_m:
+  - -0.008709002970910054
+  - -0.0033160766260291598
+  measured_yaw_deg: 30.071500360246635
+  measured_waist_pitch_deg: 1.7362689971923828
+  measured_waist_yaw_deg: 3.0264320373535156
+  end_at_square_score: 0.6401
+  end_at_apex_score: 0.4013
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6816
+  pelvis_z_max_m: 0.6912
+  stride_count: 0
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_left_45deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__Step_Rotate_Reaction_Idle_0135_001__A019
+  start_frame: 1040
+  n_frames: 105
+  fps: 30.0
+  measured_xy_m:
+  - 0.004064758378486051
+  - 0.006338796157364926
+  measured_yaw_deg: 45.8145371806331
+  measured_waist_pitch_deg: 1.6022555828094482
+  measured_waist_yaw_deg: 10.685492515563965
+  end_at_square_score: 0.7165
+  end_at_apex_score: 0.2055
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6758
+  pelvis_z_max_m: 0.6822
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_left_90deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__idle_turn_270_R_003__A235_M
+  start_frame: 0
+  n_frames: 90
+  fps: 30.0
+  measured_xy_m:
+  - 0.00829022762642221
+  - 0.01699165986323278
+  measured_yaw_deg: 90.02169328177891
+  measured_waist_pitch_deg: 7.613238334655762
+  measured_waist_yaw_deg: 7.435439109802246
+  end_at_square_score: 0.7886
+  end_at_apex_score: 0.0855
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6842
+  pelvis_z_max_m: 0.698
+  stride_count: 2
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_right_15deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__Turn_Start_Walk_0045_001__A020_M
+  start_frame: 2037
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - -0.0019481397518646183
+  - -0.01375823761355249
+  measured_yaw_deg: -14.853208686372623
+  measured_waist_pitch_deg: 2.263833522796631
+  measured_waist_yaw_deg: 12.008123397827148
+  end_at_square_score: 0.8572
+  end_at_apex_score: 1.0
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6822
+  pelvis_z_max_m: 0.686
+  stride_count: 0
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_right_30deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__big_heavy_one_hand_right_side_high_to_behind_high_R_002__A524_M
+  start_frame: 224
+  n_frames: 30
+  fps: 30.0
+  measured_xy_m:
+  - -0.00958068884962087
+  - 0.019603980550562887
+  measured_yaw_deg: -30.534086438641882
+  measured_waist_pitch_deg: 6.745004177093506
+  measured_waist_yaw_deg: 19.595840454101562
+  end_at_square_score: 0.8919
+  end_at_apex_score: 0.9712
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6805
+  pelvis_z_max_m: 0.6932
+  stride_count: 0
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_right_45deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__Step_Rotate_Reaction_Idle_0135_001__A017_M
+  start_frame: 1456
+  n_frames: 65
+  fps: 30.0
+  measured_xy_m:
+  - -0.007000815367744984
+  - -0.004084241125305541
+  measured_yaw_deg: -45.24308994063571
+  measured_waist_pitch_deg: 3.355700969696045
+  measured_waist_yaw_deg: 6.2100348472595215
+  end_at_square_score: 0.7475
+  end_at_apex_score: 0.3631
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6805
+  pelvis_z_max_m: 0.6869
+  stride_count: 1
+  partial: false
+  pinned: false
+  notes: auto-selected by curator
+- bin_name: turn_right_90deg
+  source_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+  motion_key: loco__step_rotate_idle_090_003__A023_M
+  start_frame: 37
+  n_frames: 150
+  fps: 30.0
+  measured_xy_m:
+  - -0.003573849076624071
+  - 0.018669065554980647
+  measured_yaw_deg: -89.83083332128464
+  measured_waist_pitch_deg: 3.759030342102051
+  measured_waist_yaw_deg: 9.080039978027344
+  end_at_square_score: 0.9302
+  end_at_apex_score: 0.0587
+  feet_planted_score: 0.0
+  pelvis_z_min_m: 0.6764
+  pelvis_z_max_m: 0.7114
+  stride_count: 2
+  partial: false
+  pinned: false
+  notes: auto-selected by curator

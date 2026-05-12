@@ -5,6 +5,8 @@
 // x2_deploy_onnx_ref.cpp during the full ROS 2 ament build).
 #include "zmq/zmq_debug_publisher.hpp"  // NOLINT(misc-include-cleaner)
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -78,6 +80,15 @@ std::unique_ptr<ZmqPoseInputSource> ZmqPoseInputSource::Connect(
   }
   source->latest_frame_.root_quat_xyzw = {0.0, 0.0, 0.0, 1.0};
   source->previous_frame_.root_quat_xyzw = {0.0, 0.0, 0.0, 1.0};
+  // Pre-fill the future-window slots with the same stand pose / identity
+  // quat so any Sample() that happens after has_future_window_ flips
+  // true but before a subsequent decode lands sees a sane reference.
+  for (auto& slot : source->latest_window_) {
+    slot = source->latest_frame_;
+  }
+  for (auto& slot : source->tick_window_) {
+    slot = source->latest_frame_;
+  }
   return source;
 }
 
@@ -164,6 +175,20 @@ void ZmqPoseInputSource::HandleDecoded(
   bool got_motion_token = false;
   int64_t next_frame_index = -1;
 
+  // ---- v5 future-window staging buffers --------------------------------
+  // Decoded into local arrays first; promoted into latest_window_ at the
+  // end iff the message carried a complete (joint_pos + root_quat) pair
+  // for all kFutureSlots strictly-future slots. window[0] is synthesized
+  // from the legacy single-frame fields below.
+  constexpr std::size_t kFutureSlots = NUM_FUTURE_FRAMES - 1;  // window[1..9]
+  std::array<std::array<double, NUM_DOFS>, kFutureSlots> future_jpos{};
+  std::array<std::array<double, NUM_DOFS>, kFutureSlots> future_jvel{};
+  std::array<std::array<double, 4>,        kFutureSlots> future_quat{};
+  bool got_future_jpos = false;
+  bool got_future_jvel = false;
+  bool got_future_quat = false;
+  double next_future_dt_s = DT_FUTURE_REF;
+
   // Seed next_frame from cache so partial messages don't overwrite valid state.
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -207,6 +232,33 @@ void ZmqPoseInputSource::HandleDecoded(
     } else if (f.name == "frame_index") {
       int64_t idx{};
       if (CopyInt64Scalar(f, b, &idx)) next_frame_index = idx;
+    } else if (f.name == "joint_pos_mj_future") {
+      // Expected shape: [kFutureSlots, NUM_DOFS]. Validate by total count
+      // inside CopyFloat32IntoDouble (which enforces field.shape product).
+      if (CopyFloat32IntoDouble(
+              f, b, future_jpos[0].data(), kFutureSlots * NUM_DOFS)) {
+        got_future_jpos = true;
+      }
+    } else if (f.name == "root_quat_xyzw_future") {
+      if (CopyFloat32IntoDouble(
+              f, b, future_quat[0].data(), kFutureSlots * 4)) {
+        got_future_quat = true;
+      }
+    } else if (f.name == "joint_vel_mj_future") {
+      // Optional: if absent we synthesize joint_vel from a finite-diff of
+      // future_jpos at consumer time.
+      if (CopyFloat32IntoDouble(
+              f, b, future_jvel[0].data(), kFutureSlots * NUM_DOFS)) {
+        got_future_jvel = true;
+      }
+    } else if (f.name == "future_dt_s") {
+      double tmp[1]{};
+      if (CopyFloat32IntoDouble(f, b, tmp, 1)) {
+        // Sanity-clip implausible values; default DT_FUTURE_REF on bad input.
+        if (tmp[0] >= 0.01 && tmp[0] <= 1.0) {
+          next_future_dt_s = tmp[0];
+        }
+      }
     }
     // Unknown fields are silently ignored (forward compat).
   }
@@ -243,6 +295,42 @@ void ZmqPoseInputSource::HandleDecoded(
       latest_motion_token_ = next_motion_token;
     }
     has_body_reference_.store(true, std::memory_order_release);
+
+    // ---- v5 future window: promote into latest_window_ if complete ----
+    //
+    // Only promote when both joint_pos and root_quat future arrays are
+    // present (joint_vel is optional -- we synthesize it via
+    // backward-finite-diff if missing). Partial v5 messages are
+    // intentionally treated as v4: the deploy keeps using the
+    // single-frame Sample() path until a fully-formed window arrives.
+    if (got_future_jpos && got_future_quat) {
+      latest_window_dt_ = next_future_dt_s;
+      // window[0] = the message's "current" pose. Velocity is the
+      // wall-clock finite-diff already computed in next_frame.
+      latest_window_[0] = next_frame;
+      const double dt_future = (next_future_dt_s > 1e-6)
+                                   ? next_future_dt_s
+                                   : DT_FUTURE_REF;
+      for (std::size_t k = 0; k < kFutureSlots; ++k) {
+        ReferenceFrame& slot = latest_window_[k + 1];
+        slot.joint_pos_mj = future_jpos[k];
+        slot.root_quat_xyzw = future_quat[k];
+        if (got_future_jvel) {
+          slot.joint_vel_mj = future_jvel[k];
+        } else {
+          // Backward finite-diff: vel[k] = (jpos[k] - jpos[k-1]) / dt
+          // with jpos[-1] taken as the current frame's joint_pos.
+          const auto& prev_jpos = (k == 0)
+              ? next_frame.joint_pos_mj
+              : future_jpos[k - 1];
+          for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+            slot.joint_vel_mj[i] =
+                (future_jpos[k][i] - prev_jpos[i]) / dt_future;
+          }
+        }
+      }
+      has_future_window_.store(true, std::memory_order_release);
+    }
   } else {
     // Token-only / hand-only frame: refresh side-channel caches without
     // touching the body reference (Sample() keeps returning the last
@@ -267,8 +355,52 @@ void ZmqPoseInputSource::HandleDecoded(
 // Sampling
 // ---------------------------------------------------------------------------
 
-ReferenceFrame ZmqPoseInputSource::Sample(double /*time*/) const
+ReferenceFrame ZmqPoseInputSource::Sample(double time) const
 {
+  // Tick boundary detection: the C++ tokenizer obs calls Sample() 10
+  // times per control tick at monotonically increasing ``time`` args
+  // (current_time + k * DT_FUTURE_REF for k = 0..9). Between ticks,
+  // ``time`` jumps BACKWARD (next tick's k=0 is +0.02s of the previous
+  // tick's k=0, but -0.88s relative to the previous tick's k=9). We use
+  // that backward jump to detect "this is the first Sample of a new
+  // tick" and snapshot ``latest_window_`` once per tick rather than
+  // taking ``cache_mutex_`` on every one of the 10 lookups.
+  //
+  // The half-DT_FUTURE_REF epsilon is generous enough to tolerate any
+  // realistic jitter in policy_time arithmetic but tight enough that
+  // a same-tick Sample re-call (e.g. wrist-bypass at line 1411) won't
+  // be confused for a new tick.
+  constexpr double kTickEpsilon = 0.5 * DT_FUTURE_REF;
+  const bool new_tick =
+      (prev_sample_t_ < 0.0) || (time + kTickEpsilon < prev_sample_t_);
+
+  if (new_tick) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (has_future_window_.load(std::memory_order_acquire)) {
+      tick_window_ = latest_window_;
+      tick_window_dt_ = latest_window_dt_;
+      tick_has_window_ = true;
+    } else {
+      tick_has_window_ = false;
+    }
+    tick_anchor_t_ = time;
+  }
+  prev_sample_t_ = time;
+
+  if (tick_has_window_) {
+    const double dt =
+        (tick_window_dt_ > 1e-6) ? tick_window_dt_ : DT_FUTURE_REF;
+    int k = static_cast<int>(std::lround((time - tick_anchor_t_) / dt));
+    constexpr int kMaxK = static_cast<int>(NUM_FUTURE_FRAMES) - 1;
+    if (k < 0)      k = 0;
+    if (k > kMaxK)  k = kMaxK;
+    return tick_window_[static_cast<std::size_t>(k)];
+  }
+
+  // Legacy single-frame fallback: pre-v5 publishers (or v5 publishers
+  // emitting a token-only or partial frame) land here. Behaviour matches
+  // the original v4 semantics: ``time`` is ignored, latest_frame_ is
+  // returned.
   std::lock_guard<std::mutex> lock(cache_mutex_);
   return latest_frame_;
 }

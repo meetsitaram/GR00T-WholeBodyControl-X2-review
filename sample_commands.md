@@ -85,6 +85,175 @@ SONIC-correction analysis (debug-only, not pulled into training
 batches). See [docs/source/tutorials/x2_dataset_record_and_replay.md](docs/source/tutorials/x2_dataset_record_and_replay.md)
 for the schema spec.
 
+## Robocasa scene mode (G1 architecture, hardware-required smoke)
+
+Adds a tabletop + cube + bowl scene to the deploy's MuJoCo and writes
+per-tick `task.success` / `task.reward` / `task.subtask_<name>` columns
+into the LeRobot dataset. The recorder loads the same static scene XML
+the deploy bridge sees, so the ego-view renders the table + objects
+and the `RobocasaTaskMirror` can grade success purely by mirroring the
+bridge's scene state over ZMQ. See
+[`decoupled_wbc/dexmg/gr00trobocasa/X2_INTEGRATION_NOTES.md`](decoupled_wbc/dexmg/gr00trobocasa/X2_INTEGRATION_NOTES.md)
+for the full architecture write-up.
+
+### Build the scene XMLs (one-time, after a fresh checkout)
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+```
+
+Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
+plus a `<env>.json` metadata sidecar. Both processes auto-discover the
+sidecar at startup.
+
+### Hardware-required smoke #1 — open the scene in deploy without recording
+
+Confirms the bridge boots with `--sim-mjcf` pointed at the scene and the
+operator can teleop arms freely without writing data. No Quest 3
+required if you skip teleop calibration; the bridge will still load and
+render the scene.
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --teleop-only \
+    --robocasa-env X2PickPlaceCube \
+    --wrist-bypass ik \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+What to look for in the deploy log:
+
+* `[bridge] loaded scene metadata: …/X2PickPlaceCube.json`
+* `[bridge] scene_state PUB bound at tcp://*:5559`
+* `[bridge] scene_reset SUB connected to tcp://localhost:5560`
+* MuJoCo viewer shows the X2 standing in front of a small lab table
+  with a red cube + blue bowl on top.
+
+### Hardware-required smoke #2 — record one robocasa episode end-to-end
+
+Drops the language-instruction requirement (the recorder picks it up
+from the scene metadata: "pick up the red cube and drop it into the
+blue bowl") and writes a real LeRobot v2.1 dataset with the
+`task.success` / `task.reward` / `task.subtask_grasp_cube` columns.
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_robocasa_pnp_smoke_v0 \
+    --robocasa-env X2PickPlaceCube \
+    --wrist-bypass ik \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+Operator buttons (Quest 3): **A** engages IK, **B** starts a fresh
+episode (this is when the mirror calls `reset()` and randomizes the
+cube), **X** saves, **Y** discards.
+
+#### Tight finger-closure variant (recommended for cube grasps)
+
+The default live finger pipeline is **affine-normalised only** so
+deliberate intermediate gestures (half-grasp, soft pinch) preserve
+their amplitude. On a tight power-grasp pick-and-place that means a
+~70-85 % squeeze (typical operator effort) maps to ~70-85 % of the
+way to the OmniHand CLOSED anchor — visually the fingers don't fully
+wrap a 4 cm cube. To fix this, layer the **opt-in stretch curves**
+on top of the affine normalisation so mid-range curls saturate
+toward CLOSED:
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_robocasa_pnp_v1 \
+    --robocasa-env X2PickPlaceCube \
+    --wrist-bypass ik \
+    --apply-curl-compensation \
+    --apply-oppose-compensation \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+The recorder banner at startup confirms the active mode:
+
+```
+Finger control:
+  smoothing filter (v0.6) : ON
+  curl compensation       : ON  (--apply-curl-compensation)
+  oppose compensation     : ON  (--apply-oppose-compensation)
+```
+
+The same flags are also exposed on `gear_sonic.scripts.teleop_x2_kinematic`
+for kinematic-only sessions. Background and tuning rationale:
+[`x2_dataset_record_and_replay.md` → "Why we abandoned the global
+power-curve compensation"](docs/source/tutorials/x2_dataset_record_and_replay.md).
+
+Post-flight check on the saved parquet (covers all six phases of the
+shaped-reward ladder):
+
+```sh
+.venv/bin/python - <<'PY'
+import pandas as pd, glob
+parquet = sorted(glob.glob("data/lerobot/x2_robocasa_pnp_smoke_v0/data/chunk-*/*.parquet"))[-1]
+df = pd.read_parquet(parquet)
+
+def _scalar(s):
+    return s.apply(lambda v: float(v[0]) if hasattr(v, '__len__') else float(v))
+
+print(f"=== {parquet} ===")
+print(f"frames: {len(df)}  duration ~{len(df)/50:.1f}s")
+task_cols = sorted(c for c in df.columns if c.startswith("task"))
+print(f"task columns: {task_cols}")
+print()
+
+if "task.success" in df.columns:
+    s = _scalar(df["task.success"])
+    print(f"task.success    : {int(s.sum())}/{len(s)} ticks "
+          f"(first_on_tick={int((s>0).idxmax()) if s.any() else 'never'})")
+if "task.reward" in df.columns:
+    r = _scalar(df["task.reward"])
+    print(f"task.reward     : sum={r.sum():.2f} max={r.max():.2f} mean={r.mean():.3f}")
+print()
+print("phase ladder ticks (any-on across episode):")
+for col in task_cols:
+    if col.startswith("task.subtask_"):
+        v = _scalar(df[col])
+        on = int(v.sum())
+        first = int((v>0).idxmax()) if v.any() else None
+        print(f"  {col:<32} {on:>5} ticks  first_on={first}")
+PY
+```
+
+Expected pattern on a clean cube-in-bowl demo (numbers are
+illustrative, not exact):
+
+```
+task.success    : 142/2079 ticks (first_on_tick=1937)
+task.reward     : sum=312.45 max=1.00 mean=0.150
+phase ladder ticks (any-on across episode):
+  task.subtask_approach_cube       1421 ticks  first_on=180
+  task.subtask_touch_cube           742 ticks  first_on=410
+  task.subtask_grasp_cube           526 ticks  first_on=510
+  task.subtask_cube_off_table       497 ticks  first_on=580
+  task.subtask_cube_above_bowl      214 ticks  first_on=1850
+  task.subtask_cube_in_bowl         142 ticks  first_on=1937
+```
+
+The `first_on` values should be strictly increasing through the
+ladder. If `task.success` stays at 0 the most likely culprits are:
+
+1. The bridge's `scene_state` PUB never came up — check the deploy log
+   for the `scene plumbing: N freejoints, M welded bodies, K object
+   collision geoms, L:N R:N hand geoms` line at boot.
+2. The mirror's mirror is reading the wrong body name — re-run
+   `.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all`
+   and confirm the JSON sidecar contains `object_contact_geoms`,
+   `hand_root_bodies`, and `fingertip_bodies`.
+3. The fingers aren't actually colliding with the cube — check the
+   scene XML doesn't contain `contype="0" conaffinity="0"` on the
+   fingertip cylinders (it shouldn't if it was rebuilt with the
+   `disable_hand_collisions=False` knob).
+
 ## Calibration (one-time per operator)
 
 ```sh
@@ -249,3 +418,104 @@ conda run -n env_isaaclab --no-capture-output python gear_sonic/scripts/eval_x2_
     --checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-22000-sphere-feet-20260501/model_step_022000.pt \
     --playlist gear_sonic/data/motions/playlists/showcase_v1.yaml
 ```
+
+## X2 heuristic locomotion planner
+
+The planner publishes 50 Hz pose refs over ZMQ that the SONIC deploy
+(sim or real) consumes via `--vla --vla-zmq-host/port`. Same planner +
+same deploy config drives both sim and real robot. Architecture and
+all knobs documented in
+[`docs/source/references/x2_heuristic_planner.md`](docs/source/references/x2_heuristic_planner.md).
+
+### Closed-loop sim with keyboard control
+
+Brings up `deploy_x2.sh sim --vla` (subscribes to ZMQ pose), the MuJoCo
+viewer (camera tracking pelvis), and the planner with keyboard intake,
+all under one trap-cleaned wrapper. Type keys in the same terminal to
+drive the robot.
+
+```sh
+gear_sonic/scripts/run_planner_smoke.sh --with-deploy --keyboard --duration 120
+```
+
+Each keypress **replaces** any pending commands (latest press wins);
+the currently-playing primitive finishes naturally. See `KEYBOARD_HELP`
+printed at startup for the full key map.
+
+### Closed-loop sim with a scripted demo
+
+```sh
+gear_sonic/scripts/run_planner_smoke.sh \
+    --demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml \
+    --with-deploy --duration 60
+```
+
+Available demos in `gear_sonic/data/scripted_demos/`:
+
+| Demo | Bins exercised |
+| --- | --- |
+| `eleven_motion_sequence.yaml` | All 11 working canonical bins (smoke for every family) |
+| `gallery_fwd_back_shuffle.yaml` | fwd_step + back_step variants |
+| `gallery_crouch.yaml` | crouch_medium |
+| `six_motion_smoke.yaml` | fwd_step + side steps + turns + back_step |
+| `side_steps_only_smoke.yaml` | side_left_step + side_right_step |
+| `forward_back_turn.yaml` | continuous walk + turns |
+| `static_reach.yaml` | leans + torso twists |
+| `manipulation_approach.yaml` | locomanipulation approach + reach |
+
+### Replay a baked planner trajectory directly (no ZMQ, no planner)
+
+Useful as a ground-truth reference: if a motion looks fine here but
+breaks through the planner path, the bug is in the planner / wire /
+future window, not in the bin or the policy.
+
+```sh
+bash gear_sonic_deploy/deploy_x2.sh sim --no-confirm \
+    --motion data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_planner_demo_eleven_motion_sequence.pkl \
+    --sim-profile parity \
+    --sim-viewer --max-duration 60
+```
+
+### Re-bake a demo PKL after a recipe / state-machine change
+
+```sh
+.venv/bin/python -m gear_sonic.scripts.bake_planner_demo_to_pkl \
+    --demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml \
+    --out  data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_planner_demo_eleven_motion_sequence.pkl
+```
+
+### Kinematic-only viewer (fastest iteration, no policy / no docker)
+
+```sh
+.venv/bin/python -m gear_sonic.scripts.view_x2_planner_mujoco \
+    --demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml
+```
+
+### Recovery: kill orphan planner / free the publish port
+
+```sh
+gear_sonic/scripts/run_planner_smoke.sh --cleanup-only
+```
+
+### Build / rebuild planner primitives PKL from recipes
+
+Defaults already point at the canonical paths; pass `--bins-only NAME ...`
+to rebuild a single bin during iteration.
+
+```sh
+.venv/bin/python -m gear_sonic.scripts.build_x2_planner_primitives
+```
+
+### Planner-vs-PKL parity check (catches future-window regressions)
+
+```sh
+.venv/bin/python -m gear_sonic.scripts.compare_planner_vs_motion \
+    --motion-pkl   data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_planner_demo_side_steps_only_smoke.pkl \
+    --planner-demo gear_sonic/data/scripted_demos/side_steps_only_smoke.yaml \
+    --duration 14 --no-sim-viewer
+```
+
+Compares pelvis displacement and per-joint ranges between the
+PklMotionReference path (ground truth) and the ZmqPoseInputSource
+path (planner). Big gaps indicate the deploy isn't decoding the v5
+future window correctly.

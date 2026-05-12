@@ -1,0 +1,59 @@
+# Gallery sweep of crouch bins.
+#
+# v2 (2026-05-13): all three crouch magnitudes are now aliased to
+# crouch_medium in LocomotionCommand.as_bin_name (same pattern as
+# fwd_step / side_left_step / side_right_step). The v1 synthesized
+# variants (3 / 6 / 10 cm pelvis drop) were under-tracked into a
+# shallow lean; the v2 crouch_medium uses a real squat-from-stand
+# mocap clip (~98 deg knee bend, ~27 cm pelvis drop, upright torso)
+# so the alias gives the user a single solid crouch.
+#
+# Source: A530_M front_medium_to_front_low [10, 135] (4.17 s @ 30 fps).
+# Hand-picked from 22 symmetric-squat candidates as the one with the
+# LOWEST torso pitch while still bending knees deeply.
+#
+# What "good" looks like in the viewer:
+#   - Robot drops into a clear squat: knees flex visibly (~30-50 deg
+#     under SONIC after policy under-tracking, 98 deg in the reference)
+#     and pelvis lowers noticeably (~10-15 cm under SONIC, 27 cm
+#     reference).
+#   - Torso stays roughly upright -- the squat hinges at hips + knees,
+#     NOT at the waist.
+#   - Both feet stay flat on the floor.
+#   - Pelvis returns to stand height by the end of each clip (the
+#     A530_M source has a clean recovery phase).
+#   - Minor forward XY drift at apex (~5-10 cm) is OK -- the actor's
+#     CG shifts forward to balance.
+#
+# Since all three magnitudes alias to the same bin, you'll see the
+# same crouch played three times -- this is intentional, it lets you
+# evaluate consistency / repeatability of the same primitive.
+#
+# Wall-clock budget:
+#   2.0s warmup
+#   + (4.17s motion + 2.0s idle pause) * 3 variants  ~= 18.5s
+#   + 2.0s tail idle
+#   = ~22 s. Use ``--duration 25`` for the run_planner_smoke wrapper.
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: crouch
+    magnitude: small
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: crouch
+    magnitude: medium
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: crouch
+    magnitude: large
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0

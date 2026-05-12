@@ -25,6 +25,47 @@
  *                                   docs/source/tutorials/vla_training.md).
  *     frame_index:    int64[1]      monotonic VLA tick counter
  *
+ * ## Wire format extension (v5: future-reference window)
+ *
+ * The X2 policy's tokenizer obs (``tokenizer_obs.cpp``) samples a 10-frame
+ * future-reference window at ``DT_FUTURE_REF = 0.1 s`` spacing on every
+ * control tick: ``t_k = current_time + k * 0.1`` for k = 0..9, with k=0
+ * being the current pose. ``PklMotionReference::Sample(t)`` honours the
+ * time argument by indexing the loaded PKL, so the policy sees the true
+ * future trajectory. The original v4 ZMQ wire carried ONE frame per
+ * message and ``Sample(time)`` ignored ``time``, so the policy saw the
+ * same frame replicated 10 times -- destroying the look-ahead cue and
+ * causing the policy to under-commit to dynamic gait (e.g. side-steps
+ * jiggling in place; see docs/source/dev_notes 2026-05-11 root-cause
+ * analysis).
+ *
+ * v5 adds optional fields carrying the strictly-future part of that
+ * window so the deploy can synthesize an in-memory mini-MotionSequence
+ * matching what PklMotionReference would expose:
+ *
+ *   joint_pos_mj_future:    float32[NUM_FUTURE_FRAMES - 1, 31]
+ *   root_quat_xyzw_future:  float32[NUM_FUTURE_FRAMES - 1, 4]
+ *   joint_vel_mj_future:    float32[NUM_FUTURE_FRAMES - 1, 31]  (publisher-side
+ *                                                                finite-diff)
+ *   frame_index_future:     int64  [NUM_FUTURE_FRAMES - 1]
+ *   future_dt_s:            float32[1]                          (== 0.1 s)
+ *
+ * ``window[0]`` is reconstructed from the existing single-frame
+ * ``joint_pos_mj`` / ``root_quat_xyzw`` fields; ``window[1..9]`` come
+ * from the new ``*_future`` arrays. When the future fields are absent
+ * (legacy v4 publishers or token-only frames), ``Sample(time)`` falls
+ * back to the v4 single-frame behaviour. This keeps the M2 mock VLA
+ * helpers and any existing integrations working unchanged.
+ *
+ * Pattern parity: the G1 deploy uses ``StreamedMotionMerger`` to merge
+ * multi-frame chunks into a sliding ``MotionSequence`` (see
+ * ``gear_sonic_deploy/src/g1/.../streamed_motion_merger.hpp``). For X2
+ * we use a smaller fixed ``NUM_FUTURE_FRAMES``-slot ring rather than
+ * a full ``MotionSequence`` because the X2 policy's tokenizer only
+ * looks 1 s ahead -- there's no need for arbitrary-horizon streaming
+ * yet. If we wire VLA token streaming later (v1+ of motion_token)
+ * we may want to graduate to ``StreamedMotionMerger``-style storage.
+ *
  * Compatibility with the existing wire format
  * -------------------------------------------
  *
@@ -136,6 +177,12 @@ class ZmqPoseInputSource : public ReferenceMotion {
     return has_body_reference_.load(std::memory_order_acquire);
   }
 
+  /// True once a v5 future-window-bearing message has been decoded; used by
+  /// the deploy to log "future-aware" vs "single-frame" Sample mode.
+  bool has_future_window() const noexcept {
+    return has_future_window_.load(std::memory_order_acquire);
+  }
+
  private:
   ZmqPoseInputSource(const std::string& host, int port, const std::string& topic);
 
@@ -164,6 +211,34 @@ class ZmqPoseInputSource : public ReferenceMotion {
   std::chrono::steady_clock::time_point previous_recv_{std::chrono::steady_clock::time_point::min()};
   ZmqHandJointsSnapshot       latest_hand_{};
   std::array<double, 64>      latest_motion_token_{};
+
+  // ---- v5 future-reference window --------------------------------------
+  //
+  // ``latest_window_[0]`` mirrors ``latest_frame_`` (k=0 == current pose
+  // synthesized from the legacy single-frame fields).
+  // ``latest_window_[1..NUM_FUTURE_FRAMES-1]`` come from the v5
+  // ``*_future`` arrays. Fully populated only when the most recent
+  // message carried the future fields; otherwise the deploy falls back
+  // to ``latest_frame_`` and the legacy single-frame Sample() path.
+  std::array<ReferenceFrame, NUM_FUTURE_FRAMES> latest_window_{};
+  double                latest_window_dt_{DT_FUTURE_REF};
+  std::atomic<bool>     has_future_window_{false};
+
+  // ---- per-tick snapshot consumed by Sample() (control thread only) ----
+  //
+  // Sample() is called 10 times per policy tick at monotonically
+  // increasing ``time`` arguments (current_time + k*0.1 for k=0..9).
+  // We detect tick boundaries (a sudden ``time`` decrease relative to
+  // the previous call) and snapshot ``latest_window_`` at the start of
+  // each tick so the 10 lookups within a tick are race-free without
+  // taking the cache_mutex_ on every call. ``mutable`` is sound here
+  // because Sample() is logically pure WRT the wire/cache state -- the
+  // snapshot is just a local optimisation private to the control thread.
+  mutable std::array<ReferenceFrame, NUM_FUTURE_FRAMES> tick_window_{};
+  mutable double tick_window_dt_{DT_FUTURE_REF};
+  mutable bool   tick_has_window_{false};
+  mutable double tick_anchor_t_{-1.0};
+  mutable double prev_sample_t_{-1.0};
 
   std::atomic<int64_t>        total_frames_received_{0};
   std::atomic<bool>           has_body_reference_{false};

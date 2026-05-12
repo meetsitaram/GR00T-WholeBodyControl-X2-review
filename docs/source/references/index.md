@@ -7,6 +7,7 @@ These pages contain the original standalone documentation that previously lived 
 - [Observation Configuration](observation_config.md) — YAML config format, all observation types with dimensions, and how to create custom observations
 - [Motion Reference Data](motion_reference.md) — reference motion file format, conversion, verification, and usage
 - [Kinematic Planner ONNX Model](planner_onnx.md) — detailed input/output specification for the ONNX-exported kinematic planner
+- [X2 Heuristic Locomotion Planner](x2_heuristic_planner.md) — Python heuristic planner that fills the role of the (unreleased) X2 kinematic planner: motion-primitive curator, 50 Hz state-machine daemon, scripted/keyboard/ZMQ command surface, and the layered validation pyramid
 - [JetPack 6 Flashing Guide](jetpack6.md) — flash the Orin NX on the Unitree G1
 - [Decoupled WBC (N1.5 / N1.6)](decoupled_wbc.md) — the earlier Decoupled WBC stack used in Gr00t N1.5 and N1.6
 - [X2 ↔ Isaac-GR00T Data Contract](x2_isaac_groot_data_contract.md) — the LeRobot v2.1 schema, ModalityConfig surface, and CLI knobs the X2 VLA pipeline must match (M0 reference)

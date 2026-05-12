@@ -378,6 +378,13 @@ SIM_MJCF=""
 SIM_MOTION=""
 SIM_INIT_FRAME=""
 SIM_VIEWER=false
+# Optional viewer-camera tracking. When SIM_CAM_TRACK_BODY is non-empty
+# the bridge sets cam.type=mjCAMERA_TRACKING and locks the framing onto
+# that body (e.g. "pelvis"). The other three knobs are forwarded as-is.
+SIM_CAM_TRACK_BODY=""
+SIM_CAM_DISTANCE=""
+SIM_CAM_ELEVATION=""
+SIM_CAM_AZIMUTH=""
 SIM_IMU_FROM=""
 SIM_HOLD_STIFFNESS_MULT=""
 # Bridge init-pose selector: empty = bridge default ('default'). 'gantry-hang'
@@ -650,6 +657,15 @@ Sim mode (only applies when 'sim' is selected; all optional):
                               overrides only.
   --sim-init-frame N          Motion frame to RSI from (default 0).
   --sim-viewer                Open the MuJoCo passive viewer window.
+  --sim-cam-track-body NAME   Lock the passive viewer's camera onto the named
+                              body (e.g. "pelvis") so the robot stays framed
+                              as it walks. Default: free camera.
+  --sim-cam-distance M        Tracking-camera distance in meters
+                              (default: bridge picks 3.5).
+  --sim-cam-elevation DEG     Tracking-camera elevation in degrees, negative
+                              looks down (default: bridge picks -12).
+  --sim-cam-azimuth DEG       Tracking-camera azimuth in degrees
+                              (0=+X, 90=+Y, 180=-X, 270=-Y; default 135).
   --sim-with-omnihand         Make the MuJoCo bridge load the X2 + OmniHand
                               augmented MJCF (programmatically composed via
                               gear_sonic.scripts.compose_x2_with_omnihand)
@@ -884,6 +900,10 @@ while [[ $# -gt 0 ]]; do
         --sim-motion)             SIM_MOTION="$2"; shift 2 ;;
         --sim-init-frame)         SIM_INIT_FRAME="$2"; shift 2 ;;
         --sim-viewer)             SIM_VIEWER=true; shift ;;
+      --sim-cam-track-body)     SIM_CAM_TRACK_BODY="$2"; shift 2 ;;
+      --sim-cam-distance)       SIM_CAM_DISTANCE="$2"; shift 2 ;;
+      --sim-cam-elevation)      SIM_CAM_ELEVATION="$2"; shift 2 ;;
+      --sim-cam-azimuth)        SIM_CAM_AZIMUTH="$2"; shift 2 ;;
         --sim-imu-from)           SIM_IMU_FROM="$2"; shift 2 ;;
         --sim-hold-stiffness-mult) SIM_HOLD_STIFFNESS_MULT="$2"; shift 2 ;;
         --sim-init-pose)          SIM_INIT_POSE="$2"; shift 2 ;;
@@ -1370,12 +1390,18 @@ if [[ "${VLA_MODE:-false}" == "true" ]]; then
     ROS2_ARGS+=("--zmq-pose-host" "${VLA_ZMQ_HOST:-localhost}")
     ROS2_ARGS+=("--zmq-pose-port" "${VLA_ZMQ_PORT:-5556}")
     ROS2_ARGS+=("--zmq-pose-topic" "${VLA_ZMQ_TOPIC:-pose}")
-    if [[ -n "${VLA_DEBUG_PORT:-}" && "${VLA_DEBUG_PORT}" != "0" ]]; then
-        ROS2_ARGS+=("--zmq-debug-port" "${VLA_DEBUG_PORT}")
-        ROS2_ARGS+=("--zmq-debug-topic" "${VLA_DEBUG_TOPIC:-x2_debug}")
-    fi
 elif [[ -n "$MOTION" ]]; then
     ROS2_ARGS+=("--motion" "$MOTION")
+fi
+# x2_debug telemetry PUB: enabled regardless of input source (VLA or
+# --motion playback) so dump_x2_debug.py works for BOTH paths. Without
+# this, A/B comparing PklMotionReference vs ZmqPoseInputSource is
+# blind on the --motion side: no per-tick body_q_target /
+# body_q_measured / safety_event stream. Set VLA_DEBUG_PORT=0 to
+# disable.
+if [[ -n "${VLA_DEBUG_PORT:-}" && "${VLA_DEBUG_PORT}" != "0" ]]; then
+    ROS2_ARGS+=("--zmq-debug-port" "${VLA_DEBUG_PORT}")
+    ROS2_ARGS+=("--zmq-debug-topic" "${VLA_DEBUG_TOPIC:-x2_debug}")
 fi
 [[ -n "$LOG_DIR" ]]           && ROS2_ARGS+=("--log-dir" "$LOG_DIR")
 [[ -n "$AUTOSTART" ]]         && ROS2_ARGS+=("--autostart-after" "$AUTOSTART")
@@ -2530,6 +2556,10 @@ elif [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_DT" ]]                   && BRIDGE_ARGS+=("--sim-dt" "$SIM_DT")
     BRIDGE_ARGS+=("--ros-domain-id" "$SIM_DOMAIN_ID")
     $SIM_VIEWER                          && BRIDGE_ARGS+=("--viewer")
+    [[ -n "$SIM_CAM_TRACK_BODY" ]]       && BRIDGE_ARGS+=("--cam-track-body" "$SIM_CAM_TRACK_BODY")
+    [[ -n "$SIM_CAM_DISTANCE" ]]         && BRIDGE_ARGS+=("--cam-distance" "$SIM_CAM_DISTANCE")
+    [[ -n "$SIM_CAM_ELEVATION" ]]        && BRIDGE_ARGS+=("--cam-elevation" "$SIM_CAM_ELEVATION")
+    [[ -n "$SIM_CAM_AZIMUTH" ]]          && BRIDGE_ARGS+=("--cam-azimuth" "$SIM_CAM_AZIMUTH")
     $SIM_PRINT_SCENE                     && BRIDGE_ARGS+=("--print-scene")
     $SIM_WITH_OMNIHAND                   && BRIDGE_ARGS+=("--with-omnihand")
     [[ -n "$SIM_HAND_ZMQ_HOST" ]]        && BRIDGE_ARGS+=("--hand-zmq-host" "$SIM_HAND_ZMQ_HOST")
