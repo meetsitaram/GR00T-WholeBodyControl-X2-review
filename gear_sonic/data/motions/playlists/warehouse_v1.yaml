@@ -1,0 +1,59 @@
+name: x2_ultra_warehouse_v1
+output_key: warehouse__v1__navigate_pick_place
+fps: 30
+
+# Start the run at the world origin, heading +X.
+zero_xy: true
+zero_yaw: true
+
+# Rest layer: held standing pose between every active segment, with a brief
+# SLERP blend on entry and exit. Source defaults to the curated relaxed-arms
+# stand pose; a single frame is held for `rest_frames` minus the two blends.
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 30          # 1.0 s @ 30 fps
+  blend_in_frames: 6       # 0.20 s SLERP from prev_last -> rest
+  blend_out_frames: 6      # 0.20 s SLERP from rest -> next_first
+
+# v1 storyline: walk-heavy, no deep squats. Warehouse-flavored sequence
+# (settle -> walk -> arc-left -> sideway-step -> heavy-walk -> settle) that
+# stays inside the policy's training distribution and exercises the
+# yaw-cylinder root chaining (every segment has its own world heading).
+segments:
+  - name: anchor_settle_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # ~1.0 s
+
+  - name: walk_forward_to_shelfA
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__walk_forward_loop_003__A034
+    start_frame: 0
+    n_frames: 90           # ~3.0 s, ~1.5 m forward
+
+  - name: arc_left_to_shelfA
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__arc_walk_left_loop_001__A038
+    start_frame: 0
+    n_frames: 60           # ~2.0 s, gentle left arc
+
+  - name: walk_with_cargo
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__big_heavy_two_hands_walk_ff_stop_180_R_001__A511
+    start_frame: 0
+    n_frames: 90           # ~3.0 s heavy walk + decel
+
+  - name: side_step_left
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Sideway_Walk_Left_001__A019
+    start_frame: 0
+    n_frames: 60           # ~2.0 s lateral
+
+  - name: anchor_settle_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # ~1.0 s

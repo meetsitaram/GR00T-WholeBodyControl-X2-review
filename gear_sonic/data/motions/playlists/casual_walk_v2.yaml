@@ -1,0 +1,71 @@
+name: x2_ultra_casual_walk_v2
+output_key: casual_walk__v2__tight_cycle
+fps: 30
+
+# Tighter version of casual_walk_v1 for a one-way gantry rail with ~5 ft
+# clearance. v1 used cycle 0 of loco__Turn_Start_Walk_0090_003__A020
+# (frames 0..345) which peaks at +1.81 m (~5.94 ft) -- on the real run
+# the robot reached "a couple of feet beyond the gantry rail limit".
+#
+# This v2 uses cycle 9 of the same multi-take recording (frames
+# 2639..2920) which is the smallest-peak self-contained out-and-back
+# cycle in the clip:
+#
+#   * peak |dxy| = 1.37 m (~4.5 ft) -- ~1.4 ft inside the v1 footprint
+#     and well within a 5 ft rail.
+#   * yaw swings through both +118 deg and -140 deg during the walk
+#     (left then right), so the policy still sees a full turn-and-
+#     return pattern, not a straight forward-and-back.
+#   * end point: (+0.01, -0.01) m, end yaw -1 deg -- robot returns to
+#     its starting tile within a centimetre.
+#   * 9.37 s of motion (281 frames) per cycle, looped 3x with idle
+#     rests between, bracketed by 1.0 s idle anchors -- ~32 s total
+#     reel before rest-layer seams.
+#
+# Verified kinematically via play_x2_motion_mujoco.py 2026-05-03.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 20            # 0.66 s held rest
+  blend_in_frames: 6         # 0.20 s
+  blend_out_frames: 6        # 0.20 s
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: walk_step_turn_return_1
+    # Cycle 9 of the multi-take Turn_Start_Walk recording. Self-
+    # contained: starts and ends at home (dist < 0.02 m), peak
+    # excursion 1.37 m (4.5 ft), full yaw turn through ~265 deg of
+    # combined swing. Looped 3x with idle rests between each cycle.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 281                # 9.37 s
+
+  - name: walk_step_turn_return_2
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 281                # 9.37 s
+
+  - name: walk_step_turn_return_3
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 2639
+    n_frames: 281                # 9.37 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

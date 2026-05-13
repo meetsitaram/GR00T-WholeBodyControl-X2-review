@@ -62,6 +62,14 @@ import scipy.spatial.transform
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+class _NullCtx:
+    """No-op context manager used when a viewer.lock() isn't available."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+
 class ElasticBand:
     """Virtual spring that hangs the robot's base body from world ``[0,0,1]``.
 
@@ -221,7 +229,76 @@ Examples:
 """,
     )
     p.add_argument("--mjcf", type=pathlib.Path, default=None,
-                   help="MJCF path (default: gear_sonic/data/assets/.../x2_ultra.xml)")
+                   help="MJCF path (default: gear_sonic/data/assets/.../x2_ultra.xml). "
+                        "Mutually exclusive with --with-omnihand (which programmatically "
+                        "composes a different model).")
+    p.add_argument("--with-omnihand", action="store_true",
+                   help="Compose the X2 + OmniHand augmented MJCF in-memory via "
+                        "gear_sonic.scripts.compose_x2_with_omnihand instead of "
+                        "loading the bare x2_ultra.xml. Replaces the dummy wrist "
+                        "stubs with the 10-active-DOF (per side) OmniHand "
+                        "fingers. The body joints and actuator names are "
+                        "unchanged so the deploy harness sees the exact same "
+                        "31-DoF interface; the hand qpos slots are driven by "
+                        "an optional ZMQ subscriber (see --hand-zmq-host / "
+                        "--hand-zmq-port).")
+    p.add_argument("--hand-zmq-host", type=str, default="localhost",
+                   help="Host the bridge SUBs on for OmniHand finger commands "
+                        "when --with-omnihand is set. Default 'localhost' "
+                        "(matches the live VLA bridge's PUB).")
+    p.add_argument("--hand-zmq-port", type=int, default=5556,
+                   help="Port for the OmniHand SUB (default 5556 -- the same "
+                        "port the SONIC C++ harness already subscribes to). "
+                        "ZMQ PUB/SUB is multi-subscriber-safe so the bridge "
+                        "can ride alongside the harness.")
+    p.add_argument("--hand-zmq-topic", type=str, default="pose",
+                   help="ZMQ topic prefix for the OmniHand SUB. Must match "
+                        "the live VLA bridge's --pub-topic (default 'pose').")
+    p.add_argument("--no-hand-zmq", action="store_true",
+                   help="Skip the OmniHand ZMQ subscriber even when "
+                        "--with-omnihand is set. Useful for static viewer "
+                        "screenshots: fingers stay at their MJCF rest pose.")
+    # ── G1 / robocasa scene plumbing ───────────────────────────────────
+    # When --mjcf points at a static scene XML built by
+    # gear_sonic/scripts/build_x2_robocasa_scene_xml.py, the bridge:
+    #   (a) auto-discovers the scene metadata sidecar (same stem, .json),
+    #   (b) PUBs cube/bowl/etc. freejoint qpos at state-rate so the
+    #       recorder's RobocasaTaskMirror can compute success/reward,
+    #   (c) SUBs to scene_reset on a separate port so the recorder can
+    #       inject fresh per-episode object poses (placement_initializer
+    #       output) into the bridge's MuJoCo at episode start.
+    # All three behaviours are silent no-ops on a "no scene metadata
+    # found" mjcf so existing flat-floor sims keep working unchanged.
+    p.add_argument("--scene-metadata", type=pathlib.Path, default=None,
+                   help="Override scene metadata JSON path (defaults to "
+                        "<mjcf>.json next to the MJCF when --mjcf is set).")
+    p.add_argument("--scene-state-pub-port", type=int, default=5559,
+                   help="ZMQ PUB port for the scene_state topic when scene "
+                        "metadata is detected. The recorder's "
+                        "RobocasaTaskMirror SUBs here to receive cube / "
+                        "bowl freejoint qpos at state-rate.")
+    p.add_argument("--scene-state-pub-host", default="*",
+                   help="Bind iface for the scene_state PUB (default '*').")
+    p.add_argument("--scene-reset-sub-port", type=int, default=5560,
+                   help="ZMQ SUB port for the scene_reset topic. The "
+                        "recorder publishes fresh object poses here at "
+                        "episode start; the bridge writes them into "
+                        "mj_data and re-runs mj_forward.")
+    p.add_argument("--scene-reset-sub-host", default="localhost",
+                   help="Connect iface for the scene_reset SUB.")
+    p.add_argument("--no-scene-zmq", action="store_true",
+                   help="Disable the scene_state PUB / scene_reset SUB even "
+                        "when scene metadata is detected. Useful when running "
+                        "the bridge against a scene XML purely for viewing.")
+    p.add_argument("--robot-pose-pub-port", type=int, default=5570,
+                   help="ZMQ PUB port for the ground-truth pelvis pose "
+                        "telemetry (sim-only; the real robot has no equivalent "
+                        "since it has no ground-truth XY). Host-side tools "
+                        "(browse_x2_planner_primitives.py --with-sonic) "
+                        "subscribe here to capture per-primitive distance "
+                        "and yaw deltas. Set to 0 to disable.")
+    p.add_argument("--robot-pose-pub-host", default="*",
+                   help="Bind iface for the robot_pose PUB (default '*').")
     p.add_argument("--motion", type=pathlib.Path, default=None,
                    help="Optional motion source for Reference State Initialization (RSI). "
                         "Accepts a motion-lib .pkl or a warehouse playlist .yaml/.yml "
@@ -260,6 +337,20 @@ Examples:
                         "preserve the damping ratio.")
     p.add_argument("--viewer", action="store_true",
                    help="Open the MuJoCo passive viewer window.")
+    p.add_argument("--cam-track-body", type=str, default=None,
+                   help="Body name to follow with the passive viewer's camera "
+                        "(e.g. 'pelvis'). Default: free camera (no tracking). "
+                        "Combine with --cam-distance/elevation/azimuth to frame.")
+    p.add_argument("--cam-distance", type=float, default=3.5,
+                   help="Tracking-camera distance (m) from the tracked body. "
+                        "Default 3.5; ignored unless --cam-track-body is set.")
+    p.add_argument("--cam-elevation", type=float, default=-12.0,
+                   help="Tracking-camera elevation (deg, negative = looking down). "
+                        "Default -12; ignored unless --cam-track-body is set.")
+    p.add_argument("--cam-azimuth", type=float, default=135.0,
+                   help="Tracking-camera azimuth (deg, 0=+X, 90=+Y, 180=-X, 270=-Y). "
+                        "Default 135 (3/4 view from front-right). Ignored unless "
+                        "--cam-track-body is set.")
     p.add_argument("--sim-dt", type=float, default=0.001,
                    help="Physics step (s). Default 0.001 (1 kHz).")
     p.add_argument("--state-rate-hz", type=float, default=200.0,
@@ -326,14 +417,237 @@ class X2MujocoRosBridge:
         self._ros_domain_id = os.environ.get("ROS_DOMAIN_ID", "0")
 
         # --- MuJoCo ---
-        mjcf_path = args.mjcf or pathlib.Path(self.eval_x2.MJCF_PATH)
-        if not mjcf_path.is_file():
-            raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
-        self.mjcf_path = mjcf_path
+        # Two paths:
+        #   * default (--mjcf or eval_x2.MJCF_PATH): bare X2 (dummy wrist
+        #     stubs, no OmniHand) -- the canonical 31-DoF model the
+        #     SONIC ONNX was trained against.
+        #   * --with-omnihand: programmatic compose via
+        #     gear_sonic.scripts.compose_x2_with_omnihand. Adds 10
+        #     active + 4 passive finger DOFs per side. The body joint
+        #     names + actuators are unchanged so the deploy harness's
+        #     joint-name handshake still passes.
+        if args.with_omnihand and args.mjcf is None:
+            # In-memory compose: bare canonical X2 + OmniHand, no scene.
+            # Lazy import: compose_x2_with_omnihand pulls additional
+            # urdfpy / mesh-IO machinery that we don't need on the
+            # default code path.
+            sys.path.insert(0, str(REPO_ROOT))  # so `gear_sonic.*` resolves
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                build_x2_with_omnihand_spec,
+            )
 
-        self.mj_model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+            spec, model, hand_layout = build_x2_with_omnihand_spec()
+            self.mj_model = model
+            self.mjcf_path = pathlib.Path("<composed: x2_ultra + omnihand>")
+            self._omnihand_layout = hand_layout
+        elif args.mjcf is not None:
+            mjcf_path = args.mjcf
+            if not mjcf_path.is_file():
+                raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
+            self.mjcf_path = mjcf_path
+            self.mj_model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+            # If the loaded MJCF already contains the canonical OmniHand
+            # active joints (it does when --mjcf points at a robocasa
+            # scene XML built by build_x2_robocasa_scene_xml.py), build
+            # the hand layout from the COMPILED model so OmniHand qpos
+            # ZMQ commands still flow through. The layout helper resolves
+            # everything by joint name -- it doesn't care that the bodies
+            # came from disk vs. an in-memory MjSpec.attach.
+            self._omnihand_layout = None
+            if args.with_omnihand:
+                sys.path.insert(0, str(REPO_ROOT))
+                from gear_sonic.scripts.compose_x2_with_omnihand import (
+                    _build_layout,
+                    _default_side_configs,
+                )
+                try:
+                    self._omnihand_layout = _build_layout(
+                        self.mj_model, _default_side_configs()
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"--with-omnihand was set but {mjcf_path} does not "
+                        f"contain the canonical OmniHand joints: {exc}"
+                    ) from exc
+        else:
+            mjcf_path = pathlib.Path(self.eval_x2.MJCF_PATH)
+            if not mjcf_path.is_file():
+                raise FileNotFoundError(f"MJCF not found: {mjcf_path}")
+            self.mjcf_path = mjcf_path
+            self.mj_model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+            self._omnihand_layout = None
+
+        # Auto-detect a scene metadata sidecar so the bridge knows which
+        # freejoints / welded bodies to publish + accept resets for. The
+        # sidecar lives next to the MJCF with a .json suffix (the build
+        # script's default layout). Override via --scene-metadata.
+        self._scene_metadata: dict | None = None
+        self._scene_freejoint_qadr: dict[str, int] = {}
+        self._scene_freejoint_dofadr: dict[str, int] = {}
+        self._scene_welded_bid: dict[str, int] = {}
+        # Per-object contact geom IDs (filled in below from the metadata's
+        # object_contact_geoms table). Used by ``_collect_grasp_contacts``
+        # to classify each ``mj_data.contact`` entry.
+        self._scene_object_geom_ids: dict[str, set[int]] = {}
+        # Per-side hand geom ID sets, built by walking from the wrist root
+        # body listed in the metadata. Used to classify a contact entry as
+        # left-hand vs right-hand vs neither.
+        self._scene_hand_geom_ids: dict[str, set[int]] = {"left": set(), "right": set()}
+        # Per-side fingertip body IDs (the *_dip distal phalanges). Their
+        # world positions feed the shaped-reward "approach" phase.
+        self._scene_fingertip_bids: dict[str, list[int]] = {"left": [], "right": []}
+        meta_path: pathlib.Path | None = None
+        if args.scene_metadata is not None:
+            meta_path = args.scene_metadata
+        elif args.mjcf is not None:
+            cand = args.mjcf.with_suffix(".json")
+            if cand.is_file():
+                meta_path = cand
+        if meta_path is not None and meta_path.is_file():
+            import json
+            try:
+                self._scene_metadata = json.loads(meta_path.read_text())
+                print(f"[bridge] loaded scene metadata: {meta_path}")
+            except Exception as exc:
+                print(f"[bridge] WARNING: could not parse scene metadata "
+                      f"{meta_path}: {exc}", file=sys.stderr)
+                self._scene_metadata = None
+        if self._scene_metadata is not None:
+            for jname in self._scene_metadata.get(
+                "object_freejoint_map", {}
+            ).values():
+                jid = mujoco.mj_name2id(
+                    self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname
+                )
+                if jid < 0:
+                    print(f"[bridge] WARNING: scene freejoint {jname!r} "
+                          f"not found in MJCF; skipping.", file=sys.stderr)
+                    continue
+                self._scene_freejoint_qadr[jname] = int(
+                    self.mj_model.jnt_qposadr[jid]
+                )
+                self._scene_freejoint_dofadr[jname] = int(
+                    self.mj_model.jnt_dofadr[jid]
+                )
+            for bname in self._scene_metadata.get(
+                "object_welded_map", {}
+            ).values():
+                bid = mujoco.mj_name2id(
+                    self.mj_model, mujoco.mjtObj.mjOBJ_BODY, bname
+                )
+                if bid < 0:
+                    print(f"[bridge] WARNING: scene welded body {bname!r} "
+                          f"not found in MJCF; skipping.", file=sys.stderr)
+                    continue
+                self._scene_welded_bid[bname] = int(bid)
+
+            # Resolve per-object contact-geom IDs.
+            for logical, geom_names in self._scene_metadata.get(
+                "object_contact_geoms", {}
+            ).items():
+                ids: set[int] = set()
+                for gname in geom_names:
+                    gid = mujoco.mj_name2id(
+                        self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, gname
+                    )
+                    if gid < 0:
+                        print(
+                            f"[bridge] WARNING: scene contact geom {gname!r} "
+                            f"(logical={logical!r}) not in MJCF; skipping.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    ids.add(int(gid))
+                if ids:
+                    self._scene_object_geom_ids[logical] = ids
+
+            # Resolve per-side hand geom IDs by walking the body subtree
+            # rooted at each wrist_roll_link. This catches every fingertip
+            # cylinder + thumb collision box without having to enumerate
+            # them in the metadata.
+            for side, root_bname in self._scene_metadata.get(
+                "hand_root_bodies", {}
+            ).items():
+                root_bid = mujoco.mj_name2id(
+                    self.mj_model, mujoco.mjtObj.mjOBJ_BODY, root_bname
+                )
+                if root_bid < 0:
+                    print(
+                        f"[bridge] WARNING: hand root {root_bname!r} not "
+                        f"in MJCF; side {side!r} contact reporting disabled.",
+                        file=sys.stderr,
+                    )
+                    continue
+                # Walk every body whose ancestor chain passes through
+                # root_bid; for each such body, collect its geom IDs.
+                # MuJoCo's body_parentid lets us check ancestry in O(depth).
+                hand_gids: set[int] = set()
+                for bid in range(self.mj_model.nbody):
+                    cur = int(bid)
+                    while cur > 0:
+                        if cur == root_bid:
+                            geomadr = int(self.mj_model.body_geomadr[bid])
+                            geomnum = int(self.mj_model.body_geomnum[bid])
+                            for k in range(geomnum):
+                                hand_gids.add(geomadr + k)
+                            break
+                        cur = int(self.mj_model.body_parentid[cur])
+                self._scene_hand_geom_ids[side] = hand_gids
+
+            # Resolve per-side fingertip body IDs.
+            for side, body_names in self._scene_metadata.get(
+                "fingertip_bodies", {}
+            ).items():
+                tip_bids: list[int] = []
+                for bname in body_names:
+                    bid = mujoco.mj_name2id(
+                        self.mj_model, mujoco.mjtObj.mjOBJ_BODY, bname
+                    )
+                    if bid < 0:
+                        print(
+                            f"[bridge] WARNING: fingertip body {bname!r} "
+                            f"not in MJCF; skipping (side={side}).",
+                            file=sys.stderr,
+                        )
+                        continue
+                    tip_bids.append(int(bid))
+                self._scene_fingertip_bids[side] = tip_bids
+
+            print(
+                f"[bridge] scene plumbing: "
+                f"{len(self._scene_freejoint_qadr)} freejoints, "
+                f"{len(self._scene_welded_bid)} welded bodies, "
+                f"{sum(len(v) for v in self._scene_object_geom_ids.values())} "
+                f"object collision geoms, "
+                f"L:{len(self._scene_hand_geom_ids.get('left', set()))} "
+                f"R:{len(self._scene_hand_geom_ids.get('right', set()))} "
+                f"hand geoms, "
+                f"L:{len(self._scene_fingertip_bids.get('left', []))} "
+                f"R:{len(self._scene_fingertip_bids.get('right', []))} "
+                f"fingertips"
+            )
+
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = float(args.sim_dt)
+
+        # When the OmniHand-augmented MJCF is loaded, park active hand
+        # qpos AND ctrl at the canonical open-hand rest pose *before*
+        # the first ``mj_step``. Without this, both default to 0, which
+        # (a) lands several active joints on a joint-limit edge, and
+        # (b) makes the position actuators -- ``inheritrange=1`` so the
+        # ctrl envelope matches joint range -- perpetually drive
+        # toward qpos=0. The combined effect is a slamming motion vs.
+        # the joint stops the moment dynamics start, observed by the
+        # operator as random finger jitter even when no VR commands
+        # are flowing. The retargeter's ``ratio=0`` open-hand pose is
+        # the natural target for a "rest" / "no input yet" state.
+        if self._omnihand_layout is not None:
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                apply_active_hand_rest_pose,
+            )
+            apply_active_hand_rest_pose(
+                self.mj_model, self.mj_data, self._omnihand_layout
+            )
 
         # Resolve per-joint qpos / qvel / actuator indices from joint NAMES,
         # so we don't have to trust the MJCF actuator order. Falls back to
@@ -508,6 +822,52 @@ class X2MujocoRosBridge:
         self._stop = threading.Event()
         self.viewer = None
 
+        # --- OmniHand ZMQ subscriber state (filled in run() if enabled) ---
+        # ``_hand_qpos_targets`` is the most recent (10-D-per-side)
+        # active-finger setpoint vector; ``_apply_omnihand_qpos`` writes
+        # it into ``mj_data.qpos`` every sim step. Held under a lock so
+        # the SUB thread and the sim thread can race without tearing.
+        self._hand_lock = threading.Lock()
+        # Seed the silent-stream cache with the canonical open-hand
+        # rest pose (matches what we just wrote into ``mj_data.qpos``
+        # / ``mj_data.ctrl`` above). With this seed, the recurring
+        # ``_apply_omnihand_qpos`` -> ``apply_active_hand_ctrl`` write
+        # at sim cadence keeps the actuator targets parked at rest
+        # until a real ZMQ packet arrives -- not at qpos=0, which
+        # would otherwise unwind everything we did at init.
+        if self._omnihand_layout is not None:
+            from gear_sonic.scripts.compose_x2_with_omnihand import (
+                get_active_hand_rest_pose,
+            )
+            self._hand_left_active = get_active_hand_rest_pose("left")
+            self._hand_right_active = get_active_hand_rest_pose("right")
+        else:
+            self._hand_left_active = np.zeros(10, dtype=np.float64)
+            self._hand_right_active = np.zeros(10, dtype=np.float64)
+        self._hand_first_msg_logged = False
+        self._hand_msg_count = 0
+
+        # --- Scene reset queue (set by _scene_reset_zmq_thread, drained
+        #     by the sim thread). The SUB thread previously wrote
+        #     ``mj_data.qpos`` / ``mj_model.body_pos`` directly without
+        #     holding ``viewer.lock()``; that races the sim thread's
+        #     mid-step constraint solver and silently corrupts state
+        #     once the scene has built up enough contacts (typical
+        #     symptom: the second B press on a long session leaves the
+        #     viewer rendering a frozen / NaN'd pose while the deploy
+        #     keeps publishing CONTROL ticks for ~20 s before the
+        #     operator notices and Ctrl-Cs). The queue + sim-thread
+        #     drain pattern mirrors the OmniHand SUB and applies the
+        #     reset at a known-safe sim-cycle boundary instead.
+        #     ``_pending_scene_reset`` holds the latest queued payload
+        #     (later messages overwrite earlier unprocessed ones --
+        #     drop-old semantics, identical to ZMQ_CONFLATE on the SUB
+        #     side); ``_pending_scene_reset_lock`` serialises the
+        #     stash + drain.
+        self._pending_scene_reset_lock = threading.Lock()
+        self._pending_scene_reset: Optional[dict] = None
+        self._pending_scene_reset_count = 0
+
     # ----------------------------------------------------------------
     # Command ingestion
     # ----------------------------------------------------------------
@@ -659,6 +1019,513 @@ class X2MujocoRosBridge:
         self.mj_data.ctrl[self.act_idx] = tau
 
     # ----------------------------------------------------------------
+    # OmniHand finger drive
+    # ----------------------------------------------------------------
+    def _apply_omnihand_qpos(self):
+        """Write the latest hand setpoints into ``mj_data.ctrl``.
+
+        Despite the legacy method name (kept for callsite stability),
+        this drives the augmented spec's position actuators rather than
+        stamping qpos directly. Position actuators implement
+        ``tau = kp*(ctrl - q) - kv*dq``; the integrator handles finger
+        dynamics smoothly during ``mj_step`` and the equality constraints
+        enforce mimic relationships continuously. The earlier qpos-stamp
+        approach used by the offline renderer
+        (:func:`gear_sonic.scripts.compose_x2_with_omnihand.apply_active_hand_qpos`)
+        triggered QACC NaN within 0.5 s of sim time because each tick's
+        qpos jump differentiated into infinite implicit qvel that the
+        equality solver couldn't reconcile. The ctrl-driven path is
+        also semantically equivalent to how the real OmniHand motors
+        operate (PD on torque), closing a sim-to-hardware gap.
+
+        No-op when ``--with-omnihand`` is off (``_omnihand_layout`` is
+        None) -- the bare X2 has no hand actuators to drive.
+        """
+        if self._omnihand_layout is None:
+            return
+        with self._hand_lock:
+            left = self._hand_left_active
+            right = self._hand_right_active
+        # Lazy import to keep this module importable on the bare-X2
+        # path (where compose_x2_with_omnihand is never needed).
+        from gear_sonic.scripts.compose_x2_with_omnihand import (
+            apply_active_hand_ctrl,
+        )
+        apply_active_hand_ctrl(
+            self.mj_data,
+            self._omnihand_layout,
+            left_active=left,
+            right_active=right,
+        )
+
+    def _ensure_pyzmq_in_container(self, *, purpose: str) -> bool:
+        """Lazy-install ``pyzmq`` if the container's Python is missing it.
+
+        Returns True if ``import zmq`` succeeds (either was already present
+        or just installed). Pre-2026-05-10 docker_x2 base images shipped
+        without pyzmq; the OmniHand SUB has had a one-shot pip recovery
+        forever, but the scene_state PUB and scene_reset SUB initially
+        skipped that step which left them silently dead until the next
+        ``docker compose build x2sim`` rebake. This helper centralises
+        the recovery so every ZMQ entry point gets the same self-heal.
+
+        ``purpose`` is logged so the operator can tell which feature
+        triggered the install attempt.
+        """
+        try:
+            import zmq  # noqa: F401
+            return True
+        except ImportError:
+            pass
+
+        import subprocess  # local: only when pyzmq is missing
+        self.node.get_logger().warn(
+            f"[bridge] {purpose}: pyzmq not present in this container; "
+            "attempting one-shot 'pip3 install pyzmq'. Rebuild the "
+            "docker_x2 image (``cd gear_sonic_deploy/docker_x2 && "
+            "docker compose build x2sim``) to bake this dependency in "
+            "permanently."
+        )
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install",
+                 "--quiet", "--no-input", "--disable-pip-version-check",
+                 "pyzmq"],
+                timeout=60,
+            )
+            import zmq  # noqa: F401, F811  -- side-effect after install
+            self.node.get_logger().info(
+                f"[bridge] pyzmq installed at runtime; {purpose} online."
+            )
+            return True
+        except (subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                ImportError) as exc:
+            self.node.get_logger().warn(
+                f"[bridge] runtime pip install pyzmq failed for {purpose} "
+                f"({exc})."
+            )
+            return False
+
+    def _omnihand_zmq_thread(self):
+        """SUB on the live VLA bridge's pose topic and refresh hand setpoints.
+
+        The pose message we expect (defined in
+        :mod:`gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder`) carries
+        ``left_hand_joints`` / ``right_hand_joints`` 10-D fields per tick at
+        the publisher's rate (50 Hz for the live VLA bridge). We unpack each
+        message, copy the two hand vectors under ``_hand_lock``, and let
+        ``_apply_omnihand_qpos`` write them at the sim cadence. ZMQ PUB/SUB
+        is multi-subscriber-safe so this can ride alongside the SONIC C++
+        harness reading the same port.
+
+        Connection setup is best-effort: if pyzmq isn't installed (the
+        pre-2026-05-10 Docker base image didn't carry it) we attempt
+        a one-shot ``pip3 install pyzmq`` into the running container,
+        then re-import. If the auto-install fails we log once and exit
+        the thread; the viewer then shows OmniHand fingers at their
+        MJCF rest pose -- still better than the dummy stubs. The
+        Dockerfile now bakes pyzmq in permanently so on the next
+        ``docker compose build`` of ``x2sim`` this fallback becomes a
+        no-op cached import.
+        """
+        if not self._ensure_pyzmq_in_container(
+            purpose="OmniHand ZMQ subscriber"
+        ):
+            self.node.get_logger().warn(
+                "[bridge] fingers will stay at MJCF rest pose. Install "
+                "pyzmq manually in the bridge env to drive the fingers."
+            )
+            return
+        import zmq
+        # The decoder lives under gear_sonic which is already on sys.path
+        # (we inserted REPO_ROOT earlier when --with-omnihand resolved
+        # compose_x2_with_omnihand). Be defensive in case of an exotic
+        # docker mount.
+        try:
+            from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (
+                unpack_message,
+            )
+        except ImportError as exc:
+            self.node.get_logger().warn(
+                f"[bridge] OmniHand ZMQ subscriber: cannot import "
+                f"unpack_message ({exc}); fingers stay at rest pose."
+            )
+            return
+
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        # CONFLATE keeps only the latest message; we don't need a queue
+        # and it bounds memory if the SUB thread ever falls behind.
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.RCVTIMEO, 200)  # ms: 5x our 50 Hz period
+        sock.setsockopt(zmq.SUBSCRIBE, self.args.hand_zmq_topic.encode())
+        endpoint = f"tcp://{self.args.hand_zmq_host}:{self.args.hand_zmq_port}"
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            self.node.get_logger().warn(
+                f"[bridge] OmniHand ZMQ connect to {endpoint} failed: {exc}; "
+                "fingers stay at rest pose."
+            )
+            sock.close(linger=0)
+            return
+
+        self.node.get_logger().info(
+            f"[bridge] OmniHand ZMQ SUB connected at {endpoint} "
+            f"(topic='{self.args.hand_zmq_topic}'); waiting for poses."
+        )
+        while not self._stop.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ recv error: {exc}"
+                )
+                continue
+            try:
+                msg = unpack_message(raw, expected_topic=self.args.hand_zmq_topic)
+            except ValueError as exc:
+                # Topic may legitimately drift if the publisher restarts
+                # mid-run; keep going.
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ decode error: {exc}"
+                )
+                continue
+            left = msg.fields.get("left_hand_joints")
+            right = msg.fields.get("right_hand_joints")
+            if left is None or right is None:
+                continue
+            left_arr = np.asarray(left, dtype=np.float64).reshape(-1)
+            right_arr = np.asarray(right, dtype=np.float64).reshape(-1)
+            if left_arr.size != 10 or right_arr.size != 10:
+                # Wrong shape -- log once and stop trying. Layouts that
+                # send 16-D or 20-D hand vectors must remap upstream.
+                self.node.get_logger().warn(
+                    f"[bridge] OmniHand ZMQ unexpected shape "
+                    f"left={left_arr.shape} right={right_arr.shape}; "
+                    "expected (10,) each. Dropping."
+                )
+                continue
+            with self._hand_lock:
+                self._hand_left_active = left_arr
+                self._hand_right_active = right_arr
+                self._hand_msg_count += 1
+            if not self._hand_first_msg_logged:
+                self._hand_first_msg_logged = True
+                self.node.get_logger().info(
+                    f"[bridge] OmniHand ZMQ: first finger setpoint received "
+                    f"(|L|={float(np.linalg.norm(left_arr)):.3f} "
+                    f"|R|={float(np.linalg.norm(right_arr)):.3f})."
+                )
+
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------
+    # Scene state PUB / scene reset SUB (G1 robocasa plumbing)
+    # ----------------------------------------------------------------
+    def _publish_robot_pose(self):
+        """PUB the bridge's ground-truth pelvis qpos for host-side eval tools.
+
+        Always-on companion to ``_publish_scene_state``; does not depend on
+        scene metadata. The deploy's ``x2_debug`` topic only carries IMU
+        orientation (no XY/Z), so any tool that wants to measure how far
+        the robot actually walked / how far it rotated needs this PUB.
+
+        Wire format: see :mod:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`.
+        """
+        sock = getattr(self, "_robot_pose_pub_sock", None)
+        pack = getattr(self, "_robot_pose_pack", None)
+        if sock is None or pack is None:
+            return
+        # Pelvis is the floating-base free joint; first 7 qpos entries are
+        # [x, y, z, qw, qx, qy, qz] in MuJoCo convention.
+        pelvis_qpos = self.mj_data.qpos[0:7].astype(float).tolist()
+        try:
+            sock.send(pack(float(self.mj_data.time), pelvis_qpos), flags=0)
+        except Exception as exc:
+            if not getattr(self, "_robot_pose_pub_warned", False):
+                print(f"[bridge] robot_pose PUB send failed: {exc}", flush=True)
+                self._robot_pose_pub_warned = True
+
+    def _collect_grasp_contacts(self) -> dict:
+        """Walk ``mj_data.contact[:ncon]`` and bucket each contact pair
+        into ``{logical_object_name: {"left": bool, "right": bool, "any": bool}}``.
+
+        A contact is attributed to side ``S`` if exactly one of its two
+        geoms belongs to that side's hand-geom set AND the other belongs
+        to the object's contact-geom set. ``any`` is the OR over sides --
+        useful for non-laterality oracles (e.g. bowl-on-target).
+
+        No-op (returns ``{}``) when scene metadata wasn't detected.
+        Cost is O(ncon) with per-contact O(1) set lookups -- typically
+        fewer than a hundred contacts per tick on the X2 + tabletop scene.
+        """
+        if not self._scene_object_geom_ids:
+            return {}
+        out: dict[str, dict[str, bool]] = {
+            logical: {"left": False, "right": False, "any": False}
+            for logical in self._scene_object_geom_ids
+        }
+        ncon = int(self.mj_data.ncon)
+        if ncon == 0:
+            return out
+        # Cache for lookups inside the loop.
+        left = self._scene_hand_geom_ids.get("left", set())
+        right = self._scene_hand_geom_ids.get("right", set())
+        for k in range(ncon):
+            c = self.mj_data.contact[k]
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+            for logical, obj_gids in self._scene_object_geom_ids.items():
+                if g1 in obj_gids and g2 in obj_gids:
+                    continue  # self-contact (e.g. bowl wall vs bowl floor)
+                if g1 in obj_gids:
+                    other = g2
+                elif g2 in obj_gids:
+                    other = g1
+                else:
+                    continue
+                if other in left:
+                    out[logical]["left"] = True
+                    out[logical]["any"] = True
+                elif other in right:
+                    out[logical]["right"] = True
+                    out[logical]["any"] = True
+                else:
+                    # Object-vs-non-hand contact (table, floor, other
+                    # object). Surface it under "any" so the oracle can
+                    # know "the cube touched something" without splitting
+                    # by side, but DON'T flag a side (otherwise grasp
+                    # signals would fire on table contact).
+                    out[logical]["any"] = True
+        return out
+
+    def _collect_fingertip_pos(self) -> dict:
+        """Return ``{side: [[x, y, z], …]}`` for every fingertip body in
+        the metadata, evaluated against the bridge's current ``data.xpos``.
+
+        Five entries per side (thumb/index/middle/ring/pinky distal
+        phalanx); empty list when the side wasn't resolved (e.g. on a
+        flat-floor sim with no scene metadata). The mirror uses the
+        minimum fingertip-to-cube distance for the shaped-reward
+        ``approach`` phase.
+        """
+        out: dict[str, list[list[float]]] = {}
+        for side, bids in self._scene_fingertip_bids.items():
+            out[side] = [
+                self.mj_data.xpos[bid].astype(float).tolist() for bid in bids
+            ]
+        return out
+
+    def _publish_scene_state(self):
+        """PUB the current scene-object freejoint qpos + welded body pos.
+
+        Called from the sim loop at the same cadence as
+        :meth:`_publish_joint_states`. No-op when scene metadata wasn't
+        detected at startup, or when ``--no-scene-zmq`` is set, or when
+        the SUB endpoint failed to bind.
+
+        Wire format: see ``gear_sonic.utils.teleop.zmq.scene_state_zmq``.
+        """
+        sock = getattr(self, "_scene_state_pub_sock", None)
+        if sock is None:
+            return
+        try:
+            from gear_sonic.utils.teleop.zmq.scene_state_zmq import (
+                pack_json,
+                SCENE_STATE_TOPIC,
+            )
+        except ImportError:
+            return
+        payload = dict(
+            sim_time=float(self.mj_data.time),
+            object_freejoint_qpos={
+                jname: self.mj_data.qpos[qadr:qadr + 7].astype(float).tolist()
+                for jname, qadr in self._scene_freejoint_qadr.items()
+            },
+            mutable_body_pos={
+                bname: self.mj_model.body_pos[bid].astype(float).tolist()
+                for bname, bid in self._scene_welded_bid.items()
+            },
+            grasp_contacts=self._collect_grasp_contacts(),
+            fingertip_pos=self._collect_fingertip_pos(),
+        )
+        try:
+            sock.send(pack_json(SCENE_STATE_TOPIC, payload), flags=0, copy=False)
+        except Exception as exc:
+            # The PUB is fire-and-forget; complain once but don't crash.
+            if not getattr(self, "_scene_state_pub_warned", False):
+                self.node.get_logger().warn(
+                    f"[bridge] scene_state PUB send failed: {exc}"
+                )
+                self._scene_state_pub_warned = True
+
+    def _scene_reset_zmq_thread(self):
+        """SUB on scene_reset and *enqueue* fresh per-episode object poses.
+
+        Mirror of :meth:`_omnihand_zmq_thread`: the SUB thread does
+        **not** mutate ``mj_data`` / ``mj_model`` directly. Instead it
+        stashes the latest ``ResetObjects`` payload under
+        :attr:`_pending_scene_reset_lock` and the sim thread drains it
+        from inside its existing ``viewer.lock()`` (or
+        ``_NullCtx`` in headless mode) at the start of the next
+        :meth:`_sim_step_once`. This eliminates a real data race that
+        would otherwise corrupt the MuJoCo solver state on the second
+        / third B press of a long session (the reset thread would
+        write ``qpos`` mid-``mj_step`` and the constraint solver
+        would silently NaN, leaving the viewer rendering a frozen
+        pose while CONTROL ticks kept ticking for ~20 s).
+
+        Drop-old semantics: if a second message arrives before the
+        sim thread has drained the first, the first is overwritten.
+        That matches the recorder's ad-hoc usage (one B press == one
+        new episode) and also matches ``ZMQ_CONFLATE`` on the SUB
+        side. Velocity zeroing + ``mj_forward`` happen inside the
+        drain (see :meth:`_apply_scene_reset`) so the cube doesn't
+        teleport with an instantaneous (q_new - q_old)/dt velocity.
+        """
+        if not self._scene_freejoint_qadr and not self._scene_welded_bid:
+            return  # nothing to reset
+        if not self._ensure_pyzmq_in_container(purpose="scene_reset SUB"):
+            self.node.get_logger().warn(
+                "[bridge] scene_reset SUB: pyzmq install failed; recorder "
+                "will not be able to push fresh per-episode object poses."
+            )
+            return
+        import zmq
+        try:
+            from gear_sonic.utils.teleop.zmq.scene_state_zmq import (
+                unpack_json,
+                SCENE_RESET_TOPIC,
+            )
+        except ImportError as exc:
+            self.node.get_logger().warn(
+                f"[bridge] scene_reset SUB: cannot import unpack_json ({exc}); "
+                "scene resets disabled."
+            )
+            return
+
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        sock.setsockopt(zmq.SUBSCRIBE, SCENE_RESET_TOPIC.encode())
+        endpoint = (
+            f"tcp://{self.args.scene_reset_sub_host}:{self.args.scene_reset_sub_port}"
+        )
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            self.node.get_logger().warn(
+                f"[bridge] scene_reset SUB connect to {endpoint} failed: {exc}"
+            )
+            sock.close(linger=0)
+            return
+        self.node.get_logger().info(
+            f"[bridge] scene_reset SUB connected at {endpoint} "
+            f"(topic='{SCENE_RESET_TOPIC}')."
+        )
+
+        while not self._stop.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                self.node.get_logger().warn(
+                    f"[bridge] scene_reset SUB recv error: {exc}"
+                )
+                continue
+            try:
+                _, payload = unpack_json(raw, expected_topic=SCENE_RESET_TOPIC)
+            except ValueError as exc:
+                self.node.get_logger().warn(
+                    f"[bridge] scene_reset decode error: {exc}"
+                )
+                continue
+            with self._pending_scene_reset_lock:
+                dropped = self._pending_scene_reset is not None
+                self._pending_scene_reset = payload
+                self._pending_scene_reset_count += 1
+            if dropped:
+                self.node.get_logger().info(
+                    "[bridge] scene_reset queued (overwrote previous "
+                    "un-applied payload; sim thread is behind)."
+                )
+            else:
+                n_fj = len(payload.get("object_freejoint_qpos", {}))
+                n_bd = len(payload.get("mutable_body_pos", {}))
+                self.node.get_logger().info(
+                    f"[bridge] scene_reset queued: "
+                    f"{n_fj} freejoints, {n_bd} welded bodies"
+                )
+
+    def _drain_pending_scene_reset(self) -> Optional[dict]:
+        """Pop the most recent queued ``scene_reset`` payload, if any.
+
+        Called once per sim cycle from :meth:`_sim_step_once` while the
+        sim thread already holds ``viewer.lock()`` (or runs headless).
+        Returns ``None`` if no payload is waiting.
+        """
+        with self._pending_scene_reset_lock:
+            payload = self._pending_scene_reset
+            self._pending_scene_reset = None
+        return payload
+
+    def _apply_scene_reset(self, payload: dict) -> None:
+        """Write a scene_reset payload into the bridge's MuJoCo state.
+
+        Caller invariant: the sim thread already holds ``viewer.lock()``
+        (or runs headless), so this method does **no** locking of its
+        own. Direct mutation of ``mj_data`` / ``mj_model`` from any
+        other thread will race the constraint solver -- always go
+        through :meth:`_drain_pending_scene_reset`.
+        """
+        freejoint_qpos = payload.get("object_freejoint_qpos", {})
+        body_pos = payload.get("mutable_body_pos", {})
+
+        import mujoco as _mujoco
+
+        for jname, qpos in freejoint_qpos.items():
+            qadr = self._scene_freejoint_qadr.get(jname)
+            if qadr is None:
+                continue
+            if len(qpos) < 7:
+                self.node.get_logger().warn(
+                    f"[bridge] scene_reset {jname!r} qpos has "
+                    f"len={len(qpos)} (need 7); skipping."
+                )
+                continue
+            self.mj_data.qpos[qadr:qadr + 7] = np.asarray(
+                qpos[:7], dtype=np.float64
+            )
+            vadr = self._scene_freejoint_dofadr.get(jname)
+            if vadr is not None:
+                self.mj_data.qvel[vadr:vadr + 6] = 0.0
+        for bname, pos in body_pos.items():
+            bid = self._scene_welded_bid.get(bname)
+            if bid is None:
+                continue
+            if len(pos) < 3:
+                continue
+            self.mj_model.body_pos[bid] = np.asarray(pos[:3], dtype=np.float64)
+        _mujoco.mj_forward(self.mj_model, self.mj_data)
+        self.node.get_logger().info(
+            f"[bridge] scene_reset applied: "
+            f"{len(freejoint_qpos)} freejoints, {len(body_pos)} welded bodies"
+        )
+
+    # ----------------------------------------------------------------
     # ElasticBand
     # ----------------------------------------------------------------
     def _apply_elastic_band(self):
@@ -756,22 +1623,58 @@ class X2MujocoRosBridge:
         if not self._first_command_received:
             # Frozen-body publish: state stays at RSI values, the deploy
             # gets fresh timestamps so its freshness check still clears.
+            # We still apply OmniHand qpos (if armed) so the viewer
+            # shows finger motion as soon as the live VLA bridge starts
+            # publishing -- which can be well before SONIC takes over,
+            # and is a useful "pipeline alive" signal for the operator.
+            self._apply_omnihand_qpos()
+            # Even before the deploy has started commanding we honour
+            # queued scene resets: the recorder may rerandomise the
+            # cube while the operator is still in INIT/WAIT. No
+            # mj_step is firing, so the only contender for the GIL on
+            # mj_data is the viewer's render thread -- still hold
+            # viewer.lock() to avoid a single bad frame.
+            pending_reset = self._drain_pending_scene_reset()
+            if pending_reset is not None:
+                if viewer is not None:
+                    with viewer.lock():
+                        self._apply_scene_reset(pending_reset)
+                else:
+                    self._apply_scene_reset(pending_reset)
             self._sim_step_count += 1
             if self._sim_step_count % state_period_steps == 0:
                 self._publish_joint_states()
+                self._publish_scene_state()
+                self._publish_robot_pose()
             if self._sim_step_count % imu_period_steps == 0:
                 self._publish_imu()
             return
         self._apply_pd()
         self._apply_elastic_band()
+        self._apply_omnihand_qpos()
+        # Drain at most one queued scene_reset per sim cycle and apply
+        # it immediately *before* mj_step, all under the same
+        # viewer.lock() that brackets the step. This is the only place
+        # in the bridge where mj_data.qpos / mj_model.body_pos are
+        # written for scene objects -- the SUB thread merely enqueues.
+        # Fixes the data race where ZMQ-side writes during mj_step
+        # corrupted the constraint solver and froze the viewer after
+        # ~1 reset (see _scene_reset_zmq_thread docstring).
+        pending_reset = self._drain_pending_scene_reset()
         if viewer is not None:
             with viewer.lock():
+                if pending_reset is not None:
+                    self._apply_scene_reset(pending_reset)
                 mujoco.mj_step(self.mj_model, self.mj_data)
         else:
+            if pending_reset is not None:
+                self._apply_scene_reset(pending_reset)
             mujoco.mj_step(self.mj_model, self.mj_data)
         self._sim_step_count += 1
         if self._sim_step_count % state_period_steps == 0:
             self._publish_joint_states()
+            self._publish_scene_state()
+            self._publish_robot_pose()
         if self._sim_step_count % imu_period_steps == 0:
             self._publish_imu()
 
@@ -969,8 +1872,116 @@ class X2MujocoRosBridge:
           serialised through ``viewer.lock()`` to avoid the well-known
           GLFW segfault when ``mj_step`` and ``viewer.sync`` race on
           ``mj_data``). ROS spinning is pushed to a background thread.
+
+        The OmniHand ZMQ subscriber, when armed (``--with-omnihand`` and
+        not ``--no-hand-zmq``), is *always* a background thread regardless
+        of viewer mode. It only refreshes a small numpy buffer under a
+        lock; the actual qpos write happens on the sim thread inside
+        ``_apply_omnihand_qpos``.
         """
         self._print_banner()
+
+        # Spawn OmniHand ZMQ SUB once we know the bridge is past
+        # construction. Only when --with-omnihand AND --no-hand-zmq is
+        # off; the latter is useful for static screenshots.
+        hand_zmq_thread = None
+        if self.args.with_omnihand and not self.args.no_hand_zmq:
+            hand_zmq_thread = threading.Thread(
+                target=self._omnihand_zmq_thread,
+                name="x2-omnihand-zmq",
+                daemon=True,
+            )
+            hand_zmq_thread.start()
+
+        # Always-on robot_pose PUB (sim-only ground-truth pelvis qpos for
+        # host-side eval tools). Independent of scene metadata since the
+        # deploy's x2_debug topic only carries IMU orientation.
+        self._robot_pose_pub_sock = None
+        self._robot_pose_pack = None
+        if self.args.robot_pose_pub_port and self.args.robot_pose_pub_port > 0:
+            if self._ensure_pyzmq_in_container(purpose="robot_pose PUB"):
+                try:
+                    import zmq
+                    # The sim-thread may run with a stripped sys.path (the
+                    # ros2 launcher rewrites it on exec). Make sure REPO_ROOT
+                    # is present so ``gear_sonic`` resolves there too.
+                    if str(REPO_ROOT) not in sys.path:
+                        sys.path.insert(0, str(REPO_ROOT))
+                    from gear_sonic.utils.teleop.zmq.robot_pose_zmq import pack_robot_pose
+                    self._robot_pose_pack = pack_robot_pose
+
+                    ctx = zmq.Context.instance()
+                    sock = ctx.socket(zmq.PUB)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    endpoint = (
+                        f"tcp://{self.args.robot_pose_pub_host}:{self.args.robot_pose_pub_port}"
+                    )
+                    sock.bind(endpoint)
+                    self._robot_pose_pub_sock = sock
+                    print(
+                        f"[bridge] robot_pose PUB bound at {endpoint} "
+                        f"(ground-truth pelvis qpos for eval tools)."
+                    )
+                except Exception as exc:
+                    print(f"[bridge] robot_pose PUB setup failed: {exc}",
+                          file=sys.stderr)
+                    self._robot_pose_pub_sock = None
+                    self._robot_pose_pack = None
+            else:
+                print(
+                    "[bridge] robot_pose PUB disabled: pyzmq install failed.",
+                    file=sys.stderr,
+                )
+
+        # Set up the scene_state PUB and scene_reset SUB if we have
+        # scene metadata loaded. Both default to off when --no-scene-zmq
+        # is set or when no scene metadata was found.
+        self._scene_state_pub_sock = None
+        scene_reset_thread = None
+        if (
+            self._scene_metadata is not None
+            and not self.args.no_scene_zmq
+            and (self._scene_freejoint_qadr or self._scene_welded_bid)
+        ):
+            # Self-heal pyzmq missing-from-container (same lazy-install
+            # path the OmniHand SUB uses), otherwise the scene_state PUB
+            # silently no-ops and the recorder's RobocasaTaskMirror sees
+            # frozen object poses for the entire session.
+            if self._ensure_pyzmq_in_container(purpose="scene_state PUB"):
+                try:
+                    import zmq
+                    ctx = zmq.Context.instance()
+                    pub_sock = ctx.socket(zmq.PUB)
+                    # Drop pending messages on close for snappy shutdown.
+                    pub_sock.setsockopt(zmq.LINGER, 0)
+                    # CONFLATE goes on the SUB side (scene_state recorder
+                    # SUB sets it), not on the PUB side here.
+                    pub_endpoint = (
+                        f"tcp://{self.args.scene_state_pub_host}:{self.args.scene_state_pub_port}"
+                    )
+                    pub_sock.bind(pub_endpoint)
+                    self._scene_state_pub_sock = pub_sock
+                    print(
+                        f"[bridge] scene_state PUB bound at {pub_endpoint} "
+                        f"({len(self._scene_freejoint_qadr)} freejoints, "
+                        f"{len(self._scene_welded_bid)} bodies)."
+                    )
+                except Exception as exc:
+                    print(f"[bridge] scene_state PUB setup failed: {exc}",
+                          file=sys.stderr)
+                    self._scene_state_pub_sock = None
+            else:
+                print(
+                    "[bridge] scene_state PUB disabled: pyzmq install "
+                    "failed (recorder will see frozen objects).",
+                    file=sys.stderr,
+                )
+            scene_reset_thread = threading.Thread(
+                target=self._scene_reset_zmq_thread,
+                name="x2-scene-reset-zmq",
+                daemon=True,
+            )
+            scene_reset_thread.start()
 
         if not self.args.viewer:
             sim_thread = threading.Thread(
@@ -1008,6 +2019,35 @@ class X2MujocoRosBridge:
                 self.mj_model, self.mj_data, **kw
             ) as viewer:
                 self.viewer = viewer
+                # Optional: lock the camera to a body (--cam-track-body) so
+                # the robot stays in view as it walks. Useful for long
+                # stitched motions where the robot drifts off the default
+                # free-camera framing within a few seconds. Setting the
+                # cam fields here (after launch_passive) is safe -- the
+                # passive viewer reads cam.* on every sync().
+                track_body = getattr(self.args, "cam_track_body", None)
+                if track_body:
+                    bid = mujoco.mj_name2id(
+                        self.mj_model, mujoco.mjtObj.mjOBJ_BODY, track_body
+                    )
+                    if bid < 0:
+                        print(
+                            f"[bridge] WARN --cam-track-body {track_body!r} "
+                            f"not found in MJCF; falling back to free cam."
+                        )
+                    else:
+                        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                        viewer.cam.trackbodyid = int(bid)
+                        viewer.cam.distance = float(self.args.cam_distance)
+                        viewer.cam.elevation = float(self.args.cam_elevation)
+                        viewer.cam.azimuth = float(self.args.cam_azimuth)
+                        print(
+                            f"[bridge] viewer camera tracking body "
+                            f"{track_body!r} (bid={bid}) "
+                            f"d={self.args.cam_distance:.2f} "
+                            f"el={self.args.cam_elevation:+.1f} "
+                            f"az={self.args.cam_azimuth:+.1f}"
+                        )
                 next_t = time.monotonic()
                 while viewer.is_running() and not self._stop.is_set():
                     self._sim_step_once(state_period_steps, imu_period_steps,

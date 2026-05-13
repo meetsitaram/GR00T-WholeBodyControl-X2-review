@@ -1,0 +1,62 @@
+name: x2_ultra_warehouse_v2
+output_key: warehouse__v2__navigate_pick_carry_place
+fps: 30
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 30          # 1.0 s @ 30 fps
+  blend_in_frames: 6
+  blend_out_frames: 6
+
+# v2 storyline: adds a one-handed pick at medium height between the arc-left
+# and the heavy-cargo walk. Picks at *medium* height keep pelvis ~0.68 m
+# (clear of the 0.40 m fall threshold); deep front_low picks would dip to
+# ~0.33 m and trip auto-reset, so we route around them in v2 and revisit
+# only if the policy proves robust.
+segments:
+  - name: anchor_settle_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # ~1.0 s
+
+  - name: walk_forward_to_shelfA
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__walk_forward_loop_003__A034
+    start_frame: 0
+    n_frames: 90           # ~3.0 s
+
+  - name: arc_left_to_shelfA
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__arc_walk_left_loop_001__A038
+    start_frame: 0
+    n_frames: 60           # ~2.0 s
+
+  - name: reach_pick_one_hand
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__big_heavy_one_hand_pick_up_front_medium_R_001__A510_M
+    start_frame: 0
+    n_frames: 90           # ~3.0 s, medium-height pick
+
+  - name: walk_with_cargo
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__big_heavy_two_hands_walk_ff_stop_180_R_001__A511
+    start_frame: 0
+    n_frames: 90           # ~3.0 s heavy walk
+
+  - name: side_step_left
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Sideway_Walk_Left_001__A019
+    start_frame: 0
+    n_frames: 60           # ~2.0 s
+
+  - name: anchor_settle_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30           # ~1.0 s

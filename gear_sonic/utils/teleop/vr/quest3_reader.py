@@ -28,6 +28,7 @@ import ssl
 import subprocess
 import threading
 import time
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation as sRot
@@ -44,6 +45,20 @@ WEBXR_TO_ROBOT = np.array(
 )
 
 _Q_ROT = sRot.from_matrix(WEBXR_TO_ROBOT)
+
+
+def _to_curl_array(raw: dict) -> np.ndarray | None:
+    """Convert a hand-payload dict's ``curls`` field to a clipped (5,) array.
+
+    Returns ``None`` when the field is missing or not the expected shape.
+    """
+    curls = raw.get("curls")
+    if curls is None:
+        return None
+    arr = np.asarray(curls, dtype=np.float64)
+    if arr.shape != (5,):
+        return None
+    return np.clip(arr, 0.0, 1.0)
 
 
 def _get_lan_ip() -> str:
@@ -172,11 +187,16 @@ class Quest3Reader:
         ws_port: int = 8765,
         http_port: int = 8443,
         use_ssl: bool = True,
+        quiet_periodic: bool = False,
     ):
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.http_port = http_port
         self.use_ssl = use_ssl
+        # When True, suppress the per-100-msg "msgs=N fps=X idle" line.
+        # The first-packet snapshot and one-shot XR / controller / hand
+        # tracking events still log -- those are diagnostic gold.
+        self.quiet_periodic = bool(quiet_periodic)
 
         self._latest: dict | None = None
         self._lock = threading.Lock()
@@ -188,6 +208,10 @@ class Quest3Reader:
         self._ws_thread: threading.Thread | None = None
         self._http_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Currently-connected WebXR client websocket (None if no client).
+        # Used by ``send_message`` to push JSON payloads (e.g. calibration
+        # overlays) from Python down to the browser.
+        self._client_ws: Any = None
 
         self._cert_dir = os.path.join(os.path.dirname(__file__), "quest3_certs")
 
@@ -195,6 +219,22 @@ class Quest3Reader:
 
     def start(self):
         """Start WebSocket and HTTP servers in background threads."""
+        # Generate calibration audio prompts on first run. The WebXR
+        # client falls back to ``speechSynthesis`` for any prompt that
+        # has no MP3 on disk, so failure here is non-fatal.
+        try:
+            from gear_sonic.utils.teleop.vr.quest3_audio_prompts import (
+                ensure_prompt_audio_files,
+            )
+
+            ensure_prompt_audio_files()
+        except Exception as exc:
+            print(
+                f"[Quest3Reader] WARNING: failed to materialise audio "
+                f"prompts: {exc}. Calibration will fall back to browser TTS.",
+                flush=True,
+            )
+
         self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
         self._ws_thread.start()
         self._http_thread = threading.Thread(target=self._run_http, daemon=True)
@@ -266,6 +306,152 @@ class Quest3Reader:
             bool(buttons.get("y", False)),
         )
 
+    def get_stick_clicks(self) -> tuple[bool, bool]:
+        """Returns ``(left_stick_click, right_stick_click)`` -- the
+        thumbstick "click" buttons (``gpad.buttons[3]`` in the
+        oculus-touch / standard gamepad mapping).
+
+        These are independent of the face buttons surfaced by
+        :meth:`get_buttons`, so consumers can bind them to actions
+        without conflicting with the A/B/X/Y vocabulary. Currently
+        used by :mod:`quest3_manager_x2` to cycle the deploy MuJoCo
+        viewer's fixed cameras.
+
+        Returns ``(False, False)`` when no sample is available, when
+        the WebXR client is on a build that pre-dates the stick-click
+        forwarding patch, or when the headset / browser doesn't expose
+        ``gpad.buttons[3]`` (some Quest Browser versions skip it).
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return False, False
+        buttons = sample.get("buttons", {})
+        return (
+            bool(buttons.get("leftStickClick", False)),
+            bool(buttons.get("rightStickClick", False)),
+        )
+
+    def get_hand_curls(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, str | None, str | None]:
+        """Per-finger curl from XRHand 25-joint poses, if available.
+
+        Returns:
+            ``(left_curls, right_curls, left_source, right_source)``.
+
+            - ``*_curls`` are length-5 numpy arrays in ``[0, 1]``,
+              ordered as ``[thumb, index, middle, ring, pinky]``. ``None``
+              when the side has no XRHand input source for this frame.
+            - ``*_source`` is one of ``"hand"`` (XRHand), ``"controller"``
+              (analog buttons mapped, no per-finger detail), or ``None``
+              (no input on that side).
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return None, None, None, None
+        hands = sample.get("hands") or {}
+        left_raw = hands.get("left") or {}
+        right_raw = hands.get("right") or {}
+
+        left_src = left_raw.get("source")
+        right_src = right_raw.get("source")
+        return (
+            _to_curl_array(left_raw),
+            _to_curl_array(right_raw),
+            left_src,
+            right_src,
+        )
+
+    def get_thumb_opposition(self) -> tuple[float | None, float | None]:
+        """Per-side thumb opposition score from XRHand, if available.
+
+        Returns:
+            ``(left_oppose, right_oppose)`` -- floats in ``[0, 1]``,
+            independent of finger curl. ``0`` = thumb resting at the
+            radial side of the palm (open hand); ``1`` = thumb fully
+            opposed across the palm toward the pinky. ``None`` when
+            the side has no XRHand data this frame.
+
+        See ``computeThumbOpposition`` in the WebXR client for the
+        exact geometric definition. This signal exists because
+        thumb-finger touches are dominated by motion at the thumb
+        CMC joint (which is NOT in the XRHand chain), so the
+        per-finger curl array undershoots even when the operator's
+        thumb is fully opposed.
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return None, None
+        hands = sample.get("hands") or {}
+        left_raw = hands.get("left") or {}
+        right_raw = hands.get("right") or {}
+
+        def _to_oppose_scalar(raw: dict) -> float | None:
+            v = raw.get("oppose")
+            if v is None:
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            if f < 0.0:
+                f = 0.0
+            elif f > 1.0:
+                f = 1.0
+            return f
+
+        return _to_oppose_scalar(left_raw), _to_oppose_scalar(right_raw)
+
+    def get_finger_tip_oppose(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-side, per-finger thumb-tip-to-fingertip proximity score.
+
+        Returns:
+            ``(left_finger_tip_oppose, right_finger_tip_oppose)`` --
+            length-4 numpy arrays in ``[0, 1]``, ordered as
+            ``[index, middle, ring, pinky]``. ``None`` when the side
+            has no XRHand data this frame, or when the WebXR client
+            is too old to emit the field (forwards-compat). Within
+            the array, individual entries may be NaN if a specific
+            fingertip joint dropped out for the frame -- callers
+            should treat NaN as "fall back to the curl signal".
+
+        Companion to :meth:`get_thumb_opposition` (which returns a
+        single scalar = MIN over fingertips). This 4-vector splits
+        that signal so each receiving finger gets its own dedicated
+        proximity score, and the omnihand non-thumb pip motors can
+        be driven on ``max(curls[i], finger_tip_oppose[i])``.
+
+        See ``computeFingerTipOppose`` in the WebXR client for the
+        exact geometric definition. Same touch (~0.5 cm) and far
+        (~3.5 cm) thresholds as :meth:`get_thumb_opposition`.
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return None, None
+        hands = sample.get("hands") or {}
+        left_raw = hands.get("left") or {}
+        right_raw = hands.get("right") or {}
+
+        def _to_tip_oppose_array(raw: dict) -> np.ndarray | None:
+            v = raw.get("finger_tip_oppose")
+            if v is None:
+                return None
+            try:
+                arr = np.asarray(v, dtype=np.float32)
+            except (TypeError, ValueError):
+                return None
+            if arr.shape != (4,):
+                return None
+            # NaN entries are kept; callers must handle them. Clamp
+            # finite entries to [0, 1].
+            finite = np.isfinite(arr)
+            arr[finite] = np.clip(arr[finite], 0.0, 1.0)
+            return arr
+
+        return _to_tip_oppose_array(left_raw), _to_tip_oppose_array(right_raw)
+
     # -- WebSocket server -----------------------------------------------------
 
     def _make_ssl_context(self) -> ssl.SSLContext | None:
@@ -282,6 +468,7 @@ class Quest3Reader:
 
     async def _handle_connection(self, websocket):
         self._connected = True
+        self._client_ws = websocket
         addr = getattr(websocket, "remote_address", "unknown")
         print(f"[Quest3Reader] Client connected: {addr}")
         try:
@@ -294,7 +481,41 @@ class Quest3Reader:
                 print(f"[Quest3Reader] Connection error: {e}")
         finally:
             self._connected = False
+            if self._client_ws is websocket:
+                self._client_ws = None
             print(f"[Quest3Reader] Client disconnected: {addr}")
+
+    def send_message(self, payload: dict) -> bool:
+        """Push a JSON payload to the connected WebXR client.
+
+        Used by the calibration script to drive the on-headset overlay
+        (pose instructions, capture confirmations). Returns True if the
+        send was scheduled, False if no client is connected. Thread-safe;
+        marshals to the asyncio loop running the websocket server.
+        """
+        if not self._connected or self._client_ws is None or self._loop is None:
+            return False
+        try:
+            text = json.dumps(payload)
+        except (TypeError, ValueError) as exc:
+            print(f"[Quest3Reader] send_message: bad payload ({exc})")
+            return False
+
+        ws = self._client_ws
+        loop = self._loop
+
+        async def _send():
+            try:
+                await ws.send(text)
+            except Exception as exc:  # client disconnected mid-send, etc.
+                print(f"[Quest3Reader] send_message warn: {exc}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+            return True
+        except Exception as exc:
+            print(f"[Quest3Reader] send_message threadsafe schedule failed: {exc}")
+            return False
 
     def _process_message(self, raw: str):
         try:
@@ -330,24 +551,63 @@ class Quest3Reader:
             elif event == "input_sources_changed":
                 count = data.get("count", 0)
                 sources = data.get("sources", [])
+                # The WebXR client emits an ``input_sources_changed``
+                # event every time the headset toggles between hand-only
+                # / controller / multimodal -- which on Quest 3 happens
+                # constantly as the operator rests the controllers and
+                # picks them back up. Build a stable signature of
+                # (handedness, has_grip, has_hand) tuples so we only log
+                # when the *actual* configuration changes, not on
+                # idempotent re-broadcasts. Knocks the per-session log
+                # volume from hundreds of lines down to a handful.
+                sig = tuple(sorted(
+                    (
+                        s.get("handedness", "?"),
+                        bool(s.get("has_gamepad", False)),
+                        bool(s.get("has_grip", False)),
+                        bool(s.get("has_hand", s.get("type") == "hand-tracking")),
+                    )
+                    for s in sources
+                ))
+                prev_sig = getattr(self, "_last_sources_sig", None)
+                if sig == prev_sig:
+                    return
+                self._last_sources_sig = sig
                 print(f"[Quest3Reader] Input sources changed: {count} detected")
+                # Quest 3 multimodal: a single source can carry BOTH
+                # hand-tracking and a gripSpace controller. Inspect
+                # `has_grip` and `has_hand` directly so we don't
+                # spuriously warn "no controllers" on a multimodal
+                # source whose gamepad is actually attached.
                 has_controller = False
-                has_hand = False
+                has_hand_only = False
                 for s in sources:
                     stype = s.get("type", "unknown")
                     hand = s.get("handedness", "?")
                     has_gpad = s.get("has_gamepad", False)
-                    print(f"[Quest3Reader]   {hand}: {stype} (gamepad={'yes' if has_gpad else 'NO'})")
-                    if stype == "controller":
+                    has_grip = s.get("has_grip", False)
+                    has_hand_input = s.get("has_hand", stype == "hand-tracking")
+                    print(
+                        f"[Quest3Reader]   {hand}: {stype} "
+                        f"(gamepad={'yes' if has_gpad else 'NO'} "
+                        f"grip={'yes' if has_grip else 'NO'} "
+                        f"hand={'yes' if has_hand_input else 'NO'})"
+                    )
+                    if has_grip:
                         has_controller = True
-                    elif stype == "hand-tracking":
-                        has_hand = True
-                if has_hand and not has_controller:
-                    print(f"[Quest3Reader]   WARNING: Hand tracking detected but NO controllers!")
-                    print(f"[Quest3Reader]   FIX: Pick up the physical Quest 3 controllers.")
-                    print(f"[Quest3Reader]   The headset will auto-switch to controller mode.")
+                    if has_hand_input and not has_grip:
+                        has_hand_only = True
+                if has_hand_only and not has_controller:
+                    print(f"[Quest3Reader]   WARNING: Hand tracking only -- no controllers detected!")
+                    print(f"[Quest3Reader]   FIX: Pick up the physical Quest 3 controllers")
+                    print(f"[Quest3Reader]        (A/B/X/Y, joysticks, and stable wrist tracking")
+                    print(f"[Quest3Reader]         all need the gripSpace from a controller).")
                 elif has_controller:
-                    print(f"[Quest3Reader]   Controllers detected — buttons and joysticks active.")
+                    if any(s.get("has_hand", False) for s in sources):
+                        print(f"[Quest3Reader]   Multimodal: controllers + hand-tracking active. "
+                              f"Pose from gripSpace, finger curls from XRHand.")
+                    else:
+                        print(f"[Quest3Reader]   Controllers detected — buttons and joysticks active.")
             else:
                 print(f"[Quest3Reader] Status: {data}")
             return
@@ -362,7 +622,7 @@ class Quest3Reader:
             axes = data.get("axes", {})
             print(f"[Quest3Reader]   buttons: {btns}")
             print(f"[Quest3Reader]   axes: {axes}")
-        elif self._msg_count % 100 == 0:
+        elif self._msg_count % 100 == 0 and not self.quiet_periodic:
             btns = data.get("buttons", {})
             axes = data.get("axes", {})
             has_input = any(v for k, v in btns.items() if k in ("a", "b", "x", "y") and v)
@@ -394,6 +654,7 @@ class Quest3Reader:
             "vr_3pt_pose": vr_3pt_pose,
             "buttons": data.get("buttons", {}),
             "axes": data.get("axes", {}),
+            "hands": data.get("hands", {}),
             "timestamp_realtime": now,
             "timestamp_monotonic": time.monotonic(),
             "dt": dt,

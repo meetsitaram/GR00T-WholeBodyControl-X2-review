@@ -1,0 +1,55 @@
+name: x2_ultra_casual_walk_v1
+output_key: casual_walk__v1__one_cycle
+fps: 30
+
+# Garage-friendly walk demo: idle anchor → one cycle of an out-and-back
+# walk-with-turns clip → idle anchor. The reference clip is a 115.77 s
+# multi-take recording at 30 fps; each ~11.5 s cycle has the actor walk
+# ~1.3-1.8 m forward, turn 180°, walk back to ~origin (verified
+# kinematically in MuJoCo via play_x2_motion_mujoco.py 2026-05-03).
+#
+# Total floor footprint: roughly a 2 m × 0.5 m strip aligned with the
+# robot's heading at start, with the robot returning to within ~12 cm
+# of where it started.
+#
+# Yaw stays in 178° ± 20° (turns happen but the cyclic returns to
+# origin keep the unwrapped band tight). Pelvis z stays in 0.66-0.72 m
+# (no deep squats / falls in the kinematic ref).
+
+zero_xy: true
+zero_yaw: true
+
+# Idle rest anchor between segments. Keeps seam discontinuity small at
+# the wrap (anchor_close[-1] -> anchor_open[0]) so a looping eval doesn't
+# see a step jump.
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 20
+  blend_in_frames: 6
+  blend_out_frames: 6
+
+segments:
+  - name: anchor_open
+    # Same idle clip used as anchor_close so the wrap is a near-no-op.
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30          # 1.0 s
+
+  - name: walk_out_and_back
+    # One out-and-back cycle of the multi-take Turn_Start_Walk recording.
+    # Frame range 0..345 covers x: -0.01 → +1.32 → -0.03 m and yaw:
+    # 178° → 189° → 179° (so the policy sees a real 180° turn at the
+    # apex, not a synthesized one).
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__Turn_Start_Walk_0090_003__A020
+    start_frame: 0
+    n_frames: 345         # 11.5 s @ 30 fps
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30          # 1.0 s

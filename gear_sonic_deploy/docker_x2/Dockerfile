@@ -102,23 +102,50 @@ RUN source /opt/ros/humble/setup.bash && \
 #   torch (CPU)      -- imported at module level by eval_x2_mujoco. The
 #                       bridge does not run the policy; CPU build keeps the
 #                       image ~1.5 GB lighter than the CUDA one.
+#   pyzmq            -- Python bindings for libzmq3 (already installed
+#                       below as a system dep). The bridge's OmniHand
+#                       finger SUB needs this; without it, hand
+#                       commands published by the recorder on tcp://5556
+#                       are silently dropped and ``mj_data.ctrl`` for
+#                       the fingers stays at the rest-pose seed --
+#                       visible to the operator as "fingers don't move
+#                       and just have noise on them" during teleop.
 RUN pip3 install --no-cache-dir --upgrade pip setuptools && \
     pip3 install --no-cache-dir \
         mujoco \
         numpy \
+        pyzmq \
         scipy \
         joblib && \
     pip3 install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu \
         torch
 
-# iputils-ping for deploy_x2.sh's pre-flight reachability check. Kept in its
-# own RUN layer (rather than folded into the big apt-get above) so adding it
-# does NOT invalidate the ONNX Runtime / aimdk_msgs / torch layers cached
-# below it -- a full rebuild of those takes ~20 minutes.
+# Late-binding apt deps (kept in their own RUN layer so adding them does NOT
+# invalidate the ONNX Runtime / aimdk_msgs / torch layers cached above --
+# a full rebuild of those takes ~20 minutes).
+#   iputils-ping        -- deploy_x2.sh's pre-flight reachability check
+#   libzmq3-dev         -- C ZMQ lib (deploy harness ZmqPoseInputSource +
+#                          x2_debug PUB; without it CMake aborts with a
+#                          loud "libzmq + cppzmq required" message)
+#   nlohmann-json3-dev  -- nlohmann/json.hpp for the packed-binary header
+#                          decoder shared between the ZMQ source and the
+#                          debug publisher
+# cppzmq (zmq.hpp) is header-only and not packaged on Jammy as
+# libcppzmq-dev, so we fetch the header from upstream and drop it into
+# /usr/local/include where CMake's find_path resolves it.
+ARG CPPZMQ_VERSION=4.10.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
-    && rm -rf /var/lib/apt/lists/*
+        libzmq3-dev \
+        nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/* && \
+    wget -q --tries=3 \
+        "https://raw.githubusercontent.com/zeromq/cppzmq/v${CPPZMQ_VERSION}/zmq.hpp" \
+        -O /usr/local/include/zmq.hpp && \
+    wget -q --tries=3 \
+        "https://raw.githubusercontent.com/zeromq/cppzmq/v${CPPZMQ_VERSION}/zmq_addon.hpp" \
+        -O /usr/local/include/zmq_addon.hpp
 
 # Default workdir is the bind-mounted monorepo (set in docker-compose.yml).
 WORKDIR /workspace/sonic

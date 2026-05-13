@@ -1,0 +1,54 @@
+# Canonical "static reach" demo for the static_upper_body primitive family.
+#
+# Designed to validate the lean-in / un-lean and torso-twist / un-twist
+# transitions that pick-and-place tasks rely on while the feet stay planted.
+#
+# Exercises:
+#   - idle -> lean_fwd_medium  (16 frame blend; static_upper_body family)
+#   - HOLD lean_fwd_medium     (apex held by the curated clip itself)
+#   - lean_fwd_medium -> idle  (16 frame blend = implicit "un-lean")
+#   - idle -> torso_left_30deg
+#   - HOLD torso twist
+#   - torso_left -> idle       (= implicit "un-twist")
+#   - idle -> torso_right_30deg
+#   - torso_right -> idle
+#   - idle -> lean_fwd_large -> idle
+#
+# Acceptance criteria:
+#   - feet do not move (root XY drift <= 0.04 m total)
+#   - waist apex matches each primitive's spec target within tol_waist_deg
+#   - implicit un-lean / un-twist (idle return) takes ~16 frames at 50Hz
+#   - same per-tick / yaw bounds as the other demos
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: lean_fwd
+    magnitude: medium
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: torso_left
+    magnitude: deg_30
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: torso_right
+    magnitude: deg_30
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: lean_fwd
+    magnitude: large
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0

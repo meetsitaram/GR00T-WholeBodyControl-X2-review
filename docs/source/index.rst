@@ -92,7 +92,9 @@ Documentation
    tutorials/manager
    tutorials/vr_wholebody_teleop
    tutorials/data_collection
+   tutorials/x2_dataset_record_and_replay
    tutorials/vla_workflow
+   tutorials/vla_training
    tutorials/vla_inference
 
 .. toctree::
@@ -110,6 +112,12 @@ Documentation
    user_guide/compute_scaling_sonic_vs_ours
    user_guide/gpu_cost_comparison
    user_guide/ppo_batch_size_explainer
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Milestones
+
+   user_guide/milestones/index
 
 .. toctree::
    :maxdepth: 2

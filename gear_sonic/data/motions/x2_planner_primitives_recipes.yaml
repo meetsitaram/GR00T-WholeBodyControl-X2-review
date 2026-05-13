@@ -1,0 +1,607 @@
+# X2 heuristic-planner primitive recipes (v5 — fwd_step rebased on
+# A034 forward-loop after the v5 ZMQ future-window deploy fix made
+# meaningful-magnitude references trackable again).
+#
+# Source of truth for the runtime ``x2_planner_primitives.pkl``. Built by
+# ``gear_sonic/scripts/build_x2_planner_primitives.py``. Hand-edited.
+#
+# Re-run after editing:
+#
+#     .venv/bin/python -m gear_sonic.scripts.build_x2_planner_primitives
+#
+# v5 changes (2026-05-13, gallery-validation followup):
+#   - fwd_step_1ft: replaced the v4 source
+#     (walk_randdir_relax_001__A005 [0, 68]) which only produced
+#     +20 cm of body-frame forward translation over 2.28 s (~9 cm/s avg)
+#     -- after scale_magnitude 0.5 / 0.25 the half_ft / quarter_ft
+#     derivatives became +10 / +5 cm and were below the policy noise
+#     floor, so the robot did not visibly step forward in the
+#     gallery_fwd_back_shuffle demo (only the back_step bins moved).
+#     v5 source: walk_forward_loop_003__A034 frames [279, 327] (1.6 s
+#     at 30 fps, body-frame dx=+0.45 m, lat=+0.01 m, dyaw +0.3 deg).
+#     Both endpoints are in symmetric square-ish stance (knee
+#     asymmetry 0.0 / 0.1 deg), so the seam-blend into idle does not
+#     erase the stride. This is the same source that powers the
+#     proven-tracking fwd_walk_standard. After scaling, half_ft and
+#     quarter_ft become ~22 cm and ~11 cm, both clearly above noise.
+#     The previous v3 attempt at this same clip used window [229, 277]
+#     which had a 14.8 deg knee asymmetry at one endpoint; window
+#     [279, 327] sits between strides on BOTH sides.
+#   - Other primitives unchanged from v4.
+#
+# v4 changes (2026-05-12, locomotion-rebuild followup):
+#   - fwd_step_1ft: replaced one-stride-of-continuous-walk window with a
+#     true SQUARE -> step -> square -> step -> SQUARE clip. The v3 source
+#     (walk_forward_loop_003__A034 [229, 277]) was a one-stride excerpt
+#     of a continuous walk, so its endpoints were mid-stride staggered
+#     poses. After the runtime blended 16 frames at the seams the actual
+#     foot motion was reduced to a "shake without stepping" under SONIC.
+#     v4 source: walk_randdir_relax_001__A005 [0, 68] -- begins from a
+#     >0.6s feet-side-by-side rest, lifts L 5.7 cm peak, settles into a
+#     1.0s square stance, lifts R 10.1 cm peak, settles back to square.
+#     Net dx=+0.20 m, dy=+0.027 m, dyaw +1.6 deg, yaw_osc 19.7 deg
+#     (well within SONIC tolerance). SONIC sweep: 2.9 cm of stable
+#     forward motion with +2 deg yaw drift over 7.4 s -- the under-
+#     tracking is intentional, the user prefers slow-and-stable for
+#     locomanipulation. Matches the user's ask: "two steps max, one
+#     leg moves, the other catches up."
+#   - Other primitives unchanged from v3.
+#
+# v3 changes (2026-05-11, after first SONIC sweep on v2):
+#   - The v2 walk sources had 60-80 deg pelvis-yaw oscillation (raw
+#     SMPL->X2 retargeting captures the whole walk-cycle pelvis swing).
+#     The SONIC sweep showed the policy interprets that swing as
+#     stand-in-place wobble: fwd_walk_standard moved only 0.097 m
+#     forward over 8.6s vs commanded 4 m. v3 picks clips with pelvis-yaw
+#     oscillation <= 55 deg per 1-second window (after de-trend), which
+#     matches the 17-31 deg the v1 pickups had.
+#   - v3 sources:
+#     * fwd: walk_forward_loop_003__A034   (yaw_osc 53, fwd 0.51 m/s)
+#     * back: walk_backward_loop_005__A028_M (yaw_osc 39, back 0.34 m/s)
+#     * side: walk_sideway_090_stop_001__A039_M (yaw_osc 39, side 0.21 m/s)
+#
+# v2 changes (2026-05-11):
+#   - Replaced the v1 walk sources, which the SONIC sweep showed had:
+#     * back source `Loop_Backward_Walk_001__A019`: feet lift 13 cm but
+#       net XY speed ~0.007 m/s -> robot just shook its waist in place.
+#     * forward step source `walk_180_R_003__A333_M`: 16 cm foot lift AND
+#       a 180 deg arc (yaw drift baked in).
+#     * side source `lateral_speed_step_ff_270_R_002__A359_M`: 52 cm
+#       foot lift (high-knee march), unusable.
+#
+#   - Replaced the synthesized `lean_fwd_*` family (waist_pitch ramp) with
+#     natural `body_check_001__A474_M` mocap windows. The mocap pelvis
+#     pitches over alongside the waist (real CG-shift), where the synth
+#     primitive only moved the waist joint and left the pelvis upright,
+#     creating an unstable "wagging top" that drifted forward under SONIC.
+#
+#   - Added `crouch_*` family using the only feet-planted, low-yaw squat
+#     clips the seed PKL contains (the `medium_big_light_one_hand_*` series
+#     where the actor reached low while standing in place).
+#
+# Layering (unchanged):
+#   - Static synth bins (torso left/right yaw): waist_yaw ramp from
+#     DEFAULT_STAND_POSE. Kept because the corpus had no good
+#     waist-twist-only clips.
+#
+#   - Locomotion BASES (forward / back / side / 4 left turns): clip_window
+#     into the curated source clip + freeze arms+head to neutral so the
+#     planner doesn't fight the VLA's arm output.
+#
+#   - DERIVED bins:
+#       * Magnitude variants (half / quarter step) -> scale_magnitude.
+#       * Right-side variants of left turns / leans -> mirror_lr.
+#       * Backward steps do NOT mirror from forward (heel-strike vs
+#         toe-off polarity differs); they keep their own curated base.
+
+primitives:
+
+  # =====================================================================
+  # IDLE -- always-on rest loop. Mocap idle has unnatural wrist/shoulder
+  # values (~1.3 rad), so we freeze arms+head to canonical stand so the
+  # handover into every other frozen-arm bin (which is all of them) has a
+  # small, constant seam delta instead of a huge wrist snap.
+  # =====================================================================
+
+  - bin_name: idle_stand
+    family: idle
+    notes: "curator pick: best feet-planted slice; arms+head pinned to neutral stand"
+    ops:
+      - clip_window:
+          motion_key: loco__idle_vigilance_start_R_001__A502
+          start_frame: 33
+          n_frames: 45
+      - freeze:
+          groups: [arms, head]
+
+  # =====================================================================
+  # CONTINUOUS WALK
+  # =====================================================================
+
+  - bin_name: fwd_walk_standard
+    family: continuous_walk
+    notes: |
+      v3 source: walk_forward_loop_003__A034. Whole-clip 11.17s,
+      0.51 m/s straight, fl_max 14.6 cm, dyaw -0.1 deg, yaw_osc 53 deg
+      (acceptable, <55 SONIC-trackable bound). Window [82, 262] = 6 s,
+      dx=+4.09 m, dyaw -0.3 deg, fl_max 14.6 cm, planted endpoints.
+    ops:
+      - clip_window:
+          motion_key: loco__walk_forward_loop_003__A034
+          start_frame: 82
+          n_frames: 180
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: back_walk_standard
+    family: continuous_walk
+    notes: |
+      v3 source: walk_backward_loop_005__A028_M. Whole-clip 19.87s,
+      -0.34 m/s straight, fl_max 12.7 cm, dyaw -1.5 deg, yaw_osc 39 deg.
+      Window [299, 479] = 6 s, dx=-1.89 m, dy=+0.06 m, dyaw -0.1 deg,
+      fl_max 10.3 cm.
+    ops:
+      - clip_window:
+          motion_key: loco__walk_backward_loop_005__A028_M
+          start_frame: 299
+          n_frames: 180
+      - freeze:
+          groups: [arms, head]
+
+  # =====================================================================
+  # LOCOMOTION -- forward shuffle (1ft base, halves derived).
+  #
+  # v5 base: a one-stride window from the same A034 forward-loop that
+  # powers fwd_walk_standard. Picked between strides on BOTH sides
+  # (knee asymmetry 0.0 / 0.1 deg at endpoints) so the seam-blend into
+  # idle does not erase the stride. The v4 randdir-relax base produced
+  # only +20 cm of body-frame translation in 2.3 s (~9 cm/s avg); after
+  # halving / quartering it dropped below the policy noise floor and
+  # the robot did not visibly step in the gallery demo. v5 lifts the
+  # base displacement to +45 cm over 1.6 s (~28 cm/s), comparable to
+  # the back_step base (51 cm in 1.6 s).
+  #
+  # Halves derived via scale_magnitude on root XY (not joint deltas) so
+  # the foot lift envelope stays physically consistent.
+  # =====================================================================
+
+  - bin_name: fwd_step_1ft
+    family: locomotion
+    notes: |
+      v5 source: walk_forward_loop_003__A034 frames [279, 327] (1.6s
+      at 30fps, body-frame dx=+0.45m, lat=+0.01m, dyaw +0.3 deg).
+      Both endpoints in symmetric stance (knee asym start/end =
+      0.0/0.1 deg), so seam-blend into idle preserves the stride.
+      Same source clip as the proven-tracking fwd_walk_standard.
+
+      Replaces v4 source (walk_randdir_relax_001__A005 [0, 68]) which
+      only produced +20 cm of body-frame translation in 2.3 s (~9 cm/s);
+      after scale_magnitude 0.5 / 0.25 the half_ft / quarter_ft
+      derivatives became ~10 / ~5 cm and the policy treated them as
+      noise. v5 base ~45 cm gives half_ft ~22 cm and quarter_ft ~11 cm,
+      both clearly above the policy noise floor.
+    ops:
+      - clip_window:
+          motion_key: loco__walk_forward_loop_003__A034
+          start_frame: 279
+          n_frames: 48
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: fwd_step_half_ft
+    family: locomotion
+    notes: "derived: 0.5 * fwd_step_1ft"
+    derive_from: fwd_step_1ft
+    ops:
+      - scale_magnitude:
+          factor: 0.5
+
+  - bin_name: fwd_step_quarter_ft
+    family: locomotion
+    notes: "derived: 0.25 * fwd_step_1ft"
+    derive_from: fwd_step_1ft
+    ops:
+      - scale_magnitude:
+          factor: 0.25
+
+  # =====================================================================
+  # LOCOMOTION -- backward shuffle (own base; cannot mirror from forward
+  # because heel-strike / hip-flexion polarity is gait-specific).
+  # =====================================================================
+
+  - bin_name: back_step_half_ft
+    family: locomotion
+    notes: |
+      v3 source: walk_backward_loop_005__A028_M frames [292, 340] (1.6s,
+      dx=-0.52m, dy=+0.017m clean, dyaw -0.3 deg, fl_max=8.5cm).
+      Lower yaw_osc than v2 source.
+    ops:
+      - clip_window:
+          motion_key: loco__walk_backward_loop_005__A028_M
+          start_frame: 292
+          n_frames: 48
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: back_step_quarter_ft
+    family: locomotion
+    notes: "derived: 0.5 * back_step_half_ft"
+    derive_from: back_step_half_ft
+    ops:
+      - scale_magnitude:
+          factor: 0.5
+
+  # =====================================================================
+  # LOCOMOTION -- side shuffle. MOCAP-based (clip_window from bones-seed).
+  #
+  # History: we initially tried synthesize_side_step_ramp (pure lateral
+  # hip-roll, no hip_pitch, no waist_yaw) but the policy could not track
+  # it under SONIC -- the synthesized motion lacked the implicit weight
+  # transfer that real side-stepping uses, so the robot stood still or
+  # fell over. We then reviewed all 99 walk_sideway_* / lateral_* /
+  # strafing_* clips in the source library by stitching them into a
+  # single SONIC playback (see scripts/stitch_side_walks_for_review.py +
+  # record_sonic_review_video.py). Eyeballed clip 35/99
+  # (walk_sideway_045_stop_001__A038_M) as the cleanest small step:
+  # planted endpoints, low yaw drift, waist_yaw essentially fixed.
+  #
+  # Direction: clip_name says "045" = 45-degree sideway gait. The first
+  # 3s window (frames 0..90 @ 30 Hz) projects to body-frame delta
+  # dx=-0.25m (BACK), dy=-0.27m (RIGHT) -- a back-right diagonal of
+  # ~37 cm at 45 deg. We accept the back-component for now (per user:
+  # "keep it simple given how difficult it is to get any good moves").
+  #
+  # Bin layout: side_right_step is the mocap base; side_left_step is
+  # the mirror. Single canonical magnitude per direction (no half_ft /
+  # quarter_ft variants -- see comment block below the bin definitions).
+  # =====================================================================
+
+  # Single canonical side-step per direction (no half_ft / quarter_ft /
+  # 1ft variants -- the policy could not reliably track scaled-down or
+  # scaled-up versions of the A038_M mocap source, and stacking
+  # variants with no real magnitude difference just bloats the planner
+  # API. We keep ONE bin per direction; call it from any
+  # (side_left|side_right) intent regardless of magnitude.
+
+  - bin_name: side_right_step
+    family: locomotion
+    # User-approved bake: x2_review_walk_sideway_045_stop_A038_M_3s.pkl
+    # (data/sim_to_real_anchors/browse_sonic/baked_pkls/). That file
+    # was the SONIC playback the user blessed on 2026-05-11 -- it
+    # consists of 1.5s leading stand-pad + 0.3s blend + this 3.0s
+    # mocap window + 1.5s trailing stand-pad. The bin captures only
+    # the inner 3s of motion; the planner state machine handles the
+    # bracketing pads via runtime blends to/from idle_stand at clip
+    # entry/exit.
+    source_ref:
+      mocap_key: loco__walk_sideway_045_stop_001__A038_M
+      mocap_frames: [0, 90]                       # 3.0s @ 30Hz
+      mocap_pkl: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+      review_video: data/sim_to_real_anchors/browse_sonic/videos/x2_browser_side_walks_review.mp4
+      review_clip_index: 35                       # of 99 in the review video
+      review_video_timestamp: "02:34-02:38"       # the 3s window the user reviewed
+      approved_bake_pkl: data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_review_walk_sideway_045_stop_A038_M_3s.pkl
+      approved_by_user_at: "2026-05-11"
+    notes: |
+      Mocap source: walk_sideway_045_stop_001__A038_M frames [0, 90]
+      (3.0s @ 30Hz). Body-frame delta dx=-0.25m back, dy=-0.27m right
+      -- a back-right diagonal slide at ~45deg, ~37 cm total. Yaw
+      drift -15 deg over 3s, waist_yaw essentially fixed (span 0.9 deg),
+      planted endpoints. Selected from the 99-clip side-walk SONIC
+      review as clip 35/99 (eyeballed clean by user 2026-05-11).
+
+      KNOWN LIMITATION: this 3s window is biomechanically a knees-
+      locked pelvis-slide -- L knee span 3.8 deg, R knee span 0.1 deg
+      over the window -- so visible foot lift under SONIC is minimal.
+      The pelvis travels but the feet skate. We chose simplicity here
+      ("just keep it simple for now given how difficult it is for us
+      to get any good moves" -- user 2026-05-11) over a longer window
+      with real stepping. If foot-lift becomes important later, see
+      A038_M frames [60, 150] (L knee span 12.9 deg) or revisit the
+      99-clip review video for a different source.
+    ops:
+      - clip_window:
+          motion_key: loco__walk_sideway_045_stop_001__A038_M
+          start_frame: 0
+          n_frames: 90
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: side_left_step
+    family: locomotion
+    notes: "derived: mirror_lr(side_right_step) -> back-left diagonal at ~45deg"
+    derive_from: side_right_step
+    ops:
+      - mirror_lr: {}
+
+  # =====================================================================
+  # LOCOMOTION -- pivot turns LEFT (bases). All curator picks scored 0.6+
+  # in v1 and the SONIC sweep showed they hit target heading within
+  # ±1-3 deg, so they carry over unchanged.
+  # =====================================================================
+
+  - bin_name: turn_left_15deg
+    family: locomotion
+    notes: "curator pick (score 0.745)"
+    ops:
+      - clip_window:
+          motion_key: loco__Step_Rotate_Reaction_Idle_0360_002__A019_M
+          start_frame: 1350
+          n_frames: 60
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: turn_left_30deg
+    family: locomotion
+    notes: "curator pick (score 0.610)"
+    ops:
+      - clip_window:
+          motion_key: loco__idle_turn_360_R_003__A265_M
+          start_frame: 85
+          n_frames: 70
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: turn_left_45deg
+    family: locomotion
+    notes: "curator pick (score 0.685)"
+    ops:
+      - clip_window:
+          motion_key: loco__Step_Rotate_Reaction_Idle_0135_001__A019
+          start_frame: 1040
+          n_frames: 105
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: turn_left_90deg
+    family: locomotion
+    notes: "curator pick (score 0.734)"
+    ops:
+      - clip_window:
+          motion_key: loco__idle_turn_270_R_003__A235_M
+          start_frame: 0
+          n_frames: 90
+      - freeze:
+          groups: [arms, head]
+
+  # =====================================================================
+  # LOCOMOTION -- pivot turns RIGHT (mirror of LEFT bases)
+  # =====================================================================
+
+  - bin_name: turn_right_15deg
+    family: locomotion
+    notes: "derived: mirror_lr(turn_left_15deg)"
+    derive_from: turn_left_15deg
+    ops:
+      - mirror_lr: {}
+
+  - bin_name: turn_right_30deg
+    family: locomotion
+    notes: "derived: mirror_lr(turn_left_30deg)"
+    derive_from: turn_left_30deg
+    ops:
+      - mirror_lr: {}
+
+  - bin_name: turn_right_45deg
+    family: locomotion
+    notes: "derived: mirror_lr(turn_left_45deg)"
+    derive_from: turn_left_45deg
+    ops:
+      - mirror_lr: {}
+
+  - bin_name: turn_right_90deg
+    family: locomotion
+    notes: "derived: mirror_lr(turn_left_90deg)"
+    derive_from: turn_left_90deg
+    ops:
+      - mirror_lr: {}
+
+  # =====================================================================
+  # STATIC UPPER BODY -- forward leans (NATURAL).
+  #
+  # v2: replaces synthesized waist_pitch ramps with mocap from
+  # body_check_001__A474_M, where the actor pitches the entire torso
+  # forward (real pelvis pitch + waist pitch + slight knee bend), not
+  # just bending the waist joint. This stabilises the squat-leaner
+  # geometry SONIC was trained against; the synth version drifted forward
+  # because the pelvis stayed upright while the waist alone tipped.
+  #
+  # Window [752, 827] = 2.5s, ends at 21.6 deg total fwd pitch, foot-
+  # lift max 2 cm, net XY drift <10 cm, dyaw +1.9 deg. The recipe ends
+  # at the apex; the runtime blends back to idle over 16 frames
+  # (BLEND_FRAMES_STATIC_UPPER_BODY) for recovery.
+  # =====================================================================
+
+  - bin_name: lean_fwd_medium
+    family: static_upper_body
+    notes: "natural lean: body_check_001__A474_M frames [752, 827] (~22 deg apex)"
+    ops:
+      - clip_window:
+          motion_key: loco__body_check_001__A474_M
+          start_frame: 752
+          n_frames: 75
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: lean_fwd_small
+    family: static_upper_body
+    notes: "derived: 0.5 * lean_fwd_medium (~11 deg apex)"
+    derive_from: lean_fwd_medium
+    ops:
+      - scale_magnitude:
+          factor: 0.5
+          scale_xy: false
+          scale_yaw: false
+
+  - bin_name: lean_fwd_large
+    family: static_upper_body
+    notes: "derived: 1.4 * lean_fwd_medium (~31 deg apex)"
+    derive_from: lean_fwd_medium
+    ops:
+      - scale_magnitude:
+          factor: 1.4
+          scale_xy: false
+          scale_yaw: false
+
+  # =====================================================================
+  # STATIC UPPER BODY -- crouch family.
+  #
+  # v5 (2026-05-13, gallery-validation): replaced the v4 synthesized
+  # crouch_medium with a real squat-from-stand mocap window. Even with
+  # the v5 ZMQ future-window deploy fix in place, the synthesized
+  # ``synthesize_crouch_ramp`` references (3 / 6 / 10 cm pelvis drop,
+  # 70-96 deg added knee bend) were under-tracked so heavily that the
+  # robot looked like it was doing a "low lean" instead of a squat
+  # (user observation 2026-05-13). The mocap source has ~110 deg added
+  # knee bend at apex and a ~34 cm pelvis drop -- a much stronger
+  # reference signal that survives policy under-tracking.
+  #
+  # Source: ``small_light_two_hands_front_low_to_front_low__A516`` is
+  # an actor squatting down to handle a low object then rising back to
+  # stand. Window [10, 75] (2.17 s @ 30 fps) is a self-contained
+  # stand -> squat -> stand cycle with both knees within 4 deg of each
+  # other at apex and clean square-stance endpoints.
+  #
+  # crouch_small / crouch_large are kept as the v4 synthesized
+  # primitives but are NOT REACHABLE via the planner anymore: every
+  # ``crouch`` magnitude is aliased to ``crouch_medium`` in
+  # ``LocomotionCommand.as_bin_name`` (same pattern as fwd_step /
+  # side_left_step / side_right_step). Once we have proven mocap
+  # candidates for shallower / deeper variants, undo the alias.
+  #
+  # All three are arms+head frozen so VLA / teleop arm output is not
+  # fought by the planner. The mocap source's hip_pitch and waist_pitch
+  # at apex (~95 deg hip flex, ~16 deg waist pitch) are intentionally
+  # KEPT -- a real squat needs forward CG shift, and freezing them to
+  # stand baseline would tip the robot backward.
+  # =====================================================================
+
+  - bin_name: crouch_small
+    family: static_upper_body
+    notes: |
+      v4 synthesized: 3 cm pelvis drop. UNREACHABLE via planner --
+      crouch+small is aliased to crouch_medium (mocap squat). Kept in
+      the build so existing test fixtures and the curator inventory
+      continue to resolve.
+    ops:
+      - synthesize_crouch_ramp:
+          peak_drop_m: 0.03
+          ramp_in_frames: 25
+          hold_frames: 15
+          ramp_out_frames: 25
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: crouch_medium
+    family: static_upper_body
+    notes: |
+      v5 source: medium_big_light_two_hands_front_medium_to_front_low__A530_M
+      frames [10, 135] (125f @ 30 fps = 4.17 s).
+      Hand-picked from 22 symmetric-squat candidates as the one with
+      the LOWEST torso lean while still bending knees deeply: at apex
+      (around frame 85, ~2.50 s) L/R knee +96/+100 deg (asym 4 deg),
+      L/R hip -97/-95 deg (asym 2 deg), **waist_pitch ~0 deg** (torso
+      stays upright relative to pelvis throughout), pelvis Z drop
+      27 cm. Endpoints are square stance with zero knee delta and hip
+      delta within +/-2 deg. ~13 cm forward XY drift at apex (actor
+      shifts CG forward to balance), recovers by end of window.
+      Replaces the first v5 attempt (A516 [10,75]) which had a
+      similar squat shape but +18 deg waist pitch at apex -- visually
+      a "deep stoop", not a "true squat". A530_M's flat waist + same
+      deep knee bend gives the upright crouch the user asked for.
+    ops:
+      - clip_window:
+          motion_key: loco__medium_big_light_two_hands_front_medium_to_front_low_R_001__A530_M
+          start_frame: 10
+          n_frames: 125
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: crouch_large
+    family: static_upper_body
+    notes: |
+      v4 synthesized: 10 cm pelvis drop. UNREACHABLE via planner --
+      crouch+large is aliased to crouch_medium (mocap squat). Kept in
+      the build so existing test fixtures and the curator inventory
+      continue to resolve.
+    ops:
+      - synthesize_crouch_ramp:
+          peak_drop_m: 0.10
+          ramp_in_frames: 25
+          hold_frames: 15
+          ramp_out_frames: 25
+      - freeze:
+          groups: [arms, head]
+
+  # =====================================================================
+  # STATIC UPPER BODY -- torso twists LEFT (synth bases).
+  # Slightly shorter ramps (25 frames) than leans because yaw moves are
+  # natural at a quicker pace. Kept synth: corpus has no clean
+  # waist-yaw-only motions (curator scored 0.0 across the board).
+  # =====================================================================
+
+  - bin_name: torso_left_15deg
+    family: static_upper_body
+    notes: "synthesized: waist_yaw ramp 0->+15deg->0"
+    ops:
+      - synthesize_waist_ramp:
+          axis: yaw
+          peak_deg: 15.0
+          ramp_in_frames: 25
+          hold_frames: 20
+          ramp_out_frames: 25
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: torso_left_30deg
+    family: static_upper_body
+    notes: "synthesized: waist_yaw ramp 0->+30deg->0"
+    ops:
+      - synthesize_waist_ramp:
+          axis: yaw
+          peak_deg: 30.0
+          ramp_in_frames: 25
+          hold_frames: 20
+          ramp_out_frames: 25
+      - freeze:
+          groups: [arms, head]
+
+  - bin_name: torso_left_45deg
+    family: static_upper_body
+    notes: "synthesized: waist_yaw ramp 0->+45deg->0"
+    ops:
+      - synthesize_waist_ramp:
+          axis: yaw
+          peak_deg: 45.0
+          ramp_in_frames: 25
+          hold_frames: 20
+          ramp_out_frames: 25
+      - freeze:
+          groups: [arms, head]
+
+  # =====================================================================
+  # STATIC UPPER BODY -- torso twists RIGHT (mirror of LEFT). Mirror_lr
+  # negates waist_yaw so we get the negative-peak counterpart for free
+  # while exercising the same op the locomotion turns use.
+  # =====================================================================
+
+  - bin_name: torso_right_15deg
+    family: static_upper_body
+    notes: "derived: mirror_lr(torso_left_15deg) -> waist_yaw -15deg"
+    derive_from: torso_left_15deg
+    ops:
+      - mirror_lr: {}
+
+  - bin_name: torso_right_30deg
+    family: static_upper_body
+    notes: "derived: mirror_lr(torso_left_30deg) -> waist_yaw -30deg"
+    derive_from: torso_left_30deg
+    ops:
+      - mirror_lr: {}
+
+  - bin_name: torso_right_45deg
+    family: static_upper_body
+    notes: "derived: mirror_lr(torso_left_45deg) -> waist_yaw -45deg"
+    derive_from: torso_left_45deg
+    ops:
+      - mirror_lr: {}

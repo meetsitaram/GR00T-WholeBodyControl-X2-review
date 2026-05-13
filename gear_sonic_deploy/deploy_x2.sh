@@ -226,6 +226,27 @@ MC_STOPPED_BY_US=false
 # Deploy CLI passthrough flags
 MODEL=""
 MOTION=""
+# VLA mode flips the deploy from "motion file replay" to "ZMQ pose subscriber".
+# When VLA_MODE=true, --motion is ignored and the deploy subscribes to
+# VLA_ZMQ_HOST:VLA_ZMQ_PORT instead. VLA_DEBUG_PORT (when non-zero) makes the
+# deploy also bind a PUB socket so dump_x2_debug.py can tail the telemetry.
+# Defaults match docs/source/references/x2_zmq_protocol.md.
+VLA_MODE=false
+VLA_ZMQ_HOST="localhost"
+VLA_ZMQ_PORT="5556"
+VLA_ZMQ_TOPIC="pose"
+VLA_DEBUG_PORT="5557"
+VLA_DEBUG_TOPIC="x2_debug"
+
+# Wrist bypass: forwarded to the deploy binary as --wrist-bypass {off,ik}.
+# When set to "ik" (and --vla is also set), the C++ deploy overwrites
+# target_pos_mj for the 4 broken wrist DOFs (left/right wrist_pitch +
+# wrist_roll, MJ indices {20,21,27,28}) with the latest IK reference from
+# the ZMQ pose feed. wrist_yaw is left under SONIC because it tracks fine.
+# Empty string = leave it disabled (legacy behaviour); the C++ binary
+# defaults to "off" so sim-to-real fidelity tests are unchanged. See
+# x2_deploy_onnx_ref.cpp::CliArgs::WristBypass for the full rationale.
+WRIST_BYPASS=""
 # Set when --motion is a PKL or YAML and we bake an x2m2 on the fly. Holds
 # the absolute path to the original PKL/YAML so the wrapper can route it to
 # the MuJoCo bridge as --sim-motion (matching what eval_x2_mujoco_onnx.py
@@ -357,6 +378,13 @@ SIM_MJCF=""
 SIM_MOTION=""
 SIM_INIT_FRAME=""
 SIM_VIEWER=false
+# Optional viewer-camera tracking. When SIM_CAM_TRACK_BODY is non-empty
+# the bridge sets cam.type=mjCAMERA_TRACKING and locks the framing onto
+# that body (e.g. "pelvis"). The other three knobs are forwarded as-is.
+SIM_CAM_TRACK_BODY=""
+SIM_CAM_DISTANCE=""
+SIM_CAM_ELEVATION=""
+SIM_CAM_AZIMUTH=""
 SIM_IMU_FROM=""
 SIM_HOLD_STIFFNESS_MULT=""
 # Bridge init-pose selector: empty = bridge default ('default'). 'gantry-hang'
@@ -395,6 +423,17 @@ SIM_PROFILE=""
 SIM_DT=""
 SIM_PRINT_SCENE=false
 SIM_RECORD_COMMANDS=""
+# OmniHand augmented MJCF + finger-command ZMQ subscriber. When the live
+# VLA bridge is publishing left_hand_joints / right_hand_joints on the
+# pose topic, --sim-with-omnihand makes the bridge's MuJoCo viewer load
+# the augmented spec and animate the fingers in step with the policy.
+# Defaults are off so the existing M2 / M5 acceptance gates (which pin
+# the bare X2 MJCF) keep passing without changes.
+SIM_WITH_OMNIHAND=false
+SIM_HAND_ZMQ_HOST=""
+SIM_HAND_ZMQ_PORT=""
+SIM_HAND_ZMQ_TOPIC=""
+SIM_NO_HAND_ZMQ=false
 
 # Bookkeeping for child PIDs we must clean up on exit
 SIM_BRIDGE_PID=""
@@ -618,6 +657,37 @@ Sim mode (only applies when 'sim' is selected; all optional):
                               overrides only.
   --sim-init-frame N          Motion frame to RSI from (default 0).
   --sim-viewer                Open the MuJoCo passive viewer window.
+  --sim-cam-track-body NAME   Lock the passive viewer's camera onto the named
+                              body (e.g. "pelvis") so the robot stays framed
+                              as it walks. Default: free camera.
+  --sim-cam-distance M        Tracking-camera distance in meters
+                              (default: bridge picks 3.5).
+  --sim-cam-elevation DEG     Tracking-camera elevation in degrees, negative
+                              looks down (default: bridge picks -12).
+  --sim-cam-azimuth DEG       Tracking-camera azimuth in degrees
+                              (0=+X, 90=+Y, 180=-X, 270=-Y; default 135).
+  --sim-with-omnihand         Make the MuJoCo bridge load the X2 + OmniHand
+                              augmented MJCF (programmatically composed via
+                              gear_sonic.scripts.compose_x2_with_omnihand)
+                              instead of the bare x2_ultra.xml. Replaces the
+                              dummy wrist stubs with the 10-active-DOF (per
+                              side) OmniHand fingers. The body joints +
+                              actuators are unchanged so the deploy harness's
+                              joint-name handshake still passes.
+  --sim-hand-zmq-host HOST    Host the bridge SUBs on for OmniHand finger
+                              setpoints when --sim-with-omnihand is set.
+                              Default 'localhost' (live VLA bridge).
+  --sim-hand-zmq-port PORT    Port for the OmniHand SUB. Default 5556 -- the
+                              same port the SONIC C++ harness already
+                              subscribes to (PUB/SUB is multi-subscriber-
+                              safe so they ride alongside).
+  --sim-hand-zmq-topic STR    ZMQ topic prefix for the OmniHand SUB. Must
+                              match the live VLA bridge's --pub-topic
+                              (default 'pose').
+  --sim-no-hand-zmq           Skip the OmniHand ZMQ subscriber even when
+                              --sim-with-omnihand is set. Useful for static
+                              viewer screenshots: fingers stay at the
+                              MJCF rest pose.
   --sim-imu-from {pelvis,torso}
                               Body to read IMU from (default: pelvis,
                               matches MJCF live sensor at imu_0).
@@ -670,6 +740,37 @@ Sim mode (only applies when 'sim' is selected; all optional):
                               rosbag2 directory (handy for diffing sim/real).
   --sim-domain-id N           ROS_DOMAIN_ID to isolate the sim from any real
                               robot on the same subnet (default: $SIM_DOMAIN_ID_DEFAULT)
+
+VLA / ZMQ input source (M2 acceptance gate, see
+docs/source/references/x2_zmq_protocol.md):
+  --vla                       Switch the deploy from "motion file replay" to
+                              "ZMQ pose subscriber". Ignores --motion. Pair
+                              with gear_sonic/scripts/mock_vla_publish_stand_token.py
+                              for a sim smoke test, or with the real GR00T
+                              N1.7 VLA serving the X2 once trained.
+  --vla-zmq-host HOST         Host of the VLA ZMQ pose publisher
+                              (default: $VLA_ZMQ_HOST).
+  --vla-zmq-port PORT         Port of the VLA ZMQ pose publisher
+                              (default: $VLA_ZMQ_PORT).
+  --vla-zmq-topic TOPIC       Topic prefix to subscribe to (default: $VLA_ZMQ_TOPIC).
+  --vla-debug-port PORT       Port for the deploy's x2_debug PUB socket
+                              (default: $VLA_DEBUG_PORT). Set 0 to disable.
+                              dump_x2_debug.py is the reference subscriber.
+  --vla-debug-topic TOPIC     Topic prefix for x2_debug frames
+                              (default: $VLA_DEBUG_TOPIC).
+  --wrist-bypass MODE         {off, ik}. Forwarded to the deploy binary as
+                              --wrist-bypass. When 'ik' (and --vla is set),
+                              the deploy overwrites target_pos_mj for the
+                              4 broken wrist DOFs (left/right wrist_pitch +
+                              wrist_roll) with the latest IK reference from
+                              the ZMQ pose feed BEFORE the safety stack.
+                              SONIC still drives every other DOF including
+                              wrist_yaw (which tracks correctly today).
+                              Use 'ik' for VR teleop / VLA dataset recording
+                              where SONIC's wrist attractor masks the
+                              operator's hand pose; keep unset / 'off' for
+                              sim-to-real fidelity tests. Default: empty
+                              (= binary default of 'off').
 
 Pre-flight + behaviour toggles:
   --no-stop-mc                Skip the stop_app POST (assume MC is already
@@ -799,6 +900,10 @@ while [[ $# -gt 0 ]]; do
         --sim-motion)             SIM_MOTION="$2"; shift 2 ;;
         --sim-init-frame)         SIM_INIT_FRAME="$2"; shift 2 ;;
         --sim-viewer)             SIM_VIEWER=true; shift ;;
+      --sim-cam-track-body)     SIM_CAM_TRACK_BODY="$2"; shift 2 ;;
+      --sim-cam-distance)       SIM_CAM_DISTANCE="$2"; shift 2 ;;
+      --sim-cam-elevation)      SIM_CAM_ELEVATION="$2"; shift 2 ;;
+      --sim-cam-azimuth)        SIM_CAM_AZIMUTH="$2"; shift 2 ;;
         --sim-imu-from)           SIM_IMU_FROM="$2"; shift 2 ;;
         --sim-hold-stiffness-mult) SIM_HOLD_STIFFNESS_MULT="$2"; shift 2 ;;
         --sim-init-pose)          SIM_INIT_POSE="$2"; shift 2 ;;
@@ -813,6 +918,18 @@ while [[ $# -gt 0 ]]; do
         --sim-python)             SIM_PYTHON="$2"; shift 2 ;;
         --sim-record-commands)    SIM_RECORD_COMMANDS="$2"; shift 2 ;;
         --sim-domain-id)          SIM_DOMAIN_ID="$2"; shift 2 ;;
+        --sim-with-omnihand)      SIM_WITH_OMNIHAND=true; shift ;;
+        --sim-hand-zmq-host)      SIM_HAND_ZMQ_HOST="$2"; shift 2 ;;
+        --sim-hand-zmq-port)      SIM_HAND_ZMQ_PORT="$2"; shift 2 ;;
+        --sim-hand-zmq-topic)     SIM_HAND_ZMQ_TOPIC="$2"; shift 2 ;;
+        --sim-no-hand-zmq)        SIM_NO_HAND_ZMQ=true; shift ;;
+        --vla)                VLA_MODE=true; shift ;;
+        --vla-zmq-host)       VLA_ZMQ_HOST="$2"; shift 2 ;;
+        --vla-zmq-port)       VLA_ZMQ_PORT="$2"; shift 2 ;;
+        --vla-zmq-topic)      VLA_ZMQ_TOPIC="$2"; shift 2 ;;
+        --vla-debug-port)     VLA_DEBUG_PORT="$2"; shift 2 ;;
+        --vla-debug-topic)    VLA_DEBUG_TOPIC="$2"; shift 2 ;;
+        --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
         local|onbot|sim)      MODE="$1"; shift ;;
         *)
             echo -e "${RED}Error: unknown argument: $1${NC}" >&2
@@ -1262,7 +1379,30 @@ echo ""
 # ============================================================================
 
 ROS2_ARGS=("--model" "$MODEL")
-[[ -n "$MOTION" ]]            && ROS2_ARGS+=("--motion" "$MOTION")
+# VLA / ZMQ input source. When VLA_MODE=true (set via --vla), the deploy
+# binary subscribes to a ZMQ pose topic instead of replaying a motion
+# file. The mock-VLA helper `gear_sonic/scripts/mock_vla_publish_stand_token.py`
+# is the v0 source-of-truth; the real GR00T N1.7 VLA will publish to the
+# same topic once we have a trained model. See
+# `docs/source/references/x2_zmq_protocol.md` for the wire format.
+if [[ "${VLA_MODE:-false}" == "true" ]]; then
+    ROS2_ARGS+=("--input-type" "zmq")
+    ROS2_ARGS+=("--zmq-pose-host" "${VLA_ZMQ_HOST:-localhost}")
+    ROS2_ARGS+=("--zmq-pose-port" "${VLA_ZMQ_PORT:-5556}")
+    ROS2_ARGS+=("--zmq-pose-topic" "${VLA_ZMQ_TOPIC:-pose}")
+elif [[ -n "$MOTION" ]]; then
+    ROS2_ARGS+=("--motion" "$MOTION")
+fi
+# x2_debug telemetry PUB: enabled regardless of input source (VLA or
+# --motion playback) so dump_x2_debug.py works for BOTH paths. Without
+# this, A/B comparing PklMotionReference vs ZmqPoseInputSource is
+# blind on the --motion side: no per-tick body_q_target /
+# body_q_measured / safety_event stream. Set VLA_DEBUG_PORT=0 to
+# disable.
+if [[ -n "${VLA_DEBUG_PORT:-}" && "${VLA_DEBUG_PORT}" != "0" ]]; then
+    ROS2_ARGS+=("--zmq-debug-port" "${VLA_DEBUG_PORT}")
+    ROS2_ARGS+=("--zmq-debug-topic" "${VLA_DEBUG_TOPIC:-x2_debug}")
+fi
 [[ -n "$LOG_DIR" ]]           && ROS2_ARGS+=("--log-dir" "$LOG_DIR")
 [[ -n "$AUTOSTART" ]]         && ROS2_ARGS+=("--autostart-after" "$AUTOSTART")
 [[ -n "$MAX_DURATION" ]]      && ROS2_ARGS+=("--max-duration" "$MAX_DURATION")
@@ -1275,6 +1415,7 @@ ROS2_ARGS=("--model" "$MODEL")
 [[ -n "$IMU_TOPIC" ]]         && ROS2_ARGS+=("--imu-topic" "$IMU_TOPIC")
 [[ -n "$INTRA_OP_THREADS" ]]  && ROS2_ARGS+=("--intra-op-threads" "$INTRA_OP_THREADS")
 [[ -n "$OBS_DUMP" ]]          && ROS2_ARGS+=("--obs-dump" "$OBS_DUMP")
+[[ -n "$WRIST_BYPASS" ]]      && ROS2_ARGS+=("--wrist-bypass" "$WRIST_BYPASS")
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
 
 # ────────────────────────────────────────────────────────────────────────
@@ -2415,7 +2556,16 @@ elif [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_DT" ]]                   && BRIDGE_ARGS+=("--sim-dt" "$SIM_DT")
     BRIDGE_ARGS+=("--ros-domain-id" "$SIM_DOMAIN_ID")
     $SIM_VIEWER                          && BRIDGE_ARGS+=("--viewer")
+    [[ -n "$SIM_CAM_TRACK_BODY" ]]       && BRIDGE_ARGS+=("--cam-track-body" "$SIM_CAM_TRACK_BODY")
+    [[ -n "$SIM_CAM_DISTANCE" ]]         && BRIDGE_ARGS+=("--cam-distance" "$SIM_CAM_DISTANCE")
+    [[ -n "$SIM_CAM_ELEVATION" ]]        && BRIDGE_ARGS+=("--cam-elevation" "$SIM_CAM_ELEVATION")
+    [[ -n "$SIM_CAM_AZIMUTH" ]]          && BRIDGE_ARGS+=("--cam-azimuth" "$SIM_CAM_AZIMUTH")
     $SIM_PRINT_SCENE                     && BRIDGE_ARGS+=("--print-scene")
+    $SIM_WITH_OMNIHAND                   && BRIDGE_ARGS+=("--with-omnihand")
+    [[ -n "$SIM_HAND_ZMQ_HOST" ]]        && BRIDGE_ARGS+=("--hand-zmq-host" "$SIM_HAND_ZMQ_HOST")
+    [[ -n "$SIM_HAND_ZMQ_PORT" ]]        && BRIDGE_ARGS+=("--hand-zmq-port" "$SIM_HAND_ZMQ_PORT")
+    [[ -n "$SIM_HAND_ZMQ_TOPIC" ]]       && BRIDGE_ARGS+=("--hand-zmq-topic" "$SIM_HAND_ZMQ_TOPIC")
+    $SIM_NO_HAND_ZMQ                     && BRIDGE_ARGS+=("--no-hand-zmq")
 
     echo -e "$(ts) ${BLUE}[sim]${NC} backgrounding: $SIM_PYTHON $SIM_BRIDGE_REL ${BRIDGE_ARGS[*]}"
     "$SIM_PYTHON" "$SCRIPT_DIR/$SIM_BRIDGE_REL" "${BRIDGE_ARGS[@]}" &

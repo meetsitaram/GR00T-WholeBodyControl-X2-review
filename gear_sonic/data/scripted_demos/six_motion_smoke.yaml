@@ -1,0 +1,56 @@
+# 6-motion smoke demo for the X2 heuristic planner.
+#
+# Sequence: forward step -> left side step -> turn left 45 -> right side step
+#         -> turn right 45 -> backward step. Each motion ends by sitting
+# on ``idle`` for ~1s (one idle_stand clip pass at 1.5 s) so the body
+# returns to the trained square stance between primitives. This makes
+# the cuts between motions visually obvious AND gives the policy a
+# stable settle pose to blend out of -- preferable to freezing the
+# previous segment's last frame, which we tried initially via a
+# now-removed ``hold_last_pose`` intent (see DEV_NOTES 2026-05-11:
+# side-step clips end mid-stride, so freezing them looked broken).
+#
+# Total demo wall-clock (rough):
+#   2.0s warmup idle + (~3s motion + ~1.5s idle) * 6 + ~3s tail idle
+#   ~= 32 s. Use ``--duration 35`` for the run_planner_smoke wrapper.
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: fwd_step
+    magnitude: half_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: side_left
+    magnitude: default
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: turn_left
+    magnitude: deg_45
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: side_right
+    magnitude: default
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: turn_right
+    magnitude: deg_45
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: back_step
+    magnitude: half_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5

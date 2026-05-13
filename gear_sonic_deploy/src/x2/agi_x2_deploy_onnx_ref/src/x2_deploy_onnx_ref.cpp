@@ -70,6 +70,9 @@
 #include "safety.hpp"
 #include "stand_pose_loader.hpp"
 #include "tokenizer_obs.hpp"
+#include "wrist_bypass.hpp"
+#include "zmq/zmq_debug_publisher.hpp"
+#include "zmq/zmq_pose_input_source.hpp"
 
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -248,6 +251,54 @@ struct CliArgs {
   // that the next step (touch start_trigger_sentinel) is sub-second.
   // Independent of start_trigger_sentinel; safe to use on its own.
   std::string ready_sentinel;
+  // ────────────────────────────────────────────────────────────────────
+  // VLA / ZMQ input source (M2 acceptance gate).
+  //
+  // ``--input-type`` selects what drives the tokenizer's reference window:
+  //   * ``motion_file`` (default, legacy): replay an X2M2 .pkl-style file
+  //     via ``PklMotionReference`` (requires ``--motion``), or fall back
+  //     to ``StandStillReference`` when ``--motion`` is empty.
+  //   * ``zmq``: subscribe to a packed-binary ``pose`` topic on
+  //     ``--zmq-pose-host:--zmq-pose-port`` and consume the body refs +
+  //     hand joints + (forward-compat) motion token published there.
+  //     Used by the M2 sim smoke gate (``mock_vla_publish_stand_token.py``)
+  //     and, eventually, the real GR00T N1.7 VLA serving the X2.
+  //
+  // ``--zmq-debug-port`` enables the publisher counterpart so Python
+  // tooling (``dump_x2_debug.py``) can subscribe to the deploy's
+  // telemetry stream. Set to 0 to disable.
+  // ────────────────────────────────────────────────────────────────────
+  std::string input_type        = "motion_file";  // {motion_file, zmq}
+  std::string zmq_pose_host     = "localhost";
+  int         zmq_pose_port     = 5556;
+  std::string zmq_pose_topic    = "pose";
+  int         zmq_debug_port    = 0;               // 0 = disabled
+  std::string zmq_debug_topic   = "x2_debug";
+  // ────────────────────────────────────────────────────────────────────
+  // Wrist bypass (VR-teleop quality-of-life switch).
+  //
+  // SONIC's training distribution does not include diverse wrist motion
+  // and the smallmotor wrist channels have an x2_action_scale of just
+  // 0.0715 (vs ~0.42 on the rest of the arm), so the policy outputs near
+  // a single comfort pose for wrist_pitch and pins wrist_roll at the
+  // asymmetric joint-range tight side. Empirical: data/lerobot/
+  // x2_quest3_sonic_v2/data/chunk-000/episode_000001.parquet shows
+  // corr(commanded, executed) ~0.0 for both pitches and 98-99% of frames
+  // pinned at +-41 deg for both rolls -- identical with both the iter-2k
+  // and iter-25k checkpoints, ruling out a training regression.
+  //
+  // When --wrist-bypass=ik AND --input-type=zmq, OnControl overwrites
+  // target_pos_mj for the 4 broken wrist DOFs with the latest IK
+  // reference straight off the ZMQ pose feed BEFORE the safety stack so
+  // soft-start ramp + max-target-dev clamp still apply uniformly. The
+  // tokenizer obs is unchanged (SONIC still sees the IK reference for
+  // ALL 31 dofs), only the final per-tick PD target gets the override.
+  // wrist_yaw is left under SONIC because v2 telemetry shows it tracks
+  // (corr ~0.8). Default off to preserve sim-to-real fidelity for the
+  // motion-file replay path; record_x2_dataset.sh flips it to ``ik``.
+  // ────────────────────────────────────────────────────────────────────
+  enum class WristBypass { Off, Ik };
+  WristBypass wrist_bypass      = WristBypass::Off;
 };
 
 void PrintUsage()
@@ -350,6 +401,33 @@ void PrintUsage()
       << "                             detectors are armed and the safety gate can\n"
       << "                             be shown. Independent of start-trigger; safe\n"
       << "                             to use on its own.\n"
+      << "  --input-type TYPE          {motion_file,zmq} (default motion_file). When\n"
+      << "                             'zmq', the tokenizer reference window is\n"
+      << "                             driven by a ZMQ 'pose' topic publisher\n"
+      << "                             (mock-VLA helper or real GR00T VLA). With\n"
+      << "                             'motion_file' (legacy) the deploy uses\n"
+      << "                             --motion (or StandStill if --motion empty).\n"
+      << "  --zmq-pose-host HOST       Host of the ZMQ pose publisher (default localhost).\n"
+      << "  --zmq-pose-port PORT       Port of the ZMQ pose publisher (default 5556).\n"
+      << "  --zmq-pose-topic TOPIC     Topic prefix to subscribe to (default 'pose').\n"
+      << "  --zmq-debug-port PORT      If > 0, bind a PUB socket on this port and\n"
+      << "                             publish per-tick x2_debug telemetry frames\n"
+      << "                             in the packed-binary wire format consumed by\n"
+      << "                             gear_sonic/scripts/dump_x2_debug.py. 0 disables.\n"
+      << "  --zmq-debug-topic TOPIC    Topic prefix for telemetry frames (default 'x2_debug').\n"
+      << "  --wrist-bypass MODE        {off, ik} (default 'off'). When 'ik' AND\n"
+      << "                             --input-type=zmq, OnControl overwrites\n"
+      << "                             target_pos_mj for the 4 broken wrist DOFs\n"
+      << "                             (left/right wrist_pitch + wrist_roll, MJ\n"
+      << "                             indices {20,21,27,28}) with the latest IK\n"
+      << "                             reference from the ZMQ pose feed BEFORE the\n"
+      << "                             safety stack. SONIC still drives the other 27\n"
+      << "                             DOFs (legs, waist, shoulders, elbows,\n"
+      << "                             wrist_yaw, head). Use 'ik' for VR teleop /\n"
+      << "                             VLA dataset recording where SONIC's wrist\n"
+      << "                             attractor masks the operator's hand pose;\n"
+      << "                             keep 'off' for sim-to-real fidelity tests so\n"
+      << "                             the policy's own commands reach every joint.\n"
       << "  --help, -h                 show this help\n";
 }
 
@@ -393,12 +471,40 @@ CliArgs ParseCli(int argc, char** argv)
       a.start_trigger_sentinel = next("--start-trigger-sentinel");
     else if (s == "--ready-sentinel")
       a.ready_sentinel = next("--ready-sentinel");
+    else if (s == "--input-type")
+      a.input_type = next("--input-type");
+    else if (s == "--zmq-pose-host")
+      a.zmq_pose_host = next("--zmq-pose-host");
+    else if (s == "--zmq-pose-port")
+      a.zmq_pose_port = std::stoi(next("--zmq-pose-port"));
+    else if (s == "--zmq-pose-topic")
+      a.zmq_pose_topic = next("--zmq-pose-topic");
+    else if (s == "--zmq-debug-port")
+      a.zmq_debug_port = std::stoi(next("--zmq-debug-port"));
+    else if (s == "--zmq-debug-topic")
+      a.zmq_debug_topic = next("--zmq-debug-topic");
+    else if (s == "--wrist-bypass") {
+      const std::string v = next("--wrist-bypass");
+      if      (v == "off") a.wrist_bypass = CliArgs::WristBypass::Off;
+      else if (v == "ik")  a.wrist_bypass = CliArgs::WristBypass::Ik;
+      else throw std::runtime_error(
+          "--wrist-bypass must be 'off' or 'ik', got: " + v);
+    }
     else {
       throw std::runtime_error("unknown argument: " + s);
     }
   }
   if (a.model_path.empty()) {
     throw std::runtime_error("--model is required");
+  }
+  if (a.input_type != "motion_file" && a.input_type != "zmq") {
+    throw std::runtime_error(
+        "--input-type must be 'motion_file' or 'zmq', got: " + a.input_type);
+  }
+  if (a.wrist_bypass == CliArgs::WristBypass::Ik && a.input_type != "zmq") {
+    throw std::runtime_error(
+        "--wrist-bypass=ik requires --input-type=zmq (no IK reference is "
+        "available on the motion_file path; the bypass would be a no-op)");
   }
   return a;
 }
@@ -477,7 +583,25 @@ class X2Deploy {
                   cli.imu_topic.c_str());
     }
 
-    if (cli.motion_path.empty()) {
+    if (cli.input_type == "zmq") {
+      // VLA-driven path. The ZmqPoseInputSource subscribes to the pose
+      // topic and publishes itself as a ReferenceMotion drop-in: until the
+      // first body-bearing frame arrives, Sample() returns default_angles
+      // + identity quat (matches StandStillReference exactly), so the
+      // tokenizer obs is well-defined even with no VLA on the wire.
+      auto zmq_src = ZmqPoseInputSource::Connect(
+          cli.zmq_pose_host, cli.zmq_pose_port, cli.zmq_pose_topic);
+      RCLCPP_WARN(node_->get_logger(),
+                  "Reference motion: ZmqPoseInputSource bound to "
+                  "tcp://%s:%d (topic='%s'). Until the first body-bearing "
+                  "pose frame arrives, Sample() returns the trained stand "
+                  "pose -- safe to start CONTROL on a sub-second window "
+                  "without a VLA on the wire.",
+                  cli.zmq_pose_host.c_str(), cli.zmq_pose_port,
+                  cli.zmq_pose_topic.c_str());
+      zmq_pose_source_ = zmq_src.get();  // observer pointer for hand-joint readback
+      ref_motion_ = std::move(zmq_src);
+    } else if (cli.motion_path.empty()) {
       ref_motion_ = std::make_unique<StandStillReference>();
       RCLCPP_INFO(node_->get_logger(),
                   "Reference motion: StandStill (default standing pose)");
@@ -486,6 +610,27 @@ class X2Deploy {
       RCLCPP_INFO(node_->get_logger(),
                   "Reference motion: PklMotionReference '%s'",
                   cli.motion_path.c_str());
+    }
+
+    // Optional packed-binary x2_debug PUB sink. Mirrors the input wire
+    // format end-to-end; gear_sonic/scripts/dump_x2_debug.py is its
+    // reference consumer. Must run on a different port from the input
+    // source so the SUB/PUB direction can't loop back on itself.
+    if (cli.zmq_debug_port > 0) {
+      try {
+        zmq_debug_pub_ = ZmqDebugPublisher::Bind(
+            cli.zmq_debug_port, cli.zmq_debug_topic);
+        RCLCPP_WARN(node_->get_logger(),
+                    "x2_debug telemetry: PUB bound on tcp://*:%d (topic='%s'). "
+                    "Use gear_sonic/scripts/dump_x2_debug.py --port %d --topic %s "
+                    "to inspect.",
+                    cli.zmq_debug_port, cli.zmq_debug_topic.c_str(),
+                    cli.zmq_debug_port, cli.zmq_debug_topic.c_str());
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "x2_debug PUB failed to bind on port %d: %s",
+                     cli.zmq_debug_port, e.what());
+      }
     }
 
     onnx_actor_ = std::make_unique<OnnxActor>(cli.model_path, cli.intra_op_threads);
@@ -1253,6 +1398,22 @@ class X2Deploy {
       target_pos_mj[mj] = default_angles[mj] + action_il[il] * x2_action_scale[mj];
     }
 
+    // ---- Wrist bypass: honour IK reference for the 4 broken wrist DOFs -----
+    // CLI-gated; preserves sim-to-real fidelity on the motion-file replay
+    // path when --wrist-bypass=off (default). Override sits BEFORE the
+    // safety stack so soft-start blend, --max-target-dev clamp, and the
+    // tilt-trip force-to-default branch all apply uniformly. Loop body
+    // lives in include/wrist_bypass.hpp so the unit test can exercise it
+    // without a ROS 2 / ONNX runtime in scope.
+    if (cli_.wrist_bypass == CliArgs::WristBypass::Ik
+        && zmq_pose_source_ != nullptr
+        && zmq_pose_source_->has_body_reference()) {
+      const auto ref_frame = zmq_pose_source_->Sample(policy_time);
+      const double max_delta = ApplyWristBypass(target_pos_mj, ref_frame);
+      ++wrist_bypass_tick_count_;
+      if (max_delta > wrist_bypass_max_delta_) wrist_bypass_max_delta_ = max_delta;
+    }
+
     // ---- Safety stack ------------------------------------------------------
     SafeCommand sc = ApplySafetyStack(target_pos_mj, grav[2],
                                       ramp_, watchdog_, cli_.dry_run, now,
@@ -1310,15 +1471,23 @@ class X2Deploy {
                 rs.base_quat_wxyz, rs.base_ang_vel,
                 action_il, sc);
 
+    // ---- Optional ZMQ telemetry (matches dump_x2_debug.py expectations) ----
+    if (zmq_debug_pub_) {
+      PublishDebugFrame(now, rs, action_il, sc, policy_time);
+    }
+
     // ---- Periodic status ---------------------------------------------------
     if (++control_tick_ % 50 == 0) {
       RCLCPP_INFO(node_->get_logger(),
                   "CONTROL tick=%lu policy_t=%.2fs alpha=%.2f grav_z=%+.2f "
-                  "act_clip_ticks=%lu max_pre_clip=%.2f",
+                  "act_clip_ticks=%lu max_pre_clip=%.2f "
+                  "wrist_bypass_ticks=%lu wrist_bypass_max_dev_rad=%.3f",
                   static_cast<unsigned long>(control_tick_),
                   policy_time, sc.ramp_alpha, grav[2],
                   static_cast<unsigned long>(action_clip_tick_count_),
-                  action_clip_max_pre_clip_);
+                  action_clip_max_pre_clip_,
+                  static_cast<unsigned long>(wrist_bypass_tick_count_),
+                  wrist_bypass_max_delta_);
     }
   }
 
@@ -1600,9 +1769,103 @@ class X2Deploy {
   std::uint64_t                     action_clip_tick_count_   = 0;
   double                            action_clip_max_pre_clip_ = 0.0;
 
+  // Wrist-bypass diagnostics. ``wrist_bypass_tick_count_`` increments once
+  // per tick on which the override actually fired (i.e. --wrist-bypass=ik
+  // AND a body-bearing ZMQ frame was available). ``wrist_bypass_max_delta_``
+  // tracks the largest |policy_target - ik_target| across the bypassed
+  // wrist DOFs over the whole run, so the operator can see at a glance how
+  // hard SONIC is being overruled (large numbers are normal -- they're
+  // exactly why the bypass exists). Both reported on the periodic status
+  // line. Stay at 0/0 when --wrist-bypass=off.
+  std::uint64_t                     wrist_bypass_tick_count_  = 0;
+  double                            wrist_bypass_max_delta_   = 0.0;
+
   // Set after --obs-dump fires so we don't accidentally dump a second time
   // if the executor manages to schedule another OnControl before shutdown.
   bool                              obs_dumped_          = false;
+
+  // Optional VLA / ZMQ helpers. ``zmq_pose_source_`` is an observer pointer
+  // owned by ``ref_motion_`` -- keeps us from downcasting on every tick
+  // when we want hand-joint readback. ``zmq_debug_pub_`` is the per-tick
+  // x2_debug PUB sink, bound when --zmq-debug-port > 0. Both default-null;
+  // the legacy motion-file path leaves them empty.
+  ZmqPoseInputSource*                       zmq_pose_source_ = nullptr;
+  std::unique_ptr<ZmqDebugPublisher>        zmq_debug_pub_;
+  // Cumulative count of x2_debug frames sent (or attempted -- ZMQ HWM may
+  // drop). Reported on the periodic status line so the operator can see
+  // the wire is alive without tailing a separate dump_x2_debug.py.
+  std::uint64_t                             zmq_debug_frames_published_ = 0;
+
+  // Build and send one x2_debug frame for the current control tick.
+  // Mirrors the schema documented in
+  // ``docs/source/references/x2_zmq_protocol.md`` so dump_x2_debug.py can
+  // decode without out-of-band schema knowledge. Hand-joint slots are
+  // populated from ``zmq_pose_source_->LatestHandJoints()`` when the
+  // ZMQ source is active, else left as zeros.
+  void PublishDebugFrame(double                                  now,
+                         const RobotState&                       rs,
+                         const std::array<double, NUM_DOFS>&     action_il,
+                         const SafeCommand&                      sc,
+                         double                                  policy_time)
+  {
+    if (!zmq_debug_pub_) return;
+    static_assert(NUM_DOFS == 31, "x2_debug schema assumes 31 body DOFs");
+
+    // Compose stable per-call buffers so PackedField::data pointers stay
+    // valid until SendFrame() copies them into the ZMQ message.
+    double now_f64        = now;
+    double policy_time_f64 = policy_time;
+    int64_t tick_i64      = static_cast<int64_t>(control_tick_);
+
+    std::array<double, NUM_DOFS> body_q       = rs.joint_pos_mj;
+    std::array<double, NUM_DOFS> body_dq      = rs.joint_vel_mj;
+    std::array<double, 4>        base_quat    = rs.base_quat_wxyz;
+    std::array<double, 3>        base_ang_vel = rs.base_ang_vel;
+    std::array<double, NUM_DOFS> last_action  = sc.target_pos_mj;
+
+    // Hand-joint readback (zeros when no ZMQ source is wired).
+    std::array<double, DEFAULT_HAND_DOF_PER_SIDE> left_hand{};
+    std::array<double, DEFAULT_HAND_DOF_PER_SIDE> right_hand{};
+    int64_t hand_frame_idx = -1;
+    if (zmq_pose_source_ != nullptr) {
+      const auto snap = zmq_pose_source_->LatestHandJoints();
+      if (snap.valid) {
+        left_hand  = snap.left;
+        right_hand = snap.right;
+        hand_frame_idx = snap.frame_index;
+      }
+    }
+
+    // Booleans are packed as uint8_t so they cross the wire as f32-aligned
+    // payload pieces without any host endianness drama.
+    std::uint8_t tilt_trip = sc.tilt_trip ? 1 : 0;
+    std::uint8_t dry_run   = sc.dry_run   ? 1 : 0;
+    double ramp_alpha = sc.ramp_alpha;
+
+    std::vector<PackedField> fields;
+    fields.reserve(13);
+    fields.push_back({"control_tick",   "i64", {1},                     &tick_i64,            sizeof(int64_t)});
+    fields.push_back({"ros_timestamp",  "f64", {1},                     &now_f64,             sizeof(double)});
+    fields.push_back({"policy_time",    "f64", {1},                     &policy_time_f64,     sizeof(double)});
+    fields.push_back({"base_quat",      "f64", {4},                     base_quat.data(),     0});
+    fields.push_back({"base_ang_vel",   "f64", {3},                     base_ang_vel.data(),  0});
+    fields.push_back({"body_q",         "f64", {NUM_DOFS},              body_q.data(),        0});
+    fields.push_back({"body_dq",        "f64", {NUM_DOFS},              body_dq.data(),       0});
+    fields.push_back({"last_action",    "f64", {NUM_DOFS},              last_action.data(),   0});
+    fields.push_back({"left_hand_q",    "f64", {DEFAULT_HAND_DOF_PER_SIDE}, left_hand.data(),   0});
+    fields.push_back({"right_hand_q",   "f64", {DEFAULT_HAND_DOF_PER_SIDE}, right_hand.data(),  0});
+    fields.push_back({"hand_frame_idx", "i64", {1},                     &hand_frame_idx,      sizeof(int64_t)});
+    fields.push_back({"ramp_alpha",     "f64", {1},                     &ramp_alpha,          sizeof(double)});
+    fields.push_back({"tilt_trip",      "u8",  {1},                     &tilt_trip,           sizeof(std::uint8_t)});
+
+    // Note: dry_run is intentionally LAST so dump_x2_debug.py can detect
+    // an old protocol version (without dry_run) by short-message-length.
+    fields.push_back({"dry_run",        "u8",  {1},                     &dry_run,             sizeof(std::uint8_t)});
+
+    if (zmq_debug_pub_->Publish(fields, /*version=*/4, /*count=*/1)) {
+      ++zmq_debug_frames_published_;
+    }
+  }
 
   // Write the first-tick inference payload to PATH as a binary blob, then
   // request shutdown. Layout (little-endian, no padding):

@@ -1,0 +1,56 @@
+# Gallery sweep of forward/backward shuffle bins.
+#
+# Plays each end-at-square-stance step variant with brief idle pauses
+# between, so we can spot which magnitudes actually move the body and
+# which ones the policy under-commits to. Same pattern that surfaced the
+# side-step issue.
+#
+# v2 (2026-05-13): rebased fwd_step on A034 (same source as
+# fwd_walk_standard) after the v1 run only produced visible motion on
+# the back_step bins -- the A005 forward base was too slow (~9 cm/s),
+# so the half_ft / quarter_ft derivatives fell below the policy noise
+# floor. v2 base displacement is ~45 cm in 1.6 s, comparable to the
+# back_step base (51 cm in 1.6 s). Per-bin motion duration changes from
+# 2.28 s to 1.60 s for the forward variants.
+#
+# Wall-clock budget:
+#   2.0s warmup
+#   + (1.60s motion + ~2.0s idle pause) * 3 forward variants  ~= 10.8s
+#   + (1.60s motion + ~2.0s idle pause) * 2 backward variants ~= 7.2s
+#   + 2.0s tail idle
+#   = ~22 s. Use ``--duration 25`` for the run_planner_smoke wrapper.
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: fwd_step
+    magnitude: one_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: fwd_step
+    magnitude: half_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: fwd_step
+    magnitude: quarter_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: back_step
+    magnitude: half_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: back_step
+    magnitude: quarter_ft
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0

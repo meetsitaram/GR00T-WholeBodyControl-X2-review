@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Vendored upstream repos checked out for development reference. Tracked
+# separately as siblings (Isaac-GR00T lives under external_dependencies/
+# but is its own repo, not part of this tree).
+/external_dependencies/Isaac-GR00T/
+
 # C extensions
 
 

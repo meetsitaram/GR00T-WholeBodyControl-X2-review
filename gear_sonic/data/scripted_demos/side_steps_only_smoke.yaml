@@ -1,0 +1,36 @@
+# Side-step-only smoke demo for the X2 heuristic planner.
+#
+# A/B-test companion to baked PKL playback through
+# ``deploy_x2.sh sim --motion <pkl>``: this demo drives the SAME
+# ``side_left_step`` and ``side_right_step`` bins through the
+# planner ZMQ wire (``run_planner_smoke.sh ... --with-deploy``)
+# so we can compare visible foot lift between the two paths.
+#
+# Each side step is followed by ~1 s of ``idle`` (one idle_stand
+# clip pass at 1.5 s), letting the policy blend back to the trained
+# square stance between gait segments. We previously tried freezing
+# the side-step's LAST frame via a ``hold_last_pose`` intent; that
+# proved error-prone because the A038_M [0:90] clip ends mid-stride
+# (foot on toe, torso leaning), so the freeze looked broken in sim.
+# The auto-blend-to-idle path is biomechanically valid.
+#
+# Wall-clock budget: ~2 s warmup + ~3 s side_left + ~1.5 s idle +
+# ~3 s side_right + ~3 s tail idle ~= 13 s. Use ``--duration 14``
+# for the run_planner_smoke wrapper.
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  - intent: side_left
+    magnitude: default
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.0
+
+  - intent: side_right
+    magnitude: default
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5

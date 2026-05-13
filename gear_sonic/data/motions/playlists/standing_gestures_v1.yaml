@@ -1,0 +1,66 @@
+name: x2_ultra_standing_gestures_v1
+output_key: standing_gestures__v1__hands_only
+fps: 30
+
+# All segments are stand-in-place clips, so yaw-cylinder chaining is a no-op
+# and the world cursor never advances. We still zero XY/yaw to start cleanly
+# at the origin.
+zero_xy: true
+zero_yaw: true
+
+# Shorter rest layer than warehouse_v1 (20 vs 30) -- there's no locomotion
+# phase to settle, so 0.66 s of held-rest between gestures is plenty.
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 20
+  blend_in_frames: 6
+  blend_out_frames: 6
+
+# 6-segment "stand still + hand gestures" choreography. Picks span front /
+# right_side / behind targets from the 405-candidate pool and end with a
+# curated swing + a put-down. All clips have arm_std in 0.20-0.45 rad
+# (gentle), dxy < 0.10 m (truly standing), |dyaw| < 7 deg.
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30        # 1.0 s
+
+  - name: raise_two_hands_to_front_high
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_light_two_hands_front_medium_to_front_high_R_001__A525_M
+    start_frame: 0
+    n_frames: 90        # 3.0 s    arm_std=0.38 rad
+
+  - name: sweep_two_hands_to_right_side
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_two_hands_front_high_to_right_side_high_R_001__A527_M
+    start_frame: 0
+    n_frames: 90        # 3.0 s    arm_std=0.41 rad
+
+  - name: one_hand_front_gesture
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_one_hand_front_high_to_front_medium_R_001__A525_M
+    start_frame: 0
+    n_frames: 75        # 2.5 s    arm_std=0.44 rad (one-handed for asymmetry)
+
+  - name: two_hands_swing_curated
+    source: gear_sonic/data/motions/x2_ultra_two_hands_swing.pkl
+    motion_key: null    # first (and only) key
+    start_frame: 0
+    n_frames: 90        # 3.0 s    arm_std=0.31 rad, front-medium <-> behind-medium
+
+  - name: put_down_two_hands_front
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: standing__medium_big_light_two_hands_put_down_front_medium_R_001__A511
+    start_frame: 0
+    n_frames: 90        # 3.0 s    arm_std=0.29 rad
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30        # 1.0 s

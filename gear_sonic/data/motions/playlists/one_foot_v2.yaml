@@ -1,0 +1,51 @@
+name: x2_ultra_one_foot_v2
+output_key: one_foot__v2__balance_test_left_lift
+fps: 30
+
+# Sim-only experiment, sibling of one_foot_v1 but using the
+# loco__idle_one_foot_left__001__A023_M clip instead. Both clips are
+# ~22 s long and contain 4-5 lift windows of escalating intensity. The
+# difference is that A023_M lifts the LEFT leg (L_knee folds up to
+# 118 deg at the peak) while A024 lifts the right.
+#
+# Per-window peak L_knee:
+#   * frame 165 (5.5s):  +47 deg
+#   * frame 264 (8.8s):  +57 deg
+#   * frame 396 (13.2s): +58 deg
+#   * frame 462 (15.4s): +62 deg
+#   * frame 561 (18.7s): +62 deg
+#   * frame 627 (20.9s): +102 -> +118 deg (committed)
+#
+# A023_M has 9.4 s of sustained one-foot hold (knee diff > 30 deg)
+# vs 5.5 s for A024, so this clip should give the policy more time
+# under a lifted-leg pose.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 20
+  blend_in_frames: 6
+  blend_out_frames: 6
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: stand_one_foot_left_lift
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__idle_one_foot_left__001__A023_M
+    start_frame: 0
+    n_frames: 664                # 22.13 s, full clip
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+    motion_key: loco__neutral_idle_loop_002__A074
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

@@ -16,6 +16,7 @@
 #include "proprioception_buffer.hpp"
 #include "reference_motion.hpp"
 #include "tokenizer_obs.hpp"
+#include "wrist_bypass.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -313,6 +314,87 @@ void TestStandStillTokenizerSize()
   std::cout << "  ok TestStandStillTokenizerSize\n";
 }
 
+// ---------------------------------------------------------------------------
+// Wrist bypass: pin the override invariants documented in
+// include/wrist_bypass.hpp -- the right slots, only those slots, and a
+// truthful max-delta return value for the periodic status line.
+// ---------------------------------------------------------------------------
+void TestWristBypassOverridesExactly4Slots()
+{
+  // Arrange: per-DOF target_pos_mj filled with a sentinel value (1.234)
+  // so we can detect any accidental writes outside the 4 wrist slots,
+  // and a synthetic ReferenceFrame whose joint_pos_mj has unique values
+  // per slot (slot index * 0.01 rad) so we can assert the right value
+  // landed in the right place after the override.
+  std::array<double, NUM_DOFS> target_pos_mj;
+  target_pos_mj.fill(1.234);
+
+  ReferenceFrame ref{};
+  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
+    ref.joint_pos_mj[mj] = static_cast<double>(mj) * 0.01;
+    ref.joint_vel_mj[mj] = 0.0;
+  }
+  ref.root_quat_xyzw = {0.0, 0.0, 0.0, 1.0};
+
+  // Act.
+  const double max_delta = ApplyWristBypass(target_pos_mj, ref);
+
+  // Assert (1): the bypassed indices match the documented set.
+  EXPECT(kBypassedWristMjDofs.size() == 4,
+         "kBypassedWristMjDofs must have exactly 4 entries");
+  EXPECT(kBypassedWristMjDofs[0] == 20, "slot 0 must be left_wrist_pitch (MJ 20)");
+  EXPECT(kBypassedWristMjDofs[1] == 21, "slot 1 must be left_wrist_roll  (MJ 21)");
+  EXPECT(kBypassedWristMjDofs[2] == 27, "slot 2 must be right_wrist_pitch(MJ 27)");
+  EXPECT(kBypassedWristMjDofs[3] == 28, "slot 3 must be right_wrist_roll (MJ 28)");
+
+  // Assert (2): all four bypassed slots now carry the IK reference value;
+  // every other slot is untouched (== sentinel).
+  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
+    const bool is_bypassed = (mj == 20 || mj == 21 || mj == 27 || mj == 28);
+    if (is_bypassed) {
+      EXPECT_NEAR(target_pos_mj[mj], ref.joint_pos_mj[mj], 1e-12);
+    } else {
+      EXPECT_NEAR(target_pos_mj[mj], 1.234, 1e-12);
+    }
+  }
+
+  // Assert (3): max_delta is the largest |sentinel - ref| across the
+  // bypassed slots. With sentinel=1.234 and ref values {0.20, 0.21,
+  // 0.27, 0.28} the worst case is slot 20: |1.234 - 0.20| = 1.034.
+  EXPECT_NEAR(max_delta, 1.234 - 0.20, 1e-12);
+
+  std::cout << "  ok TestWristBypassOverridesExactly4Slots\n";
+}
+
+// ---------------------------------------------------------------------------
+// Wrist bypass: when the IK reference matches the policy target exactly,
+// max_delta must be zero and target_pos_mj must remain bit-identical.
+// Catches a silly bug where an off-by-one or a wrong subtraction direction
+// would still happen to overwrite the right slots but report nonsense in
+// the periodic status line.
+// ---------------------------------------------------------------------------
+void TestWristBypassZeroDeltaWhenAligned()
+{
+  std::array<double, NUM_DOFS> target_pos_mj;
+  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
+    target_pos_mj[mj] = static_cast<double>(mj) * 0.05;
+  }
+  std::array<double, NUM_DOFS> snapshot = target_pos_mj;
+
+  ReferenceFrame ref{};
+  ref.joint_pos_mj = target_pos_mj;  // same values: nothing to override
+  ref.joint_vel_mj.fill(0.0);
+  ref.root_quat_xyzw = {0.0, 0.0, 0.0, 1.0};
+
+  const double max_delta = ApplyWristBypass(target_pos_mj, ref);
+
+  EXPECT_NEAR(max_delta, 0.0, 1e-15);
+  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
+    EXPECT_NEAR(target_pos_mj[mj], snapshot[mj], 1e-15);
+  }
+  std::cout << "  ok TestWristBypassZeroDeltaWhenAligned\n";
+}
+
 int main()
 {
   std::cout << "agi_x2_deploy_onnx_ref unit tests\n";
@@ -321,6 +403,8 @@ int main()
   TestProprioceptionTermOrderAndAging();
   TestStandStillTokenizerSize();
   TestPklMotionYawAnchor();
+  TestWristBypassOverridesExactly4Slots();
+  TestWristBypassZeroDeltaWhenAligned();
   std::cout << "all OK\n";
   return 0;
 }

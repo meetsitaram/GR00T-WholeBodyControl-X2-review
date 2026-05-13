@@ -1,0 +1,51 @@
+# Canonical "approach an object" demo for manipulation pre-positioning.
+#
+# Designed for the typical pick/place flow: get to within ~1 ft of the object,
+# then make a few quarter-foot fine adjustments to square up before the arm
+# action. Covers the "shuffle to square stance" primitive family and the
+# 15/30 deg in-place turn primitives.
+#
+# Exercises:
+#   - 1ft forward step
+#   - half-foot forward step
+#   - quarter-foot forward step
+#   - 15 deg right pivot
+#   - quarter-foot side step (for object alignment)
+#   - return-to-idle blend
+#
+# Acceptance criteria:
+#   - cumulative forward distance ~ 0.6 m (1ft + 0.5ft + 0.25ft = 1.75 ft)
+#   - heading turned by ~ -15 deg
+#   - same per-tick / yaw bounds as forward_back_turn
+
+commands:
+  - intent: idle
+    magnitude: default
+    hold_seconds: 0.6
+
+  - intent: fwd_step
+    magnitude: one_ft
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 0.4
+
+  - intent: fwd_step
+    magnitude: half_ft
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 0.4
+
+  - intent: turn_right
+    magnitude: deg_15
+
+  - intent: side_left
+    magnitude: quarter_ft
+
+  - intent: fwd_step
+    magnitude: quarter_ft
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5

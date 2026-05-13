@@ -19,6 +19,7 @@ from robosuite.models.grippers import (
 )
 
 from robocasa.models.grippers import G1ThreeFingerLeftHand, G1ThreeFingerRightHand
+from robocasa.models.grippers import OmniHandLeft, OmniHandRight
 
 from .manipulators import *
 
@@ -32,8 +33,21 @@ def unformat_gripper_space(gripper, formatted_action):
         action = formatted_action[[0, 1, 4, 6, 8, 10]]
     elif isinstance(gripper, PandaGripper):
         action = formatted_action
+    elif isinstance(gripper, OmniHandLeft) or isinstance(gripper, OmniHandRight):
+        # OmniHand-2025: 10 active actuators in the same order as the SDK's
+        # ``hand.right_hand`` / ``hand.left_hand`` 10-D control vector
+        # (see ``gear_sonic.scripts.compose_x2_with_omnihand.ACTIVE_FINGER_JOINTS``).
+        # Passthrough.
+        # NOTE: SimpleGripController.reset_goal() seeds ``goal_qvel`` with the
+        # full 17-D ``joint_vel`` vector at reset; once ``set_goal()`` is
+        # called (i.e. once ``env.step()`` has run a single iteration) it
+        # collapses to the 10-D control vector.  Dataset recording always
+        # happens post-step, so this is not a concern in practice.
+        action = formatted_action
+    elif isinstance(gripper, G1ThreeFingerLeftHand) or isinstance(gripper, G1ThreeFingerRightHand):
+        action = formatted_action
     else:
-        raise TypeError
+        raise TypeError(f"Unknown gripper type for unformat_gripper_space: {type(gripper).__name__}")
     return action
 
 
@@ -48,6 +62,11 @@ def remove_mimic_joints(gripper, formatted_action) -> ndarray[Any, dtype[Any]]:
     elif isinstance(gripper, FourierLeftHand) or isinstance(gripper, FourierRightHand):
         action = formatted_action[[0, 2, 4, 6, 8, 10]]
     elif isinstance(gripper, G1ThreeFingerLeftHand) or isinstance(gripper, G1ThreeFingerRightHand):
+        action = formatted_action
+    elif isinstance(gripper, OmniHandLeft) or isinstance(gripper, OmniHandRight):
+        # OmniHand mimic joints are coupled via MJCF equality constraints,
+        # not via actuators -- the actuator-ordered action vector is already
+        # 10 active DOFs with no mimic entries to remove.
         action = formatted_action
     elif isinstance(gripper, PandaGripper):
         action = formatted_action
@@ -106,6 +125,11 @@ def reconstruct_latest_actions(env, actions=None, verbose=False):
         robot_action = actions[cutoff : cutoff + robot.action_dim]
         cutoff += robot.action_dim
         if "GR1" in robot.name:
+            action_dict.update(_reconstruct_latest_action_gr1_impl(robot))
+        elif "X2" in robot.name or "G1" in robot.name:
+            # X2Ultra* and G1* both use JointPositionController for the
+            # arm/torso/head and SimpleGripController for the dex hands,
+            # so the GR1 reconstruction implementation works unchanged.
             action_dict.update(_reconstruct_latest_action_gr1_impl(robot))
         elif "Panda" in robot.name:
             action_dict.update(_reconstruct_latest_action_panda_impl(robot, robot_action))
@@ -750,6 +774,16 @@ GR00T_ROBOCASA_ENVS_G1 = {
     "G1FixedLowerBody": "g1_sim",
     "G1FixedBase": "g1_sim",
 }
+# AgiBot X2 Ultra + OmniHand-2025: every variant maps to a single GR00T
+# embodiment tag (``x2_ultra_omnihand``) so the same VLA / dataset schema
+# covers Phase 1 (fixed lower body) through Phase 2 (loco-manipulation).
+GR00T_ROBOCASA_ENVS_X2 = {
+    "X2Ultra": "x2_ultra_omnihand",
+    "X2UltraFixedBase": "x2_ultra_omnihand",
+    "X2UltraFixedLowerBody": "x2_ultra_omnihand",
+    "X2UltraArmsOnly": "x2_ultra_omnihand",
+    "X2UltraFloatingBody": "x2_ultra_omnihand",
+}
 GR00T_ROBOCASA_ENVS_ROBOTS = {
     **GR00T_ROBOCASA_ENVS_GR1_ARMS_ONLY,
     **GR00T_ROBOCASA_ENVS_GR1_ARMS_AND_WAIST,
@@ -758,8 +792,79 @@ GR00T_ROBOCASA_ENVS_ROBOTS = {
     **GR00T_ROBOCASA_ENVS_BIMANUAL_GRIPPER,
     **GR00T_ROBOCASA_ENVS_BIMANUAL_HAND,
     **GR00T_ROBOCASA_ENVS_G1,
+    **GR00T_ROBOCASA_ENVS_X2,
 }
-GR00T_LOCOMANIP_ENVS_ROBOTS = {**GR00T_ROBOCASA_ENVS_G1}
+GR00T_LOCOMANIP_ENVS_ROBOTS = {**GR00T_ROBOCASA_ENVS_G1, **GR00T_ROBOCASA_ENVS_X2}
+
+
+class X2UltraFixedLowerBodyKeyConverter(RobotKeyConverter):
+    """Phase 1 X2 dataset schema: arms + waist + head + 2 OmniHand vectors.
+
+    Maps the robosuite per-part observation/action keys
+    (``robot0_left``, ``robot0_left_gripper`` etc.) onto the GR00T VLA
+    schema (``body.left_arm``, ``hand.left_hand`` etc.).  Layout matches
+    the existing real-robot LeRobot recordings
+    (``data/sim_to_real_anchors/ablation_casual_walk_v1`` and friends), so
+    sim / real datasets are interchangeable for the Phase 1 task family.
+    """
+
+    @classmethod
+    def get_camera_config(cls):
+        # Use the X2 head-mounted ``rs_egoview`` camera by default. The
+        # ``oak_egoview`` mono cameras and the ``chest_view`` / ``rs_tppview``
+        # cameras are also available (see X2Ultra.get_camera_configs); add
+        # them here once dataset / training contracts are finalised.
+        mapped_names = ["video.ego_view_pad_res256_freq20"]
+        camera_names = ["robot0_rs_egoview"]
+        camera_widths, camera_heights = 1280, 800
+        return mapped_names, camera_names, camera_widths, camera_heights
+
+    @classmethod
+    def map_obs(cls, input_obs):
+        return {
+            "hand.right_hand": input_obs["robot0_right_gripper"],
+            "hand.left_hand": input_obs["robot0_left_gripper"],
+            "body.right_arm": input_obs["robot0_right"],
+            "body.left_arm": input_obs["robot0_left"],
+            "body.waist": input_obs["robot0_torso"],
+            "body.neck": input_obs["robot0_head"],
+        }
+
+    @classmethod
+    def map_action(cls, input_action):
+        return {
+            "hand.left_hand": input_action["robot0_left_gripper"],
+            "hand.right_hand": input_action["robot0_right_gripper"],
+            "body.left_arm": input_action["robot0_left"],
+            "body.right_arm": input_action["robot0_right"],
+            "body.waist": input_action["robot0_torso"],
+            "body.neck": input_action["robot0_head"],
+        }
+
+    @classmethod
+    def unmap_action(cls, input_action):
+        return {
+            "robot0_left_gripper": input_action["action.left_hand"],
+            "robot0_right_gripper": input_action["action.right_hand"],
+            "robot0_left": input_action["action.left_arm"],
+            "robot0_right": input_action["action.right_arm"],
+            "robot0_torso": input_action["action.waist"],
+            "robot0_head": input_action["action.neck"],
+        }
+
+    @classmethod
+    def get_missing_keys_in_dumping_dataset(cls):
+        # Phase 1 (fixed lower body) does not actuate the legs, but downstream
+        # GR00T training expects matching schemas across embodiments. Inject
+        # zero-vectors so leg-aware checkpoints still consume X2 datasets.
+        return {
+            "body.right_leg": np.zeros(6, dtype=np.float64),
+            "body.left_leg": np.zeros(6, dtype=np.float64),
+        }
+
+    @classmethod
+    def get_metadata(cls, name):
+        return {"absolute": True, "rotation_type": None}
 
 
 def make_key_converter(robots_name):
@@ -775,5 +880,10 @@ def make_key_converter(robots_name):
         return PandaPandaKeyConverter
     elif robots_name in GR00T_ROBOCASA_ENVS_BIMANUAL_HAND:
         return PandaDexRHPandaDexRHKeyConverter
+    elif robots_name in GR00T_ROBOCASA_ENVS_X2:
+        # All Phase 1 X2 variants -- same upper-body schema regardless of
+        # whether legs / pelvis are pinned.  Phase 2 (loco-manipulation)
+        # will introduce a wider X2UltraLocomanipKeyConverter.
+        return X2UltraFixedLowerBodyKeyConverter
     else:
         raise ValueError(f"Unknown robot name: {robots_name}")
