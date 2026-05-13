@@ -132,28 +132,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "held-pose latch. Default 0.005.",
     )
 
-    # Per-finger / thumb-oppose stretch (opt-in binarisation). See
+    # Per-finger / thumb-oppose stretch (opt-in additional shaping
+    # on top of the per-operator affine normalisation). See
     # docs/source/tutorials/x2_dataset_record_and_replay.md
-    # § "Why we abandoned the global power-curve compensation". The
-    # affine normalisation from the operator-calibration window is
-    # always on; these knobs ADDITIONALLY apply the piecewise power-
-    # curve from ``stretch_finger_curls`` / ``stretch_thumb_oppose``
-    # which pushes mid-range curls toward the OPEN/CLOSED endpoints.
+    # § "Why we abandoned the global power-curve compensation".
+    #
+    # As of 2026-05-13 the default ``stretch_finger_curls`` /
+    # ``stretch_thumb_oppose`` parameters are SMOOTH PROPORTIONAL
+    # (``dz=0.05, full=0.95, gamma=1`` -- linear in the active zone
+    # with tiny rest-noise / saturation cushions), so enabling
+    # these flags on top of an operator calibration leaves
+    # mid-range curls intact and the operator gets continuous
+    # control of the closure depth. The previous defaults were
+    # bimodal (``dz=0.35, full=0.40, gamma=5``) and silently
+    # destroyed the proportional response of a calibrated teleop
+    # loop -- see the long block-comment above
+    # DEFAULT_CURL_DEADZONE_PER_FINGER in
+    # gear_sonic/utils/teleop/x2_hand_retarget.py for the history.
     parser.add_argument(
         "--apply-curl-compensation", action="store_true",
-        help="Enable the per-finger curl stretch curve on top of the "
-             "operator's affine normalisation. Use for tight power-"
-             "grasp pick-and-place tasks where the OmniHand fingers "
-             "need to fully wrap a small object even when the operator "
-             "only squeezes ~70-85%% of their calibrated max. Trade-off: "
-             "deliberately intermediate gestures (half-grasp, soft "
-             "pinch) snap closer to OPEN/CLOSED.",
+        help="Apply the per-finger curl stretch curve on top of the "
+             "operator's affine normalisation. With the smooth-"
+             "proportional defaults this only adds a tiny rest-noise "
+             "cutoff and saturation cushion; pass explicit per-finger "
+             "params to recover the legacy bimodal 'isolated-curl "
+             "detector' behaviour for tight power-grasp tasks.",
     )
     parser.add_argument(
         "--apply-oppose-compensation", action="store_true",
-        help="Enable the thumb-opposition stretch curve. Pair with "
-             "--apply-curl-compensation when fingers need to fully "
-             "close on small objects.",
+        help="Apply the thumb-opposition stretch curve on top of the "
+             "operator's affine normalisation. Smooth-proportional by "
+             "default; pair with --apply-curl-compensation for "
+             "consistent shaping across the curl and oppose channels.",
     )
 
     # SONIC corrective-delta observability (v1 schema)

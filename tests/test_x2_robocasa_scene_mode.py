@@ -497,3 +497,384 @@ def test_mirror_reset_is_deterministic_for_seed(env_name: str) -> None:
             poses_a[jname], poses_b[jname], atol=1e-9,
             err_msg=f"freejoint {jname!r} diverged across same-seed resets",
         )
+
+
+# ── Layer 6: hand contact filter (regression: fingers don't close) ────────
+
+
+def _walk_hand_geom_collision_attrs(model, hand_root_body_names):
+    """Yield ``(contype, conaffinity, group, type, meshname_or_empty)`` for every geom in the hand subtree.
+
+    Walks the body tree ROOTED at each ``*_wrist_roll_link`` (inclusive
+    of the root body itself) so the OmniHand palm primitives -- which
+    live directly under the wrist body via the ``omnihand_mount`` frame
+    -- are visited too. The wrist body also carries X2's own collision
+    mesh; the test filters those out by checking ``geom_dataid >= 0``
+    AND ``type == mjGEOM_MESH``.
+    """
+    import mujoco  # local import: pytest.importorskip handles availability
+
+    for root_name in hand_root_body_names:
+        root_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, root_name)
+        if root_id < 0:
+            continue
+        # BFS INCLUSIVE of the root body so the OmniHand palm primitives
+        # (attached via the omnihand_mount frame, parented directly to
+        # the wrist body, NOT under any child body) get visited.
+        stack: list[int] = [int(root_id)]
+        while stack:
+            bid = stack.pop()
+            geomadr = int(model.body_geomadr[bid])
+            geomnum = int(model.body_geomnum[bid])
+            for gid in range(geomadr, geomadr + geomnum):
+                meshid = int(model.geom_dataid[gid])
+                meshname = ""
+                if meshid >= 0:
+                    meshname = mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_MESH, meshid
+                    ) or ""
+                yield (
+                    int(model.geom_contype[gid]),
+                    int(model.geom_conaffinity[gid]),
+                    int(model.geom_group[gid]),
+                    int(model.geom_type[gid]),
+                    meshname,
+                )
+            for cbid in range(model.nbody):
+                if int(model.body_parentid[cbid]) == bid:
+                    stack.append(cbid)
+
+
+def _is_x2_wrist_collision_mesh(meshname: str) -> bool:
+    """X2's own wrist_roll collision mesh -- must remain at default 1/1."""
+    return meshname.endswith("_wrist_roll_link")
+
+
+# Bitmask channels used by the OmniHand self-collision filter. Mirror
+# the production constants in
+# ``gear_sonic.scripts.compose_x2_with_omnihand``. Hard-coded here so a
+# divergence in production code surfaces as a test failure (rather than
+# the test silently re-importing the broken value).
+_HAND_COLLISION_CHANNEL: int = 2
+_WORLD_CHANNEL: int = 1
+
+
+@pytest.mark.parametrize("env_name", BUNDLED_SCENES)
+def test_scene_xml_hand_geoms_use_self_collision_filter(env_name: str) -> None:
+    """Bundled scene XMLs must ship with the hand-vs-hand contact filter.
+
+    Regression guard for the bug where ``disable_hand_collisions=False``
+    left every URDF-derived collision primitive at MuJoCo's default
+    ``contype=1, conaffinity=1`` -- which made the palm cylinder, the
+    thumb_mcp / thumb_pip / thumb_dip primitives, and the index /
+    middle / ring / pinky pip+dip cylinders all collide with each other
+    when the operator commanded a curl. The resulting constraint forces
+    routinely exceeded the 3 Nm position-actuator limit and physically
+    pinned the fingers half-open; "fully close" never reached the
+    commanded angle in robocasa scene mode even though it worked
+    perfectly with the bare X2 + OmniHand MJCF.
+
+    The current fix in
+    ``compose_x2_with_omnihand._filter_hand_self_collisions`` re-classes
+    each hand collision geom to ``(contype=_HAND_COLLISION_CHANNEL=2,
+    conaffinity=_WORLD_CHANNEL=1)``. Net effect:
+
+    * fingers / palm collide with cube, bowl, table, floor, X2 body
+      (anything at the default (1, 1)); and
+    * fingers / palm do NOT collide with each other (palm-vs-finger
+      AND finger-vs-finger uniformly filtered).
+
+    Visual geoms (``contype=0, conaffinity=0``) are tolerated and
+    skipped: the URDF import emits one mesh visual per link with
+    explicit zeros, and we don't want to promote those into the active
+    contact set.
+    """
+    mujoco = pytest.importorskip("mujoco")
+    xml_path, json_path = _scene_paths(env_name)
+    meta = json.loads(json_path.read_text())
+    hand_roots = list(meta.get("hand_root_bodies", {}).values())
+    assert hand_roots, (
+        "metadata is missing 'hand_root_bodies' -- rebuild scenes via "
+        "build_x2_robocasa_scene_xml --all"
+    )
+
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+
+    seen_collision_geoms = 0
+    seen_palm_primitives = 0
+    seen_x2_wrist_mesh_disabled = False
+    for (contype, conaffinity, _group, _gtype, meshname) in (
+        _walk_hand_geom_collision_attrs(model, hand_roots)
+    ):
+        # The X2's pre-OmniHand fist collision mesh (the legacy
+        # boxing-glove shell that lives on ``*_wrist_roll_link`` from
+        # before the OmniHand was bolted on) must be DISABLED
+        # (ct=ca=0) in the scene MJCF -- see the long block-comment
+        # above
+        # ``build_x2_robocasa_scene_xml._disable_pre_omnihand_x2_fist_collision_mesh``
+        # for why. Previously this mesh was kept at the default (1, 1)
+        # world channel, but that left it extending past the OmniHand
+        # palm mount and physically blocked finger curl past
+        # q≈+0.67 rad. The OmniHand palm primitives (cylinder + box,
+        # on the (2, 1) hand channel) provide the actual graspable
+        # contact surface, so disabling the legacy fist mesh doesn't
+        # remove the hand from physics -- it just removes the obstacle
+        # the fingers were punching into.
+        if _is_x2_wrist_collision_mesh(meshname):
+            assert (contype, conaffinity) == (0, 0), (
+                f"pre-OmniHand X2 fist collision mesh {meshname!r} has "
+                f"({contype}, {conaffinity}); expected (0, 0) so the "
+                "OmniHand fingers can curl past the wrist cuff. "
+                "Either the scene-build step's "
+                "_disable_pre_omnihand_x2_fist_collision_mesh did not "
+                "run, or the X2 vendor MJCF schema for wrist_roll_link "
+                "changed -- rebuild scenes via "
+                "``.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all``."
+            )
+            seen_x2_wrist_mesh_disabled = True
+            continue
+        if contype == 0 and conaffinity == 0:
+            continue  # visual-only geom, ignore
+        seen_collision_geoms += 1
+        # Track palm primitives separately -- these are the ones the
+        # original (incomplete) walk missed because they live in the
+        # wrist body, not under a child body.
+        if not meshname:  # non-mesh primitive (cylinder/box) = palm
+            seen_palm_primitives += 1
+        assert contype == _HAND_COLLISION_CHANNEL and conaffinity == _WORLD_CHANNEL, (
+            f"hand collision geom in {xml_path.name} has "
+            f"(contype={contype}, conaffinity={conaffinity}); expected "
+            f"({_HAND_COLLISION_CHANNEL}, {_WORLD_CHANNEL}) so finger-vs-hand "
+            "contacts are filtered but finger-vs-everything-else still fires. "
+            "Rebuild scenes via "
+            "``.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all`` "
+            "after pulling the latest compose_x2_with_omnihand."
+        )
+    assert seen_collision_geoms > 0, (
+        f"{xml_path.name}: expected at least one hand collision geom "
+        "(palm cylinder / thumb boxes / fingertip cylinders) but found "
+        "none. The URDF import or the merge step likely stripped them."
+    )
+    assert seen_palm_primitives >= 4, (  # 2 sides × (cylinder + box)
+        f"{xml_path.name}: expected at least 4 OmniHand palm primitives "
+        f"(left/right × cylinder/box) but found {seen_palm_primitives}. "
+        "Either the palm collision was lost, or the filter is missing the "
+        "wrist body's own non-mesh geoms (the regression mode)."
+    )
+    assert seen_x2_wrist_mesh_disabled, (
+        f"{xml_path.name}: expected to find X2's wrist_roll collision "
+        "mesh DISABLED at (contype=0, conaffinity=0). The walk did not "
+        "encounter it -- either the scene XML lost the X2 collision "
+        "mesh entirely, or the wrist-collision disable helper did not "
+        "run, or this test's discriminator is wrong. Either way, "
+        "OmniHand fingers will stall at q≈+0.67 if this assertion is "
+        "silently bypassed."
+    )
+
+
+@pytest.mark.parametrize("env_name", BUNDLED_SCENES)
+def test_scene_xml_touchable_geoms_keep_default_channel(env_name: str) -> None:
+    """Touchable scene-object colliders must keep their default (1, 1) bitmask.
+
+    The (2, 1) self-collision filter on the hand only works because the
+    cube / bowl / table / floor are all on the default world channel
+    (1, 1) -- the contact rule then evaluates to ``(2 & 1) | (1 & 1) =
+    1`` and the hand collides with them. If a future patch starts
+    rewriting touchable scene-object channels (the way the abandoned
+    "whitelist" prototype did), the filter math breaks and fingers
+    silently stop gripping the cube.
+
+    This guard asserts that for every collider declared in
+    ``env_spec.object_contact_geoms`` (cube_collider, bowl_floor, …)
+    the bitmask is still default (1, 1) and the contact rule against a
+    hand geom (2, 1) evaluates to True.
+    """
+    mujoco = pytest.importorskip("mujoco")
+    xml_path, json_path = _scene_paths(env_name)
+    meta = json.loads(json_path.read_text())
+    object_contact_geoms = meta.get("object_contact_geoms", {})
+    assert object_contact_geoms, (
+        f"{xml_path.name}: metadata is missing 'object_contact_geoms' -- "
+        "rebuild scenes via build_x2_robocasa_scene_xml --all"
+    )
+
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+
+    def _collide(c1: int, a1: int, c2: int, a2: int) -> bool:
+        return bool((c1 & a2) | (c2 & a1))
+
+    expected_geom_names: list[str] = []
+    for _logical, geoms in object_contact_geoms.items():
+        expected_geom_names.extend(geoms)
+    assert expected_geom_names, (
+        f"{xml_path.name}: object_contact_geoms is empty; nothing for "
+        "the hand to grasp"
+    )
+
+    for geom_name in expected_geom_names:
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        assert gid >= 0, (
+            f"{xml_path.name}: touchable-object geom {geom_name!r} "
+            "(declared in object_contact_geoms) is missing from the "
+            "compiled MJCF."
+        )
+        contype = int(model.geom_contype[gid])
+        conaffinity = int(model.geom_conaffinity[gid])
+        assert (contype, conaffinity) == (_WORLD_CHANNEL, _WORLD_CHANNEL), (
+            f"{xml_path.name}: geom {geom_name!r} has "
+            f"(contype={contype}, conaffinity={conaffinity}); expected the "
+            f"default ({_WORLD_CHANNEL}, {_WORLD_CHANNEL}). "
+            "The (2, 1) hand filter assumes touchable scene objects keep "
+            "the default world channel -- if you intentionally re-classed "
+            "this geom, update the hand filter to match."
+        )
+        # Direct rule evaluation: hand vs this geom must produce contact.
+        assert _collide(contype, conaffinity, _HAND_COLLISION_CHANNEL, _WORLD_CHANNEL), (
+            f"{xml_path.name}: geom {geom_name!r} ({contype}, {conaffinity}) "
+            "fails to collide with a hand geom "
+            f"({_HAND_COLLISION_CHANNEL}, {_WORLD_CHANNEL}) -- "
+            "fingers will pass through it."
+        )
+
+
+def test_compose_filter_keeps_world_contacts_but_drops_self_contacts() -> None:
+    """Direct unit test on the composer: no scene XML on disk required.
+
+    Builds the augmented MJCF in-process with
+    ``disable_hand_collisions=False`` and verifies the contact-rule
+    ``(c1 & a2) || (c2 & a1)`` evaluates to:
+
+    * ``True``  for hand vs default-world (1, 1) -- cube, bowl, table,
+      floor, X2 body all collide with fingers / palm
+    * ``False`` for hand vs hand (2, 1) x (2, 1) -- self contacts
+      uniformly filtered (palm-vs-finger AND finger-vs-finger)
+
+    These are the exact properties the bug fix must guarantee: the
+    MuJoCo contact resolver applies that rule per candidate pair, so
+    asserting it directly catches regressions in the bitmask choice
+    even without a robocasa scene loaded.
+    """
+    pytest.importorskip("mujoco")
+    from gear_sonic.scripts.compose_x2_with_omnihand import (
+        build_x2_with_omnihand_spec,
+    )
+
+    _, model, _ = build_x2_with_omnihand_spec(disable_hand_collisions=False)
+    hand_roots = ("left_wrist_roll_link", "right_wrist_roll_link")
+
+    def _collide(c1: int, a1: int, c2: int, a2: int) -> bool:
+        return bool((c1 & a2) | (c2 & a1))
+
+    saw_one = False
+    for (contype, conaffinity, _group, _gtype, meshname) in (
+        _walk_hand_geom_collision_attrs(model, hand_roots)
+    ):
+        if contype == 0 and conaffinity == 0:
+            continue
+        if _is_x2_wrist_collision_mesh(meshname):
+            continue  # X2's own wrist mesh stays at (1, 1)
+        saw_one = True
+        assert (contype, conaffinity) == (_HAND_COLLISION_CHANNEL, _WORLD_CHANNEL), (
+            f"hand collision geom is ({contype}, {conaffinity}); the "
+            f"self-collision filter should rewrite it to "
+            f"({_HAND_COLLISION_CHANNEL}, {_WORLD_CHANNEL})."
+        )
+        # Hand vs default-world geom (cube, bowl, table, floor, X2 body): contact ✓
+        assert _collide(contype, conaffinity, _WORLD_CHANNEL, _WORLD_CHANNEL), (
+            "hand geom must collide with default-world geoms "
+            "(contype=1, conaffinity=1) -- otherwise fingers pass "
+            "through the cube AND the table AND the floor"
+        )
+        # Hand vs hand (same bitmask on both sides): no contact ✓
+        assert not _collide(contype, conaffinity, contype, conaffinity), (
+            "hand geom must NOT collide with another hand geom -- "
+            "palm-vs-finger / finger-vs-finger pinning was the original bug"
+        )
+    assert saw_one, (
+        "no hand collision geoms found under the wrist roots -- did the "
+        "spec composition lose the OmniHand collision primitives?"
+    )
+
+
+# ── Pre-OmniHand X2 fist collision-mesh disable (scene-build only) ───────
+
+
+@pytest.mark.parametrize("env_name", BUNDLED_SCENES)
+def test_scene_xml_disables_pre_omnihand_x2_fist_collision_mesh(
+    env_name: str,
+) -> None:
+    """Bundled scene XMLs must ship with the pre-OmniHand X2 fist
+    collision mesh disabled (contype=0, conaffinity=0) on both
+    ``*_wrist_roll_link`` bodies. Otherwise the OmniHand fingers
+    physically punch into the legacy fist shell on every full-grasp
+    curl and stall at q≈+0.67 rad regardless of friction / actuator
+    settings.
+
+    Standalone MuJoCo proves this is the actual root cause: with the
+    pre-OmniHand fist mesh disabled, every finger joint reaches its
+    commanded curl target on a fresh ``mj_step`` loop. With the legacy
+    mesh enabled, PIPs saturate at +0.67 and the thumb sits near zero.
+    See the long block-comment above
+    ``build_x2_robocasa_scene_xml._disable_pre_omnihand_x2_fist_collision_mesh``
+    for the full diagnostic walkthrough -- including why "increase
+    friction" / "lower friction" / "boost actuator torque" workarounds
+    don't help, and why this fix is intentionally scoped to the scene
+    XML rather than the bare compose path.
+
+    This test loads the bundled scene MJCF into MuJoCo, walks each
+    wrist body's geoms, and asserts:
+
+      * at least one geom on the body has ``contype=0, conaffinity=0``
+        (the disabled legacy fist collision mesh), AND
+      * at least two geoms on the body still have
+        ``(contype=2, conaffinity=1)`` (the OmniHand palm primitives --
+        cylinder + box -- which provide the actual graspable surface
+        for the cube/bowl/table on the hand channel).
+
+    If either invariant breaks, the operator will see fingers stalled
+    again at recording time. The build-time verifier in
+    ``build_scene_xml`` raises the same way; this test catches a stale
+    bundled scene that hasn't been rebuilt after the fix landed.
+    """
+    mujoco = pytest.importorskip("mujoco")
+    xml_path, _ = _scene_paths(env_name)
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+
+    for side in ("left", "right"):
+        wrist_body = f"{side}_wrist_roll_link"
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, wrist_body)
+        assert bid >= 0, (
+            f"{xml_path.name}: missing expected body {wrist_body!r} -- "
+            "rebuild scenes via build_x2_robocasa_scene_xml --all"
+        )
+        n_disabled = 0
+        n_palm = 0
+        for g in range(model.ngeom):
+            if int(model.geom_bodyid[g]) != bid:
+                continue
+            ct = int(model.geom_contype[g])
+            ca = int(model.geom_conaffinity[g])
+            if ct == 0 and ca == 0:
+                n_disabled += 1
+            elif (ct, ca) == (_HAND_COLLISION_CHANNEL, _WORLD_CHANNEL):
+                n_palm += 1
+        assert n_disabled >= 1, (
+            f"{xml_path.name}: {wrist_body!r} has {n_disabled} disabled "
+            "(ct=0, ca=0) geoms; expected at least 1 (the pre-OmniHand "
+            "X2 fist collision shell). Without this, OmniHand fingers "
+            "will stall at q≈+0.67 rad on full-grasp curls. Rebuild "
+            "scenes via ``.venv_sim/bin/python -m "
+            "gear_sonic.scripts.build_x2_robocasa_scene_xml --all`` "
+            "after pulling the latest build_x2_robocasa_scene_xml."
+        )
+        assert n_palm >= 2, (
+            f"{xml_path.name}: {wrist_body!r} only has {n_palm} OmniHand "
+            "palm primitives left on the hand channel "
+            f"({_HAND_COLLISION_CHANNEL}, {_WORLD_CHANNEL}); expected "
+            "at least 2 (cylinder + box). The compose script's palm "
+            "primitives are the OmniHand's actual graspable surface; "
+            "without them the cube falls through the hand. Either the "
+            "scene-build pre-OmniHand-fist-disable helper went too "
+            "broad, or the compose pipeline stopped attaching palm "
+            "collision."
+        )

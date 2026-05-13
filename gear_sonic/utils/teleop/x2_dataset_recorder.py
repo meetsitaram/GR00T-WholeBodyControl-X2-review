@@ -128,6 +128,10 @@ from gear_sonic.utils.teleop.x2_hand_retarget import (
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
+# Prior ``Quest3Reader.get_hand_curls`` ``*_source`` for filter reset
+# (distinct from ``None`` meaning unknown on the wire).
+_PREV_Q3_HAND_SRC_UNSET: Any = object()
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -1079,6 +1083,16 @@ class X2DatasetRecorder:
         self._deploy_was_alive: bool = False
         self._last_deploy_silent_warn_t: float = 0.0
 
+        # Hand diagnostic snapshot, populated each tick from the
+        # dispatch site (raw Quest 3 inputs + filtered values + final
+        # hand_q published to deploy). Read by ``_log_hand_diag`` on
+        # the same throttle as ``_print_status`` so we don't spam the
+        # terminal. Set to ``None`` here so the diag is a no-op until
+        # at least one tick has run. The diag is most useful for
+        # debugging "thumb won't close" / "controller trigger
+        # ignored" issues -- it makes the per-tick dispatch explicit.
+        self._last_hand_diag: Optional[dict] = None
+
         if cfg.teleop_only:
             print(
                 f"[recorder] init done. mode=TELEOP_ONLY (no dataset writes) "
@@ -1141,6 +1155,8 @@ class X2DatasetRecorder:
             self._finger_filter_right: Optional[FingerSignalFilter] = (
                 FingerSignalFilter(self._cfg.finger_filter_params)
             )
+            self._prev_q3_left_hand_src: Any = _PREV_Q3_HAND_SRC_UNSET
+            self._prev_q3_right_hand_src: Any = _PREV_Q3_HAND_SRC_UNSET
             if self._cfg.verbose:
                 p = self._cfg.finger_filter_params
                 print(
@@ -1152,6 +1168,8 @@ class X2DatasetRecorder:
         else:
             self._finger_filter_left = None
             self._finger_filter_right = None
+            self._prev_q3_left_hand_src = _PREV_Q3_HAND_SRC_UNSET
+            self._prev_q3_right_hand_src = _PREV_Q3_HAND_SRC_UNSET
             if self._cfg.verbose:
                 print(
                     "[recorder] finger filter DISABLED",
@@ -1280,6 +1298,17 @@ class X2DatasetRecorder:
                 vr_pose = self._quest.get_3pt_pose()
                 buttons = self._quest.get_buttons()
                 triggers = self._quest.get_controller_inputs()
+                # Snapshot the raw + filtered finger inputs so the
+                # throttled hand-diag log (every status_log_period_s)
+                # can render exactly what the dispatch saw this tick.
+                # We populate this dict at the *end* of the dispatch
+                # block once we know the final ``hand_q`` values, but
+                # initialise it here so an early `continue` (e.g. no
+                # vr_pose this frame) doesn't leak last tick's diag.
+                hand_diag_capture: dict = {
+                    "tick": tick,
+                    "triggers": triggers,
+                }
 
                 if vr_pose is None:
                     if not wait_msg:
@@ -1303,24 +1332,58 @@ class X2DatasetRecorder:
                 # holding controllers). Fall back to the controller
                 # trigger/grip scalar only when XRHand is not available.
                 #
-                # IMPORTANT: do NOT gate on ``l_src``. In multimodal the
-                # WebXR client tags ``source = "controller"`` because
-                # gripSpace wins for IK pose, but the same frame still
-                # carries XRHand curls + the thumb opposition signal.
-                # Gating on source kind would spuriously route us to the
-                # uniform-trigger path in multimodal and throw away the
-                # per-finger detail AND the thumb opposition correction.
-                l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
-                l_oppose, r_oppose = self._quest.get_thumb_opposition()
+                # IMPORTANT: do NOT gate XRHand vs controller *dispatch*
+                # on ``l_src`` alone. In multimodal mode the WebXR client
+                # tags ``source = "controller"`` because gripSpace wins
+                # for IK pose, but the same frame can still carry XRHand
+                # curls + thumb opposition.
+                #
+                # DO reset :class:`FingerSignalFilter` when ``l_src`` /
+                # ``r_src`` *change* (``hand`` <-> ``controller`` /
+                # ``None``). Otherwise the filter's NaN-holding EMA
+                # freezes the last XRHand curls while raw ``curls`` are
+                # ``None`` after returning to controllers-only, and
+                # trigger/grip never drives ``hand_q`` again.
+                l_curls_raw, r_curls_raw, l_src, r_src = self._quest.get_hand_curls()
+                l_oppose_raw, r_oppose_raw = self._quest.get_thumb_opposition()
                 l_finger_tip_oppose, r_finger_tip_oppose = (
                     self._quest.get_finger_tip_oppose()
                 )
+                # Capture the unfiltered values so the diag can show
+                # both raw and filtered (so we can tell whether it's
+                # the headset or the FingerSignalFilter zeroing out
+                # the thumb).
+                hand_diag_capture["l_src"] = l_src
+                hand_diag_capture["r_src"] = r_src
+                hand_diag_capture["l_curls_raw"] = (
+                    None if l_curls_raw is None else np.asarray(l_curls_raw).copy()
+                )
+                hand_diag_capture["r_curls_raw"] = (
+                    None if r_curls_raw is None else np.asarray(r_curls_raw).copy()
+                )
+                hand_diag_capture["l_oppose_raw"] = l_oppose_raw
+                hand_diag_capture["r_oppose_raw"] = r_oppose_raw
 
                 # Apply the per-side smoothing filter on top of the raw
                 # Quest 3 inputs. The retargeter sees only the filtered
                 # values; the raw values are no longer kept (the SONIC-
                 # record path doesn't write a debug NPZ).
+                l_curls, r_curls = l_curls_raw, r_curls_raw
+                l_oppose, r_oppose = l_oppose_raw, r_oppose_raw
                 if self._finger_filter_left is not None and self._finger_filter_right is not None:
+                    if (
+                        self._prev_q3_left_hand_src is not _PREV_Q3_HAND_SRC_UNSET
+                        and l_src != self._prev_q3_left_hand_src
+                    ):
+                        self._finger_filter_left.reset()
+                    if (
+                        self._prev_q3_right_hand_src is not _PREV_Q3_HAND_SRC_UNSET
+                        and r_src != self._prev_q3_right_hand_src
+                    ):
+                        self._finger_filter_right.reset()
+                    self._prev_q3_left_hand_src = l_src
+                    self._prev_q3_right_hand_src = r_src
+
                     l_curls, l_oppose, l_finger_tip_oppose = (
                         self._finger_filter_left.update(
                             l_curls, l_oppose, l_finger_tip_oppose,
@@ -1331,6 +1394,14 @@ class X2DatasetRecorder:
                             r_curls, r_oppose, r_finger_tip_oppose,
                         )
                     )
+                hand_diag_capture["l_curls_filt"] = (
+                    None if l_curls is None else np.asarray(l_curls).copy()
+                )
+                hand_diag_capture["r_curls_filt"] = (
+                    None if r_curls is None else np.asarray(r_curls).copy()
+                )
+                hand_diag_capture["l_oppose_filt"] = l_oppose
+                hand_diag_capture["r_oppose_filt"] = r_oppose
 
                 hr = self._calibration.hand_range if self._calibration is not None else None
                 l_hr = hr.left if hr is not None else None
@@ -1347,6 +1418,7 @@ class X2DatasetRecorder:
                         oppose_ceiling=l_hr.oppose_ceiling if l_hr is not None else None,
                     )
                     left_ratio = float(np.mean(l_curls))
+                    hand_diag_capture["l_dispatch"] = "xrhand"
                 else:
                     left_ratio, _ = controller_grasp_ratio(
                         left_trigger=triggers[0],
@@ -1356,6 +1428,7 @@ class X2DatasetRecorder:
                         mode=self._cfg.hand_input_mode,
                     )
                     left_hand_q = grasp_command_from_ratio("left", left_ratio)
+                    hand_diag_capture["l_dispatch"] = "controller"
 
                 if r_curls is not None:
                     right_hand_q = per_finger_grasp_command_from_curls_and_oppose(
@@ -1369,6 +1442,7 @@ class X2DatasetRecorder:
                         oppose_ceiling=r_hr.oppose_ceiling if r_hr is not None else None,
                     )
                     right_ratio = float(np.mean(r_curls))
+                    hand_diag_capture["r_dispatch"] = "xrhand"
                 else:
                     _, right_ratio = controller_grasp_ratio(
                         left_trigger=triggers[0],
@@ -1378,6 +1452,17 @@ class X2DatasetRecorder:
                         mode=self._cfg.hand_input_mode,
                     )
                     right_hand_q = grasp_command_from_ratio("right", right_ratio)
+                    hand_diag_capture["r_dispatch"] = "controller"
+
+                # Final per-tick capture: the actual 10-D commands the
+                # bridge will see for each hand. Indices 0/1/2 are
+                # thumb_roll / thumb_abad / thumb_mcp -- the diag log
+                # focuses on those because that's where the "thumb
+                # won't close" symptom shows up.
+                hand_diag_capture["left_hand_q"] = left_hand_q.copy()
+                hand_diag_capture["right_hand_q"] = right_hand_q.copy()
+                hand_diag_capture["engaged"] = bool(self._teleop.is_engaged)
+                self._last_hand_diag = hand_diag_capture
 
                 # Run IK; if not engaged, this returns the operator's
                 # calibrated neutral q (a posture that is *not* the
@@ -1448,6 +1533,7 @@ class X2DatasetRecorder:
                 ):
                     self._last_status_log_t = now_log
                     self._print_status(tick=tick, tick_result=tick_result)
+                    self._log_hand_diag()
 
                 tick += 1
                 next_tick += period
@@ -1711,8 +1797,10 @@ class X2DatasetRecorder:
         # window doesn't leak state from the previous episode.
         if self._finger_filter_left is not None:
             self._finger_filter_left.reset()
+            self._prev_q3_left_hand_src = _PREV_Q3_HAND_SRC_UNSET
         if self._finger_filter_right is not None:
             self._finger_filter_right.reset()
+            self._prev_q3_right_hand_src = _PREV_Q3_HAND_SRC_UNSET
 
         # Robocasa: re-randomise scene objects via the task mirror's
         # placement_initializer, then push the new poses to the deploy.
@@ -2309,6 +2397,107 @@ class X2DatasetRecorder:
             f"[recorder] tick={tick:6d} engaged={eng} state={rec} "
             f"buffered={n} deploy_alive={alive} "
             f"|ik_err|=({l_err:.3f}, {r_err:.3f}) m",
+            flush=True,
+        )
+
+    def _log_hand_diag(self) -> None:
+        """Per-side hand diagnostic: raw vs filtered curls + final hand_q.
+
+        Throttled by the same ``status_log_period_s`` cadence as
+        :meth:`_print_status` (default 5 s) so it doesn't spam the
+        terminal at 50 Hz. Useful for "thumb won't close" /
+        "controller trigger ignored" investigations because it makes
+        the per-tick dispatch path explicit:
+
+          * ``src``      -- which Quest 3 source is feeding the curls
+                            (xrhand, controller, multimodal). When the
+                            headset reports multimodal we **always**
+                            take the xrhand path -- the controller
+                            triggers are silently ignored. That's by
+                            design but trips up operators who think
+                            the trigger should still close fingers.
+          * ``raw``      -- the unfiltered Quest 3 thumb_flex + oppose
+                            values. If raw thumb_flex maxes out around
+                            0.10-0.20 then the calibration floor (0.198
+                            in the bundled default) is clamping it to
+                            zero before per-finger retargeting ever
+                            sees it.
+          * ``filt``     -- post FingerSignalFilter. If raw is healthy
+                            but filt is zero, the filter's smoothing
+                            constants are eating the signal.
+          * ``hand_q``   -- the final 10-D command published to the
+                            bridge. Indices 0/1/2 are
+                            thumb_roll / thumb_abad / thumb_mcp -- the
+                            three actuators that drive the thumb's
+                            "close into palm" motion. If these are
+                            non-zero in the recorder log but the robot
+                            doesn't move, the bug is in the bridge
+                            (actuator routing, contact gate, etc) not
+                            the recorder.
+
+        We only print when at least one tick has populated the diag
+        snapshot, and we keep the line under 200 cols so it survives
+        operator log scraping.
+        """
+        diag = self._last_hand_diag
+        if diag is None:
+            return
+
+        def _fmt_arr(a: Any, n: int = 5) -> str:
+            if a is None:
+                return "None"
+            arr = np.asarray(a)
+            if arr.size < n:
+                n = int(arr.size)
+            parts = ",".join(f"{float(arr[i]):+.2f}" for i in range(n))
+            return f"[{parts}]"
+
+        def _fmt_scalar(v: Any) -> str:
+            if v is None:
+                return " None"
+            return f"{float(v):+.2f}"
+
+        triggers = diag.get("triggers")
+        if triggers is None:
+            tr_str = "trig=None"
+        else:
+            t0, t1, g0, g1 = triggers
+            tr_str = (
+                f"trig=L_t{float(t0):+.2f}/g{float(g0):+.2f} "
+                f"R_t{float(t1):+.2f}/g{float(g1):+.2f}"
+            )
+
+        def _safe_str(v: Any, default: str = "None") -> str:
+            # Quest3Reader can return ``None`` for the per-side source
+            # tag when no XR hand input is bound yet (controller-only,
+            # or before the first hand-tracking frame), and any other
+            # diag field can race during shutdown. Coerce so the
+            # f-string format spec ``{:<11s}`` doesn't blow up.
+            return default if v is None else str(v)
+
+        for side, hand_key in (("l", "left_hand_q"), ("r", "right_hand_q")):
+            label = "LEFT " if side == "l" else "RIGHT"
+            src = _safe_str(diag.get(f"{side}_src"))
+            dispatch = _safe_str(diag.get(f"{side}_dispatch"), default="?")
+            curls_raw = diag.get(f"{side}_curls_raw")
+            curls_filt = diag.get(f"{side}_curls_filt")
+            opp_raw = diag.get(f"{side}_oppose_raw")
+            opp_filt = diag.get(f"{side}_oppose_filt")
+            hand_q = diag.get(hand_key)
+            print(
+                f"[hand-diag] {label} src={src:<11s} dispatch={dispatch:<10s} "
+                f"curls_raw={_fmt_arr(curls_raw)} curls_filt={_fmt_arr(curls_filt)} "
+                f"oppose_raw={_fmt_scalar(opp_raw)} oppose_filt={_fmt_scalar(opp_filt)} "
+                f"hand_q[0:3]={_fmt_arr(hand_q, 3)} "
+                f"hand_q[3:5]={_fmt_arr(hand_q[3:5] if hand_q is not None else None, 2)} "
+                f"hand_q[5:10]={_fmt_arr(hand_q[5:10] if hand_q is not None else None, 5)}",
+                flush=True,
+            )
+        engaged = diag.get("engaged", False)
+        print(
+            f"[hand-diag] {tr_str} engaged={engaged} "
+            f"compensation curl={self._cfg.apply_curl_compensation} "
+            f"oppose={self._cfg.apply_oppose_compensation}",
             flush=True,
         )
 

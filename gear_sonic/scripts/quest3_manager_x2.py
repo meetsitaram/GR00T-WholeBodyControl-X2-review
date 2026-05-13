@@ -156,6 +156,12 @@ class ManagerConfig:
     # hold the static lean / torso pose without snapping back.
     intent_enable_lean_fwd: bool = False
     intent_enable_torso: bool = False
+    # Continuous waist hold via the right stick: pitch (ry > 0), yaw
+    # (rx, no A), roll (rx, A held). Default True because this is the
+    # primary VR teleop surface for static reach now that the planner
+    # has STATIC_HOLD wired up. Set False to fall back to the legacy
+    # discrete soft-band torso bins.
+    intent_enable_continuous_torso: bool = True
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
     #
     # Operator UX contract: pushing the left stick AWAY from your body
@@ -243,8 +249,24 @@ def _default_calibration_path() -> Path:
 
 
 def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
-    """Build the JSON payload the planner's _zmq_command_thread expects."""
-    return json.dumps({"intent": cmd.intent, "magnitude": cmd.magnitude}).encode("utf-8")
+    """Build the JSON payload the planner's _zmq_command_thread expects.
+
+    For ``hold_torso`` commands we also serialize the continuous waist
+    targets; the planner's ``_zmq_command_thread`` reads them as
+    optional fields and feeds them into ``LocomotionCommand.waist_*_deg``.
+    For every other intent we omit them (defaulting to 0.0 on the
+    receiving end), which keeps wire payloads minimal and matches the
+    pre-v7 wire format.
+    """
+    payload: dict[str, object] = {
+        "intent": cmd.intent,
+        "magnitude": cmd.magnitude,
+    }
+    if cmd.intent == "hold_torso":
+        payload["waist_pitch_deg"] = float(cmd.waist_pitch_deg)
+        payload["waist_roll_deg"] = float(cmd.waist_roll_deg)
+        payload["waist_yaw_deg"] = float(cmd.waist_yaw_deg)
+    return json.dumps(payload).encode("utf-8")
 
 
 def _recorder_cmd_payload(action: str, tick: int) -> bytes:
@@ -296,7 +318,14 @@ class Quest3ManagerX2:
             repeat_interval_s=cfg.intent_repeat_interval_s,
             enable_lean_fwd=cfg.intent_enable_lean_fwd,
             enable_torso=cfg.intent_enable_torso,
+            enable_continuous_torso=cfg.intent_enable_continuous_torso,
         )
+        # Latched continuous waist target. Captured at the moment the
+        # operator presses B to flip LOCOMOTION -> ARM_MANIPULATION;
+        # republished as a hold_torso command so the planner pins
+        # STATIC_HOLD at the same pose during arm manipulation. Cleared
+        # on the reverse transition. None means "no latch active".
+        self._latched_waist: tuple[float, float, float] | None = None
         self._button_sm = ButtonStateMachine(log_prefix="Input")
 
         # Stick-click rising-edge tracker: the WebXR client polls the
@@ -472,11 +501,32 @@ class Quest3ManagerX2:
                 wait_logged = False
 
                 ev = self._button_sm.tick(*buttons)
+                a_held, _b_held, x_held, y_held = buttons
+
+                # Live continuous waist target derived from the right
+                # stick + A modifier. We compute this BEFORE the mode
+                # transition handler so a B-press into ARM_MANIPULATION
+                # can latch exactly the pose the operator was holding
+                # at the moment of the press, rather than the pose from
+                # the previous tick (which would drift by up to one
+                # 50 Hz interval). The continuous target is well-defined
+                # in any mode (it's a pure function of stick state) but
+                # only consumed on the LOCOMOTION -> ARM_MANIPULATION
+                # transition.
+                live_waist_target = self._intent.continuous_waist_target(
+                    rx=rx, ry=ry,
+                    a_held=(a_held and self._intent.mode == StreamMode.LOCOMOTION),
+                )
 
                 # 1) Mode transitions ---------------------------------------
                 transition = self._intent.update_mode(ev, now=tick_now)
                 if transition is not None:
-                    self._on_mode_transition(transition, vr_pose=vr_pose, tick=tick)
+                    self._on_mode_transition(
+                        transition,
+                        vr_pose=vr_pose,
+                        tick=tick,
+                        live_waist_target=live_waist_target,
+                    )
 
                 # 2) Operator-facing UX hint: in OFF mode, A/B/X/Y by
                 #    themselves do nothing useful. Print a one-shot hint
@@ -569,8 +619,9 @@ class Quest3ManagerX2:
                 # Held-button modifiers (LOCOMOTION-only via decoder
                 # short-circuit). A held + ly = continuous walk;
                 # X held + rx = 90° turn. Y held was crouch; currently
-                # gated off in IntentDecoder.
-                a_held, _b_held, x_held, y_held = buttons
+                # gated off in IntentDecoder. Buttons already destructured
+                # above so the live_waist_target sample agrees with the
+                # decoder's view of the held modifiers.
                 cmd = self._intent.decode_locomotion(
                     lx=lx, ly=ly, rx=rx, ry=ry,
                     y_held=(y_held and self._intent.mode == StreamMode.LOCOMOTION),
@@ -649,7 +700,7 @@ class Quest3ManagerX2:
         vr_pose: np.ndarray,
         triggers: tuple[float, float, float, float],
     ) -> RetargetTickInput:
-        l_curls, r_curls, _l_src, _r_src = self._quest.get_hand_curls()
+        l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
         l_oppose, r_oppose = self._quest.get_thumb_opposition()
         l_tip, r_tip = self._quest.get_finger_tip_oppose()
         return RetargetTickInput(
@@ -661,6 +712,8 @@ class Quest3ManagerX2:
             right_thumb_oppose=None if r_oppose is None else float(r_oppose),
             left_finger_tip_oppose=l_tip,
             right_finger_tip_oppose=r_tip,
+            left_hand_source=l_src,
+            right_hand_source=r_src,
         )
 
     def _on_mode_transition(
@@ -669,6 +722,7 @@ class Quest3ManagerX2:
         *,
         vr_pose: np.ndarray,
         tick: int,
+        live_waist_target: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         log.info("[manager-x2] mode %s -> %s", transition.previous.name, transition.current.name)
         # Re-arm the OFF-mode hint so it fires once again on next entry
@@ -678,15 +732,66 @@ class Quest3ManagerX2:
         # planner clears any stale queue entries and goes to idle_stand.
         if transition.previous == StreamMode.OFF:
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
-        # When entering ARM_MANIPULATION we tell the planner to idle so
-        # the lower body holds the trained stand pose while we drive arms.
-        if transition.current == StreamMode.ARM_MANIPULATION:
+
+        # ----- LOCOMOTION <-> ARM_MANIPULATION transitions ---------------
+        # Going INTO ARM_MANIPULATION: latch whatever pitch / roll / yaw
+        # the operator was holding via the right stick at the moment of
+        # B-press, and pin the planner's STATIC_HOLD to that pose. This
+        # mirrors the existing arm-latch on the reverse transition: the
+        # operator picks an upper-body pose in LOCOMOTION, B-clicks into
+        # ARM_MANIPULATION, then drives arms via VR IK while the lower
+        # body stays at the chosen lean / twist for extra reach.
+        #
+        # Going OUT of ARM_MANIPULATION (back to LOCOMOTION): clear the
+        # latch and emit a single idle cmd so the planner cleanly
+        # blends out of STATIC_HOLD; subsequent ticks resume normal
+        # continuous emission from the right stick.
+        if (
+            transition.previous == StreamMode.LOCOMOTION
+            and transition.current == StreamMode.ARM_MANIPULATION
+        ):
+            pitch, roll, yaw = live_waist_target
+            self._latched_waist = (pitch, roll, yaw)
+            self._publish_planner_cmd(
+                LocomotionCmd(
+                    intent="hold_torso",
+                    magnitude="continuous",
+                    waist_pitch_deg=pitch,
+                    waist_roll_deg=roll,
+                    waist_yaw_deg=yaw,
+                )
+            )
+            self._retargeter.reset_finger_filter()
+            log.info(
+                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f",
+                pitch, roll, yaw,
+            )
+            # Audio cue: separate "torso_locked" prompt only when the
+            # latched pose is meaningfully non-neutral (>= 1 deg on
+            # any axis). For neutral poses the standard
+            # "mode_arm_manipulation" cue below covers it.
+            if max(abs(pitch), abs(roll), abs(yaw)) >= 1.0:
+                self._play_audio_prompt(
+                    "mode_torso_locked", fallback="Torso locked.",
+                )
+        elif (
+            transition.previous == StreamMode.ARM_MANIPULATION
+            and transition.current == StreamMode.LOCOMOTION
+        ):
+            self._latched_waist = None
+            self._publish_planner_cmd(LocomotionCmd("idle", "default"))
+        elif transition.current == StreamMode.ARM_MANIPULATION:
+            # Reached ARM_MANIPULATION not via LOCOMOTION (e.g. would
+            # only happen if a future chord adds a direct OFF -> ARM
+            # path). Keep the legacy "planner idles" semantics.
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
             self._retargeter.reset_finger_filter()
+
         # On leaving an active mode -> OFF: tell the recorder to drop
         # any in-progress episode (this is a hard E-stop semantic;
         # operator can re-arm and start fresh).
         if transition.current == StreamMode.OFF and transition.previous != StreamMode.OFF:
+            self._latched_waist = None
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
             self._publish_recorder_cmd("estop", tick)
 

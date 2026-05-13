@@ -568,6 +568,135 @@ def _inject_workspace_cameras(root: ET.Element, env_spec: SceneEnvSpec) -> int:
     return n_added
 
 
+# ── Pre-OmniHand X2 fist collision-mesh disable (post-merge) ─────────────
+
+
+# Each X2 ``*_wrist_roll_link`` body ships with a single primary
+# collision mesh (``group=3``, ``contype=1``, ``conaffinity=1``) that
+# wraps the *original* (pre-OmniHand) X2 fist shape -- i.e. the closed
+# "boxing-glove" shell the X2 used before the OmniHand was bolted on.
+# That collision shell extends from the wrist tube down past the
+# OmniHand palm mount (``z = _DEFAULT_MOUNT_Z = -0.182m`` in the wrist
+# body frame) -- i.e. straight into the workspace where the OmniHand
+# fingers curl. With
+# the OmniHand attached, every fingertip on a full-grasp curl
+# physically punches into that wrist shell:
+#
+#   [contact] left_L_index_pip   <->  left_wrist_roll_link
+#   [contact] left_L_middle_pip  <->  left_wrist_roll_link
+#   [contact] left_L_ring_pip    <->  left_wrist_roll_link
+#   [contact] left_L_pinky_pip   <->  left_wrist_roll_link
+#   [contact] left_L_thumb_mcp   <->  left_wrist_roll_link
+#
+# The constraint forces from those penetration contacts saturate the
+# OmniHand position-actuator force budget (forcerange=±3 Nm, joint
+# actuatorfrcrange=±1.764 Nm on PIP, ±0.314 Nm on thumb_abad), so the
+# fingers stall well short of their commanded curl. Empirically the
+# pip joints saturate at q≈+0.67 rad (target +1.54) and the thumb
+# joints at q≈±0.05 rad (target ±0.70 / ±1.40), regardless of friction
+# or damping settings:
+#
+#   bridge log:  [hand-bridge] target->settled:
+#                ... (+1.54 -> +0.67) (+1.54 -> +0.67) ...
+#
+# Standalone MuJoCo confirms this: with ``model.opt.disableflags |=
+# mjDSBL_CONTACT`` every joint reaches its target perfectly, and with
+# only this single ``geom_contype/conaffinity`` set to zero on the X2
+# wrist mesh every joint *also* reaches its target perfectly. The
+# wrist body still has collision presence in the world via its two
+# OmniHand palm primitives (a ~28mm cylinder + ~40mm box, both on the
+# (contype=2, conaffinity=1) hand channel) -- those are physically the
+# correct contact surface anyway since the OmniHand palm IS what
+# touches the table / cube / bowl, not the X2 wrist cuff.
+#
+# Per operator direction (2026-05-13) this fix is scene-only: the
+# bare composed MJCF used by ``--no-robocasa-env`` teleop loops keeps
+# the X2 wrist collision mesh intact so SONIC sees the same wrist
+# dynamics it was trained against, and the bare loop has no table /
+# cube anyway so finger-vs-wrist contacts are only an issue on the
+# rare full-grasp curl (where they remain noise-level visually). The
+# robocasa scene path is where finger closure is load-bearing for the
+# task, so the wrist-collision shell is removed only there and only
+# from the X2's own group-3 mesh -- the OmniHand palm primitives stay
+# on the hand channel and the X2 visual meshes are untouched.
+#
+# IMPORTANT: if you change which geom we walk here, also update::
+#
+#   * tests/test_x2_robocasa_scene_mode.py
+#       ::test_scene_xml_disables_pre_omnihand_x2_fist_collision_mesh
+#   * docs/source/references/x2_groot_robocasa.md (physics-overrides §)
+#
+# so future readers don't reintroduce the stall via a silent merge
+# regression.
+
+
+def _disable_pre_omnihand_x2_fist_collision_mesh(root: ET.Element) -> int:
+    """Zero ``contype`` / ``conaffinity`` on the pre-OmniHand X2 fist mesh.
+
+    The X2's ``*_wrist_roll_link`` body still ships with the *original*
+    (pre-OmniHand) fist-shaped collision shell from before the OmniHand
+    was bolted onto the wrist. Now that the OmniHand provides the
+    actual graspable surface (palm primitives + finger geoms), that
+    legacy fist mesh is purely a ghost obstacle -- it has no visual
+    counterpart in the scene anymore (the matching visual mesh is
+    clipped at compose time) and its only effect is to physically
+    block the OmniHand fingers from curling past the wrist cuff.
+
+    This helper walks ``root`` for ``<body name="*_wrist_roll_link">``
+    elements, locates that legacy collision geom (the one with
+    ``class="collision"``, i.e. inheriting the X2 ``group=3``
+    collision class), and stamps ``contype="0" conaffinity="0"`` on it
+    so MuJoCo skips it entirely. The OmniHand palm primitives that
+    ``compose_x2_with_omnihand`` injects under the same wrist body are
+    left alone -- they keep their (contype=2, conaffinity=1) hand
+    channel and continue to provide palm-vs-table / palm-vs-cube
+    contact for grasp dynamics.
+
+    Returns the number of geoms actually disabled (expected to be 2:
+    one for ``left_wrist_roll_link``, one for ``right_wrist_roll_link``).
+    Raises if the count is wrong so a future MJCF restructure can't
+    silently bypass this fix.
+
+    See the long block comment above for the rationale + diagnostic
+    walkthrough showing why this is the actual cause of the
+    finger-stalls-at-+0.67-rad bug, and why the obvious-looking
+    "increase friction" / "lower friction" / "increase actuator
+    torque" workarounds don't help.
+    """
+    # We target the X2's *direct-child* class="collision" geom on each
+    # wrist_roll_link body. That's the merged-X2 fist-shape collision
+    # mesh declared in the X2 vendor MJCF. The OmniHand palm primitives
+    # live inside the ``<frame name="..._omnihand_mount">`` block, NOT
+    # as direct geom children of the wrist body, so this walk
+    # explicitly does not touch them. (Their bodyid still resolves to
+    # the wrist body at compile time -- MuJoCo's <frame> just provides
+    # a coordinate system, not a body boundary -- so the post-compile
+    # verifier in ``build_scene_xml`` confirms they survived the cull.)
+    n_disabled = 0
+    for body in root.iter("body"):
+        bname = body.get("name", "")
+        if not bname.endswith("_wrist_roll_link"):
+            continue
+        for geom in body.findall("geom"):
+            if geom.get("class", "") == "collision":
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                n_disabled += 1
+
+    if n_disabled != 2:
+        raise RuntimeError(
+            f"_disable_pre_omnihand_x2_fist_collision_mesh disabled "
+            f"{n_disabled} legacy fist collision meshes; expected "
+            "exactly 2 (one per side). The MJCF schema for X2 "
+            "``wrist_roll_link`` probably changed -- update this helper "
+            "alongside the compose / clip pipeline. The post-compile "
+            "verifier in build_scene_xml will additionally assert that "
+            "each wrist body still carries >=2 hand-channel palm "
+            "primitives."
+        )
+    return n_disabled
+
+
 # ── End-to-end entry point ────────────────────────────────────────────────
 
 
@@ -603,11 +732,32 @@ def build_scene_xml(
     final_xml = merge_scene_into_compose(compose_xml, scene_bodies, scene_assets)
     print(f"[build_scene] final XML: {len(final_xml)} chars", flush=True)
 
-    # Bake the close-up workspace cameras (obj_left / obj_right) AFTER
-    # the merge so they can declare ``targetbody=cube_body`` (or the
-    # bowl equivalent) -- the manipulable target body only exists in
-    # the merged worldbody, not in the bare compose spec.
+    # Re-parse once for all post-merge mutations:
+    #   1. ``_disable_pre_omnihand_x2_fist_collision_mesh`` -- zeros
+    #      contype/conaffinity on the X2's pre-OmniHand fist-shaped
+    #      collision shell, which otherwise extends past the OmniHand
+    #      palm mount and physically blocks the fingers from curling
+    #      past q≈0.67 rad (and pins the thumb near zero). The OmniHand
+    #      palm primitives stay on the (2, 1) hand channel and continue
+    #      to provide the actual grasp contact surface. See the long
+    #      block-comment above the helper for the full diagnostic.
+    #   2. ``_inject_workspace_cameras`` -- bakes ``obj_left`` /
+    #      ``obj_right`` cameras targeting the per-env manipulable body,
+    #      which only exists post-merge.
+    # The OmniHand collision filter (hand-vs-hand off, hand-vs-
+    # everything-else on) is still applied at compose time -- scene
+    # object geoms keep their default (1, 1) bitmask, so no scene-side
+    # collision patching is required for the cube/bowl/table.
     final_root = ET.fromstring(final_xml)
+
+    n_fist_disabled = _disable_pre_omnihand_x2_fist_collision_mesh(final_root)
+    print(
+        f"[build_scene] disabled pre-OmniHand X2 fist collision mesh on "
+        f"{n_fist_disabled} wrist bodies (left + right); OmniHand palm "
+        "primitives left intact on the hand channel.",
+        flush=True,
+    )
+
     n_cams = _inject_workspace_cameras(final_root, env_spec)
     if n_cams > 0:
         print(
@@ -616,7 +766,7 @@ def build_scene_xml(
             "press [ / ] in the MuJoCo viewer to cycle to them.",
             flush=True,
         )
-        final_xml = ET.tostring(final_root, encoding="unicode")
+    final_xml = ET.tostring(final_root, encoding="unicode")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -660,6 +810,66 @@ def build_scene_xml(
                     raise RuntimeError(
                         f"OmniHand joint {jname!r} missing from final scene MJCF"
                     )
+        # Verify the pre-OmniHand X2 fist collision-mesh disable
+        # actually landed on the compiled model. We look up each
+        # ``*_wrist_roll_link`` body and walk its geoms: at least one
+        # must have contype=0/conaffinity=0 (the disabled legacy fist
+        # shell) AND at least one must still have the
+        # (contype=2, conaffinity=1) hand-channel bitmask (the
+        # OmniHand palm primitives the compose script attached). If
+        # either invariant is broken the operator will see fingers
+        # stalled at q≈+0.67 again -- catch it here at build time.
+        fist_disabled_per_side: dict[str, int] = {}
+        wrist_palm_per_side: dict[str, int] = {}
+        for side in ("left", "right"):
+            wrist_body = f"{side}_wrist_roll_link"
+            bid = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, wrist_body
+            )
+            if bid < 0:
+                raise RuntimeError(
+                    f"scene MJCF missing expected body {wrist_body!r} -- "
+                    "pre-OmniHand fist-collision verification cannot run"
+                )
+            ndis = npalm = 0
+            for g in range(model.ngeom):
+                if int(model.geom_bodyid[g]) != bid:
+                    continue
+                ct = int(model.geom_contype[g])
+                ca = int(model.geom_conaffinity[g])
+                if ct == 0 and ca == 0:
+                    ndis += 1
+                elif (ct, ca) == (2, 1):
+                    npalm += 1
+            fist_disabled_per_side[side] = ndis
+            wrist_palm_per_side[side] = npalm
+
+        for side, ndis in fist_disabled_per_side.items():
+            if ndis < 1:
+                raise RuntimeError(
+                    f"{side}_wrist_roll_link has no disabled (ct=0, "
+                    "ca=0) geoms -- the pre-OmniHand X2 fist collision "
+                    "shell was not zeroed. Fingers will stall at "
+                    "q≈+0.67 again."
+                )
+        for side, npalm in wrist_palm_per_side.items():
+            if npalm < 2:
+                raise RuntimeError(
+                    f"{side}_wrist_roll_link only has {npalm} OmniHand "
+                    "palm primitives left on the hand channel; expected "
+                    "at least 2 (cylinder + box). Without these, the "
+                    "OmniHand palm has no graspable surface."
+                )
+        print(
+            f"[build_scene] ✓ pre-OmniHand X2 fist collision disable "
+            f"verified: "
+            f"left={fist_disabled_per_side['left']} disabled / "
+            f"{wrist_palm_per_side['left']} palm primitives intact, "
+            f"right={fist_disabled_per_side['right']} disabled / "
+            f"{wrist_palm_per_side['right']} palm primitives intact",
+            flush=True,
+        )
+
         # Also check the scene-object freejoints survived (the recorder
         # writes per-episode object poses by name into mj_data.qpos).
         for logical, joint_name in env_spec.object_freejoint_map.items():
