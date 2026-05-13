@@ -75,6 +75,7 @@ V0 scope
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 import signal
@@ -237,6 +238,41 @@ class RecorderConfig:
     sonic_correction_warn_rad: float = 0.05
     log_sonic_correction: bool = True
 
+    # ── Phase 0 subscribe-only mode (planner-driven recorder) ──────────
+    # When ``body_pose_source`` AND ``arm_targets_source`` are both
+    # ``"zmq"``, the recorder is Quest-unaware: it skips the
+    # :class:`Quest3Reader` + :class:`VRArmTeleopCalibrated` stack
+    # entirely and instead subscribes to:
+    #   - the planner's ``body_pose`` topic (31-DOF reference)
+    #   - the manager's ``arm_targets`` topic (14-DOF arm IK)
+    #   - the manager's ``hand_finger_cmd`` topic (10-DOF/side OmniHand)
+    #   - the manager's ``stream_mode`` + ``recorder_cmd`` topics
+    # It then merges body_pose + arm_targets into a 31-DOF ``final_pose``
+    # and publishes that to the deploy on the existing
+    # ``--pub-port`` (5556) under topic ``pose``. Episode control
+    # buttons (start / save / discard) are forwarded from the manager
+    # over ``recorder_cmd``.
+    body_pose_source: str = "internal"
+    """``"internal"`` (legacy: run Quest 3 + IK in this process) or
+    ``"zmq"`` (Phase 0: subscribe to the planner's body_pose)."""
+
+    arm_targets_source: str = "internal"
+    """``"internal"`` or ``"zmq"`` (Phase 0: subscribe to the manager's
+    arm_targets + hand_finger_cmd). Must equal
+    :attr:`body_pose_source` -- mixing internal IK with external
+    body_pose is intentionally rejected."""
+
+    body_pose_sub_host: str = "localhost"
+    body_pose_sub_port: int = 5565
+    body_pose_sub_topic: str = "body_pose"
+
+    arm_and_hands_sub_host: str = "localhost"
+    arm_and_hands_sub_port: int = 5564
+    arm_targets_topic: str = "arm_targets"
+    hand_finger_cmd_topic: str = "hand_finger_cmd"
+    stream_mode_topic: str = "stream_mode"
+    recorder_cmd_topic: str = "recorder_cmd"
+
     # ── Phase-1 robocasa scene plumbing (G1 architecture) ──────────────
     # When ``scene_xml_path`` is set, the recorder:
     #   (a) loads the static MJCF for ego-view rendering so frames show
@@ -307,10 +343,422 @@ class _EpisodeBuffer:
         self.frames.clear()
 
 
+class _SubscribeModeState:
+    """Latest snapshot of the manager + planner ZMQ topics.
+
+    Threadsafe: a single background thread writes via :meth:`update_*`,
+    the recorder loop reads via :meth:`snapshot`. All state behind
+    one lock to keep the contract obvious; payloads are small (<1 KB)
+    so contention is negligible.
+
+    Used only in Phase 0 subscribe mode.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._body_pose_q_mj: Optional[np.ndarray] = None
+        # v5 wire-format fields from the planner's body_pose payload.
+        # ``root_quat_xyzw`` is the current-frame root orientation
+        # reference; the ``*_future`` arrays carry the strictly-future
+        # window the C++ deploy's tokenizer needs to anticipate the
+        # next 0.9 s of motion (without it the deploy returns the
+        # latest single frame for all 10 future slots, which is what
+        # makes the policy "step in place" -- legs animate but the
+        # body never gets a forward-thrust ref).
+        self._root_quat_xyzw: Optional[np.ndarray] = None
+        self._joint_pos_mj_future: Optional[np.ndarray] = None
+        self._root_quat_xyzw_future: Optional[np.ndarray] = None
+        self._joint_vel_mj_future: Optional[np.ndarray] = None
+        self._frame_index_future: Optional[np.ndarray] = None
+        self._future_dt_s: Optional[float] = None
+        self._arm_left_q: Optional[np.ndarray] = None
+        self._arm_right_q: Optional[np.ndarray] = None
+        self._arm_engaged: bool = False
+        self._left_hand_q: Optional[np.ndarray] = None
+        self._right_hand_q: Optional[np.ndarray] = None
+        self._stream_mode: str = "OFF"
+        self._pending_recorder_cmd: list[tuple[str, int]] = []
+        self._last_body_pose_t: float = 0.0
+        self._last_arm_targets_t: float = 0.0
+
+    def update_body_pose(
+        self,
+        q_mj: np.ndarray,
+        *,
+        root_quat_xyzw: Optional[np.ndarray] = None,
+        joint_pos_mj_future: Optional[np.ndarray] = None,
+        root_quat_xyzw_future: Optional[np.ndarray] = None,
+        joint_vel_mj_future: Optional[np.ndarray] = None,
+        frame_index_future: Optional[np.ndarray] = None,
+        future_dt_s: Optional[float] = None,
+    ) -> None:
+        """Atomically refresh the planner's body_pose snapshot.
+
+        ``q_mj`` is required (single-frame fallback always available).
+        The v5 fields are optional: when present they enable the C++
+        deploy's future-window tokenizer; when absent the deploy falls
+        back to the legacy single-frame Sample() path. The whole set
+        is updated under the lock so a reader never sees a current
+        frame from tick N with a future window from tick N-1.
+        """
+        with self._lock:
+            self._body_pose_q_mj = q_mj.copy()
+            self._root_quat_xyzw = (
+                None if root_quat_xyzw is None else root_quat_xyzw.copy()
+            )
+            self._joint_pos_mj_future = (
+                None if joint_pos_mj_future is None
+                else joint_pos_mj_future.copy()
+            )
+            self._root_quat_xyzw_future = (
+                None if root_quat_xyzw_future is None
+                else root_quat_xyzw_future.copy()
+            )
+            self._joint_vel_mj_future = (
+                None if joint_vel_mj_future is None
+                else joint_vel_mj_future.copy()
+            )
+            self._frame_index_future = (
+                None if frame_index_future is None
+                else frame_index_future.copy()
+            )
+            self._future_dt_s = (
+                None if future_dt_s is None else float(future_dt_s)
+            )
+            self._last_body_pose_t = time.time()
+
+    def update_arm_targets(
+        self, left: np.ndarray, right: np.ndarray, engaged: bool,
+    ) -> None:
+        with self._lock:
+            self._arm_left_q = left.copy()
+            self._arm_right_q = right.copy()
+            self._arm_engaged = bool(engaged)
+            self._last_arm_targets_t = time.time()
+
+    def update_hand_finger_cmd(
+        self, left: np.ndarray, right: np.ndarray,
+    ) -> None:
+        with self._lock:
+            self._left_hand_q = left.copy()
+            self._right_hand_q = right.copy()
+
+    def update_stream_mode(self, mode: str) -> None:
+        with self._lock:
+            self._stream_mode = mode
+
+    def push_recorder_cmd(self, action: str, tick: int) -> None:
+        with self._lock:
+            self._pending_recorder_cmd.append((action, tick))
+
+    def drain_recorder_cmds(self) -> list[tuple[str, int]]:
+        with self._lock:
+            out, self._pending_recorder_cmd = self._pending_recorder_cmd, []
+        return out
+
+    def snapshot(self) -> dict:
+        """Return a frozen view of the latest state for one tick."""
+        with self._lock:
+            return {
+                "body_pose_q_mj": (
+                    None if self._body_pose_q_mj is None
+                    else self._body_pose_q_mj.copy()
+                ),
+                "root_quat_xyzw": (
+                    None if self._root_quat_xyzw is None
+                    else self._root_quat_xyzw.copy()
+                ),
+                "joint_pos_mj_future": (
+                    None if self._joint_pos_mj_future is None
+                    else self._joint_pos_mj_future.copy()
+                ),
+                "root_quat_xyzw_future": (
+                    None if self._root_quat_xyzw_future is None
+                    else self._root_quat_xyzw_future.copy()
+                ),
+                "joint_vel_mj_future": (
+                    None if self._joint_vel_mj_future is None
+                    else self._joint_vel_mj_future.copy()
+                ),
+                "frame_index_future": (
+                    None if self._frame_index_future is None
+                    else self._frame_index_future.copy()
+                ),
+                "future_dt_s": self._future_dt_s,
+                "arm_left_q": (
+                    None if self._arm_left_q is None else self._arm_left_q.copy()
+                ),
+                "arm_right_q": (
+                    None if self._arm_right_q is None else self._arm_right_q.copy()
+                ),
+                "arm_engaged": self._arm_engaged,
+                "left_hand_q": (
+                    None if self._left_hand_q is None else self._left_hand_q.copy()
+                ),
+                "right_hand_q": (
+                    None if self._right_hand_q is None else self._right_hand_q.copy()
+                ),
+                "stream_mode": self._stream_mode,
+                "last_body_pose_t": self._last_body_pose_t,
+                "last_arm_targets_t": self._last_arm_targets_t,
+            }
+
+
+def _subscribe_mode_thread(
+    *,
+    body_pose_url: str,
+    body_pose_topic: str,
+    arm_and_hands_url: str,
+    arm_targets_topic: str,
+    hand_finger_cmd_topic: str,
+    stream_mode_topic: str,
+    recorder_cmd_topic: str,
+    state: _SubscribeModeState,
+    stop_event: threading.Event,
+    verbose: bool = False,
+) -> None:
+    """Single SUB thread that fans the manager + planner streams into ``state``.
+
+    Subscribes to all five topics on the two PUB sockets the planner +
+    manager bind. Polls with a 50 ms RCVTIMEO so shutdown is responsive.
+    """
+    try:
+        import msgpack
+    except ImportError:
+        msgpack = None  # type: ignore[assignment]
+
+    ctx = zmq.Context.instance()
+    sub_planner = ctx.socket(zmq.SUB)
+    sub_planner.setsockopt(zmq.LINGER, 0)
+    sub_planner.setsockopt(zmq.RCVTIMEO, 50)
+    sub_planner.setsockopt_string(zmq.SUBSCRIBE, body_pose_topic)
+    sub_planner.connect(body_pose_url)
+
+    sub_mgr = ctx.socket(zmq.SUB)
+    sub_mgr.setsockopt(zmq.LINGER, 0)
+    sub_mgr.setsockopt(zmq.RCVTIMEO, 50)
+    for topic in (
+        arm_targets_topic, hand_finger_cmd_topic,
+        stream_mode_topic, recorder_cmd_topic,
+    ):
+        sub_mgr.setsockopt_string(zmq.SUBSCRIBE, topic)
+    sub_mgr.connect(arm_and_hands_url)
+
+    if verbose:
+        print(
+            f"[recorder] subscribe-mode SUBs:\n"
+            f"  planner   {body_pose_url} topic={body_pose_topic!r}\n"
+            f"  manager   {arm_and_hands_url} topics="
+            f"{[arm_targets_topic, hand_finger_cmd_topic, stream_mode_topic, recorder_cmd_topic]}",
+            flush=True,
+        )
+
+    poller = zmq.Poller()
+    poller.register(sub_planner, zmq.POLLIN)
+    poller.register(sub_mgr, zmq.POLLIN)
+
+    try:
+        while not stop_event.is_set():
+            events = dict(poller.poll(timeout=50))
+
+            if sub_planner in events:
+                try:
+                    parts = sub_planner.recv_multipart(flags=zmq.NOBLOCK)
+                    _handle_body_pose_msg(
+                        parts, state, expected_topic=body_pose_topic,
+                    )
+                except zmq.error.Again:
+                    pass
+
+            if sub_mgr in events:
+                try:
+                    parts = sub_mgr.recv_multipart(flags=zmq.NOBLOCK)
+                    _handle_arm_and_hands_msg(
+                        parts, state,
+                        arm_targets_topic=arm_targets_topic,
+                        hand_finger_cmd_topic=hand_finger_cmd_topic,
+                        stream_mode_topic=stream_mode_topic,
+                        recorder_cmd_topic=recorder_cmd_topic,
+                    )
+                except zmq.error.Again:
+                    pass
+    finally:
+        try:
+            sub_planner.close(linger=0)
+        except Exception:
+            pass
+        try:
+            sub_mgr.close(linger=0)
+        except Exception:
+            pass
+
+
+def _handle_body_pose_msg(
+    parts: list[bytes], state: _SubscribeModeState,
+    *, expected_topic: str,
+) -> None:
+    """Decode the planner's body_pose payload and update state.
+
+    The planner uses :func:`pack_pose_message` (single-frame topic +
+    1280-byte JSON header + binary payload) so we decode with the
+    matching :func:`unpack_message` from the packed-message decoder.
+
+    The decoder exposes every named array in the wire payload; we
+    forward the v5 future-window fields verbatim so the recorder's
+    publish path can pass them on to the C++ deploy. Without this,
+    the deploy's tokenizer falls back to its single-frame path and
+    the policy gets a frozen future window (10 copies of the current
+    pose), which is exactly the "legs animate but body doesn't
+    translate" symptom we hit in Phase 0 smoke testing.
+    """
+    from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (
+        unpack_message,
+    )
+    if not parts:
+        return
+    # Planner sends a SINGLE-PART message ([topic][header][binary]),
+    # not multipart. ZMQ subscribers still wrap it in a multipart list
+    # when called via recv_multipart, so parts[0] is the whole frame.
+    try:
+        decoded = unpack_message(parts[0], expected_topic=expected_topic)
+    except ValueError:
+        return
+    fields = decoded.fields
+    if "joint_pos_mj" not in fields:
+        return
+    q = np.asarray(fields["joint_pos_mj"], dtype=np.float64).reshape(-1)
+    if q.shape != (NUM_BODY_DOFS,):
+        return
+
+    # Optional fields. We accept any frame that has the required
+    # ``joint_pos_mj``; the v5 future window is opt-in (older planners
+    # only emit single-frame fields).
+    root_quat = None
+    if "root_quat_xyzw" in fields:
+        rq = np.asarray(fields["root_quat_xyzw"], dtype=np.float32).reshape(-1)
+        if rq.shape == (4,):
+            root_quat = rq
+
+    # Future-window fields are only forwarded when ALL the required
+    # parts are present and self-consistent. A partial window would
+    # confuse the C++ deploy (it requires both jpos+rotation futures
+    # to promote into ``has_future_window_``).
+    jpos_future = fields.get("joint_pos_mj_future")
+    rot_future = fields.get("root_quat_xyzw_future")
+    jvel_future = fields.get("joint_vel_mj_future")
+    fidx_future = fields.get("frame_index_future")
+    fdt_field = fields.get("future_dt_s")
+
+    have_full_window = (
+        jpos_future is not None
+        and rot_future is not None
+        and jpos_future.ndim == 2
+        and jpos_future.shape[1] == NUM_BODY_DOFS
+        and rot_future.ndim == 2
+        and rot_future.shape == (jpos_future.shape[0], 4)
+    )
+
+    if have_full_window:
+        jpos_future_arr = np.asarray(jpos_future, dtype=np.float32)
+        rot_future_arr = np.asarray(rot_future, dtype=np.float32)
+        jvel_future_arr = (
+            None if jvel_future is None
+            else np.asarray(jvel_future, dtype=np.float32)
+        )
+        if (
+            jvel_future_arr is not None
+            and jvel_future_arr.shape != jpos_future_arr.shape
+        ):
+            jvel_future_arr = None
+        fidx_future_arr = (
+            None if fidx_future is None
+            else np.asarray(fidx_future, dtype=np.int64).reshape(-1)
+        )
+        if (
+            fidx_future_arr is not None
+            and fidx_future_arr.shape != (jpos_future_arr.shape[0],)
+        ):
+            fidx_future_arr = None
+        future_dt_val: Optional[float] = None
+        if fdt_field is not None:
+            try:
+                future_dt_val = float(np.asarray(fdt_field).reshape(-1)[0])
+            except (IndexError, ValueError):
+                future_dt_val = None
+        state.update_body_pose(
+            q,
+            root_quat_xyzw=root_quat,
+            joint_pos_mj_future=jpos_future_arr,
+            root_quat_xyzw_future=rot_future_arr,
+            joint_vel_mj_future=jvel_future_arr,
+            frame_index_future=fidx_future_arr,
+            future_dt_s=future_dt_val,
+        )
+    else:
+        state.update_body_pose(q, root_quat_xyzw=root_quat)
+
+
+def _handle_arm_and_hands_msg(
+    parts: list[bytes],
+    state: _SubscribeModeState,
+    *,
+    arm_targets_topic: str,
+    hand_finger_cmd_topic: str,
+    stream_mode_topic: str,
+    recorder_cmd_topic: str,
+) -> None:
+    if len(parts) < 2:
+        return
+    topic = parts[0].decode("ascii", errors="replace")
+    payload_bytes = parts[1]
+
+    import msgpack
+    if topic == arm_targets_topic:
+        msg = msgpack.unpackb(payload_bytes, raw=False)
+        l = np.asarray(msg["left_q_rad"], dtype=np.float64)
+        r = np.asarray(msg["right_q_rad"], dtype=np.float64)
+        state.update_arm_targets(l, r, bool(msg.get("is_engaged", False)))
+    elif topic == hand_finger_cmd_topic:
+        msg = msgpack.unpackb(payload_bytes, raw=False)
+        l = np.asarray(msg["left_hand_q"], dtype=np.float64)
+        r = np.asarray(msg["right_hand_q"], dtype=np.float64)
+        state.update_hand_finger_cmd(l, r)
+    elif topic == stream_mode_topic:
+        msg = msgpack.unpackb(payload_bytes, raw=False)
+        state.update_stream_mode(str(msg.get("mode", "OFF")))
+    elif topic == recorder_cmd_topic:
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+            state.push_recorder_cmd(
+                str(payload["action"]), int(payload.get("tick", -1))
+            )
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return
+
+
 class X2DatasetRecorder:
     """Top-level orchestrator for the VR-driven X2 dataset recorder."""
 
     def __init__(self, cfg: RecorderConfig) -> None:
+        # Validate subscribe-mode coherence early.
+        if cfg.body_pose_source not in ("internal", "zmq"):
+            raise ValueError(
+                f"body_pose_source must be 'internal' or 'zmq'; "
+                f"got {cfg.body_pose_source!r}"
+            )
+        if cfg.arm_targets_source not in ("internal", "zmq"):
+            raise ValueError(
+                f"arm_targets_source must be 'internal' or 'zmq'; "
+                f"got {cfg.arm_targets_source!r}"
+            )
+        if cfg.body_pose_source != cfg.arm_targets_source:
+            raise ValueError(
+                "Mixing body_pose_source != arm_targets_source is not "
+                "supported in Phase 0. Both must be 'internal' or both "
+                "'zmq'."
+            )
+        self._subscribe_mode = (cfg.body_pose_source == "zmq")
+
         self._cfg = cfg
         if cfg.teleop_only:
             self._cfg.output_dir = None
@@ -383,12 +831,27 @@ class X2DatasetRecorder:
         # second flood that drowns out the throttled recorder/deploy logs).
         # First-packet snapshot and one-shot XR / source-changed events
         # still fire.
-        self._quest = Quest3Reader(
-            ws_port=cfg.quest3_ws_port,
-            http_port=cfg.quest3_http_port,
-            use_ssl=cfg.quest3_use_ssl,
-            quiet_periodic=True,
-        )
+        #
+        # Phase 0 subscribe mode: the manager owns the Quest 3 connection
+        # and runs all VR retargeting (IK, hand mapping, calibration); the
+        # recorder is Quest-unaware and only consumes ZMQ topics. We set
+        # ``self._quest = None`` so any stray reference from the legacy
+        # internal-mode path crashes loudly instead of silently mixing
+        # two competing input sources.
+        if self._subscribe_mode:
+            self._quest = None
+            print(
+                "[recorder] subscribe-mode: Quest3Reader skipped "
+                "(manager owns the VR loop)",
+                flush=True,
+            )
+        else:
+            self._quest = Quest3Reader(
+                ws_port=cfg.quest3_ws_port,
+                http_port=cfg.quest3_http_port,
+                use_ssl=cfg.quest3_use_ssl,
+                quiet_periodic=True,
+            )
 
         # ZMQ
         ctx = zmq.Context.instance()
@@ -411,6 +874,52 @@ class X2DatasetRecorder:
             name="x2_debug-sub",
             daemon=True,
         )
+
+        # Phase 0 subscribe-mode SUB: a single thread that fans the
+        # planner's body_pose stream and the manager's
+        # arm_targets/hand_finger_cmd/stream_mode/recorder_cmd streams
+        # into ``self._sub_state``. Built unconditionally so tests can
+        # introspect it; the thread is only ``start()``-ed when
+        # ``_subscribe_mode`` is True.
+        self._sub_state: Optional[_SubscribeModeState] = None
+        self._sub_mode_thread: Optional[threading.Thread] = None
+        if self._subscribe_mode:
+            self._sub_state = _SubscribeModeState()
+            self._sub_mode_thread = threading.Thread(
+                target=_subscribe_mode_thread,
+                kwargs=dict(
+                    body_pose_url=(
+                        f"tcp://{cfg.body_pose_sub_host}:"
+                        f"{cfg.body_pose_sub_port}"
+                    ),
+                    body_pose_topic=cfg.body_pose_sub_topic,
+                    arm_and_hands_url=(
+                        f"tcp://{cfg.arm_and_hands_sub_host}:"
+                        f"{cfg.arm_and_hands_sub_port}"
+                    ),
+                    arm_targets_topic=cfg.arm_targets_topic,
+                    hand_finger_cmd_topic=cfg.hand_finger_cmd_topic,
+                    stream_mode_topic=cfg.stream_mode_topic,
+                    recorder_cmd_topic=cfg.recorder_cmd_topic,
+                    state=self._sub_state,
+                    stop_event=self._stop_event,
+                    verbose=cfg.verbose,
+                ),
+                name="recorder-sub-mode",
+                daemon=True,
+            )
+            print(
+                "[recorder] subscribe-mode wired:\n"
+                f"  body_pose  SUB tcp://{cfg.body_pose_sub_host}:"
+                f"{cfg.body_pose_sub_port} topic={cfg.body_pose_sub_topic!r}\n"
+                f"  manager    SUB tcp://{cfg.arm_and_hands_sub_host}:"
+                f"{cfg.arm_and_hands_sub_port} topics="
+                f"[{cfg.arm_targets_topic!r}, "
+                f"{cfg.hand_finger_cmd_topic!r}, "
+                f"{cfg.stream_mode_topic!r}, "
+                f"{cfg.recorder_cmd_topic!r}]",
+                flush=True,
+            )
 
         # MuJoCo renderer is constructed lazily on the recording thread:
         # MuJoCo's EGL backend pins to the thread that created the
@@ -586,14 +1095,32 @@ class X2DatasetRecorder:
     # -- lifecycle ------------------------------------------------------------
 
     def start(self) -> None:
-        self._quest.start()
+        if not self._subscribe_mode:
+            self._quest.start()
         self._sub_thread.start()
+        if self._sub_mode_thread is not None:
+            self._sub_mode_thread.start()
         # Robocasa scene_state subscriber (no-op when not in scene mode).
         if self._scene_state_thread is not None:
             self._scene_state_thread.start()
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
+        # Calibration + IK + finger filter only matter in internal mode;
+        # in subscribe mode the manager owns all of that and the recorder
+        # just routes its outputs.
+        if self._subscribe_mode:
+            self._calibration = None
+            self._teleop = None
+            self._finger_filter_left = None
+            self._finger_filter_right = None
+            print(
+                "[recorder] subscribe-mode: skipping calibration / IK / "
+                "finger-filter init (manager owns them)",
+                flush=True,
+            )
+            return
+
         # Calibration is loaded *after* Quest 3 boot in case the operator
         # passed --recalibrate (which needs a connected WebXR client).
         self._calibration = self._resolve_calibration()
@@ -696,6 +1223,11 @@ class X2DatasetRecorder:
             self._sub_thread.join(timeout=1.0)
         except Exception:
             pass
+        if self._sub_mode_thread is not None:
+            try:
+                self._sub_mode_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if self._scene_state_thread is not None:
             try:
                 self._scene_state_thread.join(timeout=1.0)
@@ -715,10 +1247,11 @@ class X2DatasetRecorder:
                 self._task_mirror.close()
             except Exception:
                 pass
-        try:
-            self._quest.stop()
-        except Exception:
-            pass
+        if self._quest is not None:
+            try:
+                self._quest.stop()
+            except Exception:
+                pass
         if self._renderer is not None:
             try:
                 self._renderer.close()
@@ -732,6 +1265,8 @@ class X2DatasetRecorder:
         if not self._cfg.teleop_only:
             self._build_renderer()
         self._print_startup_banner()
+        if self._subscribe_mode:
+            return self._run_subscribe_mode()
         period = 1.0 / max(self._cfg.publish_rate_hz, 1e-6)
         next_tick = time.monotonic()
         tick = 0
@@ -930,6 +1465,205 @@ class X2DatasetRecorder:
                 self._stop_episode(save=True)
         return tick
 
+    # -- subscribe-mode loop --------------------------------------------------
+
+    def _run_subscribe_mode(self) -> int:
+        """Phase 0 subscribe-only loop: planner + manager drive everything.
+
+        The recorder is Quest-unaware in this mode. Each tick we:
+            1. Snapshot the latest body_pose (planner) +
+               arm_targets / hand_finger_cmd (manager).
+            2. Drain pending recorder_cmd episode events from the manager.
+            3. Merge body_pose with arm/hand targets into a 31-DOF
+               joint_pos_mj reference.
+            4. Publish to the deploy on ``cfg.pub_port`` under topic
+               ``cfg.pub_topic`` (back-compat with the legacy direct
+               wiring -- the deploy doesn't know the planner moved).
+            5. Optionally record an aligned (observation, action) frame.
+        """
+        assert self._sub_state is not None
+        period = 1.0 / max(self._cfg.publish_rate_hz, 1e-6)
+        next_tick = time.monotonic()
+        tick = 0
+        wait_msg = False
+        first_body_pose_logged = False
+        zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
+
+        try:
+            while not self._stop_event.is_set():
+                snap = self._sub_state.snapshot()
+
+                # Drain manager-issued episode commands first so a
+                # ``start`` and an immediate ``save`` both get serviced
+                # in their original order.
+                for action, sub_tick in self._sub_state.drain_recorder_cmds():
+                    if action == "start":
+                        self._start_episode()
+                    elif action == "save":
+                        self._stop_episode(save=True)
+                    elif action == "discard":
+                        self._stop_episode(save=False)
+                    elif action == "estop":
+                        if self._is_recording:
+                            print(
+                                f"[recorder] [estop@{sub_tick}] manager "
+                                f"signalled OFF; dropping open episode",
+                                flush=True,
+                            )
+                            self._stop_episode(save=False)
+                    else:
+                        if self._cfg.verbose:
+                            print(
+                                f"[recorder] unknown recorder_cmd "
+                                f"action={action!r} (tick={sub_tick}); "
+                                f"ignoring",
+                                flush=True,
+                            )
+
+                body_pose = snap["body_pose_q_mj"]
+                if body_pose is None:
+                    if not wait_msg:
+                        print(
+                            f"[recorder] subscribe-mode: waiting for first "
+                            f"body_pose on tcp://"
+                            f"{self._cfg.body_pose_sub_host}:"
+                            f"{self._cfg.body_pose_sub_port} topic="
+                            f"{self._cfg.body_pose_sub_topic!r} …",
+                            flush=True,
+                        )
+                        wait_msg = True
+                    self._publish_idle()
+                    next_tick += period
+                    self._sleep_until(next_tick)
+                    continue
+
+                if not first_body_pose_logged:
+                    print(
+                        "[recorder] subscribe-mode: first body_pose "
+                        "received; entering merge+publish loop",
+                        flush=True,
+                    )
+                    first_body_pose_logged = True
+
+                # Merge: planner-driven legs + waist + head come from
+                # body_pose; arm slices come from the manager IF it is
+                # publishing arm_targets, otherwise we fall through to
+                # the planner's stand-pose arm slice (== legacy idle).
+                body_q_mj = np.asarray(body_pose, dtype=np.float64).copy()
+                left_arm = snap["arm_left_q"]
+                right_arm = snap["arm_right_q"]
+                arm_dof = _LEFT_ARM_MJ_SLICE.stop - _LEFT_ARM_MJ_SLICE.start
+                left_arm_valid = (
+                    left_arm is not None and left_arm.shape == (arm_dof,)
+                )
+                right_arm_valid = (
+                    right_arm is not None and right_arm.shape == (arm_dof,)
+                )
+                if left_arm_valid:
+                    body_q_mj[_LEFT_ARM_MJ_SLICE] = left_arm
+                if right_arm_valid:
+                    body_q_mj[_RIGHT_ARM_MJ_SLICE] = right_arm
+
+                # Forward the planner's full v5 future-window so the
+                # deploy's tokenizer can anticipate the next 0.9 s of
+                # locomotion (without it the C++ ZmqPoseInputSource
+                # falls back to the legacy single-frame Sample() path
+                # and the policy's future tokens are pinned at the
+                # current pose -- which is what made the robot "step
+                # in place" when commanded to walk).
+                jpos_future_planner = snap["joint_pos_mj_future"]
+                rot_future_planner = snap["root_quat_xyzw_future"]
+                fidx_future_planner = snap["frame_index_future"]
+                future_dt_s = snap["future_dt_s"]
+                jpos_future_overlaid: Optional[np.ndarray] = None
+                if (
+                    jpos_future_planner is not None
+                    and rot_future_planner is not None
+                    and jpos_future_planner.ndim == 2
+                    and jpos_future_planner.shape[1] == NUM_BODY_DOFS
+                    and rot_future_planner.shape == (
+                        jpos_future_planner.shape[0], 4,
+                    )
+                ):
+                    # The manager's arm_targets is a "current command"
+                    # from the operator -- we don't have an arm
+                    # trajectory to look ahead with. Pin the same
+                    # commanded arm pose across every future slot;
+                    # leg / waist / head trajectories continue to
+                    # follow the planner's curated bin verbatim.
+                    jpos_future_overlaid = jpos_future_planner.astype(
+                        np.float32, copy=True,
+                    )
+                    if left_arm_valid:
+                        jpos_future_overlaid[
+                            :, _LEFT_ARM_MJ_SLICE
+                        ] = left_arm.astype(np.float32, copy=False)
+                    if right_arm_valid:
+                        jpos_future_overlaid[
+                            :, _RIGHT_ARM_MJ_SLICE
+                        ] = right_arm.astype(np.float32, copy=False)
+
+                left_hand = snap["left_hand_q"]
+                right_hand = snap["right_hand_q"]
+                left_hand_q = (
+                    left_hand if left_hand is not None else zero_hand
+                )
+                right_hand_q = (
+                    right_hand if right_hand is not None else zero_hand
+                )
+
+                token = self._zero_motion_token
+
+                self._publish_pose(
+                    body_q_mj=body_q_mj,
+                    motion_token=token,
+                    left_hand_q=left_hand_q,
+                    right_hand_q=right_hand_q,
+                    tick=tick,
+                    root_quat_xyzw=snap["root_quat_xyzw"],
+                    joint_pos_mj_future=jpos_future_overlaid,
+                    root_quat_xyzw_future=rot_future_planner,
+                    frame_index_future=fidx_future_planner,
+                    future_dt_s=future_dt_s,
+                )
+
+                if self._is_recording:
+                    self._record_frame(
+                        commanded_body_q_mj=body_q_mj,
+                        commanded_left_hand_q=left_hand_q,
+                        commanded_right_hand_q=right_hand_q,
+                        commanded_token=token,
+                    )
+
+                now_log = time.monotonic()
+                self._maybe_warn_deploy_silent(now=now_log)
+                if (
+                    self._cfg.verbose
+                    and (now_log - self._last_status_log_t)
+                        >= self._cfg.status_log_period_s
+                ):
+                    self._last_status_log_t = now_log
+                    print(
+                        f"[recorder] subscribe-mode status: tick={tick} "
+                        f"mode={snap['stream_mode']} "
+                        f"recording={self._is_recording} "
+                        f"buffered={len(self._episode_buffer)} frames",
+                        flush=True,
+                    )
+
+                tick += 1
+                next_tick += period
+                self._sleep_until(next_tick)
+        finally:
+            if self._is_recording and len(self._episode_buffer) > 0:
+                print(
+                    f"[recorder] auto-saving open episode with "
+                    f"{len(self._episode_buffer)} frames on shutdown",
+                    flush=True,
+                )
+                self._stop_episode(save=True)
+        return tick
+
     # -- buttons --------------------------------------------------------------
 
     def _handle_buttons(
@@ -955,14 +1689,19 @@ class X2DatasetRecorder:
         self._prev_buttons = buttons
 
     def _start_episode(self) -> None:
+        # Operator-facing label: start is triggered by the X button
+        # in ARM_MANIPULATION mode (post-2026-05-13 button rebind;
+        # the manager publishes "start" on recorder_cmd from the X
+        # press). Pre-rebind this branch said [B] because the chord
+        # was A+B; the label was never updated.
         if self._cfg.teleop_only:
             print(
-                "[recorder] [B] ignored: --teleop-only mode (no dataset writes)",
+                "[recorder] [X] ignored: --teleop-only mode (no dataset writes)",
                 flush=True,
             )
             return
         if self._is_recording:
-            print("[recorder] [B] ignored: already recording", flush=True)
+            print("[recorder] [X] ignored: already recording", flush=True)
             return
         self._ensure_exporter()
         self._episode_buffer.reset()
@@ -989,27 +1728,37 @@ class X2DatasetRecorder:
                 )
                 self._scene_reset_pub_sock.send(serialize_reset_objects(payload))
                 print(
-                    f"[recorder] [B] scene_reset sent: "
+                    f"[recorder] [X] scene_reset sent: "
                     f"freejoints={list(payload.object_freejoint_qpos)} "
                     f"welded={list(payload.mutable_body_pos)}",
                     flush=True,
                 )
             except Exception as exc:
                 print(
-                    f"[recorder] [B] WARNING: scene_reset failed: {exc}",
+                    f"[recorder] [X] WARNING: scene_reset failed: {exc}",
                     flush=True,
                 )
 
         self._is_recording = True
         print(
-            f"[recorder] [B] episode start (task={self._cfg.task!r}, "
+            f"[recorder] [X] episode start (task={self._cfg.task!r}, "
             f"# {self._episode_count + 1})",
             flush=True,
         )
 
     def _stop_episode(self, *, save: bool) -> None:
+        # Operator-facing label rules (post-2026-05-13 button rebind):
+        #   - save=True  is triggered by the Y button (publish "save"
+        #     on recorder_cmd from the manager). Log as [Y] so the
+        #     operator can match each recorder log line back to the
+        #     button they pressed.
+        #   - save=False is no longer reachable from any button press
+        #     -- the manager does not publish "discard" today -- so
+        #     it can only fire from an internal auto-discard path
+        #     (timeout, error abort, planned but unimplemented). Log
+        #     as [auto-discard] to make that provenance unambiguous.
+        kind = "Y" if save else "auto-discard"
         if not self._is_recording:
-            kind = "X" if save else "Y"
             print(f"[recorder] [{kind}] ignored: no active episode", flush=True)
             return
         n = len(self._episode_buffer)
@@ -1025,6 +1774,13 @@ class X2DatasetRecorder:
             # :class:`Gr00tDataExporter` v2.1: parquet under
             # ``data/chunk-000/`` and the ego-view mp4 under
             # ``videos/chunk-000/observation.images.ego_view/``.
+            #
+            # IMPORTANT: keep the ``parquet ->`` / ``mp4 ->`` prefix
+            # exactly as-is. The wrapper's recorder-log mirror (in
+            # run_x2_quest3_planner_stack.sh) greps on the
+            # ``[recorder]`` line plus a 4-space indent to surface
+            # these to the foreground; changing the indent or the
+            # arrow style breaks that mirror silently.
             saved_idx = self._episode_count - 1
             out_root = self._cfg.output_dir
             parquet_path = (
@@ -1037,14 +1793,13 @@ class X2DatasetRecorder:
                 / f"episode_{saved_idx:06d}.mp4"
             )
             print(
-                f"[recorder] [X] episode saved: {n} frames "
+                f"[recorder] [Y] episode saved: {n} frames "
                 f"(total saved={self._episode_count})",
                 flush=True,
             )
             print(f"[recorder]     parquet -> {parquet_path}", flush=True)
             print(f"[recorder]     mp4     -> {mp4_path}", flush=True)
         else:
-            kind = "X" if save else "Y"
             reason = "no frames" if save else "discarded by operator"
             print(f"[recorder] [{kind}] dropping {n} frames ({reason})", flush=True)
         self._episode_buffer.reset()
@@ -1073,15 +1828,75 @@ class X2DatasetRecorder:
         left_hand_q: np.ndarray,
         right_hand_q: np.ndarray,
         tick: int,
+        root_quat_xyzw: Optional[np.ndarray] = None,
+        joint_pos_mj_future: Optional[np.ndarray] = None,
+        root_quat_xyzw_future: Optional[np.ndarray] = None,
+        frame_index_future: Optional[np.ndarray] = None,
+        future_dt_s: Optional[float] = None,
     ) -> None:
-        payload = {
+        """Publish a single reference frame to the deploy.
+
+        When ``joint_pos_mj_future`` and ``root_quat_xyzw_future`` are
+        both provided, this also emits the v5 future-window fields
+        (``joint_vel_mj_future`` is recomputed by backward finite-diff
+        over the supplied future window so it remains consistent with
+        any arm-pose overlay the caller has applied). Without those
+        future fields the deploy's ``ZmqPoseInputSource::Sample()``
+        falls back to its single-frame v4 path -- which leaves the
+        policy's 10-slot future window pinned at the current pose
+        and prevents anticipatory locomotion thrust.
+        """
+        payload: dict[str, np.ndarray] = {
             "joint_pos_mj": body_q_mj.astype(np.float32),
-            "root_quat_xyzw": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            "root_quat_xyzw": (
+                np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                if root_quat_xyzw is None
+                else np.asarray(root_quat_xyzw, dtype=np.float32).reshape(4)
+            ),
             "motion_token": motion_token.astype(np.float32),
             "left_hand_joints": left_hand_q.astype(np.float32),
             "right_hand_joints": right_hand_q.astype(np.float32),
             "frame_index": np.array([tick], dtype=np.int64),
         }
+
+        if (
+            joint_pos_mj_future is not None
+            and root_quat_xyzw_future is not None
+        ):
+            jpos_future = np.asarray(joint_pos_mj_future, dtype=np.float32)
+            rot_future = np.asarray(root_quat_xyzw_future, dtype=np.float32)
+            if (
+                jpos_future.ndim == 2
+                and jpos_future.shape[1] == NUM_BODY_DOFS
+                and rot_future.shape == (jpos_future.shape[0], 4)
+            ):
+                dt = (
+                    float(future_dt_s)
+                    if future_dt_s is not None and future_dt_s > 1e-6
+                    else 0.1
+                )
+                # Recompute joint_vel from finite-diff over the supplied
+                # future window. This matches the planner's own scheme
+                # (build_pose_payload in state_machine.py) and keeps the
+                # arm-overlay slices internally consistent: when the
+                # caller pinned arms across all future frames, the
+                # corresponding arm dq is zero (correct), while leg dq
+                # follows the planner's stride exactly.
+                prev_jpos = payload["joint_pos_mj"][None, :]
+                all_jpos = np.concatenate([prev_jpos, jpos_future], axis=0)
+                jvel_future = (
+                    (all_jpos[1:] - all_jpos[:-1]) / dt
+                ).astype(np.float32)
+
+                payload["joint_pos_mj_future"] = jpos_future
+                payload["root_quat_xyzw_future"] = rot_future
+                payload["joint_vel_mj_future"] = jvel_future
+                if frame_index_future is not None:
+                    fidx = np.asarray(frame_index_future, dtype=np.int64).reshape(-1)
+                    if fidx.shape == (jpos_future.shape[0],):
+                        payload["frame_index_future"] = fidx
+                payload["future_dt_s"] = np.array([dt], dtype=np.float32)
+
         msg = pack_pose_message(
             payload, topic=self._cfg.pub_topic, version=self._cfg.protocol_version
         )

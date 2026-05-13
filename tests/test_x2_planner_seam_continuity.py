@@ -475,7 +475,13 @@ def test_command_resolves_to_correct_bin_name() -> None:
         (("fwd_step", "one_ft"), "fwd_step_1ft"),
         (("fwd_step", "quarter_ft"), "fwd_step_1ft"),
         (("fwd_step", "default"), "fwd_step_1ft"),
+        # back_step has no 1ft variant in the current library; every
+        # magnitude collapses to back_step_half_ft so the manager's
+        # default-magnitude emission resolves to a real primitive
+        # (was silently falling back to idle_stand before 2026-05-13).
         (("back_step", "half_ft"), "back_step_half_ft"),
+        (("back_step", "quarter_ft"), "back_step_half_ft"),
+        (("back_step", "default"), "back_step_half_ft"),
         (("side_left", "default"), "side_left_step"),
         (("side_left", "half_ft"), "side_left_step"),
         (("side_left", "quarter_ft"), "side_left_step"),

@@ -71,43 +71,21 @@ class StreamMode(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants + YawAccumulator (re-exported from vr.joystick_mapping)
 # ---------------------------------------------------------------------------
+#
+# The actual implementation lives in
+# ``gear_sonic.utils.teleop.vr.joystick_mapping`` so the new X2 manager
+# (``quest3_manager_x2.py``) can import it without pulling in the G1-only
+# ``LocomotionMode`` enum below. We keep the names re-exported here for
+# back-compat with the PICO and G1 manager scripts that already do
+# ``from gear_sonic.utils.teleop.common import JOYSTICK_DEADZONE,
+# YawAccumulator``.
 
-JOYSTICK_DEADZONE = 0.15
-
-
-# ---------------------------------------------------------------------------
-# YawAccumulator
-# ---------------------------------------------------------------------------
-
-
-class YawAccumulator:
-    """Accumulates yaw heading angle based on joystick input."""
-
-    def __init__(self, yaw_gain: float = 1.5, deadzone: float = JOYSTICK_DEADZONE):
-        self.yaw_gain = yaw_gain
-        self.deadzone = deadzone
-        self.reset()
-
-    def reset(self):
-        self.heading = [1.0, 0.0, 0.0]
-        self.yaw_angle_rad = 0.0
-        self.dyaw = 0.0
-        print("YawAccumulator: reset yaw angle to 0.0")
-
-    def yaw_angle(self) -> float:
-        return self.yaw_angle_rad
-
-    def yaw_angle_change(self) -> float:
-        return self.dyaw
-
-    def update(self, rx: float, dt: float) -> list[float]:
-        self.dyaw = self.yaw_gain * (-rx) * dt
-        if abs(rx) >= self.deadzone:
-            self.yaw_angle_rad += self.dyaw
-            self.heading = [np.cos(self.yaw_angle_rad), np.sin(self.yaw_angle_rad), 0.0]
-        return self.heading
+from gear_sonic.utils.teleop.vr.joystick_mapping import (  # noqa: E402
+    JOYSTICK_DEADZONE,
+    YawAccumulator,
+)
 
 
 # ---------------------------------------------------------------------------

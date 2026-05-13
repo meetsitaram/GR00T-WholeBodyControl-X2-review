@@ -367,15 +367,38 @@ def run(
     hand_dof: int,
     verbose: bool,
     warmup_quiet_stand_s: float = 2.0,
+    body_pose_port: Optional[int] = None,
 ) -> int:
     _setup_logging(verbose)
 
+    # ---- Phase 0 architecture: when ``body_pose_port`` is set, the
+    # planner publishes its 31-DOF reference on a NON-deploy port
+    # under topic ``body_pose``. The recorder subscribes here, merges
+    # in operator-driven ``arm_targets`` from the manager, and forwards
+    # ``final_pose`` to the deploy on port 5556. Today's
+    # "publish straight to deploy" workflow continues to work with
+    # ``--pub-port 5556`` (topic ``pose``); the two modes are mutually
+    # exclusive at the CLI layer (``body_pose_port`` overrides
+    # ``pub_port`` + topic when both are passed).
+    if body_pose_port is not None:
+        effective_port = body_pose_port
+        effective_topic = "body_pose"
+        log.info(
+            "Phase 0 mode: publishing 'body_pose' to recorder for merging "
+            "(port %d). Pass --pub-port without --body-pose-port to fall "
+            "back to direct-to-deploy 'pose' on 5556.",
+            effective_port,
+        )
+    else:
+        effective_port = pub_port
+        effective_topic = "pose"
+
     # ---- Pre-flight checks
-    if _port_in_use(pub_port, "127.0.0.1") or _port_in_use(pub_port, "0.0.0.0"):
+    if _port_in_use(effective_port, "127.0.0.1") or _port_in_use(effective_port, "0.0.0.0"):
         log.error(
             "publish port %d already in use. Run "
             "`gear_sonic/scripts/run_planner_smoke.sh --cleanup-only` first.",
-            pub_port,
+            effective_port,
         )
         return 1
     if not primitives_pkl.exists():
@@ -402,9 +425,15 @@ def run(
     planner = HeuristicPlanner(primitives=primitives)
 
     publisher = PosePublisher(
-        host=pub_host, port=pub_port, hand_dof=hand_dof,
+        host=pub_host,
+        port=effective_port,
+        topic=effective_topic,
+        hand_dof=hand_dof,
     )
-    log.info("publishing 'pose' on tcp://%s:%d at %.1f Hz", pub_host, pub_port, OUTPUT_FPS)
+    log.info(
+        "publishing %r on tcp://%s:%d at %.1f Hz",
+        effective_topic, pub_host, effective_port, OUTPUT_FPS,
+    )
 
     # ---- Command sources
     cmd_queue: "queue.Queue[LocomotionCommand]" = queue.Queue()
@@ -619,6 +648,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="ZMQ publish port (default: 5556 — matches mock_vla_publish_stand_token).",
     )
     p.add_argument(
+        "--body-pose-port", type=int, default=None,
+        help=(
+            "Phase 0: publish the 31-DOF reference under topic "
+            "'body_pose' on this port (instead of topic 'pose' on "
+            "--pub-port). Use when the recorder is the merger that "
+            "combines body_pose + arm_targets and forwards "
+            "final_pose to the deploy. Mutually exclusive with the "
+            "default direct-to-deploy mode; when set, overrides "
+            "--pub-port."
+        ),
+    )
+    p.add_argument(
         "--pid-file",
         type=Path,
         default=Path("/tmp/x2_heuristic_planner.pid"),
@@ -680,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
         hand_dof=args.hand_dof,
         verbose=args.verbose,
         warmup_quiet_stand_s=args.warmup_quiet_stand_s,
+        body_pose_port=args.body_pose_port,
     )
 
 

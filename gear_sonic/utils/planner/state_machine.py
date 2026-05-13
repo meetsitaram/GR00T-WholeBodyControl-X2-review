@@ -102,6 +102,19 @@ class LocomotionCommand:
         # that survives 0.5x / 0.25x scaling) instead of one base + scale.
         if self.intent == "fwd_step":
             return "fwd_step_1ft"
+        # Back step has NO 1ft variant in the current primitive library
+        # (only back_step_half_ft and back_step_quarter_ft), and the
+        # default magnitude was previously falling through to the
+        # generic ``{intent}_{suffix}`` path which produced the
+        # nonexistent bin name ``back_step_default`` -- so every Quest 3
+        # back_step request silently degraded to idle_stand and the
+        # robot looked frozen. Until a back_step_1ft mocap lands, route
+        # every back_step magnitude to back_step_half_ft (the larger of
+        # the two existing variants); per the comment above this is
+        # near the tracking noise floor but is at least a real reverse
+        # primitive instead of a no-op.
+        if self.intent == "back_step":
+            return "back_step_half_ft"
         # Crouch family currently collapses to crouch_medium for ALL
         # magnitudes. The v4 synthesized small / medium / large
         # variants (3 / 6 / 10 cm pelvis drop, 70-96 deg added knee

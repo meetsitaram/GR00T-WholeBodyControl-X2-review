@@ -40,10 +40,14 @@ from gear_sonic.utils.teleop.common import (
     LocomotionMode,
     StreamMode,
     ThreePointPose,
-    YawAccumulator,
-    JOYSTICK_DEADZONE,
     compute_hand_joints_from_inputs,
     init_hand_ik_solvers,
+)
+from gear_sonic.utils.teleop.vr.button_state_machine import ButtonStateMachine
+from gear_sonic.utils.teleop.vr.joystick_mapping import (
+    JOYSTICK_DEADZONE,
+    YawAccumulator,
+    apply_radial_deadzone,
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
@@ -83,12 +87,7 @@ class Quest3PlannerStreamer:
 
         self.dt = 1.0 / max(1, poll_hz)
         self.mode = LocomotionMode.IDLE
-        self.prev_ab = False
-        self.prev_xy = False
-        self.prev_a = False
-        self.prev_b = False
-        self.prev_x = False
-        self.prev_y = False
+        self.button_sm = ButtonStateMachine(log_prefix="Input")
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
         self._last_axes_log = 0.0
@@ -114,28 +113,14 @@ class Quest3PlannerStreamer:
         try:
             # --- button state (edge-triggered mode switching) -----------------
             a, b, x, y = self.reader.get_buttons()
+            ev = self.button_sm.tick(a, b, x, y)
 
-            # Log individual button presses (edge-triggered)
-            if a and not self.prev_a:
-                print("[Input] A pressed")
-            if b and not self.prev_b:
-                print("[Input] B pressed")
-            if x and not self.prev_x:
-                print("[Input] X pressed")
-            if y and not self.prev_y:
-                print("[Input] Y pressed")
-            self.prev_a, self.prev_b, self.prev_x, self.prev_y = a, b, x, y
-
-            ab_now = a and b
-            xy_now = x and y
-            if ab_now and not self.prev_ab:
+            if ev.ab_pressed:
                 self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
                 print(f"[Quest3Planner] Mode -> {self.mode.value}: {self.mode.name}")
-            if xy_now and not self.prev_xy:
+            if ev.xy_pressed:
                 self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
                 print(f"[Quest3Planner] Mode -> {self.mode.value}: {self.mode.name}")
-            self.prev_ab = ab_now
-            self.prev_xy = xy_now
 
             # --- joystick movement / facing -----------------------------------
             lx, ly, rx, ry = self.reader.get_controller_axes()
@@ -156,16 +141,12 @@ class Quest3PlannerStreamer:
                     self._last_axes_log = now
             facing = self.yaw_accumulator.update(rx, self.dt)
 
-            raw_mag = np.hypot(lx, ly)
-            raw_mag = np.clip(raw_mag, 0.0, 1.0)
-            if np.abs(raw_mag) < JOYSTICK_DEADZONE:
-                mag = 0.0
+            raw_mag = float(np.clip(np.hypot(lx, ly), 0.0, 1.0))
+            mag = apply_radial_deadzone(raw_mag)
+            if mag == 0.0:
                 speed = -1.0
                 mode_to_send = LocomotionMode.IDLE
             else:
-                mag = (raw_mag - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
-                if mag > 1.0:
-                    mag = 1.0
                 mode_to_send = self.mode
 
                 if self.mode == LocomotionMode.SLOW_WALK:
@@ -326,12 +307,7 @@ def run_quest3_manager(
     #    A+X     : toggle PLANNER <-> PLANNER_VR_3PT
     #
     current_mode = StreamMode.OFF
-    prev_start_combo = False
-    prev_ax = False
-    mgr_prev_a = False
-    mgr_prev_b = False
-    mgr_prev_x = False
-    mgr_prev_y = False
+    mgr_button_sm = ButtonStateMachine(log_prefix="Input")
 
     print("[Manager] Controls: A+B+X+Y = start/stop, A+X = toggle VR 3PT")
 
@@ -342,25 +318,12 @@ def run_quest3_manager(
                 continue
 
             a, b, x, y = reader.get_buttons()
-
-            # Log individual button presses in all modes (edge-triggered)
-            if a and not mgr_prev_a:
-                print("[Input] A pressed")
-            if b and not mgr_prev_b:
-                print("[Input] B pressed")
-            if x and not mgr_prev_x:
-                print("[Input] X pressed")
-            if y and not mgr_prev_y:
-                print("[Input] Y pressed")
-            mgr_prev_a, mgr_prev_b, mgr_prev_x, mgr_prev_y = a, b, x, y
-
-            start_combo = a and b and x and y
-            ax_pressed = a and x
+            ev = mgr_button_sm.tick(a, b, x, y)
 
             new_mode = current_mode
 
             if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
+                if ev.abxy_pressed:
                     new_mode = StreamMode.PLANNER
                     raw_3pt = reader.get_3pt_pose()
                     if raw_3pt is not None:
@@ -369,15 +332,15 @@ def run_quest3_manager(
                         print("[Manager] WARNING: No tracking data for calibration")
 
             elif current_mode == StreamMode.PLANNER:
-                if start_combo and not prev_start_combo:
+                if ev.abxy_pressed:
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax:
+                elif ev.ax_pressed:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
-                if start_combo and not prev_start_combo:
+                if ev.abxy_pressed:
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax:
+                elif ev.ax_pressed:
                     new_mode = StreamMode.PLANNER
 
             # -- handle transitions -------------------------------------------
@@ -402,9 +365,6 @@ def run_quest3_manager(
 
                 print(f"[Manager] {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
-
-            prev_start_combo = start_combo
-            prev_ax = ax_pressed
 
     except KeyboardInterrupt:
         print("\n[Manager] Interrupted")

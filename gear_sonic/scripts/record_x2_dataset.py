@@ -261,6 +261,61 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # main() can find scene XMLs without recomputing the path.
     parser.set_defaults(_robocasa_scenes_dir=_scenes_dir)
 
+    # ── Phase 0 subscribe-only mode (planner-driven recorder) ──────────
+    # Default = "internal": legacy direct-Quest pipeline. Set both
+    # flags to "zmq" to subscribe to the planner's body_pose AND the
+    # manager's arm_targets / hand_finger_cmd / stream_mode /
+    # recorder_cmd topics. Mixing the two is rejected at startup.
+    parser.add_argument(
+        "--body-pose-source", choices=("internal", "zmq"), default="internal",
+        help=(
+            "Where the recorder gets its 31-DOF body_pose reference "
+            "from. 'internal' (default): legacy in-process Quest 3 + "
+            "VR IK. 'zmq': subscribe to the planner's body_pose topic "
+            "(use with --arm-targets-source=zmq for the Phase 0 "
+            "planner-driven stack)."
+        ),
+    )
+    parser.add_argument(
+        "--arm-targets-source", choices=("internal", "zmq"), default="internal",
+        help=(
+            "Where arm_targets + hand_finger_cmd come from. 'internal' "
+            "runs IK + finger filter inline; 'zmq' subscribes to the "
+            "manager's arm_targets / hand_finger_cmd / stream_mode / "
+            "recorder_cmd topics. Must match --body-pose-source."
+        ),
+    )
+    parser.add_argument(
+        "--body-pose-sub-host", default="localhost",
+        help="Host for the body_pose SUB (planner -> recorder).",
+    )
+    parser.add_argument(
+        "--body-pose-sub-port", type=int, default=5565,
+        help=(
+            "Port for the body_pose SUB. Must match the planner's "
+            "--body-pose-port."
+        ),
+    )
+    parser.add_argument(
+        "--body-pose-sub-topic", default="body_pose",
+        help="Topic for the body_pose SUB. Must match the planner.",
+    )
+    parser.add_argument(
+        "--arm-and-hands-sub-host", default="localhost",
+        help=(
+            "Host for the manager's multi-topic SUB "
+            "(arm_targets / hand_finger_cmd / stream_mode / "
+            "recorder_cmd)."
+        ),
+    )
+    parser.add_argument(
+        "--arm-and-hands-sub-port", type=int, default=5564,
+        help=(
+            "Port for the manager's multi-topic SUB. Must match the "
+            "manager's --recorder-pub-port."
+        ),
+    )
+
     # Misc
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--embodiment-tag", default="new_embodiment")
@@ -392,6 +447,13 @@ def main(argv: list[str] | None = None) -> int:
         scene_reset_pub_host=args.scene_reset_pub_host,
         scene_reset_pub_port=args.scene_reset_pub_port,
         episode_seed=args.episode_seed,
+        body_pose_source=args.body_pose_source,
+        arm_targets_source=args.arm_targets_source,
+        body_pose_sub_host=args.body_pose_sub_host,
+        body_pose_sub_port=args.body_pose_sub_port,
+        body_pose_sub_topic=args.body_pose_sub_topic,
+        arm_and_hands_sub_host=args.arm_and_hands_sub_host,
+        arm_and_hands_sub_port=args.arm_and_hands_sub_port,
         verbose=(not args.quiet),
     )
 

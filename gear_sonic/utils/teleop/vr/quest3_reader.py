@@ -306,6 +306,31 @@ class Quest3Reader:
             bool(buttons.get("y", False)),
         )
 
+    def get_stick_clicks(self) -> tuple[bool, bool]:
+        """Returns ``(left_stick_click, right_stick_click)`` -- the
+        thumbstick "click" buttons (``gpad.buttons[3]`` in the
+        oculus-touch / standard gamepad mapping).
+
+        These are independent of the face buttons surfaced by
+        :meth:`get_buttons`, so consumers can bind them to actions
+        without conflicting with the A/B/X/Y vocabulary. Currently
+        used by :mod:`quest3_manager_x2` to cycle the deploy MuJoCo
+        viewer's fixed cameras.
+
+        Returns ``(False, False)`` when no sample is available, when
+        the WebXR client is on a build that pre-dates the stick-click
+        forwarding patch, or when the headset / browser doesn't expose
+        ``gpad.buttons[3]`` (some Quest Browser versions skip it).
+        """
+        sample = self.get_latest()
+        if sample is None:
+            return False, False
+        buttons = sample.get("buttons", {})
+        return (
+            bool(buttons.get("leftStickClick", False)),
+            bool(buttons.get("rightStickClick", False)),
+        )
+
     def get_hand_curls(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None, str | None, str | None]:

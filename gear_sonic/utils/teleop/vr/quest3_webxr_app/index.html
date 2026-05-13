@@ -200,7 +200,8 @@ const FPS_WINDOW = 20;
 let fpsRing = [];
 
 /* Previous button state for edge-triggered logging */
-let prevBtns = { a: false, b: false, x: false, y: false };
+let prevBtns = { a: false, b: false, x: false, y: false,
+                 leftStickClick: false, rightStickClick: false };
 
 /* ------------------------------------------------------------------ */
 /* Debug logger                                                        */
@@ -651,10 +652,31 @@ function handleServerMessage(payload) {
     case 'calibration_pose_captured': flashCalibrationCaptured(payload); break;
     case 'calibration_done':         calibrationDone(payload); break;
     case 'calibration_hide':         hideCalibrationOverlay(); break;
+    case 'play_audio':               handlePlayAudio(payload); break;
     default:
       /* Unknown server messages are not an error -- forward-compat. */
       debugLog('server msg: ' + JSON.stringify(payload).slice(0, 80), 'log-ws');
   }
+}
+
+/* Server-driven audio cue: play /audio/<key>.mp3 immediately. Used by
+ * the manager for mode-switch and recording-lifecycle prompts so the
+ * operator gets non-visual feedback without having to glance at the
+ * dashboard / passthrough overlay.
+ *
+ * If the MP3 is missing we fall back to speechSynthesis with the
+ * (optional) ``fallback`` text from the payload, and if that is
+ * absent too we silently no-op (better than blasting "undefined" out
+ * of the headset speakers).
+ */
+function handlePlayAudio(payload) {
+  const key = payload && payload.key;
+  if (!key) {
+    debugLog('play_audio: missing key', 'log-err');
+    return;
+  }
+  const fallback = payload.fallback || '';
+  speakPrompt(key, fallback);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1234,7 +1256,12 @@ function onXRFrame(time, frame) {
   const buttons = {
     leftTrigger: 0, rightTrigger: 0,
     leftGrip: 0, rightGrip: 0,
-    a: false, b: false, x: false, y: false
+    a: false, b: false, x: false, y: false,
+    /* Thumbstick clicks (gpad.buttons[3] in the oculus-touch /
+     * standard gamepad mapping). Currently consumed by
+     * Quest3ManagerX2 to cycle the deploy MuJoCo viewer's fixed
+     * cameras (Tab-equivalent) without occupying any face button. */
+    leftStickClick: false, rightStickClick: false
   };
   const axes = { lx: 0, ly: 0, rx: 0, ry: 0 };
 
@@ -1392,10 +1419,14 @@ function onXRFrame(time, frame) {
         if (src.handedness === 'left') {
           leftCtrlPose = poseArr;
           if (gpad) {
-            buttons.leftTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
-            buttons.leftGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
-            buttons.x           = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
-            buttons.y           = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
+            buttons.leftTrigger    = gpad.buttons[0] ? gpad.buttons[0].value : 0;
+            buttons.leftGrip       = gpad.buttons[1] ? gpad.buttons[1].value : 0;
+            /* gpad.buttons[3] is the thumbstick click in the
+             * oculus-touch / standard mapping. Some headsets / browsers
+             * skip this index, so guard against undefined. */
+            buttons.leftStickClick = gpad.buttons[3] ? gpad.buttons[3].pressed : false;
+            buttons.x              = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
+            buttons.y              = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
             axes.lx = gpad.axes[2] || 0;
             /* Invert Y so that forward = positive */
             axes.ly = -(gpad.axes[3] || 0);
@@ -1403,10 +1434,11 @@ function onXRFrame(time, frame) {
         } else if (src.handedness === 'right') {
           rightCtrlPose = poseArr;
           if (gpad) {
-            buttons.rightTrigger = gpad.buttons[0] ? gpad.buttons[0].value : 0;
-            buttons.rightGrip    = gpad.buttons[1] ? gpad.buttons[1].value : 0;
-            buttons.a            = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
-            buttons.b            = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
+            buttons.rightTrigger    = gpad.buttons[0] ? gpad.buttons[0].value : 0;
+            buttons.rightGrip       = gpad.buttons[1] ? gpad.buttons[1].value : 0;
+            buttons.rightStickClick = gpad.buttons[3] ? gpad.buttons[3].pressed : false;
+            buttons.a               = gpad.buttons[4] ? gpad.buttons[4].pressed : false;
+            buttons.b               = gpad.buttons[5] ? gpad.buttons[5].pressed : false;
             axes.rx = gpad.axes[2] || 0;
             axes.ry = -(gpad.axes[3] || 0);
           }
@@ -1480,11 +1512,15 @@ function onXRFrame(time, frame) {
   if (buttons.b && !prevBtns.b) debugLog('B pressed', 'log-btn');
   if (buttons.x && !prevBtns.x) debugLog('X pressed', 'log-btn');
   if (buttons.y && !prevBtns.y) debugLog('Y pressed', 'log-btn');
+  if (buttons.leftStickClick  && !prevBtns.leftStickClick)  debugLog('L-stick click', 'log-btn');
+  if (buttons.rightStickClick && !prevBtns.rightStickClick) debugLog('R-stick click', 'log-btn');
   if (!buttons.a && prevBtns.a) debugLog('A released', 'log-btn');
   if (!buttons.b && prevBtns.b) debugLog('B released', 'log-btn');
   if (!buttons.x && prevBtns.x) debugLog('X released', 'log-btn');
   if (!buttons.y && prevBtns.y) debugLog('Y released', 'log-btn');
-  prevBtns = { a: buttons.a, b: buttons.b, x: buttons.x, y: buttons.y };
+  prevBtns = { a: buttons.a, b: buttons.b, x: buttons.x, y: buttons.y,
+               leftStickClick: buttons.leftStickClick,
+               rightStickClick: buttons.rightStickClick };
 
   /* Update live input state display */
   document.getElementById('controllerCount').textContent = numControllers;

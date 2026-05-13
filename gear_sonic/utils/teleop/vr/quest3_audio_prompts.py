@@ -87,7 +87,30 @@ PROMPT_TEXTS: dict[str, str] = {
         "Audio test successful. Calibration prompts will speak through this "
         "audio device."
     ),
+    # Manager UX prompts: mode transitions and episode lifecycle. These
+    # fire on every chord / single-button press the operator makes, so
+    # the prompts are intentionally short (sub-second) -- a long prompt
+    # would still be playing when the operator's next press lands and
+    # we'd queue up a backlog of overlapping voice cues.
+    "mode_off":              "Off.",
+    "mode_locomotion":       "Locomotion.",
+    "mode_arm_manipulation": "Arm manipulation.",
+    "record_start":          "Recording.",
+    "record_save":           "Saved.",
 }
+
+
+# Manager-driven prompt keys (mode + recording lifecycle). Exported as a
+# tuple so callers can iterate without hard-coding the names; tests use
+# this to verify the WebXR client + audio cache stay in sync with the
+# server-side enums.
+MANAGER_PROMPT_KEYS: tuple[str, ...] = (
+    "mode_off",
+    "mode_locomotion",
+    "mode_arm_manipulation",
+    "record_start",
+    "record_save",
+)
 
 
 def audio_dir() -> Path:
@@ -157,6 +180,7 @@ def ensure_prompt_audio_files(*, force_regenerate: bool = False) -> dict[str, Pa
 
 
 __all__ = [
+    "MANAGER_PROMPT_KEYS",
     "PROMPT_TEXTS",
     "audio_dir",
     "filename_for",

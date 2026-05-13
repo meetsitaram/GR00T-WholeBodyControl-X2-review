@@ -74,6 +74,61 @@ def test_status_prompts_present() -> None:
         assert required in PROMPT_TEXTS, f"missing {required} prompt"
 
 
+def test_every_x2_stream_mode_has_a_prompt() -> None:
+    """Every X2 StreamMode must have a matching ``mode_<lower>`` MP3
+    key. The Quest3ManagerX2 plays one of these on every mode
+    transition; a missing key means the operator gets silent audio
+    feedback (and we'd only catch it at runtime by ear).
+    """
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+    from gear_sonic.utils.teleop.vr.quest3_audio_prompts import PROMPT_TEXTS
+
+    for mode in StreamMode:
+        key = f"mode_{mode.name.lower()}"
+        assert key in PROMPT_TEXTS, (
+            f"missing {key} prompt -- add it to PROMPT_TEXTS so the "
+            f"WebXR client can play /audio/{key}.mp3 on transitions to "
+            f"StreamMode.{mode.name}"
+        )
+
+
+def test_recording_lifecycle_prompts_present() -> None:
+    """The manager fires ``record_start`` and ``record_save`` on
+    X / Y press during ARM_MANIPULATION. Both keys must exist.
+    """
+    from gear_sonic.utils.teleop.vr.quest3_audio_prompts import PROMPT_TEXTS
+
+    for required in ("record_start", "record_save"):
+        assert required in PROMPT_TEXTS, f"missing {required} prompt"
+
+
+def test_manager_prompt_keys_exported_and_consistent() -> None:
+    """The exported ``MANAGER_PROMPT_KEYS`` tuple must match the
+    union of mode + recording prompts and stay in sync with
+    PROMPT_TEXTS so callers can iterate without hard-coding names.
+    """
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+    from gear_sonic.utils.teleop.vr.quest3_audio_prompts import (
+        MANAGER_PROMPT_KEYS,
+        PROMPT_TEXTS,
+    )
+
+    expected = {f"mode_{m.name.lower()}" for m in StreamMode} | {
+        "record_start",
+        "record_save",
+    }
+    assert set(MANAGER_PROMPT_KEYS) == expected, (
+        "MANAGER_PROMPT_KEYS drifted from the StreamMode enum + "
+        "recording lifecycle keys; update either the enum or the "
+        "exported tuple to match"
+    )
+    for key in MANAGER_PROMPT_KEYS:
+        assert key in PROMPT_TEXTS, (
+            f"MANAGER_PROMPT_KEYS lists {key} but it's not in "
+            f"PROMPT_TEXTS"
+        )
+
+
 def test_audio_dir_under_webxr_app() -> None:
     """The audio cache lives under the WebXR HTTP root so the headset
     can fetch it via ``/audio/<key>.mp3`` from the same origin.
