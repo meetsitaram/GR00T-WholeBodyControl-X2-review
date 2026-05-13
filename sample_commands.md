@@ -254,6 +254,199 @@ ladder. If `task.success` stays at 0 the most likely culprits are:
    fingertip cylinders (it shouldn't if it was rebuilt with the
    `disable_hand_collisions=False` knob).
 
+## X2 Quest 3 planner stack (locomotion + arms + record)
+
+`gear_sonic/scripts/run_x2_quest3_planner_stack.sh` is the all-in-one
+wrapper that brings up the heuristic locomotion **planner**, the Quest 3
+**manager**, the C++ **deploy** (sim or real), and (optionally) the
+LeRobot **recorder** under one trap-cleaned shell with one Ctrl-C. Use
+this for **mobile-manipulation** episodes where the operator drives the
+lower body via the left thumbstick (planner) while their arms / hands
+track in VR.
+
+Difference vs `record_x2_dataset.sh` (the section just above): that
+script runs the recorder + deploy in *teleop-only* mode where the lower
+body holds the SONIC stand pose for the whole episode. The planner stack
+adds locomotion on top, so the operator can walk into / around the
+robocasa scene before manipulating.
+
+For the full operator cheat sheet (button mappings, mode transitions,
+audio cues, camera cycling, recording controls), see
+[`docs/source/tutorials/x2_quest3_planner_stack_cheatsheet.md`](docs/source/tutorials/x2_quest3_planner_stack_cheatsheet.md).
+For the engineering architecture (process topology, ZMQ port + topic
+catalogue, CONFLATE/HWM matrix, boot/shutdown sequencing, complete
+invocation matrix incl. tests), see
+[`docs/source/references/x2_quest3_planner_stack_architecture.md`](docs/source/references/x2_quest3_planner_stack_architecture.md).
+
+### Quick teleop only (no recording, flat floor)
+
+Smoke-test the 4-process stack without writing data; useful first time
+after a fresh checkout to confirm planner / manager / deploy come up.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh --duration 300
+```
+
+### Record mobile-manipulation episodes (flat floor)
+
+Same scene as the kinematic / SONIC recorders above (no table, no
+objects), but the planner is alive so the operator can walk the robot
+between captures.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 600 --with-record \
+    --output-dir data/lerobot/x2_planner_stack_v0 \
+    --task "wave hello while walking forward"
+```
+
+### Robocasa scene + record (recommended VLA recipe)
+
+The wrapper auto-resolves the scene XML from `--robocasa-env`, forwards
+`--sim-mjcf` to the deploy bridge, forwards `--robocasa-env` + scene
+ports (`5559` PUB / `5560` SUB) to the recorder, and **auto-enables
+`--apply-curl-compensation` + `--apply-oppose-compensation`** (defaults
+that match the recorder's robocasa flow above). `--task` is optional in
+robocasa mode — the recorder auto-fills the language label from the
+scene metadata (e.g. *"pick up the red cube and drop it into the blue
+bowl"*).
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 1200 --with-record \
+    --output-dir data/lerobot/x2_pick_place_cube_v0 \
+    --robocasa-env X2PickPlaceCube
+```
+
+The startup banner echoes the resolved configuration:
+
+```
+scene            : X2PickPlaceCube -> .../robocasa_scenes/X2PickPlaceCube.xml
+finger comp      : curl=on  oppose=on  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)
+ports            : pose=5556  x2_debug=5557  planner_cmd=5563
+                   arm/hands=5564  body_pose=5565
+                   scene_state=5559  scene_reset=5560
+```
+
+Operator buttons (Quest 3): **B** toggles `OFF → LOCOMOTION → ARM_MAN`,
+**A** engages IK in `ARM_MAN`, **X** starts a fresh episode (this is
+when the mirror calls `reset()` and randomises the cube), **Y** saves.
+
+### Reproducible per-episode object placement
+
+Pass `--episode-seed` to lock the random cube / bowl pose to a known
+value. Useful for A/B comparisons across recording sessions.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 600 --with-record \
+    --output-dir data/lerobot/x2_pick_place_cube_seed42 \
+    --robocasa-env X2PickPlaceCube \
+    --episode-seed 42
+```
+
+### Custom scene XML override
+
+If you've built a tweaked scene (e.g. moved the table, swapped the
+object), point both deploy and recorder at it explicitly:
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 600 --with-record \
+    --output-dir data/lerobot/x2_pick_place_cube_custom \
+    --robocasa-env X2PickPlaceCube \
+    --scene-xml-path /path/to/custom_scene.xml
+```
+
+### Override finger compensations
+
+Force-disable in robocasa mode (e.g. while debugging the OmniHand
+finger pipeline — see also
+[`bug-tracker/thumb-closing-bug.md`](bug-tracker/thumb-closing-bug.md)):
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 600 --with-record \
+    --output-dir data/lerobot/x2_pick_place_cube_no_comp \
+    --robocasa-env X2PickPlaceCube \
+    --no-apply-curl-compensation --no-apply-oppose-compensation
+```
+
+Force-enable in flat-floor mode (the inverse — same compensation knobs
+the robocasa default would have given you, but on the bare-floor
+scene):
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --apply-curl-compensation --apply-oppose-compensation
+```
+
+### Sanity-check args without launching anything
+
+`--validate-only` runs the full pre-flight (port collision, calibration
+YAML, scene MJCF existence, ONNX model presence) then exits 0. Used by
+CI and by the `tests/test_run_x2_quest3_planner_stack_cli.py` smoke
+suite to validate the wrapper's CLI contract without spawning Quest 3 /
+deploy children.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --validate-only --robocasa-env X2PickPlaceCube --with-record \
+    --output-dir /tmp/dryrun
+```
+
+### Recovery — kill orphans, free ports
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh --cleanup-only
+```
+
+Frees ZMQ ports `5556` / `5557` / `5563` / `5564` / `5565` (plus
+`5559` / `5560` if a previous robocasa run leaked), kills orphan
+planner / manager / recorder processes by PID file + name, and stops
+any leftover `gr00t-x2sim` / `x2sim-run` Docker containers from a
+crashed deploy.
+
+### Useful flags
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `--duration N` | `600` | Auto-shutdown after N seconds (deploy `--max-duration`). |
+| `--with-record` | off | Spawn the LeRobot recorder. Requires `--output-dir`. |
+| `--output-dir PATH` | — | Required with `--with-record`. |
+| `--task STR` | required in flat-floor; **optional in robocasa** | Language instruction stamped on every frame. Robocasa mode auto-fills from scene metadata. |
+| `--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl}` | `none` | Load a Robocasa scene; flat floor when `none`. Build the XMLs first via `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env <ENV>`. |
+| `--scene-xml-path PATH` | auto-resolved from env | Override `gear_sonic/data/assets/robocasa_scenes/<env>.xml`. |
+| `--episode-seed INT` | (numpy global RNG) | Reproducible per-`start` object placement. |
+| `--apply-curl-compensation` / `--no-apply-curl-compensation` | **ON in robocasa**, OFF otherwise | Per-finger curl stretch (boosts mid-range curls toward CLOSED). Applied on the manager side (which owns the Retargeter in subscribe-mode). |
+| `--apply-oppose-compensation` / `--no-apply-oppose-compensation` | **ON in robocasa**, OFF otherwise | Thumb-oppose stretch (suppresses 5–25 % rest-bleed at the open hand). |
+| `--operator-id NAME` | `default` | Loads `data/operator_calibrations/<NAME>.yaml`. |
+| `--calibration PATH` | auto from `--operator-id` | Explicit calibration override. |
+| `--wrist-bypass {off,ik}` | `ik` | Override SONIC's wrist target with the operator's IK reference. Same semantics as `record_x2_dataset.sh`. |
+| `--no-deploy` | off | Skip launching `deploy_x2.sh` (assume external). |
+| `--no-sim-viewer` | off | Run the deploy headless (no MuJoCo viewer; headset still required). |
+| `--sim-profile {parity,manual}` | `parity` | Deploy SONIC profile. `parity` matches the bake-vs-planner reference; `manual` skips the RSI anchor. |
+| `--model PATH` | env `X2_PLANNER_SMOKE_MODEL` or h200-iter-25000 | ONNX policy. |
+| `--scene-state-port INT` / `--scene-reset-port INT` | `5559` / `5560` | Override scene-mirroring ports if 5559 / 5560 are already bound by another stack. |
+| `--validate-only` | off | Pre-flight + exit 0 (no children spawned). For CI / smoke validation. |
+| `--cleanup-only` | off | Free leaked ports / kill orphan processes / stop containers, then exit. |
+
+### One-time setup before first robocasa launch
+
+If you haven't built the scene XMLs yet (or pulled a fresh checkout
+that doesn't have them committed), the wrapper will refuse to start
+with a helpful error pointing at the build command. Run it once:
+
+```sh
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+```
+
+Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
+plus a `<env>.json` metadata sidecar (the wrapper passes the XML path;
+both the deploy bridge and the recorder auto-discover the JSON sidecar
+at startup).
+
 ## Calibration (one-time per operator)
 
 ```sh
