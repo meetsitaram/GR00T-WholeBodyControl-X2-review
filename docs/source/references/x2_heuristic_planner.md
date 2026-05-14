@@ -168,6 +168,25 @@ with deploys that don't know about the new state.
 > Pre-v7.1 the right click cycled deploy MuJoCo viewer cameras; that
 > binding moved to the **left** thumbstick click in the same release.
 
+> **Operator note (v7.2: R-stick waist hold active in ARM_MANIPULATION)**
+> — the `IntentDecoder` mode gate was relaxed so `hold_torso` commands
+> flow in **both** `LOCOMOTION` and `ARM_MANIPULATION`. The arm IK
+> targets are computed in the robot's torso frame, so a torso lean /
+> twist during arm work cleanly extends the reachable envelope (the
+> arms ride the torso). Walk / step / turn commands are still gated to
+> LOCO mode — translating the base while the operator is targeting an
+> object would slide the IK reference out from under their hands. The
+> v7 B-press latch (LOCO → ARM_MAN samples the live waist target and
+> pins `STATIC_HOLD(latched)`) still fires; it is now best understood
+> as a *no-jump seed* — the planner enters ARM_MAN at exactly the
+> pre-flip pose, and the operator's R-stick continues to slew it from
+> there. The lateral-lean (roll) modifier was simultaneously removed
+> from the operator vocabulary: v7.0 used "A held + R-stick X → roll",
+> but A and the R-stick share the operator's right thumb on the same
+> controller and the modifier was unreachable mid-lean. The wire
+> format still carries `waist_roll_deg` for scripted demos and future
+> VLA outputs; the operator path always emits 0 there.
+
 ### Why some families are alias-collapsed
 
 `fwd_step`, `side_left`, `side_right`, and `crouch` use a single canonical

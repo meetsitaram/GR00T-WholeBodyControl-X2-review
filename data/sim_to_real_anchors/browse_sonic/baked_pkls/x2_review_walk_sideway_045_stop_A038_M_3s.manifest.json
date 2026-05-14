@@ -1,0 +1,26 @@
+{
+  "pkl": "data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_review_walk_sideway_045_stop_A038_M_3s.pkl",
+  "fps": 30.0,
+  "total_frames": 189,
+  "total_seconds": 6.3,
+  "max_clip_seconds": 3.0,
+  "pad_seconds": 1.5,
+  "blend_seconds": 0.3,
+  "n_clips": 1,
+  "clips": [
+    {
+      "index": 0,
+      "clip_name": "loco__walk_sideway_045_stop_001__A038_M",
+      "blend_start_frame": 45,
+      "clip_start_frame": 54,
+      "clip_end_frame": 144,
+      "pad_end_frame": 189,
+      "blend_start_s": 1.5,
+      "clip_start_s": 1.8,
+      "clip_end_s": 4.8,
+      "pad_end_s": 6.3,
+      "n_clip_frames": 90,
+      "src_fps": 30.0
+    }
+  ]
+}

@@ -302,6 +302,38 @@ class RecorderConfig:
     """Robocasa env name (e.g. ``"X2PickPlaceCube"``). Falls back to the
     metadata sidecar's ``env_name`` field when not set explicitly."""
 
+    record_front_cam: bool = False
+    """When True, the recorder builds a second :class:`MujocoFrameRenderer`
+    bound to the scene XML's ``front_cam`` (a wide-angle world-fixed
+    witness camera baked in by ``_WORKSPACE_CAMERAS`` -- see
+    ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``) and writes
+    its frames to ``observation.images.front_cam`` alongside
+    ``observation.images.ego_view``. Also flips ``include_front_cam=True``
+    on :func:`get_features_x2_vla` / :func:`get_modality_config_x2_vla`
+    so the LeRobot v2.1 schema declares the second video track up
+    front; mismatches trip the exporter's per-frame validator. The
+    ``record_x2_dataset.py`` CLI defaults this to True iff
+    ``--scene-xml-path`` resolves (i.e. ``--robocasa-env != none``),
+    since the camera only exists in robocasa-built scenes; pass
+    ``--no-front-cam`` to opt out (e.g. for legacy single-camera
+    parquets). Has no effect in ``--teleop-only`` mode (no recorder ->
+    no schema)."""
+
+    robot_pose_sub_host: str = "localhost"
+    robot_pose_sub_port: int = 5570
+    robot_pose_sub_topic: str = "robot_pose"
+    """Bridge -> recorder pelvis-pose telemetry (see
+    :mod:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`). Defaults match
+    ``x2_mujoco_ros_bridge.py --robot-pose-pub-port`` (5570). The
+    recorder uses the freshest pelvis ``(x, y, z)`` from this topic to
+    drive ``MujocoFrameRenderer.render_frame(root_pos_xyz=…)`` so a
+    fixed witness camera (``front_cam``) actually sees the robot
+    translate when it walks; the head-mounted ``ego_view`` is
+    insensitive to root translation but using the live value here keeps
+    both renderers consistent. Falls back to the renderer's hardcoded
+    ``(0, 0, 0.793)`` when no ``robot_pose`` packet has arrived yet
+    (e.g. before the bridge has written its first tick)."""
+
     scene_state_sub_host: str = "localhost"
     scene_state_sub_port: int = 5559
     scene_reset_pub_host: str = "*"
@@ -799,10 +831,14 @@ class X2DatasetRecorder:
         print("[recorder] loading X2 robot model + features …", flush=True)
         self._robot_model = get_x2_robot_model(hand_variant="omnihand_10")
         self._features = get_features_x2_vla(
-            self._robot_model, hand_dof_per_side=HAND_DOF_OMNI
+            self._robot_model,
+            hand_dof_per_side=HAND_DOF_OMNI,
+            include_front_cam=cfg.record_front_cam,
         )
         self._modality_cfg = get_modality_config_x2_vla(
-            self._robot_model, hand_dof_per_side=HAND_DOF_OMNI
+            self._robot_model,
+            hand_dof_per_side=HAND_DOF_OMNI,
+            include_front_cam=cfg.record_front_cam,
         )
         if self._robot_model.num_joints != NUM_BODY_DOFS:
             raise RuntimeError(
@@ -930,6 +966,30 @@ class X2DatasetRecorder:
         # renderer. The recording loop needs it, so we delay until that
         # loop spins up.
         self._renderer: Any | None = None
+        # Optional second renderer for ``front_cam`` (gated on
+        # ``cfg.record_front_cam`` and on ``cfg.scene_xml_path`` actually
+        # containing a camera with that name). Same EGL-thread-pinning
+        # constraint, same lazy build-on-recording-thread pattern. See
+        # :meth:`_build_renderer` and :meth:`_record_frame`.
+        self._front_cam_renderer: Any | None = None
+
+        # ── Live pelvis-pose cache ─────────────────────────────────────
+        # Most-recent ``(x, y, z)`` from the bridge's ``robot_pose`` PUB
+        # (see :data:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`). The
+        # background SUB thread (:meth:`_robot_pose_subscriber`) keeps
+        # this current at state-rate; the recording loop reads it every
+        # frame so the rendered scene -- particularly the world-fixed
+        # ``front_cam`` -- shows the robot wherever the deploy actually
+        # placed it, instead of the renderer's hardcoded
+        # ``(0, 0, 0.793)`` default. The latch starts at the renderer's
+        # default so the very first render before any ``robot_pose``
+        # packet arrives still composes a sensible frame.
+        self._pelvis_pose_lock = threading.Lock()
+        self._latest_pelvis_xyz: np.ndarray = np.array(
+            [0.0, 0.0, 0.793], dtype=np.float64
+        )
+        self._pelvis_pose_seen_any: bool = False
+        self._robot_pose_thread: Optional[threading.Thread] = None
 
         # ── Robocasa scene plumbing (G1) ───────────────────────────────
         # Mirror is constructed eagerly here (its underlying robosuite
@@ -1000,6 +1060,22 @@ class X2DatasetRecorder:
             self._scene_state_thread = threading.Thread(
                 target=self._scene_state_subscriber,
                 name="scene-state-sub",
+                daemon=True,
+            )
+
+            # robot_pose SUB (bridge -> recorder, sim-only ground-truth
+            # pelvis qpos). Always-on companion to ``scene_state``: the
+            # bridge publishes this unconditionally on the default port
+            # (5570) regardless of recorder config, and we want the
+            # cache primed so the very first ``front_cam`` render lands
+            # at the actual robot location instead of the hardcoded
+            # ``(0, 0, 0.793)`` default. Only spun up in scene mode
+            # because that's the only mode where the bridge runs at
+            # all (the legacy flat-floor recorder path doesn't talk to
+            # the bridge).
+            self._robot_pose_thread = threading.Thread(
+                target=self._robot_pose_subscriber,
+                name="robot-pose-sub",
                 daemon=True,
             )
 
@@ -1117,6 +1193,8 @@ class X2DatasetRecorder:
         # Robocasa scene_state subscriber (no-op when not in scene mode).
         if self._scene_state_thread is not None:
             self._scene_state_thread.start()
+        if self._robot_pose_thread is not None:
+            self._robot_pose_thread.start()
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
@@ -1251,6 +1329,11 @@ class X2DatasetRecorder:
                 self._scene_state_thread.join(timeout=1.0)
             except Exception:
                 pass
+        if self._robot_pose_thread is not None:
+            try:
+                self._robot_pose_thread.join(timeout=1.0)
+            except Exception:
+                pass
         try:
             self._pub_sock.close(linger=0)
         except Exception:
@@ -1273,6 +1356,11 @@ class X2DatasetRecorder:
         if self._renderer is not None:
             try:
                 self._renderer.close()
+            except Exception:
+                pass
+        if self._front_cam_renderer is not None:
+            try:
+                self._front_cam_renderer.close()
             except Exception:
                 pass
 
@@ -2058,11 +2146,21 @@ class X2DatasetRecorder:
         # dataset's image and proprio tracks the actual robot, not the
         # commanded target. (Otherwise the frames would diverge from
         # ground truth whenever the tracking policy lags.)
+        #
+        # ``root_pos_xyz`` comes from the bridge's ``robot_pose`` PUB
+        # (cached by :meth:`_robot_pose_subscriber`). The head-mounted
+        # ego_view is rigidly attached to the robot so its visual
+        # output is invariant under root translation -- but the
+        # world-fixed ``front_cam`` is not: it needs the live root pos
+        # to actually see the robot move. We pass the same value to
+        # both renderers so any future debug overlays stay consistent.
+        pelvis_xyz = self._snapshot_pelvis_xyz()
         try:
             ego_view = self._renderer.render_frame(  # type: ignore[union-attr]
                 body_q=obs_body_q_mj,
                 left_active=obs_left_hand_q.astype(np.float64),
                 right_active=obs_right_hand_q.astype(np.float64),
+                root_pos_xyz=pelvis_xyz,
                 root_quat_wxyz=obs_base_quat_wxyz,
             )
         except Exception as exc:
@@ -2079,6 +2177,45 @@ class X2DatasetRecorder:
                 flush=True,
             )
             return
+
+        # Optional second view: the world-fixed wide-angle ``front_cam``
+        # baked into the robocasa scene XMLs. Renders the SAME body_q +
+        # base_quat + pelvis_xyz from a different MJCF camera, so the
+        # two video tracks are bit-for-bit synchronized at the proprio
+        # level. Render failures here are non-fatal: we drop the whole
+        # frame (rather than write a partial one with a missing
+        # ``observation.images.front_cam`` key) so the LeRobot
+        # exporter's ``validate_frame`` strict-schema check stays
+        # happy. ``front_view`` lives in local scope here and is
+        # spliced into ``frame_data`` just below.
+        front_view: np.ndarray | None = None
+        if self._front_cam_renderer is not None:
+            try:
+                front_view = self._front_cam_renderer.render_frame(
+                    body_q=obs_body_q_mj,
+                    left_active=obs_left_hand_q.astype(np.float64),
+                    right_active=obs_right_hand_q.astype(np.float64),
+                    root_pos_xyz=pelvis_xyz,
+                    root_quat_wxyz=obs_base_quat_wxyz,
+                )
+            except Exception as exc:
+                print(
+                    f"[recorder] front_cam render warn (frame skipped): "
+                    f"{exc}",
+                    flush=True,
+                )
+                return
+            front_view = np.ascontiguousarray(front_view, dtype=np.uint8)
+            if front_view.shape != (
+                self._cfg.render_height, self._cfg.render_width, 3,
+            ):
+                print(
+                    f"[recorder] WARN: front_cam shape {front_view.shape} "
+                    f"!= ({self._cfg.render_height}, "
+                    f"{self._cfg.render_width}, 3); skipping frame",
+                    flush=True,
+                )
+                return
 
         # v1 schema: bare-canonical action columns carry the post-SONIC
         # executed q (what the trained tracking policy achieved, i.e.
@@ -2134,6 +2271,13 @@ class X2DatasetRecorder:
             "observation.images.ego_view": ego_view,
             "task": self._episode_buffer.task,
         }
+        if front_view is not None:
+            # Schema parity with :func:`get_features_x2_vla`: the key
+            # exists in ``self._features`` iff
+            # ``cfg.record_front_cam=True``. Conditionally emitting it
+            # here mirrors the conditional render above; the exporter
+            # rejects either side mismatching at validate time.
+            frame_data["observation.images.front_cam"] = front_view
         # Robocasa mode: append per-frame success / reward / subtask
         # signals from the task mirror. The mirror's mj_data has been
         # synced from the deploy bridge's most recent ``scene_state``
@@ -2247,6 +2391,103 @@ class X2DatasetRecorder:
         except Exception:
             pass
 
+    def _robot_pose_subscriber(self) -> None:
+        """Background SUB on the bridge's ``robot_pose`` topic.
+
+        Updates :attr:`_latest_pelvis_xyz` whenever a fresh packet
+        arrives so :meth:`_record_frame` can pass the live pelvis
+        ``(x, y, z)`` into :meth:`MujocoFrameRenderer.render_frame` as
+        ``root_pos_xyz``. Bridge publishes at state-rate (default
+        200 Hz); we use ``CONFLATE=1`` to avoid backlog. The orientation
+        component (``[3:7]``) is currently ignored here -- the recorder
+        already gets that via the ``x2_debug`` ``base_quat`` field
+        (cached in :class:`_LatestState`) and the two paths must agree
+        on the same fresh ``base_quat`` for the rendered ``ego_view`` /
+        ``front_cam`` to look right.
+
+        No-op when the bridge isn't running (recv just times out
+        forever); the recorder stays alive on the renderer's hardcoded
+        ``(0, 0, 0.793)`` fallback.
+        """
+        try:
+            from gear_sonic.utils.teleop.zmq.robot_pose_zmq import (
+                unpack_robot_pose,
+            )
+        except ImportError as exc:
+            print(f"[recorder] robot_pose SUB import failed: {exc}",
+                  flush=True)
+            return
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(
+            zmq.SUBSCRIBE, self._cfg.robot_pose_sub_topic.encode()
+        )
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        endpoint = (
+            f"tcp://{self._cfg.robot_pose_sub_host}:"
+            f"{self._cfg.robot_pose_sub_port}"
+        )
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            print(f"[recorder] robot_pose SUB connect to {endpoint} "
+                  f"failed: {exc}", flush=True)
+            sock.close(linger=0)
+            return
+        print(
+            f"[recorder] robot_pose SUB connected at {endpoint} "
+            f"(topic={self._cfg.robot_pose_sub_topic!r})",
+            flush=True,
+        )
+        first = True
+        while not self._stop_event.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                print(f"[recorder] robot_pose SUB recv error: {exc}",
+                      flush=True)
+                continue
+            try:
+                payload = unpack_robot_pose(raw)
+            except ValueError as exc:
+                print(f"[recorder] robot_pose decode error: {exc}",
+                      flush=True)
+                continue
+            qpos = payload.get("pelvis_qpos_wxyz")
+            if not isinstance(qpos, list) or len(qpos) < 3:
+                continue
+            xyz = np.array(qpos[0:3], dtype=np.float64)
+            with self._pelvis_pose_lock:
+                self._latest_pelvis_xyz = xyz
+                self._pelvis_pose_seen_any = True
+            if first:
+                first = False
+                print(
+                    f"[recorder] robot_pose SUB: first packet "
+                    f"(pelvis_xyz={xyz.tolist()})",
+                    flush=True,
+                )
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+    def _snapshot_pelvis_xyz(self) -> np.ndarray:
+        """Return the latest cached pelvis ``(x, y, z)``.
+
+        Returns a copy so callers can pass it straight into the
+        renderer without worrying about the SUB thread overwriting it
+        mid-render. Falls back to the renderer's default
+        ``(0, 0, 0.793)`` when no ``robot_pose`` packet has arrived.
+        """
+        with self._pelvis_pose_lock:
+            return self._latest_pelvis_xyz.copy()
+
     def _drain_scene_state_into_mirror(self) -> None:
         """Pull the latest scene_state snapshot and apply it to the mirror.
 
@@ -2288,6 +2529,44 @@ class X2DatasetRecorder:
             f"{self._renderer.height}, omnihand={self._renderer.with_omnihand})",
             flush=True,
         )
+        # Optional second renderer for the wide-angle world-fixed
+        # ``front_cam`` baked into the robocasa scene XMLs. Spinning up
+        # a second :class:`MujocoFrameRenderer` keeps the per-camera
+        # render path completely independent (separate ``mjData``,
+        # separate EGL framebuffer) -- ~20-40 MB extra GPU/CPU memory
+        # and one extra ``render()`` call per tick (sub-millisecond at
+        # 640x480 on a modern GPU). Only built when (a) the operator
+        # asked for it AND (b) we're in scene mode (the camera doesn't
+        # exist in the legacy flat-floor MJCF). See
+        # ``RecorderConfig.record_front_cam``.
+        if self._cfg.record_front_cam and scene_xml_path is not None:
+            print("[recorder] building MuJoCo front_cam renderer …", flush=True)
+            self._front_cam_renderer = MujocoFrameRenderer(
+                camera="front_cam",
+                width=self._cfg.render_width,
+                height=self._cfg.render_height,
+                with_omnihand=self._cfg.with_omnihand,
+                egl=True,
+                scene_xml_path=scene_xml_path,
+            )
+            print(
+                f"[recorder] front_cam renderer ready "
+                f"({self._front_cam_renderer.width}x"
+                f"{self._front_cam_renderer.height})",
+                flush=True,
+            )
+        elif self._cfg.record_front_cam:
+            # Operator opted in but we're not in scene mode -> the
+            # ``front_cam`` camera does not exist in the legacy MJCF.
+            # Don't blow up; just warn loudly so the missing video
+            # track in the dataset is obvious during triage.
+            print(
+                "[recorder] WARN: record_front_cam=True but "
+                "scene_xml_path is None -- the legacy flat-floor MJCF "
+                "has no 'front_cam' camera. Skipping the second "
+                "renderer; dataset will only contain ego_view.",
+                flush=True,
+            )
 
     def _ensure_exporter(self) -> None:
         if self._exporter is not None:

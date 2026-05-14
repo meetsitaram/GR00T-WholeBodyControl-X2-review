@@ -541,66 +541,139 @@ def merge_scene_into_compose(
 
 
 # Bake-time camera placements for the close-up "left" and "right" views
-# of the manipulable object. World-frame coordinates assume the X2
-# pelvis is at roughly (0, 0, 0.68), the table top hovers around z≈0.7
-# in front of the robot at x≈0.5, and the manipulable object spawns
-# somewhere over the table top.
+# of the manipulable object plus a wide-angle world-fixed `front_cam`.
+# World-frame coordinates assume the X2 pelvis is at roughly
+# ``(0, 0, 0.68)``, the table top hovers around ``z≈0.7`` in front of
+# the robot at ``x≈0.5``, and the manipulable object spawns somewhere
+# over the table top.
 #
-# Convention: ``+y`` is the robot's left (humanoid right-hand rule, +x
-# forward, +z up), so ``obj_left`` sits on the +y side of the cube.
-# The ``targetbody`` mode keeps the optical axis pointed at the body
-# every frame regardless of where it gets randomized to or where the
-# operator drags it -- so these cameras stay useful through grasps,
-# lifts, and drops without any per-episode bookkeeping.
+# Convention: ``+y`` is the robot's left (humanoid right-hand rule,
+# ``+x`` forward, ``+z`` up), so ``obj_left`` sits on the ``+y`` side
+# of the cube. The ``targetbody`` mode keeps the optical axis pointed
+# at the body every frame regardless of where it gets randomized to or
+# where the operator drags it -- so those two stay useful through
+# grasps, lifts, and drops without any per-episode bookkeeping.
+#
+# ``front_cam`` is different on purpose: ``mode="fixed"`` with explicit
+# ``xyaxes`` so it keeps a static framing of the launch position even
+# when the robot walks away. That gives the dataset a stable
+# third-person witness camera to pair with the head-mounted ``ego_view``
+# (see ``observation.images.front_cam``). 120° vertical FoV widens the
+# frustum enough that the table + the entire X2 stay in shot from
+# 3 ft / ~0.91 m in front of the launch spot, at chest height
+# (~``z=1.10`` m above the floor; pelvis is at ``0.68`` and torso adds
+# another ~0.4 m before the shoulders).
+#
+# Per-camera schema:
+#   ``name``    -- MJCF camera name (must be unique within the model).
+#   ``pos``     -- ``(x, y, z)`` world-frame position in metres.
+#   ``fovy``    -- vertical field-of-view in degrees, written as a str.
+#   ``mode``    -- one of ``"targetbody"`` (default) or ``"fixed"``.
+#                 ``targetbody`` cameras require the env to declare a
+#                 ``manipulable_target_body``; ``fixed`` cameras don't.
+#   ``xyaxes``  -- only honoured when ``mode == "fixed"``. Six floats
+#                 ``(x_x, x_y, x_z,  y_x, y_y, y_z)`` describing the
+#                 camera's local +x and +y axes in world coordinates.
+#                 The +z axis (and therefore the look direction, which
+#                 is local -z in MuJoCo's camera convention) is derived
+#                 as the cross product. When omitted, MuJoCo uses its
+#                 default (camera looks down -z = world -z).
 _WORKSPACE_CAMERAS: tuple[dict, ...] = (
     {
         "name": "obj_left",
         "pos": (0.50, 0.45, 0.95),
         "fovy": "50",
+        "mode": "targetbody",
     },
     {
         "name": "obj_right",
         "pos": (0.50, -0.45, 0.95),
         "fovy": "50",
+        "mode": "targetbody",
+    },
+    {
+        "name": "front_cam",
+        # 3 ft (~0.9144 m) in front of the robot launch position, at
+        # roughly chest height. Sits ~0.3 m past the table-top edge,
+        # looking back toward the robot along world -x.
+        "pos": (0.9144, 0.0, 1.10),
+        "fovy": "120",
+        "mode": "fixed",
+        # Camera +x = world +y  (image-right is operator-right when
+        # looking at the robot from in front), camera +y = world +z
+        # (up stays up). MuJoCo derives camera +z = +x × +y = world +x,
+        # which makes camera -z (the look direction) = world -x, i.e.
+        # back at the robot. Sanity-checked with mujoco.MjData.cam_xmat
+        # in the build script's smoke pass.
+        "xyaxes": (0.0, 1.0, 0.0,  0.0, 0.0, 1.0),
     },
 )
 
 
 def _inject_workspace_cameras(root: ET.Element, env_spec: SceneEnvSpec) -> int:
-    """Inject ``obj_left`` and ``obj_right`` worldbody cameras targeting
-    the env's manipulable object body.
+    """Inject the bake-time workspace cameras (``obj_left`` / ``obj_right``
+    / ``front_cam``) into the merged scene's ``<worldbody>``.
 
-    Returns the number of cameras actually appended (0 when the env
-    declares no ``manipulable_target_body``). Cameras are added at the
-    end of ``<worldbody>`` so the operator can press ``[`` / ``]`` in
-    the live MuJoCo viewer to cycle to them after the head camera.
+    Cameras with ``mode="targetbody"`` require the env to declare a
+    ``manipulable_target_body``; if it doesn't, those cameras are
+    silently skipped (so a future "no manipulable object" scene still
+    works). ``mode="fixed"`` cameras (e.g. ``front_cam``) are
+    target-independent and are always emitted.
+
+    Returns the number of cameras actually appended. Cameras are added
+    at the end of ``<worldbody>`` so the operator can press ``[`` /
+    ``]`` in the live MuJoCo viewer to cycle to them after the
+    head-mounted ``ego_view``.
     """
     target_body = env_spec.manipulable_target_body
-    if not target_body:
-        return 0
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise RuntimeError(
             "scene XML missing <worldbody> after merge -- cannot inject "
             "workspace cameras"
         )
-    # Defensive: only inject if the named body actually exists in the
-    # merged worldbody, otherwise mujoco compile would fail later with
-    # an opaque "target body not found" error.
     body_names = {b.get("name", "") for b in worldbody.iter("body")}
-    if target_body not in body_names:
-        raise RuntimeError(
-            f"manipulable_target_body {target_body!r} not present in merged "
-            f"worldbody (have: {sorted(b for b in body_names if b)})"
+    if target_body and target_body not in body_names:
+        # Defensive: only fail if a target-body camera below would
+        # actually need the missing body; mujoco compile would
+        # otherwise barf with an opaque "target body not found" error.
+        needs_target = any(
+            spec.get("mode", "targetbody") == "targetbody"
+            for spec in _WORKSPACE_CAMERAS
         )
+        if needs_target:
+            raise RuntimeError(
+                f"manipulable_target_body {target_body!r} not present in merged "
+                f"worldbody (have: {sorted(b for b in body_names if b)})"
+            )
     n_added = 0
     for cam_spec in _WORKSPACE_CAMERAS:
+        mode = cam_spec.get("mode", "targetbody")
+        if mode == "targetbody" and not target_body:
+            # Skip target-body cameras for envs without a manipulable
+            # object (no scene like that exists today, but the next
+            # one is one PR away -- don't crash on it).
+            continue
         cam = ET.SubElement(worldbody, "camera")
         cam.set("name", cam_spec["name"])
         cam.set("pos", " ".join(f"{v:.4f}" for v in cam_spec["pos"]))
         cam.set("fovy", cam_spec["fovy"])
-        cam.set("mode", "targetbody")
-        cam.set("target", target_body)
+        cam.set("mode", mode)
+        if mode == "targetbody":
+            assert target_body, (
+                "_inject_workspace_cameras: targetbody requested but "
+                "env_spec.manipulable_target_body is unset"
+            )
+            cam.set("target", target_body)
+        elif mode == "fixed":
+            xyaxes = cam_spec.get("xyaxes")
+            if xyaxes is not None:
+                cam.set("xyaxes", " ".join(f"{v:.4f}" for v in xyaxes))
+        else:
+            raise ValueError(
+                f"_inject_workspace_cameras: unsupported camera mode "
+                f"{mode!r} (allowed: 'targetbody', 'fixed')"
+            )
         n_added += 1
     return n_added
 

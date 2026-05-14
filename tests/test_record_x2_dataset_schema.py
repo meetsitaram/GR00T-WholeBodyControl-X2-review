@@ -23,6 +23,8 @@ from gear_sonic.data.features_x2_vla import (
     EGO_VIEW_HEIGHT,
     EGO_VIEW_WIDTH,
     FPS as DATASET_FPS,
+    FRONT_CAM_HEIGHT,
+    FRONT_CAM_WIDTH,
     HAND_DOF_OMNI,
     SONIC_MOTION_TOKEN_DIM,
     get_features_x2_vla,
@@ -201,6 +203,102 @@ def test_modality_config_consistency():
         sl = cfg["state"][side]
         assert sl["original_key"] == "observation.state"
         assert 0 <= sl["start"] < sl["end"] <= state_dim
+
+
+# ── front_cam (witness camera) opt-in schema ──────────────────────────────
+
+
+def test_front_cam_default_off_keeps_legacy_schema():
+    """Without ``include_front_cam=True`` the schema must be byte-identical
+    to the pre-front_cam recorder output -- otherwise old datasets in the
+    wild can't be re-validated by the exporter."""
+    rm = get_x2_robot_model(hand_variant="omnihand_10")
+    features = get_features_x2_vla(rm, hand_dof_per_side=HAND_DOF_OMNI)
+    image_keys = sorted(k for k in features if k.startswith("observation.images"))
+    assert image_keys == ["observation.images.ego_view"], (
+        f"front_cam must NOT appear in default features; got {image_keys}"
+    )
+    cfg = get_modality_config_x2_vla(rm, hand_dof_per_side=HAND_DOF_OMNI)
+    assert sorted(cfg["video"]) == ["ego_view"], (
+        f"front_cam must NOT appear in default modality.video; got "
+        f"{sorted(cfg['video'])}"
+    )
+
+
+def test_front_cam_include_adds_video_feature():
+    """``include_front_cam=True`` must add the second video feature with
+    the documented shape AND register it in ``modality.video``. Both
+    sides MUST agree because the LeRobot exporter cross-checks them at
+    first-frame validation."""
+    rm = get_x2_robot_model(hand_variant="omnihand_10")
+    features = get_features_x2_vla(
+        rm, hand_dof_per_side=HAND_DOF_OMNI, include_front_cam=True,
+    )
+    assert "observation.images.front_cam" in features
+    fc = features["observation.images.front_cam"]
+    assert fc["dtype"] == "video"
+    assert tuple(fc["shape"]) == (FRONT_CAM_HEIGHT, FRONT_CAM_WIDTH, 3)
+    assert fc["names"] == ["height", "width", "channel"]
+    # ego_view must still be present (we add front_cam, not replace).
+    assert "observation.images.ego_view" in features
+
+    cfg = get_modality_config_x2_vla(
+        rm, hand_dof_per_side=HAND_DOF_OMNI, include_front_cam=True,
+    )
+    assert sorted(cfg["video"]) == ["ego_view", "front_cam"]
+    assert cfg["video"]["front_cam"]["original_key"] == (
+        "observation.images.front_cam"
+    )
+
+
+def test_front_cam_resolver_default_in_record_cli():
+    """The CLI helper `_resolve_front_cam_default` must:
+      * default to True iff a scene XML is loaded (robocasa mode), AND
+      * always honour an explicit operator flag (True or False).
+
+    The wrapper script relies on this so passing only ``--robocasa-env``
+    automatically lights up the second video track.
+    """
+    from gear_sonic.scripts.record_x2_dataset import (
+        _resolve_front_cam_default,
+    )
+    fake_scene = Path("/tmp/never_actually_read.xml")
+    assert _resolve_front_cam_default(None, None) is False
+    assert _resolve_front_cam_default(None, fake_scene) is True
+    assert _resolve_front_cam_default(False, fake_scene) is False
+    assert _resolve_front_cam_default(True, None) is True
+
+
+def test_front_cam_baked_into_robocasa_scene_xmls():
+    """Each shipped robocasa scene XML must declare a ``front_cam``
+    camera with the documented pose + 120° FoV. Catches accidental
+    rebuilds that drop the second camera."""
+    import mujoco
+
+    scenes_dir = (
+        Path(__file__).resolve().parent.parent
+        / "gear_sonic" / "data" / "assets" / "robocasa_scenes"
+    )
+    for env in ("X2PickPlaceCube", "X2PickPlaceBowl", "X2PickPlaceApple"):
+        xml = scenes_dir / f"{env}.xml"
+        if not xml.is_file():
+            pytest.skip(f"scene XML missing: {xml}")
+        m = mujoco.MjModel.from_xml_path(str(xml))
+        cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "front_cam")
+        assert cam_id >= 0, f"{env}: front_cam not in compiled MJCF"
+        # Pose: 3 ft (~0.9144 m) in front of the robot launch, chest height.
+        np.testing.assert_allclose(
+            m.cam_pos[cam_id], [0.9144, 0.0, 1.10], atol=1e-3,
+            err_msg=f"{env}: front_cam pos drifted",
+        )
+        # Wide-angle 120° vertical FoV (per user spec).
+        assert float(m.cam_fovy[cam_id]) == pytest.approx(120.0, abs=1e-3), (
+            f"{env}: front_cam fovy != 120 (got {float(m.cam_fovy[cam_id])})"
+        )
+        # mode=0 -> mjCAMLIGHT_FIXED (camera does NOT track the robot).
+        assert int(m.cam_mode[cam_id]) == 0, (
+            f"{env}: front_cam must be mode=fixed (got {int(m.cam_mode[cam_id])})"
+        )
 
 
 # ── Online tokenizer (gated on the SONIC checkpoint) ──────────────────────

@@ -49,9 +49,15 @@ Locomotion vocabulary (LOCOMOTION mode only)
 - Left stick left             -> ``(side_left,  default)``
 - Right stick hard left/right -> ``(turn_left/right, deg_45 [or deg_90])``
 - Right stick (continuous)    -> ``(hold_torso, continuous, waist_*_deg)``
-    * ``ry > 0`` => positive ``waist_pitch_deg`` (forward lean)
-    * ``rx`` (no A held) => negative ``waist_yaw_deg`` for stick-right (twist)
-    * ``rx`` (A held)    => negative ``waist_roll_deg`` for stick-right (lateral lean)
+    * ``ry > 0`` => positive ``waist_pitch_deg`` (forward lean; backward
+      lean has no primitive and is clamped to 0)
+    * ``rx``     => negative ``waist_yaw_deg`` for stick-right (twist)
+    * ``waist_roll_deg`` is always 0 from the operator path. v7.0 used
+      "A held + rx -> roll" but A and the R-stick share the operator's
+      right thumb and the modifier was unreachable mid-lean; v7.2
+      removed it. The wire format still carries the field for scripted
+      demos / future VLA outputs, but the right thumbstick can no
+      longer steer it.
 - ``Y`` held                  -> ``(crouch, medium)`` (only when enabled)
 - All sticks neutral          -> ``(idle, default)`` (or ``hold_torso`` at 0/0/0
                                   while continuous mode is engaged)
@@ -327,7 +333,7 @@ class IntentDecoder:
           (``turn_left / deg_90`` resp. ``turn_right / deg_90``)
           instead of the default 45° step.
         """
-        if self._mode != StreamMode.LOCOMOTION:
+        if self._mode == StreamMode.OFF:
             return None
 
         if now < self._chord_quiet_until:
@@ -340,6 +346,23 @@ class IntentDecoder:
                 lx=lx, ly=ly, rx=rx, ry=ry,
                 y_held=y_held, a_held=a_held, x_held=x_held,
             )
+
+        # In ARM_MANIPULATION the operator is doing VR-IK on the arms;
+        # we MUST NOT pass through commands that move the robot's base
+        # (walk / fwd_step / back_step / side_left / side_right /
+        # turn_*) because the arm-IK targets are computed in torso
+        # frame and a base translation slides the IK reference out
+        # from under the operator's hands. Continuous waist hold
+        # (hold_torso) is safe -- it only changes waist DOFs (pitch /
+        # roll / yaw) and the IK actually rides along (torso lean
+        # extends the arm reach envelope, which is the whole point
+        # of v7.2 unlocking R-stick in ARM_MAN). Idle commands also
+        # filtered so we don't wash away the planner's STATIC_HOLD
+        # target with stale "go to idle_stand" pulses on every chord
+        # quiet window.
+        if self._mode == StreamMode.ARM_MANIPULATION and cmd.intent != "hold_torso":
+            return None
+
         return self._maybe_emit(cmd, now)
 
     def _cmd_for_inputs(
@@ -397,7 +420,12 @@ class IntentDecoder:
                 if rx > 0:
                     return LocomotionCmd("turn_right", magnitude)
                 return LocomotionCmd("turn_left", magnitude)
-            return self._continuous_hold_cmd(rx=rx, ry=ry, a_held=a_held)
+            # v7.2: roll modifier removed; ``a_held`` is intentionally
+            # not forwarded to ``_continuous_hold_cmd``. The operator's
+            # right thumb drives the R-stick, so A on the same
+            # controller is unreachable mid-lean. See the docstring on
+            # ``_continuous_hold_cmd`` for the full rationale.
+            return self._continuous_hold_cmd(rx=rx, ry=ry)
 
         # ----- Legacy discrete-bin path -----------------------------------
         # Y axis (forward) -> graded lean_fwd_{small,medium,large}
@@ -463,8 +491,14 @@ class IntentDecoder:
 
         Always returns clamped, deadzone-aware angles regardless of the
         decoder's mode or the ``enable_continuous_torso`` flag.
+
+        The ``a_held`` parameter is accepted for backward compatibility
+        with v7.1 callers but is now ignored: see :meth:`_continuous_hold_cmd`
+        for the ergonomic rationale (operator's right thumb cannot reach
+        A while driving the R-stick on the same controller).
         """
-        cmd = self._continuous_hold_cmd(rx=rx, ry=ry, a_held=a_held)
+        del a_held  # v7.2: accepted but ignored
+        cmd = self._continuous_hold_cmd(rx=rx, ry=ry)
         return (cmd.waist_pitch_deg, cmd.waist_roll_deg, cmd.waist_yaw_deg)
 
     def _continuous_hold_cmd(
@@ -472,20 +506,31 @@ class IntentDecoder:
         *,
         rx: float,
         ry: float,
-        a_held: bool,
     ) -> LocomotionCmd:
         """Build a continuous-hold LocomotionCmd from the right-stick state.
 
-        Stick conventions (validated with the operator on 2026-05-13):
+        Stick conventions (validated with the operator on 2026-05-13,
+        revised on 2026-05-14 to drop the lateral-lean (roll) axis):
 
         - ``ry > 0`` (stick up)   -> forward lean (positive pitch).
           Backward lean is unsupported (no primitive, single-sided cap).
-        - ``rx`` (no A held)      -> twist (yaw). Stick right (rx > 0)
+        - ``rx``                  -> twist (yaw). Stick right (rx > 0)
           maps to a NEGATIVE waist_yaw, matching ``torso_right_*deg``
           which uses negative peak_deg.
-        - ``rx`` (A held)         -> lateral lean (roll). Stick right
-          maps to a NEGATIVE waist_roll for the same sign convention as
-          ``lean_right_*``.
+
+        ``waist_roll_deg`` is always emitted as 0 from the operator
+        path. The underlying planner / ``make_waist_pose_frame`` still
+        supports continuous roll (and the wire format reserves the
+        field) so scripted demos and future VLA outputs can emit it,
+        but the right thumbstick can no longer steer it. The original
+        v7.1 design used "A held + R-stick X" -> roll, but A and the
+        R-stick share the operator's right thumb; in practice the
+        modifier was unreachable mid-lean. Rather than reassign roll
+        to a left-hand button (and burn a second face button for an
+        axis the operator can already approximate by chaining a brief
+        twist + lean), v7.2 simply removes it from the operator
+        vocabulary. See ``docs/source/tutorials/x2_quest3_planner_stack_cheatsheet.md``
+        for the operator-facing explanation.
 
         Released stick (in deadzone) yields a (0, 0, 0) hold target;
         the planner's STATIC_HOLD state slews back to neutral via the
@@ -500,21 +545,14 @@ class IntentDecoder:
                 self._max_waist_pitch_deg,
             ),
         )
-        if a_held:
-            roll_deg = -self._scaled_axis(
-                rx, self._stick_deadzone, self._max_waist_roll_deg,
-            )
-            yaw_deg = 0.0
-        else:
-            roll_deg = 0.0
-            yaw_deg = -self._scaled_axis(
-                rx, self._stick_deadzone, self._max_waist_yaw_deg,
-            )
+        yaw_deg = -self._scaled_axis(
+            rx, self._stick_deadzone, self._max_waist_yaw_deg,
+        )
         return LocomotionCmd(
             intent="hold_torso",
             magnitude="continuous",
             waist_pitch_deg=float(pitch_deg),
-            waist_roll_deg=float(roll_deg),
+            waist_roll_deg=0.0,
             waist_yaw_deg=float(yaw_deg),
         )
 

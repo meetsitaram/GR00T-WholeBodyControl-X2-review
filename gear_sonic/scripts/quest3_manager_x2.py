@@ -93,7 +93,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from gear_sonic.utils.teleop.finger_signal_filter import FingerFilterParams  # noqa: E402
 from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration  # noqa: E402
-from gear_sonic.utils.teleop.vr.button_state_machine import ButtonStateMachine  # noqa: E402
+from gear_sonic.utils.teleop.vr.button_state_machine import (  # noqa: E402
+    ButtonEvents,
+    ButtonStateMachine,
+)
 from gear_sonic.utils.teleop.vr.intent_decoder import (  # noqa: E402
     IntentDecoder,
     LocomotionCmd,
@@ -157,9 +160,13 @@ class ManagerConfig:
     intent_enable_lean_fwd: bool = False
     intent_enable_torso: bool = False
     # Continuous waist hold via the right stick: pitch (ry > 0), yaw
-    # (rx, no A), roll (rx, A held). Default True because this is the
-    # primary VR teleop surface for static reach now that the planner
-    # has STATIC_HOLD wired up. Set False to fall back to the legacy
+    # (rx). The roll axis was retired in v7.2 (the operator's right
+    # thumb owns the R-stick, leaving A on the same controller
+    # unreachable mid-lean -- so the legacy "A held + rx -> roll"
+    # modifier was a footgun rather than a feature). Default True
+    # because this is the primary VR teleop surface for static reach
+    # now that the planner has STATIC_HOLD wired up. Set False to
+    # fall back to the legacy
     # discrete soft-band torso bins.
     intent_enable_continuous_torso: bool = True
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
@@ -208,11 +215,40 @@ class ManagerConfig:
     """If set, append one JSONL line per emitted ``planner_cmd`` to this
     file. Useful for post-hoc analysis (which intent fired when)."""
 
-    # Camera cycler (right-stick-click -> Tab to deploy MuJoCo viewer)
+    # Episode lifecycle audio cues
+    recorder_enabled: bool = False
+    """When True, the manager plays the ``record_start`` / ``record_save``
+    headset audio cues on X / Y press in ARM_MANIPULATION. When False
+    (the default, matching ``--teleop-only`` recorder mode), those
+    cues are suppressed so the operator doesn't get a false "Recording."
+    / "Saved." ACK while no parquet is being written.
+
+    The ``recorder_cmd`` ZMQ message is **always** published regardless
+    of this flag: the recorder is the source of truth for whether the
+    save actually landed and logs ``[recorder] [Y] ignored: ...`` when
+    it can't honour the request. This flag only gates the *audio* path,
+    not the wire path, so a future ACK-driven cue (recorder PUBs
+    ``recorder_ack`` -> manager waits before playing) can land
+    incrementally without breaking existing teleop-only sessions.
+
+    The wrapper (``run_x2_quest3_planner_stack.sh``) sets this to True
+    iff ``--with-record`` was passed; manual launches must set it
+    explicitly with ``--recorder-enabled``. Note: this flag still
+    leaves a known footgun -- in ``--with-record`` mode an X press
+    while already recording, or a Y press with no active episode,
+    will fire the cue (the recorder logs ``ignored`` but the manager
+    doesn't see that). Tracked as the "ACK topic" follow-up."""
+
+    # Camera cycler (left-stick-click -> ']' to deploy MuJoCo viewer)
     enable_viewer_camera_cycler: bool = True
-    """When True (default), pressing the right thumbstick click cycles
-    the deploy MuJoCo viewer's fixed cameras via xdotool (Tab). Set
-    to False on headless / CI runs where no GLFW window exists.
+    """When True (default), pressing the LEFT thumbstick click cycles
+    the deploy MuJoCo viewer's fixed cameras via a synthesised ``]``
+    keystroke (xdotool keysym ``bracketright``; that's the next-fixed-
+    camera key in mujoco.viewer.launch_passive). Set to False on
+    headless / CI runs where no GLFW window exists. Pre-v7.1 the
+    binding was on the right click; pre-deploy-test we briefly used
+    ``Tab`` here, but Tab only toggles the viewer's left UI panel and
+    doesn't change cameras.
 
     TODO(unified-vr-input-topic): replace this entire xdotool path with
     a proper ZMQ ``vr_input`` topic that the manager publishes and any
@@ -230,8 +266,8 @@ class ManagerConfig:
     precise way to find the deploy viewer window. WM_CLASS is set
     by GLFW on the application window itself and is NOT inherited
     by the GNOME / mutter compositor's frame wrapper, so this filter
-    avoids the "Tab vanishes into mutter-x11-frames" failure mode
-    we hit before 2026-05-13. Only override if you've rebuilt
+    avoids the "synthetic key vanishes into mutter-x11-frames"
+    failure mode we hit before 2026-05-13. Only override if you've rebuilt
     MuJoCo with a custom WM_CLASS string (very rare)."""
 
     # Misc
@@ -481,6 +517,15 @@ class Quest3ManagerX2:
             self._cfg.invert_lx, self._cfg.invert_ly,
             self._cfg.invert_rx, self._cfg.invert_ry,
         )
+        log.info(
+            "[manager-x2] recorder audio cues: %s "
+            "(controlled by --recorder-enabled / --no-recorder-enabled; "
+            "the wrapper sets it to ON iff --with-record was passed). "
+            "When OFF, X/Y in ARM_MAN still publish recorder_cmd but "
+            "skip the 'Recording.' / 'Saved.' headset cue so the "
+            "operator doesn't get a false ACK in --teleop-only runs.",
+            "ON" if self._cfg.recorder_enabled else "OFF",
+        )
 
         try:
             while not self._stop.is_set():
@@ -517,18 +562,18 @@ class Quest3ManagerX2:
                 a_held, _b_held, x_held, y_held = buttons
 
                 # Live continuous waist target derived from the right
-                # stick + A modifier. We compute this BEFORE the mode
-                # transition handler so a B-press into ARM_MANIPULATION
-                # can latch exactly the pose the operator was holding
-                # at the moment of the press, rather than the pose from
-                # the previous tick (which would drift by up to one
-                # 50 Hz interval). The continuous target is well-defined
-                # in any mode (it's a pure function of stick state) but
+                # stick. We compute this BEFORE the mode transition
+                # handler so a B-press into ARM_MANIPULATION can latch
+                # exactly the pose the operator was holding at the
+                # moment of the press, rather than the pose from the
+                # previous tick (which would drift by up to one 50 Hz
+                # interval). The continuous target is well-defined in
+                # any mode (it's a pure function of stick state) but
                 # only consumed on the LOCOMOTION -> ARM_MANIPULATION
-                # transition.
+                # transition. v7.2: A-modifier removed from the waist
+                # path (right-thumb ergonomics; see decoder docstring).
                 live_waist_target = self._intent.continuous_waist_target(
                     rx=rx, ry=ry,
-                    a_held=(a_held and self._intent.mode == StreamMode.LOCOMOTION),
                 )
 
                 # 1) Mode transitions ---------------------------------------
@@ -592,19 +637,12 @@ class Quest3ManagerX2:
                 # delete the latest parquet/mp4 if you need to drop a
                 # bad episode -- the recorder still understands the
                 # 'discard' wire action if we re-bind it later).
-                in_arm_man = self._intent.mode == StreamMode.ARM_MANIPULATION
-                if in_arm_man and ev.x_pressed:
-                    log.info("[X] start episode forwarded to recorder")
-                    self._publish_recorder_cmd("start", tick)
-                    self._play_audio_prompt("record_start", fallback="Recording.")
-                if in_arm_man and ev.y_pressed:
-                    log.info("[Y] save episode forwarded to recorder")
-                    self._publish_recorder_cmd("save", tick)
-                    self._play_audio_prompt("record_save", fallback="Saved.")
+                self._handle_episode_buttons(ev, tick)
 
                 # 4b) Stick clicks ------------------------------------------
                 #     LEFT thumbstick click  -> cycle deploy MuJoCo viewer
-                #         cameras (xdotool Tab keypress). Pre-v7 this was
+                #         cameras (xdotool ']' keypress -- mujoco's
+                #         next-fixed-camera key). Pre-v7 this was
                 #         the right click; moved here so the operator can
                 #         keep their right thumb on the lean / twist stick
                 #         while clicking the LEFT stick to re-frame.
@@ -631,13 +669,35 @@ class Quest3ManagerX2:
                 r_click_edge = r_click and not self._prev_right_stick_click
                 self._prev_left_stick_click = l_click
                 self._prev_right_stick_click = r_click
-                if (
-                    l_click_edge
-                    and self._intent.mode != StreamMode.OFF
-                    and self._viewer_cycler is not None
-                ):
-                    if self._viewer_cycler.cycle():
-                        log.info("[L-click] cycled deploy viewer camera (Tab)")
+                if l_click_edge and self._intent.mode != StreamMode.OFF:
+                    # ALWAYS log the rising edge so we can tell whether
+                    # the L-click event reached the manager at all,
+                    # even when the cycler is disabled or fails. The
+                    # cycler itself does its own one-shot WARN on the
+                    # first failure (missing xdotool / DISPLAY / no
+                    # MuJoCo window) and a periodic re-warn after that
+                    # so a long session doesn't go silent if the viewer
+                    # gets restarted under us. Crucial for diagnosing
+                    # "I pressed the stick but nothing happened":
+                    # without this line you can't tell stick-not-
+                    # detected from cycler-failed-silently.
+                    if self._viewer_cycler is None:
+                        log.info(
+                            "[L-click] camera cycler disabled "
+                            "(--no-viewer-camera-cycler); ignoring."
+                        )
+                    else:
+                        ok = self._viewer_cycler.cycle()
+                        log.info(
+                            "[L-click] camera cycle: %s",
+                            "ok ('%s' dispatched to deploy viewer)" % (
+                                self._viewer_cycler.CYCLE_KEYSYM,
+                            )
+                            if ok
+                            else "no-op (cooldown or xdotool/window "
+                            "unavailable; see preceding [viewer-cycler] "
+                            "warning for the specific reason)",
+                        )
                 if r_click_edge and self._intent.mode != StreamMode.OFF:
                     self._toggle_waist_freeze(live_waist_target)
 
@@ -668,12 +728,15 @@ class Quest3ManagerX2:
                         self._publish_planner_cmd(cmd)
                         self._sidecar_emit(cmd, tick)
 
-                # In ARM_MANIPULATION we keep the planner held at idle by
-                # emitting an idle command on entry (handled in the mode
-                # transition); we do NOT emit one per tick here because
-                # the planner's queue dedupes anyway and we want to leave
-                # bandwidth for the operator to flip back to LOCOMOTION
-                # without a stale walk command lurking in the queue.
+                # In ARM_MANIPULATION the per-tick decoder output above
+                # is whatever ``hold_torso`` target the right stick is
+                # currently demanding (or None if the operator is
+                # pushing the L-stick / hard R-stick, both of which the
+                # decoder filters out in ARM_MAN). The B-press into
+                # ARM_MAN handler already emitted a one-shot
+                # ``hold_torso(latched)`` so the planner is in
+                # STATIC_HOLD with no jump on entry; subsequent ticks
+                # just slew the target via the same path.
 
                 # 4) Retargeting ---------------------------------------------
                 # We RUN the retargeter every tick (even in LOCOMOTION
@@ -1007,6 +1070,48 @@ class Quest3ManagerX2:
         except zmq.Again:
             pass
 
+    def _handle_episode_buttons(self, ev: ButtonEvents, tick: int) -> None:
+        """Translate X / Y rising edges in ARM_MANIPULATION into recorder
+        commands and (optionally) headset audio cues.
+
+        Splits cleanly into wire path + audio path:
+
+        - **Wire** (always fires when the chord is right): publish a
+          ``recorder_cmd`` so the recorder can decide to honour or
+          ignore the action. Same in ``--with-record`` and
+          ``--teleop-only`` -- the recorder is the source of truth.
+        - **Audio** (gated on ``self._cfg.recorder_enabled``): play
+          the ``record_start`` / ``record_save`` headset cue. When
+          disabled, no cue plays so the operator doesn't get a false
+          ACK in teleop-only sessions where no parquet is being
+          written. Known footgun (still): in ``--with-record`` the
+          cue still plays on X-while-recording / Y-with-no-episode
+          because the manager has no ACK channel from the recorder.
+          Tracked as the "recorder ACK topic" follow-up; the gate
+          covers the most common foot-shoot (operator forgets the
+          ``--with-record`` flag and trusts the headset).
+
+        Args:
+            ev: Rising-edge button events for this tick.
+            tick: Current tick index, stamped into the ZMQ payload.
+        """
+        if self._intent.mode != StreamMode.ARM_MANIPULATION:
+            return
+        if ev.x_pressed:
+            log.info("[X] start episode forwarded to recorder")
+            self._publish_recorder_cmd("start", tick)
+            if self._cfg.recorder_enabled:
+                self._play_audio_prompt(
+                    "record_start", fallback="Recording.",
+                )
+        if ev.y_pressed:
+            log.info("[Y] save episode forwarded to recorder")
+            self._publish_recorder_cmd("save", tick)
+            if self._cfg.recorder_enabled:
+                self._play_audio_prompt(
+                    "record_save", fallback="Saved.",
+                )
+
     def _play_audio_prompt(
         self, key: str, *, fallback: Optional[str] = None,
     ) -> None:
@@ -1150,13 +1255,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to write a JSONL sidecar of emitted planner_cmds",
     )
 
+    # Episode lifecycle audio cues
+    rec_grp = p.add_argument_group("recorder audio cues")
+    rec_grp.add_argument(
+        "--recorder-enabled", dest="recorder_enabled",
+        action="store_true", default=False,
+        help=(
+            "Play the 'Recording.' / 'Saved.' headset audio cues on "
+            "X / Y press in ARM_MANIPULATION. Set this iff the "
+            "downstream record_x2_dataset is running with "
+            "--output-dir (i.e. NOT --teleop-only); the wrapper "
+            "(run_x2_quest3_planner_stack.sh) sets it automatically "
+            "when --with-record is passed. The recorder_cmd ZMQ "
+            "message is published either way; this only gates the "
+            "audio path so the operator doesn't get a false 'Saved.' "
+            "ACK while no parquet is being written."
+        ),
+    )
+    rec_grp.add_argument(
+        "--no-recorder-enabled", dest="recorder_enabled",
+        action="store_false",
+        help="Suppress the X/Y audio cues (default; teleop-only safe).",
+    )
+
     # Camera cycler (xdotool path; TODO replace with vr_input topic)
     cam_grp = p.add_argument_group("viewer camera cycler")
     cam_grp.add_argument(
         "--no-viewer-camera-cycler", dest="enable_viewer_camera_cycler",
         action="store_false", default=True,
         help=(
-            "Disable the right-stick-click -> Tab camera cycler. "
+            "Disable the left-stick-click -> ']' camera cycler. "
             "Useful for headless / CI runs where no GLFW window exists."
         ),
     )
@@ -1173,7 +1301,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "xdotool search --classname pattern -- the PRIMARY way to "
             "find the deploy viewer window (avoids GNOME mutter's "
-            "frame-wrapper that swallows synthetic Tab events). "
+            "frame-wrapper that swallows synthetic key events). "
             "Only override if you've rebuilt MuJoCo with a custom "
             "WM_CLASS via glfwWindowHintString."
         ),
@@ -1220,6 +1348,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         apply_oppose_compensation=args.apply_oppose_compensation,
         enable_finger_filter=not args.no_finger_filter,
         sidecar_log_path=args.sidecar_log,
+        recorder_enabled=args.recorder_enabled,
         verbose=args.verbose,
     )
 

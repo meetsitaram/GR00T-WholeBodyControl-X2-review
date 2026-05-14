@@ -1260,7 +1260,8 @@ function onXRFrame(time, frame) {
     /* Thumbstick clicks (gpad.buttons[3] in the oculus-touch /
      * standard gamepad mapping). Currently consumed by
      * Quest3ManagerX2 to cycle the deploy MuJoCo viewer's fixed
-     * cameras (Tab-equivalent) without occupying any face button. */
+     * cameras (synthesises a `]` keystroke -- mujoco's next-fixed-
+     * camera key) without occupying any face button. */
     leftStickClick: false, rightStickClick: false
   };
   const axes = { lx: 0, ly: 0, rx: 0, ry: 0 };

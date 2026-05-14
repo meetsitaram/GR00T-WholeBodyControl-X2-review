@@ -279,3 +279,52 @@ def test_help_mentions_robocasa_flag() -> None:
     )
     # Sanity: examples block survived the edit.
     assert "X2PickPlaceCube" in res.stderr or "robocasa-env" in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# v7.2: --recorder-enabled audio-cue gate plumbing.
+#
+# We can't introspect MANAGER_ARGS at runtime without spawning the
+# manager (``--validate-only`` exits before the array is built), so
+# these are source-level smoke tests: the wrapper must mention BOTH
+# branches (``--recorder-enabled`` for --with-record runs, and
+# ``--no-recorder-enabled`` for the teleop-only default), and they
+# must be conditional on ``WITH_RECORD``. If a refactor drops one of
+# these the manager will silently regress to "always play the audio
+# cue", which is the false-ACK trap v7.2 set out to fix.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_forwards_recorder_enabled_iff_with_record() -> None:
+    """The wrapper must populate MANAGER_ARGS with --recorder-enabled
+    when WITH_RECORD=1 and --no-recorder-enabled otherwise. Source-level
+    pin; the runtime behaviour is covered by the manager unit tests
+    (test_quest3_manager_x2_wire_format::test_*recorder_enabled*).
+    """
+    src = WRAPPER.read_text()
+    assert "MANAGER_ARGS+=(--recorder-enabled)" in src, (
+        "wrapper no longer forwards --recorder-enabled to the manager; "
+        "the v7.2 audio-cue gate will silently break and the headset "
+        "will start lying again in --teleop-only sessions."
+    )
+    assert "MANAGER_ARGS+=(--no-recorder-enabled)" in src, (
+        "wrapper no longer explicitly passes --no-recorder-enabled in "
+        "the teleop-only branch. The CLI default is False so behaviour "
+        "is currently OK, but the explicit form makes the intent clear "
+        "and protects against a future change to the manager default."
+    )
+    # The two forms must live under a WITH_RECORD conditional. Looking
+    # for the literal block protects against a refactor that splits
+    # them across two unrelated ifs.
+    expect_block = (
+        "if [[ \"${WITH_RECORD}\" -eq 1 ]]; then\n"
+        "    MANAGER_ARGS+=(--recorder-enabled)\n"
+        "else\n"
+        "    MANAGER_ARGS+=(--no-recorder-enabled)\n"
+        "fi"
+    )
+    assert expect_block in src, (
+        "the WITH_RECORD->recorder-enabled forwarding block has been "
+        "rewritten; double-check the v7.2 audio-gate semantics still "
+        "hold and update this assertion to match the new layout."
+    )

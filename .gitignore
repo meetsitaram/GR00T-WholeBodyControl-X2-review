@@ -4,9 +4,10 @@ __pycache__/
 *$py.class
 
 # Vendored upstream repos checked out for development reference. Tracked
-# separately as siblings (Isaac-GR00T lives under external_dependencies/
-# but is its own repo, not part of this tree).
+# separately as siblings (each lives under external_dependencies/ but is
+# its own git repo, not part of this tree).
 /external_dependencies/Isaac-GR00T/
+/external_dependencies/GR00T-VisualSim2Real/
 
 # C extensions
 
@@ -79,6 +80,15 @@ data/*
 # matching plots, and per-anchor SUMMARY docs). Tracked in git so the
 # paper artefacts travel with the repo.
 !data/sim_to_real_anchors/
+
+# …but inside the whitelisted sim-to-real anchors, the heavy per-run
+# binaries (motion bakes, replay videos, raw obs npz, per-tick csv logs)
+# are regenerable locally and would balloon repo size. Keep the README /
+# manifest / eval markdown trackable, drop the blobs.
+data/sim_to_real_anchors/**/*.pkl
+data/sim_to_real_anchors/**/*.mp4
+data/sim_to_real_anchors/**/*.npz
+data/sim_to_real_anchors/**/*.csv
 
 # PyBuilder
 .pybuilder/
@@ -224,6 +234,12 @@ gear_sonic/utils/teleop/vr/quest3_certs/
 data/motion_lib_bones_seed
 bones_seed_smpl/
 sonic_release/
+
+# Local motion libraries (rebuilt by gear_sonic/scripts/build_x2_planner_motion_lib.py
+# and friends from upstream mocap; tens to hundreds of MB each, regenerable,
+# not source-of-truth for the repo). Recipes that produce them ARE tracked
+# (see gear_sonic/data/x2_planner_primitives_recipes.yaml etc).
+gear_sonic/data/motions/*.pkl
 
 # Training output logs
 logs_rl/

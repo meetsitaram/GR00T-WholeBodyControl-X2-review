@@ -242,9 +242,16 @@ For runtime we don't load the live robocasa env in the deploy. Instead,
 1. Composes X2 + OmniHand (with `disable_hand_collisions=False`).
 2. Spins up a transient robocasa env, scrapes the table + cube + bowl
    bodies (and assets) from its compiled XML.
-3. Bakes the `rgbd_head_front` head camera and two close-up
-   `obj_left` / `obj_right` workspace cameras (target-body cameras
-   that track the manipulable object).
+3. Bakes the `rgbd_head_front` head camera, two close-up
+   `obj_left` / `obj_right` workspace cameras (`mode="targetbody"`,
+   each tracking the env's manipulable object), and one wide-angle
+   world-fixed witness camera `front_cam` (`mode="fixed"`, 120°
+   vertical FoV, sat at `(0.9144, 0, 1.10)` looking back along world
+   `-x`). All three workspace cameras live in the
+   `_WORKSPACE_CAMERAS` tuple in
+   `build_x2_robocasa_scene_xml.py`; per-camera `mode` + optional
+   `xyaxes` controls whether the camera tracks an object or stays
+   pinned to the launch framing.
 4. Absolutizes every `<mesh file="…">` path so the result is a
    single self-contained XML.
 5. Writes `<env>.xml` plus a `<env>.json` sidecar listing freejoints,
@@ -532,6 +539,13 @@ keeps the ladder monotonic.
   serialization, phased reward monotonicity, scene XML invariants.
 * `tests/test_x2_camera_plumbing.py` — verifies `rgbd_head_front` +
   `obj_left` / `obj_right` cameras land in the built scene XML.
+* `tests/test_record_x2_dataset_schema.py::test_front_cam_baked_into_robocasa_scene_xmls`
+  — locks down the world-fixed `front_cam` (120° FoV, fixed pose,
+  3 ft / chest-height) across all three bundled robocasa scene XMLs;
+  paired with `test_front_cam_include_adds_video_feature` /
+  `test_front_cam_default_off_keeps_legacy_schema` /
+  `test_front_cam_resolver_default_in_record_cli` for the recorder
+  feature schema + CLI default.
 * `tests/test_x2_lerobot_exporter.py` — schema / column-name lock-down
   for the LeRobot v2.1 writer.
 

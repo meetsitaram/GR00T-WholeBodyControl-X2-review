@@ -519,7 +519,6 @@ def _x2_debug_subscriber(
     topic: str,
     state: _LatestState,
     stop_event: threading.Event,
-    verbose: bool = False,
 ) -> None:
     """Thread A: SUB to ``x2_debug`` and update :class:`_LatestState`."""
     ctx = zmq.Context.instance()
@@ -532,7 +531,6 @@ def _x2_debug_subscriber(
     poller.register(sock, zmq.POLLIN)
     print(f"[live-VLA] x2_debug SUB connected to {sub_url} (topic={topic!r})", flush=True)
 
-    n = 0
     try:
         while not stop_event.is_set():
             events = dict(poller.poll(200))
@@ -567,9 +565,6 @@ def _x2_debug_subscriber(
                 left_hand_q=left_hq,
                 right_hand_q=right_hq,
             )
-            n += 1
-            if verbose and n % 100 == 0:
-                print(f"[live-VLA] x2_debug rx#{n}", flush=True)
     finally:
         try:
             sock.close(linger=0)
@@ -1092,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
         target=_x2_debug_subscriber,
         kwargs=dict(
             sub_url=sub_url, topic=args.sub_topic,
-            state=state, stop_event=stop_event, verbose=not args.quiet,
+            state=state, stop_event=stop_event,
         ),
         name="x2_debug-sub",
         daemon=True,

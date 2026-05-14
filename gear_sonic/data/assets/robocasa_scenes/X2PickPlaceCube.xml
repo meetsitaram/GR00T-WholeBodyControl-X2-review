@@ -568,7 +568,7 @@
       <geom name="bowl_wall_yn_vis" size="0.075 0.005 0.02" pos="0 -0.07 0.02" type="box" contype="0" conaffinity="0" group="1" material="bowl_mat" />
       <geom name="bowl_wall_yn" size="0.075 0.005 0.02" pos="0 -0.07 0.02" type="box" friction="1 0.5 0.1" solref="0.001 2" solimp="0.998 0.998" density="500" />
     </body>
-  <camera name="obj_left" pos="0.5000 0.4500 0.9500" fovy="50" mode="targetbody" target="cube_body" /><camera name="obj_right" pos="0.5000 -0.4500 0.9500" fovy="50" mode="targetbody" target="cube_body" /></worldbody>
+  <camera name="obj_left" pos="0.5000 0.4500 0.9500" fovy="50" mode="targetbody" target="cube_body" /><camera name="obj_right" pos="0.5000 -0.4500 0.9500" fovy="50" mode="targetbody" target="cube_body" /><camera name="front_cam" pos="0.9144 0.0000 1.1000" fovy="120" mode="fixed" xyaxes="0.0000 1.0000 0.0000 0.0000 0.0000 1.0000" /></worldbody>
 
   <equality>
     <joint name="left_mimic_thumb_pip" joint1="left_L_thumb_pip_joint" joint2="left_L_thumb_mcp_joint" polycoef="0 1.33 0 0 0" />

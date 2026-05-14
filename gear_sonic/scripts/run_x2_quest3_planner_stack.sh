@@ -879,6 +879,18 @@ fi
 if [[ "${APPLY_OPPOSE_COMP}" -eq 1 ]]; then
     MANAGER_ARGS+=(--apply-oppose-compensation)
 fi
+# Audio cues for X/Y in ARM_MAN ('Recording.' / 'Saved.') are gated on
+# --recorder-enabled to stop the headset from announcing a save in
+# --teleop-only sessions where no parquet is being written. The
+# manager publishes recorder_cmd either way; this only mutes the
+# audio path. Set iff --with-record was requested -- the recorder
+# is the source of truth for whether a save actually landed and we
+# want the operator's audio feedback to track that.
+if [[ "${WITH_RECORD}" -eq 1 ]]; then
+    MANAGER_ARGS+=(--recorder-enabled)
+else
+    MANAGER_ARGS+=(--no-recorder-enabled)
+fi
 
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
@@ -920,7 +932,11 @@ ${C_YELLOW}┌──────────────────────
 │  Continuous waist (v7; soft R stick, position-mapped, slewed 60deg/s):│
 │    R stick fwd / back  forward / backward lean (clamp +/-20deg)      │
 │    R stick L/R soft    torso twist L/R       (clamp +/-40deg)        │
-│    R stick L/R + A     lateral lean L/R sway (clamp +/-10deg)        │
+│    (v7.2: lateral lean / roll removed -- A+R-stick is unreachable    │
+│     mid-lean with a single right thumb. Chain twist+lean instead.)   │
+│  v7.2: R-stick lean+twist now ALSO active in ARM_MANIPULATION        │
+│    (walk / turn still LOCO-only -- arm IK targets ride the torso so  │
+│     leaning extends reach, but a base translation would break IK).   │
 │  Note: the planner-log "command" appears flipped vs. the operator    │
 │  intent because the curated bins were authored in a body frame       │
 │  rotated 180 deg from the bridge's RSI init. End-to-end behaviour    │
@@ -929,7 +945,13 @@ ${C_YELLOW}┌──────────────────────
 │    A press           engage / disengage arm IK                       │
 │    X press           start episode (--with-record only)              │
 │    Y press           stop & save episode (--with-record only)        │
+│    R stick           SAME lean / twist as in LOCOMOTION (v7.2)       │
+│    L stick           NO-OP (walk / step gated to LOCO mode)          │
 │  (B-single still toggles LOCOMOTION <-> ARM_MANIPULATION; no chord.) │
+│  Headset audio for X/Y ('Recording.' / 'Saved.') is gated on the     │
+│  manager's --recorder-enabled flag (set iff --with-record). In       │
+│  TELEOP-ONLY runs no audio fires on X/Y so the operator doesn't      │
+│  get a false ACK; the [recorder] log line is the ground truth.       │
 │  Stick clicks (v7.1; LOCOMOTION + ARM_MAN; idle in OFF):             │
 │    L thumbstick click   cycle deploy MuJoCo viewer fixed cameras     │
 │                         (sends ']' via xdotool; needs xdotool)       │

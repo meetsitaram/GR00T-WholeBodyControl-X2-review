@@ -138,12 +138,21 @@ class HeadCameraSpec:
 
 @dataclass(frozen=True)
 class ExternalCameraSpec:
-    """A free-floating worldbody camera that looks at a target body.
+    """A free-floating worldbody camera. Two flavours:
+
+    * ``target_body`` set + ``xyaxes`` ``None`` -> ``mode="targetbody"``:
+      the optical axis tracks the named MJCF body frame-by-frame so
+      the framing stays useful no matter where the robot drifts. Used
+      by the close-up workspace cameras (``obj_left`` / ``obj_right``).
+
+    * ``target_body`` ``None`` + ``xyaxes`` set -> ``mode="fixed"``:
+      both position and orientation are nailed down at scene-load
+      time. Used by ``front_cam`` (a wide-angle witness camera that
+      stays put even when the robot walks across the scene).
 
     Unlike :class:`HeadCameraSpec` (rigidly attached to a head link),
-    these cameras live on the MuJoCo ``worldbody`` and use the
-    ``mode="targetbody"`` projection so the look direction tracks the
-    robot's pelvis frame-by-frame, regardless of root motion.
+    these all live on the MuJoCo ``worldbody`` and never appear on the
+    real robot -- they're inspection / dataset auxiliaries only.
 
     Attributes:
         name: MJCF camera name (must be unique within the model).
@@ -151,18 +160,40 @@ class ExternalCameraSpec:
             Convention: ``+x`` forward of the robot at episode start,
             ``+z`` up. The pelvis sits near the world origin at
             ``z = 0.793``.
-        target_body: the MJCF body name the camera should track. The
-            X2 root body in the compiled MJCF is ``pelvis`` (the URDF
-            ``base_link`` is collapsed during MuJoCo's URDF import);
-            using the floating-base body keeps the framing stable.
+        target_body: when set, the MJCF body the camera should track
+            (``mode="targetbody"``). The X2 floating-base root body in
+            the compiled MJCF is ``pelvis`` (the URDF ``base_link`` is
+            collapsed during MuJoCo's URDF import). Mutually exclusive
+            with ``xyaxes``.
         fovy: vertical field-of-view in degrees.
+        xyaxes: when set, six floats ``(x_x, x_y, x_z, y_x, y_y, y_z)``
+            describing the camera's local +x and +y axes in world
+            coordinates. The +z axis (and therefore the look direction,
+            which is local -z) is derived as the cross product. Selects
+            ``mode="fixed"``. Mutually exclusive with ``target_body``.
+        aliases: alternative names ``resolve_camera_spec`` will accept.
     """
 
     name: str
     pos: tuple[float, float, float]
-    target_body: str
+    target_body: str | None
     fovy: float
+    xyaxes: tuple[float, float, float, float, float, float] | None = None
     aliases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Either tracking OR fixed -- never both, never neither. Ban
+        # ambiguous specs early so misconfigs surface at module import
+        # rather than at MJCF compile time inside a Docker container.
+        has_target = self.target_body is not None
+        has_axes = self.xyaxes is not None
+        if has_target == has_axes:
+            raise ValueError(
+                f"ExternalCameraSpec {self.name!r}: exactly one of "
+                f"'target_body' (targetbody mode) or 'xyaxes' (fixed "
+                f"mode) must be set; got target_body={self.target_body!r}, "
+                f"xyaxes={self.xyaxes!r}."
+            )
 
 
 # Camera mounting frames -- copy-pasted from
@@ -232,6 +263,24 @@ EXTERNAL_CAMERAS: dict[str, ExternalCameraSpec] = {
         target_body="pelvis",
         fovy=55.0,
         aliases=("overhead", "top_down"),
+    ),
+    # Wide-angle, world-fixed witness camera baked into the robocasa
+    # scene XMLs (see ``_WORKSPACE_CAMERAS`` in
+    # ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``). Sits 3
+    # ft (~0.91 m) in front of the robot's launch position at chest
+    # height, looking back along world -x with world +z as up. 120°
+    # vertical FoV is wide enough to keep the entire X2 + the table
+    # in frame even when the robot leans forward to grasp something.
+    # Recorded into the LeRobot dataset as
+    # ``observation.images.front_cam`` whenever the recorder is
+    # invoked with ``--front-cam`` (default in robocasa scene mode).
+    "front_cam": ExternalCameraSpec(
+        name="front_cam",
+        pos=(0.9144, 0.0, 1.10),
+        target_body=None,
+        xyaxes=(0.0, 1.0, 0.0,  0.0, 0.0, 1.0),
+        fovy=120.0,
+        aliases=("front", "witness"),
     ),
 }
 

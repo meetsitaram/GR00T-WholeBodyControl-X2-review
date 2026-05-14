@@ -500,3 +500,169 @@ def test_sidecar_log_appends_jsonl(tmp_path, manager):
     finally:
         manager._sidecar.close()
         manager._sidecar = None
+
+
+# ---------------------------------------------------------------------------
+# Episode-button audio gating (--recorder-enabled / --no-recorder-enabled).
+#
+# The ZMQ ``recorder_cmd`` PUB is one-way (no ACK channel back to the
+# manager), so prior to v7.2 the headset would say "Recording." / "Saved."
+# on every X / Y press in ARM_MAN regardless of whether the recorder
+# actually accepted the action -- including in ``--teleop-only`` runs
+# where no parquet was being written. The wire path stays unchanged
+# (always publish so the recorder is the source of truth); only the
+# audio path is gated on ``ManagerConfig.recorder_enabled``. The
+# wrapper sets that flag iff ``--with-record`` was passed.
+# ---------------------------------------------------------------------------
+
+
+def _make_button_event(*, x_pressed: bool = False, y_pressed: bool = False):
+    from gear_sonic.utils.teleop.vr.button_state_machine import ButtonEvents
+    return ButtonEvents(
+        a_pressed=False, b_pressed=False,
+        x_pressed=x_pressed, y_pressed=y_pressed,
+        ab_pressed=False, xy_pressed=False,
+        ax_pressed=False, by_pressed=False,
+        abxy_pressed=False,
+    )
+
+
+def test_x_press_in_arm_man_publishes_recorder_cmd_when_audio_disabled(manager):
+    """Wire path is unconditional: even with audio gated OFF the recorder
+    must still receive the ``start`` command so it can decide to honour
+    or ignore it. Otherwise the operator could never start recording in
+    a session where they manually disabled the cue."""
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    manager._intent._mode = StreamMode.ARM_MANIPULATION
+    manager._cfg.recorder_enabled = False
+    sent_audio: list[dict] = []
+    manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+    manager._publish_recorder_cmd = MagicMock()
+
+    manager._handle_episode_buttons(_make_button_event(x_pressed=True), tick=42)
+
+    manager._publish_recorder_cmd.assert_called_once_with("start", 42)
+    audio_msgs = [m for m in sent_audio if m.get("_type") == "play_audio"]
+    assert audio_msgs == [], (
+        "audio cue fired despite recorder_enabled=False; this is the "
+        "exact false-ACK regression v7.2 set out to fix"
+    )
+
+
+def test_y_press_in_arm_man_publishes_recorder_cmd_when_audio_disabled(manager):
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    manager._intent._mode = StreamMode.ARM_MANIPULATION
+    manager._cfg.recorder_enabled = False
+    sent_audio: list[dict] = []
+    manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+    manager._publish_recorder_cmd = MagicMock()
+
+    manager._handle_episode_buttons(_make_button_event(y_pressed=True), tick=99)
+
+    manager._publish_recorder_cmd.assert_called_once_with("save", 99)
+    audio_msgs = [m for m in sent_audio if m.get("_type") == "play_audio"]
+    assert audio_msgs == []
+
+
+def test_x_press_in_arm_man_plays_audio_when_recorder_enabled(manager):
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    manager._intent._mode = StreamMode.ARM_MANIPULATION
+    manager._cfg.recorder_enabled = True
+    sent_audio: list[dict] = []
+    manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+    manager._publish_recorder_cmd = MagicMock()
+
+    manager._handle_episode_buttons(_make_button_event(x_pressed=True), tick=7)
+
+    manager._publish_recorder_cmd.assert_called_once_with("start", 7)
+    audio_msgs = [m for m in sent_audio if m.get("_type") == "play_audio"]
+    assert len(audio_msgs) == 1
+    assert audio_msgs[0]["key"] == "record_start"
+    assert audio_msgs[0]["fallback"] == "Recording."
+
+
+def test_y_press_in_arm_man_plays_audio_when_recorder_enabled(manager):
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    manager._intent._mode = StreamMode.ARM_MANIPULATION
+    manager._cfg.recorder_enabled = True
+    sent_audio: list[dict] = []
+    manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+    manager._publish_recorder_cmd = MagicMock()
+
+    manager._handle_episode_buttons(_make_button_event(y_pressed=True), tick=11)
+
+    manager._publish_recorder_cmd.assert_called_once_with("save", 11)
+    audio_msgs = [m for m in sent_audio if m.get("_type") == "play_audio"]
+    assert len(audio_msgs) == 1
+    assert audio_msgs[0]["key"] == "record_save"
+    assert audio_msgs[0]["fallback"] == "Saved."
+
+
+def test_x_press_outside_arm_man_does_not_publish_or_play(manager):
+    """Recording is ARM_MAN-only; X in OFF or LOCO must not poke the
+    recorder OR the audio. Locking this in so a future refactor can't
+    accidentally fire 'Recording.' while the operator is just walking."""
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    for mode in (StreamMode.OFF, StreamMode.LOCOMOTION):
+        manager._intent._mode = mode
+        manager._cfg.recorder_enabled = True  # cue would fire in ARM_MAN
+        sent_audio: list[dict] = []
+        manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+        manager._publish_recorder_cmd = MagicMock()
+
+        manager._handle_episode_buttons(
+            _make_button_event(x_pressed=True), tick=1,
+        )
+
+        manager._publish_recorder_cmd.assert_not_called()
+        assert sent_audio == [], f"audio leaked in mode {mode.name}"
+
+
+def test_y_press_outside_arm_man_does_not_publish_or_play(manager):
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    for mode in (StreamMode.OFF, StreamMode.LOCOMOTION):
+        manager._intent._mode = mode
+        manager._cfg.recorder_enabled = True
+        sent_audio: list[dict] = []
+        manager._quest.send_message = lambda p: (sent_audio.append(p), True)[1]
+        manager._publish_recorder_cmd = MagicMock()
+
+        manager._handle_episode_buttons(
+            _make_button_event(y_pressed=True), tick=1,
+        )
+
+        manager._publish_recorder_cmd.assert_not_called()
+        assert sent_audio == []
+
+
+def test_default_recorder_enabled_is_false(manager):
+    """The default ManagerConfig (and therefore a manual ``python -m
+    gear_sonic.scripts.quest3_manager_x2`` launch with no flags) must
+    leave audio gated OFF -- the wrapper opts in via --recorder-enabled
+    when --with-record is set, so the safe default is silence."""
+    assert manager._cfg.recorder_enabled is False
+
+
+def test_cli_flag_recorder_enabled_flips_default():
+    """``--recorder-enabled`` on the CLI must produce a config with the
+    field set to True; ``--no-recorder-enabled`` resets to False."""
+    from gear_sonic.scripts.quest3_manager_x2 import _build_parser
+
+    parser = _build_parser()
+    args = parser.parse_args(["--recorder-enabled"])
+    assert args.recorder_enabled is True
+
+    args2 = parser.parse_args(["--recorder-enabled", "--no-recorder-enabled"])
+    assert args2.recorder_enabled is False
+
+    args3 = parser.parse_args([])
+    assert args3.recorder_enabled is False, (
+        "default changed; the wrapper relies on the safe-silent default "
+        "for --teleop-only sessions"
+    )

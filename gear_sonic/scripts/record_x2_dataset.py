@@ -43,6 +43,29 @@ if str(REPO_ROOT) not in sys.path:
 # happens inside ``main()`` -- see the deferred-import comment below.
 
 
+def _resolve_front_cam_default(
+    explicit: bool | None,
+    scene_xml_path: Path | None,
+) -> bool:
+    """Resolve ``--front-cam`` / ``--no-front-cam`` to a ``bool``.
+
+    Precedence:
+      1. Explicit operator flag (``True`` / ``False``) wins.
+      2. Otherwise default to ``True`` iff a scene XML is loaded
+         (``front_cam`` only exists in the robocasa-built MJCFs --
+         see ``_WORKSPACE_CAMERAS`` in
+         ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``).
+
+    Centralized here so the wrapper script
+    (``run_x2_quest3_planner_stack.sh``) doesn't need to mirror the
+    decision: passing ``--robocasa-env <env>`` alone is enough to
+    light up both the scene XML and the second camera.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return scene_xml_path is not None
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -267,6 +290,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "reset (object placement randomization). Useful for "
              "reproducible smoke tests.",
     )
+    # ── Wide-angle world-fixed witness camera (`front_cam`) ────────────
+    # The robocasa scene XMLs (built by build_x2_robocasa_scene_xml.py)
+    # bake in a 120° FoV camera 3 ft in front of the robot launch
+    # position at chest height. When --front-cam is set, the recorder
+    # builds a second MujocoFrameRenderer pinned to it and writes the
+    # frames as `observation.images.front_cam` alongside the existing
+    # `observation.images.ego_view`. Defaults to None so we can flip
+    # to True iff a scene XML is actually loaded (the legacy flat-floor
+    # MJCF doesn't contain the camera). Pass --no-front-cam to opt out
+    # explicitly (e.g. to keep the legacy single-camera schema for an
+    # existing dataset directory you're appending to).
+    front_grp = parser.add_argument_group("front_cam (witness view)")
+    front_grp.add_argument(
+        "--front-cam", dest="front_cam",
+        action="store_true", default=None,
+        help=(
+            "Enable the world-fixed wide-angle witness camera "
+            "(observation.images.front_cam). Defaults to True iff "
+            "--robocasa-env != none / --scene-xml-path resolves; pass "
+            "--no-front-cam to opt out. The camera lives in the scene "
+            "XML (see _WORKSPACE_CAMERAS in "
+            "gear_sonic/scripts/build_x2_robocasa_scene_xml.py); "
+            "asking for it without a scene XML is a no-op + warning "
+            "(legacy flat-floor MJCF has no front_cam definition)."
+        ),
+    )
+    front_grp.add_argument(
+        "--no-front-cam", dest="front_cam",
+        action="store_false",
+        help=(
+            "Suppress the front_cam video track. Use this when "
+            "appending to a pre-existing single-camera LeRobot "
+            "dataset directory whose meta/info.json was written "
+            "without the front_cam feature (the exporter rejects "
+            "post-hoc schema additions)."
+        ),
+    )
     # Stash the resolved scenes dir on the parser so the resolver in
     # main() can find scene XMLs without recomputing the path.
     parser.set_defaults(_robocasa_scenes_dir=_scenes_dir)
@@ -452,6 +512,9 @@ def main(argv: list[str] | None = None) -> int:
         log_sonic_correction=(not args.no_sonic_correction_log),
         scene_xml_path=scene_xml_path,
         robocasa_env=robocasa_env_name,
+        record_front_cam=_resolve_front_cam_default(
+            args.front_cam, scene_xml_path
+        ),
         scene_state_sub_host=args.scene_state_sub_host,
         scene_state_sub_port=args.scene_state_sub_port,
         scene_reset_pub_host=args.scene_reset_pub_host,
