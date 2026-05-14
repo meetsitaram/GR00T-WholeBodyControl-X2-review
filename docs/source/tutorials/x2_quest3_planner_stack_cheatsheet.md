@@ -139,7 +139,7 @@ Most planner primitives are **single-stride**: one push of the L stick = one `fw
 | **B press** | back to LOCOMOTION; clears the latched waist hold so the right stick takes over again |
 | **X press** | start episode  *(`--with-record` only; no-op if already recording)* |
 | **Y press** | stop & save episode  *(`--with-record` only; no-op if no open episode)* |
-| **L thumbstick click** | cycle deploy MuJoCo viewer's fixed cameras (Tab-equivalent; works in LOCOMOTION too). Pre-v7.1 this was the right click. |
+| **L thumbstick click** | cycle deploy MuJoCo viewer's fixed cameras (synthesises a `]` keystroke; works in LOCOMOTION too). Pre-v7.1 this was the right click; v7.1 also briefly used `Tab` here, but `Tab` only toggles the viewer's left UI panel — `]` is the real "next fixed camera" key. |
 | **R thumbstick click** | toggle waist freeze on / off — same control as in LOCOMOTION. Useful to release a freeze without flipping back to LOCOMOTION first. |
 | **R stick** | **No-op for waist** while in this mode (the body is held at the latched pose). |
 
@@ -292,16 +292,18 @@ If a cue is missing on the headset, check (1) the headset isn't muted in Quest S
 
 ---
 
-## Camera cycling (left thumbstick click → deploy viewer Tab)
+## Camera cycling (left thumbstick click → deploy viewer `]`)
 
-Manipulation work benefits a lot from re-framing — picking up a small object reads better from `obj_left` or `obj_right` than from `ego_view`. Pressing the **left thumbstick click** sends a synthetic `Tab` keystroke to the deploy MuJoCo viewer's GLFW window, cycling the same fixed cameras you'd cycle from the workstation keyboard. Pre-v7.1 this was on the right click, but the right click is now reserved for the waist freeze toggle so the operator can keep their right thumb on the lean / twist stick.
+Manipulation work benefits a lot from re-framing — picking up a small object reads better from `obj_left` or `obj_right` than from `ego_view`. Pressing the **left thumbstick click** sends a synthetic `]` keystroke to the deploy MuJoCo viewer's GLFW window, cycling the same fixed cameras you'd cycle from the workstation keyboard. Pre-v7.1 this was on the right click, but the right click is now reserved for the waist freeze toggle so the operator can keep their right thumb on the lean / twist stick.
+
+> **Why `]` and not `Tab`?** v7.1 originally synthesised `Tab` because that key was named in an early cheatsheet draft, but `Tab` actually toggles the viewer's **left UI panel** in `mujoco.viewer.launch_passive` and leaves the active camera unchanged. The next-fixed-camera key is `]` (xdotool keysym `bracketright`); the previous is `[` (`bracketleft`); `Esc` snaps back to the free orbit camera. Verified live on `mujoco==3.5.0`. Override via `ViewerCameraCycler.CYCLE_KEYSYM` if you want to cycle backwards.
 
 | Camera (default order) | What it shows |
 |------------------------|---------------|
 | `obj_left`             | Wrist-side view biased to the robot's left hand |
 | `obj_right`            | Wrist-side view biased to the robot's right hand |
 | `rgbd_head_front`      | Head-mounted, near identical to the recorded `ego_view` |
-| free orbit             | Mouse-controlled (after Tab cycles past the fixed cameras) |
+| free orbit             | Mouse-controlled (cycle past all fixed cameras with `]`, or press `Esc` directly) |
 
 Active in **LOCOMOTION** and **ARM_MANIPULATION**, idle in OFF. Rate-limited to ~250 ms so a noisy stick can't fire 5 Tabs and overshoot the camera you wanted.
 
@@ -346,11 +348,23 @@ tail -F /tmp/x2_quest3_planner_stack-*/manager.log | grep -E 'First tracking|R-c
 
 If the `First tracking data received!` line shows `buttons: {'leftTrigger': ..., 'rightTrigger': ..., ..., 'a': False, 'b': False, 'x': False, 'y': False}` — **eight keys, no `leftStickClick` / `rightStickClick`** — your browser is on the cached old build. Fix: take the headset off, **fully close the Quest Browser tab** (long-press → close, not just background it), reopen `https://<workstation-ip>:8443`, hit "Start VR" again. The Python HTTP server already sends `Cache-Control: no-cache, no-store, must-revalidate + Pragma: no-cache` so a fresh tab reload fetches the new JS.
 
-If the `buttons:` line **does** include `leftStickClick / rightStickClick` keys but pressing the click still doesn't log `R-stick click` in the manager log, the headset / browser combo isn't exposing `gpad.buttons[3]` (rare on older Quest Browser builds). Workaround: use the workstation `Tab` key directly — the cycler is purely additive, it doesn't disable the keyboard binding.
+If the `buttons:` line **does** include `leftStickClick / rightStickClick` keys but pressing the click still doesn't log `L-stick click` in the manager log, the headset / browser combo isn't exposing `gpad.buttons[3]` (rare on older Quest Browser builds). Workaround: use the workstation `]` key directly on the focused MuJoCo viewer window — the cycler is purely additive, it doesn't disable the keyboard binding.
 
-### "manager logs `cycled deploy viewer camera (Tab)` but the camera doesn't actually move"
+### "manager logs `[L-click] camera cycle: ok` but the camera doesn't actually move"
 
-This is the GNOME-Shell mutter-frames bug fixed 2026-05-13. On GNOME (and a few other compositors that wrap X11 clients in a decorative window) `xdotool search --name "MuJoCo"` returns **two** windows — the real GLFW viewer (class `MuJoCo`) and the compositor's frame wrapper (class `mutter-x11-frames`). The wrapper has the right title but doesn't have a GLFW event loop, so synthetic Tab events to it land in the void. Pre-fix, the cycler picked the wrapper; post-fix it filters by `--classname MuJoCo` first and falls back to a class-filtered name search that excludes `mutter-x11-frames` explicitly.
+Two known causes:
+
+1. **Wrong keysym** — the cycler is dispatching a key but the viewer doesn't bind it to camera-cycle. v7.1 originally sent `Tab`, which only toggles the left UI panel; the fix is to send `]` (xdotool keysym `bracketright`). Pinned by `test_cycler_default_keysym_is_bracketright_not_tab`. If your fork uses a custom MuJoCo build that rebinds `]`, override `ViewerCameraCycler.CYCLE_KEYSYM` (e.g. to `F2` or whatever the build uses).
+
+2. **GNOME mutter wrapper swallowing the keystroke** (fixed 2026-05-13). On GNOME (and a few other compositors that wrap X11 clients in a decorative window) `xdotool search --name "MuJoCo"` returns **two** windows — the real GLFW viewer (class `MuJoCo`) and the compositor's frame wrapper (class `mutter-x11-frames`). The wrapper has the right title but doesn't have a GLFW event loop, so synthetic key events to it land in the void. Pre-fix, the cycler picked the wrapper; post-fix it filters by `--classname MuJoCo` first and falls back to a class-filtered name search that excludes `mutter-x11-frames` explicitly.
+
+To diagnose without putting the headset on, run the standalone CLI:
+
+```bash
+.venv/bin/python -m gear_sonic.utils.teleop.vr.viewer_camera_cycler --repeat 3 -v
+```
+
+It prints the resolved DISPLAY, xdotool path, search pattern, and the keysym it'll send, then dispatches `cycle()` three times against the live viewer. If you see `OK ('bracketright' dispatched)` three times AND the viewer rotates through three cameras, the path is healthy. If the dispatcher reports OK but the viewer doesn't move, you're hitting one of the two causes above.
 
 If you ever hit this again on a fresh compositor / window manager, confirm by running on the workstation:
 
@@ -381,11 +395,17 @@ The wrapper can launch the deploy with a pre-built **robocasa scene XML** so the
 The XML lives at `gear_sonic/data/assets/robocasa_scenes/<env>.xml`. Build it once per env (or after editing the underlying robocasa env):
 
 ```bash
-# Pick-place cube on a table:
+# Pick-place cube on a table (red primitive cube → blue bowl):
 python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube
 
-# Pick-place bowl on a table:
+# Pick-place bowl on a table (blue primitive bowl → green target zone):
 python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+
+# Pick-place apple on a table (real-mesh apple → blue bowl):
+python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceApple
+
+# Or build all bundled scenes in one go:
+python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
 ```
 
 The build script writes both the `.xml` and a `.json` sidecar (joint/body/site names, freejoint qpos addresses, instruction text). The wrapper, the deploy bridge, and the recorder all read the sidecar — don't edit the `.xml` by hand.
@@ -444,7 +464,13 @@ gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
 
 ### Picking the right `--robocasa-env`
 
-`X2PickPlaceCube` and `X2PickPlaceBowl` both put a single object on a low table within reach of the X2's pre-calibrated arm workspace. They're the only two envs we've validated end-to-end with the deploy bridge + recorder; adding a new env means writing a `RobocasaTaskMirror` subclass, building its scene XML, and re-running the in-sim object-placement sanity check before recording any episodes.
+`X2PickPlaceCube`, `X2PickPlaceBowl`, and `X2PickPlaceApple` all put a single object on a low table within reach of the X2's pre-calibrated arm workspace. They're the only three envs we've validated end-to-end with the deploy bridge + recorder; adding a new env means writing a `RobocasaTaskMirror` subclass (or, for "object → bowl" siblings of the cube task, registering a new oracle entry that reuses `_phase_pick_place_apple`-style helpers), building its scene XML, and re-running the in-sim object-placement sanity check before recording any episodes.
+
+| `--robocasa-env`     | Manipulable object             | Receptacle                | Success criterion                                        | Notes |
+|----------------------|--------------------------------|---------------------------|----------------------------------------------------------|-------|
+| `X2PickPlaceCube`    | `PrimitiveCube` (red, ~4.4 cm) | `PrimitiveBowl` (blue)    | Cube xy inside bowl footprint, z within wall window, upright | Original validation scene. Sharp corners are easy for the OmniHand to "trap". |
+| `X2PickPlaceBowl`    | `PrimitiveBowl` (blue)         | `PrimitiveFixture` (green target zone) | Bowl xy / z inside target zone, upright             | The bowl is bigger than the cube; tests the OmniHand's ability to grasp a thin-walled receptacle by its rim. |
+| `X2PickPlaceApple`   | `apple_0` real-mesh (~7.4 cm)  | `PrimitiveBowl` (blue)    | Apple xy inside bowl footprint, z within wall window. **No uprightness check** (apple is roughly spherical). | Real-mesh sibling of the cube task. Same bowl + table + spawn ranges; mix-and-match with cube data for VLA training without renormalising rewards. The apple's curved sides + stem indent stress non-convex grasping that a cube-only policy never sees. |
 
 ### Custom scene XMLs (rare)
 

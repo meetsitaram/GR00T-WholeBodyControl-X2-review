@@ -243,8 +243,9 @@ Bundled scenes live in `gear_sonic/data/assets/robocasa_scenes/`:
 
 | File | Env | Task instruction |
 |------|-----|------------------|
-| `X2PickPlaceCube.xml` + `.json` | `X2PickPlaceCube` | pick up the red cube and drop it into the blue bowl |
-| `X2PickPlaceBowl.xml` + `.json` | `X2PickPlaceBowl` | pick up the blue bowl and place it on the green target zone |
+| `X2PickPlaceCube.xml` + `.json`  | `X2PickPlaceCube`  | pick up the red cube and drop it into the blue bowl                 |
+| `X2PickPlaceBowl.xml` + `.json`  | `X2PickPlaceBowl`  | pick up the blue bowl and place it on the green target zone         |
+| `X2PickPlaceApple.xml` + `.json` | `X2PickPlaceApple` | pick up the apple and drop it into the blue bowl (real-mesh sibling of cube) |
 
 The `.json` sidecar is the source of truth for which freejoints /
 welded bodies are scene-mutable; the bridge auto-discovers it from the
@@ -289,24 +290,42 @@ robosuite + `compose_x2_with_omnihand`'s MuJoCo 3.5.0 features).
 Three files to touch, in order:
 
 1. **Define the env class.** Add a new `X2PickPlace<Name>` subclass to
-   `decoupled_wbc/dexmg/gr00trobocasa/robocasa/environments/locomanipulation/x2_tabletop_pnp.py`
-   (you can copy the cube class as a template). Make sure it ends up
-   exported from the package's `__init__.py`.
+   `decoupled_wbc/dexmg/gr00trobocasa/robocasa/environments/locomanipulation/x2_tabletop_pnp.py`.
+   Two templates to copy from depending on the manipulable type:
+   * **Primitive box / sphere / bowl prop?** Copy `X2PickPlaceCube` —
+     it inlines a `PrimitiveCube` directly into `self.model.worldbody`
+     after `super()._load_model()` runs.
+   * **Real-mesh `MJCFObject` from the upstream locomanip asset
+     library?** Copy `X2PickPlaceApple` — it overrides the
+     `_build_mujoco_objects()` hook on `LMTabletopFixedBase` to
+     append the MJCFObject to `self.mujoco_objects` BEFORE
+     `super()._load_model()` runs (so robosuite merges its
+     `<asset>` section + auto-generates the free joint).
+   Make sure the new class ends up exported from the package's
+   `__init__.py`.
 2. **Register it in the builder.** Add an entry to `_KNOWN_ENVS` in
    `gear_sonic/scripts/build_x2_robocasa_scene_xml.py` with the env
-   name, the canonical task string, and any extra metadata fields.
+   name, the canonical task string, the body / freejoint / contact-geom
+   names, and the manipulable-target body. For an MJCFObject(name=X)
+   the conventions are `X_main` (root body) / `X_joint0` (auto free
+   joint) / `X_g1..X_gN` (collision geoms; `X_g0` is the visual mesh
+   and has no contact channel).
 3. **Register the oracle.** Add a `_TaskOracle` to `_ORACLES` in
    `gear_sonic/utils/teleop/robocasa_task_mirror.py` with the
    pure-MuJoCo `success_fn` / `reward_fn` / `subtasks_fn` for that
-   task. Mirror the upstream env's `_check_success` /
-   `get_subtask_term_signals` exactly.
+   task. For "object-into-bowl" siblings of the cube task you can
+   crib `_phase_pick_place_apple` directly — same six-rung phase
+   ladder, just substitute the body / half-size / phase-name prefix.
 
 Then build the XML once (`build_x2_robocasa_scene_xml --env <Name>`),
 extend the `--robocasa-env` choices in
-`gear_sonic/scripts/record_x2_dataset.py` and
-`gear_sonic/scripts/record_x2_dataset.sh` (search for the existing
-choices list — it's small), and add a smoke test in
-`tests/test_x2_robocasa_scene_mode.py`.
+`gear_sonic/scripts/record_x2_dataset.py`,
+`gear_sonic/scripts/record_x2_dataset.sh`, and
+`gear_sonic/scripts/run_x2_quest3_planner_stack.sh` (search for the
+existing choices list — it's small), and add the new env name to
+`BUNDLED_SCENES` in `tests/test_x2_robocasa_scene_mode.py` (which auto-
+parametrises every scene-load / metadata / camera / hand-collision-
+filter / fist-disable test for the new scene).
 
 ---
 
@@ -415,6 +434,82 @@ finger-vs-cube and finger-vs-bowl contact pairs, which is exactly
 what the contact-walker above needs. Cost in the bridge is
 single-digit-ms per tick on the X2 + tabletop scene.
 
+#### Hand self-collision filter (the `(2, 1)` bitmask trick)
+
+Naively flipping `disable_hand_collisions=False` re-enables collisions
+for every URDF-derived OmniHand primitive, which immediately uncovers
+a problem: the palm cylinder (z≈-0.062 in the wrist frame), the palm
+box (z≈-0.112), and the thumb MCP / PIP / DIP boxes all overlap with
+the fingertip cylinders when the operator commands a curl. The
+constraint forces from those overlaps routinely exceed the 3 Nm
+position-actuator limit, so the fingers physically pin half-open and
+"fully close" never reaches the commanded angle. (Symptom in the
+viewer: the curl visibly stops short and the actuator setpoint trace
+diverges from the measured joint angle.)
+
+The fix lives in `compose_x2_with_omnihand._filter_hand_self_collisions`
+and uses MuJoCo's contype/conaffinity bitmasks. Every OmniHand
+collision geom (palm primitives + every finger box/cylinder, walked
+inclusively from each `*_wrist_roll_link` body) gets re-classed to:
+
+```
+contype     = _HAND_COLLISION_CHANNEL = 2
+conaffinity = _WORLD_CHANNEL          = 1
+```
+
+Every other geom in the scene (cube_collider, bowl_floor, table mesh,
+floor mesh, X2 body collisions, even X2's own `*_wrist_roll_link`
+collision MESH) keeps the MuJoCo default `(contype=1, conaffinity=1)`.
+The MuJoCo contact rule `(c1 & a2) || (c2 & a1)` then evaluates as:
+
+| Pair | Math | Result |
+|------|------|--------|
+| Hand vs cube / bowl / table / floor / X2 body (default 1, 1) | `(2 & 1) \| (1 & 1) = 0 \| 1 = 1` | **contact ✓** (grasp + table contact + everything else fires) |
+| Hand vs hand (palm-vs-finger, finger-vs-finger, both sides) | `(2 & 1) \| (2 & 1) = 0 \| 0 = 0` | filtered (no self-pinning) |
+
+Two corollaries that surprise people:
+
+1. **Finger-vs-finger is also filtered.** The (2, 1) scheme can't
+   distinguish "palm" geoms from "finger" geoms -- they all carry the
+   same bitmask -- so adjacent fingertips also pass through each
+   other when their colliders overlap. In practice this is fine for
+   pick-and-place: the thumb does cross the index finger when the
+   hand fully closes, but the cube is between the fingertips and the
+   palm so the grasp still works. If a future task needs realistic
+   finger-vs-finger contact (precision pinch, reading a textured
+   surface with the index pad), split palm and finger geoms onto
+   different advertised channels and have fingers OR a finger channel
+   into their own conaffinity. The infrastructure is ready -- just
+   add a third class.
+
+2. **X2's own wrist-roll collision mesh stays at (1, 1).** The walk
+   visits the wrist body itself (so it can re-class the OmniHand palm
+   primitives, which mount directly under the wrist), but discriminates
+   X2's own wrist mesh by `geom.type == mjGEOM_MESH` and skips it.
+   This keeps the X2 body model byte-identical to the SONIC pipeline.
+
+The bundled scene XMLs (`gear_sonic/data/assets/robocasa_scenes/*.xml`)
+already ship with the (2, 1) filter baked in. The pytest suite has
+three regression guards in `tests/test_x2_robocasa_scene_mode.py`:
+
+* `test_scene_xml_hand_geoms_use_self_collision_filter` -- every hand
+  geom in the bundled XMLs carries (2, 1), and X2's own wrist mesh
+  remains at (1, 1).
+* `test_scene_xml_touchable_geoms_keep_default_channel` -- cube /
+  bowl / target colliders keep their default (1, 1), so the (2, 1)
+  hand filter actually fires against them.
+* `test_compose_filter_keeps_world_contacts_but_drops_self_contacts`
+  -- direct unit test on the composer, no scene XML required:
+  builds the augmented MJCF in-process and verifies the contact rule
+  evaluates to True for hand-vs-world and False for hand-vs-hand.
+
+If you change the bitmask values, rebuild the scene XMLs:
+
+```bash
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
+.venv_sim/bin/python -m pytest tests/test_x2_robocasa_scene_mode.py -v
+```
+
 ### What lives where
 
 | File | Role |
@@ -426,7 +521,7 @@ single-digit-ms per tick on the X2 + tabletop scene.
 | `gear_sonic/utils/teleop/zmq/scene_state_zmq.py` | Wire format helpers (`pack_json` / `unpack_json` / `serialize_*` / `parse_*`). |
 | `gear_sonic/scripts/build_x2_robocasa_scene_xml.py` | Static scene XML builder (compose-driven). |
 | `gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py` | MuJoCo bridge that lives inside `docker_x2`. Handles `--mjcf`, scene metadata auto-discovery, scene_state PUB, scene_reset SUB, and pyzmq self-install. |
-| `decoupled_wbc/dexmg/gr00trobocasa/robocasa/environments/locomanipulation/x2_tabletop_pnp.py` | The X2-specific robocasa env classes (`X2PickPlaceCube`, `X2PickPlaceBowl`, primitives). |
+| `decoupled_wbc/dexmg/gr00trobocasa/robocasa/environments/locomanipulation/x2_tabletop_pnp.py` | The X2-specific robocasa env classes (`X2PickPlaceCube`, `X2PickPlaceBowl`, `X2PickPlaceApple`, primitives, and the `LMTabletopFixedBase` base class with its `_build_mujoco_objects` hook). |
 
 ---
 
@@ -436,7 +531,7 @@ single-digit-ms per tick on the X2 + tabletop scene.
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--robocasa-env {none, X2PickPlaceCube, X2PickPlaceBowl}` | `none` | Switch into scene mode. Resolves scene XML, forwards `--sim-mjcf`, forces `--sim-with-omnihand`, fills `--task` from sidecar. |
+| `--robocasa-env {none, X2PickPlaceCube, X2PickPlaceBowl, X2PickPlaceApple}` | `none` | Switch into scene mode. Resolves scene XML, forwards `--sim-mjcf`, forces `--sim-with-omnihand`, fills `--task` from sidecar. |
 | `--output-dir <path>` | required (unless `--teleop-only`) | LeRobot dataset destination. Pre-flight cleanup runs if a stub is present. |
 | `--task "<instruction>"` | optional in scene mode (auto-filled) | Override the language instruction for this session. |
 | `--sonic-checkpoint <path-to-.pt>` | required (or `--deploy-model-dir`) | Used to derive the deploy's `exported/*.onnx` bundle path. |
@@ -485,6 +580,12 @@ bash gear_sonic/scripts/record_x2_dataset.sh \
 bash gear_sonic/scripts/record_x2_dataset.sh \
     --output-dir data/lerobot/x2_place_bowl_v0 \
     --robocasa-env X2PickPlaceBowl \
+    --sonic-checkpoint <path>.pt
+
+# Real-mesh apple → blue bowl (sibling of the cube task)
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_pnp_apple_v0 \
+    --robocasa-env X2PickPlaceApple \
     --sonic-checkpoint <path>.pt
 ```
 

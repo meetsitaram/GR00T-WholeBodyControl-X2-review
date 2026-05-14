@@ -222,7 +222,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--robocasa-env",
-        choices=("none", "X2PickPlaceCube", "X2PickPlaceBowl"),
+        choices=("none", "X2PickPlaceCube", "X2PickPlaceBowl", "X2PickPlaceApple"),
         default="none",
         help="When != 'none', the recorder switches into robocasa scene "
              "mode: it loads "

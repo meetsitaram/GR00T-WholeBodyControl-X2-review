@@ -299,7 +299,8 @@ sample at every other frame.
 ## 6. Robocasa scene mode — what changes
 
 When the wrapper is launched with `--robocasa-env X2PickPlaceCube` (or
-`X2PickPlaceBowl`), three things happen on top of the flat-floor flow:
+`X2PickPlaceBowl` / `X2PickPlaceApple`), three things happen on top of
+the flat-floor flow:
 
 1. **Wrapper resolves** `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
    (one-time built via
@@ -426,7 +427,7 @@ Run one stage in isolation — useful for debugging without the full stack.
 
 | Script | Purpose |
 |--------|---------|
-| `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env {X2PickPlaceCube,X2PickPlaceBowl,--all}` | Build a robocasa scene MJCF + JSON sidecar. Required before first robocasa launch. |
+| `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env {X2PickPlaceCube,X2PickPlaceBowl,X2PickPlaceApple,--all}` | Build a robocasa scene MJCF + JSON sidecar. Required before first robocasa launch. |
 | `python -m gear_sonic.scripts.build_x2_planner_primitives` | Build the planner's motion primitive PKL from recipe sources. |
 | `python -m gear_sonic.scripts.bake_planner_demo_to_pkl --demo <yaml> --out <pkl>` | Bake a scripted YAML demo into a PKL the deploy can replay via `--motion`. |
 | `python -m gear_sonic.scripts.bake_planner_rsi_anchor` | Bake the RSI anchor PKL used by `--sim-profile parity` (auto-rebuilt by the wrapper if missing). |

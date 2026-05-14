@@ -162,6 +162,43 @@ _KNOWN_ENVS: dict[str, SceneEnvSpec] = {
             "target": ("target_collider",),
         },
     ),
+    "X2PickPlaceApple": SceneEnvSpec(
+        env_name="X2PickPlaceApple",
+        task_string="pick up the apple and drop it into the blue bowl",
+        # Body names follow robosuite's MJCFObject convention (the apple
+        # is loaded as ``MJCFObject(name="apple", static=False)`` so its
+        # root body is ``apple_main`` and its auto-generated free joint
+        # is ``apple_joint0``). The bowl is the same welded
+        # ``PrimitiveBowl`` X2PickPlaceCube uses.
+        scene_body_names=("table_body_main", "apple_main", "bowl_body"),
+        object_freejoint_map={"apple": "apple_joint0"},
+        object_welded_map={"bowl": "bowl_body", "table": "table_body_main"},
+        manipulable_target_body="apple_main",
+        object_contact_geoms={
+            # MJCFObject auto-names the apple's geoms as ``apple_g0``
+            # (the visual mesh) ... ``apple_g5`` (the 5 convex-
+            # decomposition collision fragments). Only the collision
+            # geoms (g1..g5) belong here; the visual geom has
+            # contype=conaffinity=0 and never enters mj_data.contact[]
+            # anyway.
+            "apple": (
+                "apple_g1",
+                "apple_g2",
+                "apple_g3",
+                "apple_g4",
+                "apple_g5",
+            ),
+            # PrimitiveBowl emits five colliders: the floor + four walls.
+            # Same names as in X2PickPlaceCube (PrimitiveBowl is shared).
+            "bowl": (
+                "bowl_floor",
+                "bowl_wall_xp",
+                "bowl_wall_xn",
+                "bowl_wall_yp",
+                "bowl_wall_yn",
+            ),
+        },
+    ),
 }
 
 

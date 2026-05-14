@@ -46,7 +46,7 @@
 # Usage:
 #   gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
 #       [--duration N] [--with-record] [--output-dir PATH] [--task STR]
-#       [--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl}]
+#       [--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl,X2PickPlaceApple}]
 #       [--scene-xml-path PATH] [--episode-seed N]
 #       [--model PATH] [--calibration PATH] [--operator-id NAME]
 #       [--no-deploy] [--no-sim-viewer] [--sim-profile {parity,manual}]
@@ -595,7 +595,7 @@ fi
 ROBOCASA_SCENE_XML=""
 case "${ROBOCASA_ENV}" in
     none) ;;
-    X2PickPlaceCube|X2PickPlaceBowl)
+    X2PickPlaceCube|X2PickPlaceBowl|X2PickPlaceApple)
         if [[ -n "${SCENE_XML_PATH}" ]]; then
             ROBOCASA_SCENE_XML="${SCENE_XML_PATH}"
         else
@@ -615,7 +615,7 @@ case "${ROBOCASA_ENV}" in
         # invariant.)
         ;;
     *)
-        err "--robocasa-env must be one of 'none', 'X2PickPlaceCube', 'X2PickPlaceBowl' (got '${ROBOCASA_ENV}')"
+        err "--robocasa-env must be one of 'none', 'X2PickPlaceCube', 'X2PickPlaceBowl', 'X2PickPlaceApple' (got '${ROBOCASA_ENV}')"
         exit 1
         ;;
 esac
@@ -917,9 +917,10 @@ ${C_YELLOW}┌──────────────────────
 │    L stick L/R       side_left_step / side_right_step                │
 │    R stick L/R hard  turn_left_45deg / turn_right_45deg              │
 │    R stick L/R hard + X held   turn_left_90deg / turn_right_90deg    │
-│  Disabled (replay bins that snap back; pass --enable-* to restore):  │
-│    R stick fwd       lean_fwd_*       (--enable-lean-fwd)            │
-│    R stick L/R soft  torso_*_30deg    (--enable-torso)               │
+│  Continuous waist (v7; soft R stick, position-mapped, slewed 60deg/s):│
+│    R stick fwd / back  forward / backward lean (clamp +/-20deg)      │
+│    R stick L/R soft    torso twist L/R       (clamp +/-40deg)        │
+│    R stick L/R + A     lateral lean L/R sway (clamp +/-10deg)        │
 │  Note: the planner-log "command" appears flipped vs. the operator    │
 │  intent because the curated bins were authored in a body frame       │
 │  rotated 180 deg from the bridge's RSI init. End-to-end behaviour    │
@@ -929,9 +930,11 @@ ${C_YELLOW}┌──────────────────────
 │    X press           start episode (--with-record only)              │
 │    Y press           stop & save episode (--with-record only)        │
 │  (B-single still toggles LOCOMOTION <-> ARM_MANIPULATION; no chord.) │
-│  Camera (LOCOMOTION + ARM_MAN; needs apt install xdotool):           │
-│    R thumbstick click   cycle deploy MuJoCo viewer fixed cameras     │
-│    (Tab-equivalent; obj_left -> obj_right -> rgbd_head_front -> free)│
+│  Stick clicks (v7.1; LOCOMOTION + ARM_MAN; idle in OFF):             │
+│    L thumbstick click   cycle deploy MuJoCo viewer fixed cameras     │
+│                         (sends ']' via xdotool; needs xdotool)       │
+│    R thumbstick click   FREEZE / RELEASE waist hold at current pose  │
+│                         (planner stays in STATIC_HOLD while frozen)  │
 │                                                                       │
 │  Full reference: docs/source/tutorials/x2_quest3_planner_stack_     │
 │                  cheatsheet.md                                       │

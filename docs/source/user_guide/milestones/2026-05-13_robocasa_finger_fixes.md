@@ -50,8 +50,10 @@ gestures freezing the hand.
   && conaffinity == 0`). If a future X2 URDF revision changes the
   body name or adds another vestigial collision mesh, the assertion
   fires loudly instead of silently blocking the fingers again.
-* Both bundled scene XMLs (`X2PickPlaceCube.xml`,
-  `X2PickPlaceBowl.xml`) were rebuilt to embed the disable. Diff is
+* All bundled scene XMLs (`X2PickPlaceCube.xml`,
+  `X2PickPlaceBowl.xml`; the later-added `X2PickPlaceApple.xml` picks
+  up the disable automatically when built via the same helper) were
+  rebuilt to embed the disable. Diff is
   6 attribute changes per scene (`contype="1" conaffinity="1"` → `"0"
   "0"` on the two wrist meshes per side).
 

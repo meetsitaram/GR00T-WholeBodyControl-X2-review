@@ -100,8 +100,16 @@ for the full architecture write-up.
 
 ```sh
 cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
+```
+
+Or build them one at a time:
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
 .venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceApple
 ```
 
 Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
@@ -415,7 +423,7 @@ crashed deploy.
 | `--with-record` | off | Spawn the LeRobot recorder. Requires `--output-dir`. |
 | `--output-dir PATH` | — | Required with `--with-record`. |
 | `--task STR` | required in flat-floor; **optional in robocasa** | Language instruction stamped on every frame. Robocasa mode auto-fills from scene metadata. |
-| `--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl}` | `none` | Load a Robocasa scene; flat floor when `none`. Build the XMLs first via `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env <ENV>`. |
+| `--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl,X2PickPlaceApple}` | `none` | Load a Robocasa scene; flat floor when `none`. Build the XMLs first via `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env <ENV>` (or `--all`). |
 | `--scene-xml-path PATH` | auto-resolved from env | Override `gear_sonic/data/assets/robocasa_scenes/<env>.xml`. |
 | `--episode-seed INT` | (numpy global RNG) | Reproducible per-`start` object placement. |
 | `--apply-curl-compensation` / `--no-apply-curl-compensation` | **ON in robocasa**, OFF otherwise | Per-finger curl stretch (boosts mid-range curls toward CLOSED). Applied on the manager side (which owns the Retargeter in subscribe-mode). |
@@ -438,8 +446,7 @@ that doesn't have them committed), the wrapper will refuse to start
 with a helpful error pointing at the build command. Run it once:
 
 ```sh
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
 ```
 
 Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`

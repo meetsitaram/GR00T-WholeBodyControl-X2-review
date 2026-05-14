@@ -59,7 +59,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCENES_DIR = REPO_ROOT / "gear_sonic" / "data" / "assets" / "robocasa_scenes"
-BUNDLED_SCENES = ("X2PickPlaceCube", "X2PickPlaceBowl")
+BUNDLED_SCENES = ("X2PickPlaceCube", "X2PickPlaceBowl", "X2PickPlaceApple")
 
 
 def _ensure_repo_on_path() -> None:
@@ -407,6 +407,119 @@ def test_mirror_phased_reward_climbs_through_stages(cube_mirror) -> None:
     r_success = cube_mirror.compute_reward()
     assert r_success == 1.0
     assert r_success >= r_lift
+
+
+# ── Apple-task oracle (sibling of cube task; real-mesh manipulable) ──────
+
+
+@pytest.fixture
+def apple_mirror():
+    pytest.importorskip("mujoco")
+    from gear_sonic.utils.teleop.robocasa_task_mirror import RobocasaTaskMirror
+
+    xml_path, json_path = _scene_paths("X2PickPlaceApple")
+    meta = json.loads(json_path.read_text())
+    mirror = RobocasaTaskMirror(
+        scene_xml_path=xml_path,
+        scene_metadata=meta,
+        env_name="X2PickPlaceApple",
+    )
+    yield mirror
+    mirror.close()
+
+
+def test_apple_mirror_advertises_static_subtask_signals(apple_mirror) -> None:
+    """The apple oracle must expose the same six-rung phase ladder as
+    the cube oracle so a mixed cube+apple training set sees a
+    consistent set of subtask termination signals (only the per-rung
+    object name differs)."""
+    sigs = apple_mirror.subtask_signals()
+    expected_phases = {
+        "approach_apple",
+        "touch_apple",
+        "grasp_apple",
+        "apple_off_table",
+        "apple_above_bowl",
+        "apple_in_bowl",
+    }
+    assert set(sigs.keys()) == expected_phases
+    for name in expected_phases:
+        assert sigs[name] == 0, f"phase {name} should be 0 at default pose"
+    # Static name list must match the live signature.
+    assert set(apple_mirror.static_subtask_names) == expected_phases
+
+
+def test_apple_mirror_check_success_is_false_at_default_pose(
+    apple_mirror,
+) -> None:
+    """Default scene XML places the apple at table-rest height and the
+    bowl off to the side; the success oracle must return False on this
+    initial state, otherwise the recorder would falsely label the very
+    first frame of every apple episode as a win."""
+    assert apple_mirror.check_success() is False
+    assert apple_mirror.compute_reward() == 0.0
+
+
+def test_apple_mirror_success_flips_when_apple_dropped_into_bowl(
+    apple_mirror,
+) -> None:
+    """End-to-end happy path for the apple task: synthesise a
+    SceneState that places the apple inside the bowl and assert the
+    oracle declares success WITHOUT requiring uprightness (the apple
+    is roughly spherical, unlike the cube)."""
+    pytest.importorskip("mujoco")
+    import mujoco
+
+    from gear_sonic.utils.teleop.robocasa_task_mirror import SceneState
+
+    bowl_bid = mujoco.mj_name2id(
+        apple_mirror.mj_model, mujoco.mjtObj.mjOBJ_BODY, "bowl_body"
+    )
+    assert bowl_bid >= 0
+    bowl_pos = np.array(apple_mirror.mj_model.body_pos[bowl_bid], dtype=float)
+    # Place the apple directly above the bowl floor and rotated 30 deg
+    # around the X axis so we exercise the "no uprightness" path -- a
+    # sideways-resting apple must still count as success.
+    angle = np.pi / 6  # 30 deg
+    quat = [float(np.cos(angle / 2)), float(np.sin(angle / 2)), 0.0, 0.0]
+    apple_qpos = [
+        float(bowl_pos[0]),
+        float(bowl_pos[1]),
+        float(bowl_pos[2]) + 0.025,
+        *quat,
+    ]
+    apple_mirror.sync_from_state(SceneState(
+        sim_time=1.0,
+        object_freejoint_qpos={"apple_joint0": apple_qpos},
+        mutable_body_pos={"bowl_body": bowl_pos.tolist()},
+    ))
+    assert apple_mirror.check_success() is True
+    assert apple_mirror.compute_reward() == 1.0
+
+
+def test_apple_mirror_subtask_grasp_apple_reflects_contact_signal(
+    apple_mirror,
+) -> None:
+    """Grasp signal is right-hand specific (mirrors the cube
+    oracle and the upstream env's right-hand-grasp definition)."""
+    pytest.importorskip("mujoco")
+    from gear_sonic.utils.teleop.robocasa_task_mirror import SceneState
+
+    apple_mirror.sync_from_state(SceneState(
+        sim_time=0.0,
+        grasp_contacts={"apple": {"left": False, "right": True, "any": True}},
+    ))
+    sigs = apple_mirror.subtask_signals()
+    assert sigs["grasp_apple"] == 1
+    assert sigs["touch_apple"] == 1
+
+    apple_mirror.sync_from_state(SceneState(
+        sim_time=0.1,
+        grasp_contacts={"apple": {"left": False, "right": False, "any": False}},
+    ))
+    sigs = apple_mirror.subtask_signals()
+    assert sigs["grasp_apple"] == 0
+    assert sigs["touch_apple"] == 0
 
 
 # ── Layer 4: recorder CLI argparse + scene XML resolution ────────────────
