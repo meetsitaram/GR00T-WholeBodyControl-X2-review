@@ -104,8 +104,10 @@ def test_recording_lifecycle_prompts_present() -> None:
 
 def test_manager_prompt_keys_exported_and_consistent() -> None:
     """The exported ``MANAGER_PROMPT_KEYS`` tuple must match the
-    union of mode + recording prompts and stay in sync with
-    PROMPT_TEXTS so callers can iterate without hard-coding names.
+    union of mode + recording prompts (plus the modal ``mode_torso_locked``
+    cue fired on LOCOMOTION -> ARM_MANIPULATION B-press latch) and stay
+    in sync with PROMPT_TEXTS so callers can iterate without hard-coding
+    names.
     """
     from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
     from gear_sonic.utils.teleop.vr.quest3_audio_prompts import (
@@ -114,13 +116,17 @@ def test_manager_prompt_keys_exported_and_consistent() -> None:
     )
 
     expected = {f"mode_{m.name.lower()}" for m in StreamMode} | {
+        "mode_torso_locked",
+        "torso_frozen",
+        "torso_released",
         "record_start",
         "record_save",
     }
     assert set(MANAGER_PROMPT_KEYS) == expected, (
         "MANAGER_PROMPT_KEYS drifted from the StreamMode enum + "
-        "recording lifecycle keys; update either the enum or the "
-        "exported tuple to match"
+        "recording lifecycle keys (plus the mode_torso_locked latch "
+        "cue and the torso_frozen / torso_released R-click toggle "
+        "cues); update either the enum or the exported tuple to match"
     )
     for key in MANAGER_PROMPT_KEYS:
         assert key in PROMPT_TEXTS, (

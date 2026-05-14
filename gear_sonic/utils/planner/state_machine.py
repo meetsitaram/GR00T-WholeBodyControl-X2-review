@@ -11,6 +11,13 @@ State machine:
   - PLAYING     : stepping forward through a non-idle primitive.
   - BLENDING    : synthesizing the blend window between two segments
                   (current-pose-frozen XY, SLERP'd root rot, LERP'd dof).
+  - STATIC_HOLD : continuously holding a synthesized waist pose
+                  (pitch/roll/yaw tracked against operator targets via
+                  a slew-rate-limited tracker). Bypasses ``_active``;
+                  the per-tick frame is generated directly from
+                  ``make_waist_pose_frame`` so the planner can hold a
+                  non-neutral lean / twist indefinitely while the
+                  operator drives arms via VR IK.
 
 Transitions:
 
@@ -19,7 +26,10 @@ Transitions:
   PLAYING     -- frames done  --> BLENDING(cmd_primitive, idle)
                                    OR BLENDING(cmd_primitive, next_cmd)
                                    if another command arrived while playing.
-  BLENDING    -- frames done  --> IDLE_LOOP / PLAYING
+  BLENDING    -- frames done  --> IDLE_LOOP / PLAYING / STATIC_HOLD
+  ANY         -- hold_torso   --> BLENDING(prev, hold_target) -> STATIC_HOLD
+  STATIC_HOLD -- hold_torso   --> STATIC_HOLD (target update only, slew handles)
+  STATIC_HOLD -- non-hold cmd --> BLENDING(hold_pose, cmd_primitive)
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ from .constants import (
     IDENTITY_ROOT_QUAT_XYZW,
     NUM_BODY_DOFS,
 )
+from .x2_recipes import make_waist_pose_frame
 
 
 log = logging.getLogger("x2_planner")
@@ -60,6 +71,20 @@ BLEND_FRAMES_STATIC_UPPER_BODY: int = 16
 
 OUTPUT_FPS: float = 50.0
 
+# Continuous waist hold parameters. Counter-balance shares match the
+# discrete static_upper_body bins (lean_fwd_*, torso_*) so VR-driven
+# continuous holds look identical to the curated bins at the same angle.
+HOLD_HIP_PITCH_SHARE: float = 0.30
+HOLD_HIP_YAW_SHARE: float = 0.30
+HOLD_ANKLE_PITCH_SHARE: float = 0.0
+HOLD_ANKLE_ROLL_SHARE: float = 0.0
+# Per-axis maximum deg/s the synthesized hold pose is allowed to slew at.
+# 60 deg/s ~= 1.2 deg per 50 Hz tick; a full 40 deg yaw stick-snap takes
+# ~0.67 s to reach target, matching the discrete torso_*_40deg ramp time.
+HOLD_SLEW_DPS: float = 60.0
+# Sentinel intent string for continuous waist hold commands.
+HOLD_TORSO_INTENT: str = "hold_torso"
+
 
 # ---------------------------------------------------------------------------
 # Command interface
@@ -68,14 +93,33 @@ OUTPUT_FPS: float = 50.0
 
 @dataclass(frozen=True)
 class LocomotionCommand:
-    """High-level command emitted by command sources (scripted, ZMQ, keyboard)."""
+    """High-level command emitted by command sources (scripted, ZMQ, keyboard).
+
+    The optional ``waist_*_deg`` fields carry continuous waist targets
+    when ``intent == "hold_torso"``; for every other intent they are
+    ignored (so existing callers / wire payloads remain valid). See
+    :class:`PlannerState.STATIC_HOLD` for the runtime behaviour.
+    """
 
     intent: str  # idle / walk / fwd_step / back_step
                   # / side_left / side_right / turn_left / turn_right
-                  # / lean_fwd / torso_left / torso_right / crouch
+                  # / lean_fwd / lean_left / lean_right
+                  # / torso_left / torso_right / crouch
+                  # / hold_torso (continuous waist target; uses waist_*_deg)
     magnitude: str  # default / forward / backward / one_ft / half_ft / quarter_ft
-                    # / deg_15 / deg_30 / deg_45 / deg_90 / small / medium / large
+                    # / deg_15 / deg_30 / deg_40 / deg_45 / deg_90
+                    # / small / medium / large
+                    # / continuous (paired with intent=hold_torso)
     source: str = "scripted"  # for logging only
+    # Continuous waist targets (degrees). Only consulted when
+    # ``intent == HOLD_TORSO_INTENT``. Defaults to 0.0 = neutral, so an
+    # operator releasing the right stick produces a hold at the rest pose.
+    waist_pitch_deg: float = 0.0
+    waist_roll_deg: float = 0.0
+    waist_yaw_deg: float = 0.0
+
+    def is_hold_torso(self) -> bool:
+        return self.intent == HOLD_TORSO_INTENT
 
     def as_bin_name(self) -> str:
         """Map (intent, magnitude) to a registry bin name."""
@@ -136,7 +180,8 @@ class LocomotionCommand:
             "quarter_ft": "quarter_ft",
             "deg_15": "15deg",
             "deg_30": "30deg",
-            "deg_45": "45deg",
+            "deg_40": "40deg",  # torso_*_40deg (v6 yaw cap; replaces deg_45 for torso intent)
+            "deg_45": "45deg",  # turn_*_45deg
             "deg_90": "90deg",
             "small": "small",
             "medium": "medium",
@@ -219,6 +264,69 @@ class PlannerState(enum.Enum):
     IDLE_LOOP = "idle_loop"
     PLAYING = "playing"
     BLENDING = "blending"
+    STATIC_HOLD = "static_hold"
+
+
+@dataclass
+class _HoldTracker:
+    """Slew-rate-limited continuous waist target tracker.
+
+    The operator's stick samples a TARGET pose (pitch / roll / yaw in
+    degrees). ``step()`` walks the CURRENT pose toward the target by at
+    most ``slew_dps * dt`` degrees per axis per call. The current pose
+    is what the planner emits each tick via ``make_waist_pose_frame``.
+
+    On entering STATIC_HOLD the planner pre-blends the body from the
+    previous segment to the target pose over BLEND_FRAMES_STATIC_UPPER_BODY
+    frames; ``snap_to_target()`` is then called so the first STATIC_HOLD
+    frame sits AT the target (no double-ramp). Subsequent in-state
+    target updates rely on the slew limit for smoothness.
+    """
+
+    current_pitch_deg: float = 0.0
+    current_roll_deg: float = 0.0
+    current_yaw_deg: float = 0.0
+    target_pitch_deg: float = 0.0
+    target_roll_deg: float = 0.0
+    target_yaw_deg: float = 0.0
+
+    def set_target(
+        self,
+        pitch_deg: float,
+        roll_deg: float,
+        yaw_deg: float,
+    ) -> None:
+        self.target_pitch_deg = float(pitch_deg)
+        self.target_roll_deg = float(roll_deg)
+        self.target_yaw_deg = float(yaw_deg)
+
+    def snap_to_target(self) -> None:
+        self.current_pitch_deg = self.target_pitch_deg
+        self.current_roll_deg = self.target_roll_deg
+        self.current_yaw_deg = self.target_yaw_deg
+
+    def step(self, *, dt_s: float, slew_dps: float = HOLD_SLEW_DPS) -> None:
+        max_step = float(slew_dps) * float(dt_s)
+        if max_step < 0:
+            raise ValueError(f"slew_dps must be non-negative; got {slew_dps}")
+        for axis in ("pitch", "roll", "yaw"):
+            cur_attr = f"current_{axis}_deg"
+            tgt_attr = f"target_{axis}_deg"
+            cur = float(getattr(self, cur_attr))
+            tgt = float(getattr(self, tgt_attr))
+            err = tgt - cur
+            if abs(err) <= max_step:
+                cur = tgt
+            else:
+                cur += max_step * (1.0 if err > 0.0 else -1.0)
+            setattr(self, cur_attr, cur)
+
+    def at_target(self, eps_deg: float = 1e-6) -> bool:
+        return (
+            abs(self.current_pitch_deg - self.target_pitch_deg) <= eps_deg
+            and abs(self.current_roll_deg - self.target_roll_deg) <= eps_deg
+            and abs(self.current_yaw_deg - self.target_yaw_deg) <= eps_deg
+        )
 
 
 @dataclass
@@ -302,6 +410,7 @@ class HeuristicPlanner:
         self._cmd_queue: deque[LocomotionCommand] = deque()
         self._active: _ActiveSegment | None = None
         self._next_after_active: LocomotionCommand | None = None
+        self._hold_tracker: _HoldTracker = _HoldTracker()
         # Set to True by ``step_with_lookahead`` while it's peeking ahead;
         # used to silence the per-tick debug log so a single real tick
         # doesn't emit (num_future * step_ticks + 1) log lines.
@@ -487,6 +596,7 @@ class HeuristicPlanner:
             ),
             "cmd_queue": deque(self._cmd_queue),
             "next_after_active": self._next_after_active,
+            "hold_tracker": dataclasses.replace(self._hold_tracker),
         }
 
     def _restore(self, snap: dict[str, Any]) -> None:
@@ -500,9 +610,27 @@ class HeuristicPlanner:
         self._active = snap["active"]
         self._cmd_queue = snap["cmd_queue"]
         self._next_after_active = snap["next_after_active"]
+        self._hold_tracker = snap["hold_tracker"]
 
     def step(self) -> StreamFrame:
         """Emit the next frame and advance one tick."""
+        # ----- STATIC_HOLD fast path --------------------------------------
+        # While holding, fold incoming hold_torso commands into the
+        # tracker target (no segment swap). If a non-hold command shows
+        # up, build a blend out of the held pose into the next primitive
+        # and fall through to the normal segment path on the NEXT tick.
+        if self._state == PlannerState.STATIC_HOLD:
+            self._drain_hold_targets_into_tracker()
+            if self._cmd_queue and not self._cmd_queue[0].is_hold_torso():
+                # Operator wants to do something else: blend out of hold.
+                cmd = self._cmd_queue.popleft()
+                self._start_blend_out_of_hold(cmd)
+                # Fall through: blend segment is now active; emit its
+                # first frame normally below.
+            else:
+                return self._step_static_hold()
+
+        # ----- Normal (segment-driven) path -------------------------------
         # Interrupt the cheap idle loop as soon as a command arrives;
         # otherwise a gait command would have to wait up to one full idle
         # clip (~1.5 s) to take effect.
@@ -514,6 +642,14 @@ class HeuristicPlanner:
             self._advance_segment()
         elif self._active is None or self._active.remaining == 0:
             self._advance_segment()
+
+        # _advance_segment() may have transitioned us into STATIC_HOLD
+        # (when a hold_torso command was popped and the blend completed
+        # in the same tick boundary). Re-dispatch in that case so the
+        # first STATIC_HOLD frame emits via the synthesizer rather than
+        # advancing a now-defunct ``_active`` cursor.
+        if self._state == PlannerState.STATIC_HOLD:
+            return self._step_static_hold()
         assert self._active is not None  # noqa: S101 — invariant after _advance_segment
 
         seg = self._active
@@ -556,6 +692,94 @@ class HeuristicPlanner:
             )
         return frame
 
+    # ------- STATIC_HOLD helpers ----------------------------------------
+
+    def _drain_hold_targets_into_tracker(self) -> None:
+        """Pop every hold_torso command at the queue head into the tracker.
+
+        Multiple stick samples can arrive between two ticks; we collapse
+        them so only the most recent target survives. The tracker's
+        slew-rate limit smooths the cross-tick transition.
+        """
+        last_cmd: LocomotionCommand | None = None
+        while self._cmd_queue and self._cmd_queue[0].is_hold_torso():
+            last_cmd = self._cmd_queue.popleft()
+        if last_cmd is not None:
+            self._hold_tracker.set_target(
+                last_cmd.waist_pitch_deg,
+                last_cmd.waist_roll_deg,
+                last_cmd.waist_yaw_deg,
+            )
+
+    def _step_static_hold(self) -> StreamFrame:
+        """Emit one frame from the synthesized hold pose and advance the tracker."""
+        dt_s = 1.0 / OUTPUT_FPS
+        self._hold_tracker.step(dt_s=dt_s)
+        dof_64 = make_waist_pose_frame(
+            pitch_deg=self._hold_tracker.current_pitch_deg,
+            roll_deg=self._hold_tracker.current_roll_deg,
+            yaw_deg=self._hold_tracker.current_yaw_deg,
+            hip_pitch_share=HOLD_HIP_PITCH_SHARE,
+            hip_yaw_share=HOLD_HIP_YAW_SHARE,
+            ankle_pitch_share=HOLD_ANKLE_PITCH_SHARE,
+            ankle_roll_share=HOLD_ANKLE_ROLL_SHARE,
+        )
+        dof = dof_64.astype(np.float32)
+        # Anchor at current world xy/yaw using the same yaw_align_segment
+        # path the discrete static_upper_body bins use, so the deploy
+        # never sees a root-yaw discontinuity on STATIC_HOLD entry/exit.
+        rot, trans = self._anchor_synth_frame_at_world()
+        self._last_dof = dof
+        self._last_rot = rot
+        self._last_trans = trans
+        # cur_xy / cur_yaw are NOT updated here -- the hold is feet-planted
+        # and we want any subsequent locomotion blend to start from where
+        # the operator last drove the body, not drift due to per-tick
+        # yaw_align_segment round-trips.
+
+        frame = StreamFrame(
+            joint_pos_mj=dof,
+            root_quat_xyzw=rot,
+            root_xy_world=self._cur_xy.copy(),
+            yaw_world_deg=float(np.degrees(self._cur_yaw)),
+            state=PlannerState.STATIC_HOLD,
+            bin_name=HOLD_TORSO_INTENT,
+            frame_index=self._tick,
+            seam_blend=False,
+        )
+        self._tick += 1
+        if (
+            not self._in_lookahead
+            and self.log_every_n_ticks
+            and self._tick % self.log_every_n_ticks == 0
+        ):
+            log.debug(
+                "tick=%d state=static_hold target=(%.1f,%.1f,%.1f) "
+                "current=(%.1f,%.1f,%.1f) queue=%d",
+                self._tick,
+                self._hold_tracker.target_pitch_deg,
+                self._hold_tracker.target_roll_deg,
+                self._hold_tracker.target_yaw_deg,
+                self._hold_tracker.current_pitch_deg,
+                self._hold_tracker.current_roll_deg,
+                self._hold_tracker.current_yaw_deg,
+                len(self._cmd_queue),
+            )
+        return frame
+
+    def _anchor_synth_frame_at_world(self) -> tuple[np.ndarray, np.ndarray]:
+        """Build (rot, trans) for a synthesized stand-pose frame at current world xy/yaw."""
+        rot_id = np.asarray(IDENTITY_ROOT_QUAT_XYZW, dtype=np.float32)[None, :]
+        trans_id = np.array(
+            [[0.0, 0.0, DEFAULT_PELVIS_Z_M]], dtype=np.float64
+        )
+        dof_dummy = DEFAULT_STAND_POSE_NP.astype(np.float32)[None, :]
+        _, aligned_rot, aligned_trans = yaw_align_segment(
+            dof_dummy, rot_id, trans_id,
+            xy_world=self._cur_xy, yaw_world=self._cur_yaw,
+        )
+        return aligned_rot[0].astype(np.float32), aligned_trans[0].astype(np.float64)
+
     # ---------------------------------------------------------------- internals
 
     def _resolve_command(
@@ -583,6 +807,9 @@ class HeuristicPlanner:
             cmd = self._next_after_active
             self._next_after_active = None
             assert cmd is not None  # noqa: S101 — set when blend was queued
+            if cmd.is_hold_torso():
+                self._enter_static_hold(cmd)
+                return
             prim = self._resolve_command(cmd)
             self._start_play(prim)
             return
@@ -595,6 +822,9 @@ class HeuristicPlanner:
 
         if self._cmd_queue:
             cmd = self._cmd_queue.popleft()
+            if cmd.is_hold_torso():
+                self._start_blend_to_hold(cmd)
+                return
             prim = self._resolve_command(cmd)
             if prim.bin_name == "idle_stand":
                 # Blend into idle, then loop idle.
@@ -609,6 +839,88 @@ class HeuristicPlanner:
             return
         idle = self.primitives["idle_stand"]
         self._start_blend_to(idle, after_command=None)
+
+    def _enter_static_hold(self, cmd: LocomotionCommand) -> None:
+        """Switch into STATIC_HOLD with the tracker initialised at ``cmd``'s target.
+
+        Called from _advance_segment when a blend-to-hold completes.
+        ``snap_to_target`` skips the slew so the first emitted hold
+        frame matches the blend's last frame (the operator already
+        absorbed ramp time during the blend window).
+        """
+        self._hold_tracker.set_target(
+            cmd.waist_pitch_deg, cmd.waist_roll_deg, cmd.waist_yaw_deg,
+        )
+        self._hold_tracker.snap_to_target()
+        # _active is intentionally cleared: STATIC_HOLD synthesises
+        # frames per-tick and bypasses the segment cursor.
+        self._active = None
+        self._state = PlannerState.STATIC_HOLD
+
+    def _start_blend_to_hold(self, cmd: LocomotionCommand) -> None:
+        """Build a blend window from current pose to the hold target."""
+        target_dof_64 = make_waist_pose_frame(
+            pitch_deg=cmd.waist_pitch_deg,
+            roll_deg=cmd.waist_roll_deg,
+            yaw_deg=cmd.waist_yaw_deg,
+            hip_pitch_share=HOLD_HIP_PITCH_SHARE,
+            hip_yaw_share=HOLD_HIP_YAW_SHARE,
+            ankle_pitch_share=HOLD_ANKLE_PITCH_SHARE,
+            ankle_roll_share=HOLD_ANKLE_ROLL_SHARE,
+        )
+        target_dof = target_dof_64.astype(np.float32)
+        target_rot, target_trans = self._anchor_synth_frame_at_world()
+
+        from_family = (
+            self._active.primitive.family if self._active else "idle"
+        )
+        n_blend = _pick_blend_frames(from_family, "static_upper_body")
+        blend_dof, blend_rot, blend_trans = build_blend_window(
+            self._last_dof,
+            self._last_rot,
+            self._last_trans,
+            target_dof,
+            target_rot,
+            target_trans,
+            n_blend,
+        )
+        # Stitch the held target frame as the last frame of the blend so
+        # the segment cursor walks the operator into the held pose
+        # without any "land then drift" feel. We keep the synthetic
+        # primitive marker so seg.primitive.family resolves the next
+        # blend-out length correctly.
+        sentinel_prim = self.primitives.get(
+            "idle_stand"
+        )  # safe fallback for family lookup; STATIC_HOLD bypasses replay
+        if sentinel_prim is None:
+            raise RuntimeError(
+                "_start_blend_to_hold requires idle_stand to be loaded"
+            )
+        self._active = _ActiveSegment(
+            primitive=sentinel_prim,
+            aligned_dof=blend_dof.astype(np.float32),
+            aligned_rot=blend_rot.astype(np.float32),
+            aligned_trans=blend_trans,
+            bin_name_for_log=f"blend->{HOLD_TORSO_INTENT}",
+            is_blend=True,
+        )
+        self._next_after_active = cmd
+        self._state = PlannerState.BLENDING
+
+    def _start_blend_out_of_hold(self, cmd: LocomotionCommand) -> None:
+        """Exit STATIC_HOLD by blending from the held pose to ``cmd``'s primitive."""
+        prim = self._resolve_command(cmd)
+        # _last_dof / _last_rot / _last_trans were updated by the most
+        # recent _step_static_hold call -- they ARE the held pose. The
+        # from_family override gives us the static_upper_body blend
+        # window length (16 frames) instead of the default "idle"->
+        # destination length, which is the right shape for unwinding a
+        # held lean / twist.
+        after_cmd = None if prim.bin_name == "idle_stand" else cmd
+        self._start_blend_to(
+            prim, after_command=after_cmd,
+            from_family_override="static_upper_body",
+        )
 
     def _start_idle_loop(self) -> None:
         idle = self.primitives["idle_stand"]
@@ -651,7 +963,11 @@ class HeuristicPlanner:
         )
 
     def _start_blend_to(
-        self, target_prim: Primitive, after_command: LocomotionCommand | None
+        self,
+        target_prim: Primitive,
+        after_command: LocomotionCommand | None,
+        *,
+        from_family_override: str | None = None,
     ) -> None:
         """Synthesize a blend window from the current pose to target frame 0."""
         # Align target prim so frame 0 sits at (cur_xy, cur_yaw).
@@ -659,9 +975,12 @@ class HeuristicPlanner:
             target_prim.dof, target_prim.root_rot_xyzw, target_prim.root_trans,
             xy_world=self._cur_xy, yaw_world=self._cur_yaw,
         )
-        from_family = (
-            self._active.primitive.family if self._active else "idle"
-        )
+        if from_family_override is not None:
+            from_family = from_family_override
+        else:
+            from_family = (
+                self._active.primitive.family if self._active else "idle"
+            )
         n_blend = _pick_blend_frames(from_family, target_prim.family)
 
         blend_dof, blend_rot, blend_trans = build_blend_window(

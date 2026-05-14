@@ -321,13 +321,15 @@ def test_on_mode_transition_emits_matching_audio_cue(
 
 
 # ---------------------------------------------------------------------------
-# Right-stick-click camera cycler (xdotool path)
-# ---------------------------------------------------------------------------
+# Stick-click bindings (v7+):
+#   LEFT  thumbstick click -> camera cycler (xdotool Tab keypress)
+#   RIGHT thumbstick click -> waist freeze toggle
 #
-# We exercise the manager-side rising-edge detector + mode gate by
-# stubbing out get_stick_clicks() and observing whether the cycler's
-# cycle() method was called. The xdotool side is covered separately
-# in tests/test_viewer_camera_cycler.py.
+# We exercise the manager-side rising-edge detectors + mode gates by
+# stubbing out get_stick_clicks() and observing whether cycle() (left)
+# or _toggle_waist_freeze() (right) was called. The xdotool side is
+# covered separately in tests/test_viewer_camera_cycler.py.
+# ---------------------------------------------------------------------------
 
 
 def _step_main_loop_once(manager) -> None:
@@ -336,21 +338,26 @@ def _step_main_loop_once(manager) -> None:
     We can't call _run_loop() itself because it spins and blocks on
     the WS thread; but the per-tick logic is small enough to inline
     here for the purpose of the rising-edge / mode-gate assertions.
-    Mirrors the production path: get_stick_clicks() -> rising-edge
-    -> mode gate -> cycle(). Any drift from the production code path
-    will surface as a failing wire-format test.
+    Mirrors the production path: get_stick_clicks() -> rising-edge ->
+    mode gate -> cycle() (L) or _toggle_waist_freeze() (R). Any drift
+    from the production code path will surface as a failing test.
     """
     from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
 
-    _l, r = manager._quest.get_stick_clicks()
-    edge = r and not manager._prev_right_stick_click
+    l, r = manager._quest.get_stick_clicks()
+    l_edge = l and not manager._prev_left_stick_click
+    r_edge = r and not manager._prev_right_stick_click
+    manager._prev_left_stick_click = l
     manager._prev_right_stick_click = r
-    if edge and manager._intent.mode != StreamMode.OFF and manager._viewer_cycler is not None:
+    in_active_mode = manager._intent.mode != StreamMode.OFF
+    if l_edge and in_active_mode and manager._viewer_cycler is not None:
         manager._viewer_cycler.cycle()
+    if r_edge and in_active_mode:
+        manager._toggle_waist_freeze((0.0, 0.0, 0.0))
 
 
 def test_camera_cycler_fires_on_rising_edge_in_arm_man(manager):
-    """Single press in ARM_MANIPULATION must fire exactly one cycle()."""
+    """Single LEFT click in ARM_MANIPULATION must fire exactly one cycle()."""
     from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
 
     manager._intent._mode = StreamMode.ARM_MANIPULATION  # force mode
@@ -358,11 +365,11 @@ def test_camera_cycler_fires_on_rising_edge_in_arm_man(manager):
     manager._viewer_cycler = MagicMock()
     manager._viewer_cycler.cycle = cycle_mock
 
-    # Simulate: press, hold (3 ticks), release.
+    # Simulate: press, hold (3 ticks), release. (left, right) tuple.
     manager._quest.get_stick_clicks = MagicMock(side_effect=[
-        (False, True),  # press
-        (False, True),  # hold
-        (False, True),  # hold
+        (True, False),  # press
+        (True, False),  # hold
+        (True, False),  # hold
         (False, False), # release
     ])
     for _ in range(4):
@@ -375,7 +382,7 @@ def test_camera_cycler_fires_on_rising_edge_in_arm_man(manager):
 
 
 def test_camera_cycler_fires_again_after_release(manager):
-    """Press, release, press again -> two cycle() calls."""
+    """Press, release, press again -> two cycle() calls (LEFT click)."""
     from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
 
     manager._intent._mode = StreamMode.ARM_MANIPULATION
@@ -384,9 +391,9 @@ def test_camera_cycler_fires_again_after_release(manager):
     manager._viewer_cycler.cycle = cycle_mock
 
     manager._quest.get_stick_clicks = MagicMock(side_effect=[
-        (False, True),  # press 1
+        (True, False),  # press 1
         (False, False), # release
-        (False, True),  # press 2
+        (True, False),  # press 2
         (False, False), # release
     ])
     for _ in range(4):
@@ -406,7 +413,7 @@ def test_camera_cycler_suppressed_in_off_mode(manager):
     manager._viewer_cycler = MagicMock()
     manager._viewer_cycler.cycle = cycle_mock
 
-    manager._quest.get_stick_clicks = MagicMock(return_value=(False, True))
+    manager._quest.get_stick_clicks = MagicMock(return_value=(True, False))
     for _ in range(3):
         _step_main_loop_once(manager)
 
@@ -414,9 +421,7 @@ def test_camera_cycler_suppressed_in_off_mode(manager):
 
 
 def test_camera_cycler_fires_in_locomotion_mode(manager):
-    """LOCOMOTION is also an active mode; the cycler should fire there
-    too. (User wanted it mainly for ARM_MAN but said no-op in OFF;
-    LOCOMOTION is the natural in-between.)"""
+    """LOCOMOTION is also an active mode; the cycler should fire there too."""
     from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
 
     manager._intent._mode = StreamMode.LOCOMOTION
@@ -425,7 +430,7 @@ def test_camera_cycler_fires_in_locomotion_mode(manager):
     manager._viewer_cycler.cycle = cycle_mock
 
     manager._quest.get_stick_clicks = MagicMock(side_effect=[
-        (False, True),
+        (True, False),
         (False, False),
     ])
     for _ in range(2):
@@ -443,10 +448,31 @@ def test_camera_cycler_disabled_via_config(manager):
     manager._intent._mode = StreamMode.ARM_MANIPULATION
     manager._viewer_cycler = None
 
-    manager._quest.get_stick_clicks = MagicMock(return_value=(False, True))
+    manager._quest.get_stick_clicks = MagicMock(return_value=(True, False))
     # Should NOT raise -- the None check in the production path is
     # the contract being tested here.
     _step_main_loop_once(manager)
+
+
+def test_right_click_does_not_fire_camera_cycler(manager):
+    """RIGHT click was the camera cycler pre-v7; it now toggles waist
+    freeze instead. Exercising a right-only press must NOT call the
+    viewer cycler -- otherwise we'd double-bind the click."""
+    from gear_sonic.utils.teleop.vr.intent_decoder import StreamMode
+
+    manager._intent._mode = StreamMode.LOCOMOTION
+    cycle_mock = MagicMock(return_value=True)
+    manager._viewer_cycler = MagicMock()
+    manager._viewer_cycler.cycle = cycle_mock
+
+    manager._quest.get_stick_clicks = MagicMock(side_effect=[
+        (False, True),
+        (False, False),
+    ])
+    for _ in range(2):
+        _step_main_loop_once(manager)
+
+    cycle_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -66,48 +66,68 @@ inputs so the chord-release doesn't kick the robot.
 > so the bin labelled `back_step_half_ft` actually translates the body
 > forward in world. See "Stick polarity" below for why.
 
-| Input | Command in planner log | Planner bin | World-frame motion |
+| Input | Command in planner log | Planner bin / state | World-frame motion |
 |---|---|---|---|
 | **L stick fwd** | `back_step / default` | `back_step_half_ft` | One stride **forward** |
 | **L stick back** | `fwd_step / default` | `fwd_step_1ft` | One stride **backward** |
 | **L stick fwd + A held** | `walk / backward` | `back_walk_standard` | **Continuous walk forward**; release to stop |
 | **L stick back + A held** | `walk / forward` | `fwd_walk_standard` | **Continuous walk backward**; release to stop |
 | **L stick L / R** | `side_left` / `side_right` | `side_left_step` / `side_right_step` | Single side stride |
-| **R stick L / R**, hard (\|rx\| ≥ 0.60) | `turn_left / deg_45` / `turn_right / deg_45` | `turn_*_45deg` | Yaw step |
+| **R stick L / R**, hard (\|rx\| ≥ 0.75) | `turn_left / deg_45` / `turn_right / deg_45` | `turn_*_45deg` | Yaw step |
 | **R stick L / R**, hard + **X held** | `turn_* / deg_90` | `turn_*_90deg` | Bigger yaw step |
-| Sticks neutral | `idle / default` | `idle_stand` (loops) | |
+| **R stick fwd (ry > 0)** | `hold_torso / continuous` (waist_pitch_deg > 0) | `STATIC_HOLD` | Continuous **forward lean** (0 → 20° clamp) |
+| **R stick L / R, soft (\|rx\| < 0.75)** | `hold_torso / continuous` (waist_yaw_deg ≠ 0) | `STATIC_HOLD` | Continuous **torso twist** (up to ±25.7° at the threshold; ±40° hard cap) |
+| **R stick L / R, soft + A held** | `hold_torso / continuous` (waist_roll_deg ≠ 0) | `STATIC_HOLD` | Continuous **lateral lean** (±10° clamp) |
+| Sticks neutral | `hold_torso / continuous` (0, 0, 0) | `STATIC_HOLD` (slewed back to neutral) | Stand still |
+| **R thumbstick CLICK** | (no `planner_cmd`; manager toggles `_waist_frozen`) | `STATIC_HOLD` pinned at click-time pose | Freeze the current lean / twist; release with another click |
 
-> **Disabled by default**: `lean_fwd_*` (R stick fwd) and
-> `torso_*_30deg` (R stick L/R **soft**) are *replay* primitives —
-> the curated bin leans / twists into the pose and immediately blends
-> back to standing instead of holding. That made the body flicker
-> when operators tried to use them. They're now silently ignored
-> (fall through to `idle / default`) unless you re-enable them on
-> the manager:
+> **v7 continuous torso hold**: the right stick is now position-mapped
+> to a continuous `(pitch, roll, yaw)` target while in LOCOMOTION
+> (gated by the manager's default `--intent-enable-continuous-torso`).
+> The decoder throttles emissions to a 0.5° change-or-50 ms cadence,
+> the planner runs the per-axis 60 °/s slew limit, and
+> `_WAIST_RAMP_CAP_DEG` (pitch 20°, roll 10°, yaw 40°) clamps the
+> target so an extreme stick yank can't drive SONIC out of
+> distribution. Backward lean (`ry < 0`) has no primitive and is
+> clamped to 0.
 >
-> ```bash
-> --enable-lean-fwd    # restore R stick fwd graded lean
-> --enable-torso       # restore R stick L/R soft torso twist
-> ```
+> **R-click waist freeze (v7.1)**: pressing the **right thumbstick
+> down** toggles `_waist_frozen`. While frozen the manager drops
+> live `hold_torso` updates from the right stick — the planner stays
+> in `STATIC_HOLD` at whatever pose was active at click time. Other
+> commands (walk, turn, idle) still flow through, so you can lean,
+> click to freeze, then walk around with the body locked at the lean
+> using the left stick. Click again to release. The freeze persists
+> across B-press mode flips, including ARM_MANIPULATION → LOCOMOTION
+> (you can do arm work, B-flip back, and keep walking with the
+> torso still frozen). Going to OFF clears the freeze.
 >
-> The hard turn (R stick L/R, |rx| ≥ 0.60) is **always on** because
-> the `turn_*` bins commit to a real discrete yaw step.
+> The legacy discrete `lean_fwd_*` and `torso_*_30deg` bins remain
+> reachable via `--enable-lean-fwd` / `--enable-torso` (and via the
+> scripted YAML demos), but the VR right-stick path is now the
+> continuous one. Pass `--no-intent-enable-continuous-torso` on the
+> manager to fall back to the v6 dominant-axis behavior.
+>
+> The hard turn (R stick L/R, |rx| ≥ 0.75) is **always on** and
+> pre-empts the continuous hold — the operator wants to PIVOT at the
+> end of the stick, not just lean further.
 
-### Precedence rules (locked in by `tests/test_intent_decoder.py`)
+### Precedence rules (locked in by `tests/test_intent_decoder.py` + `tests/test_intent_decoder_continuous_torso.py`)
 
 1. **Y held** → would emit `crouch / medium`, but **crouch is currently disabled** (X2 SONIC tips over on the crouch primitive). Y held is silently ignored.
 2. **L stick** wins over R stick: any active L stick beats any R stick.
 3. On L stick, **dominant axis** wins: \|ly\| ≥ \|lx\| → fwd/back; otherwise side-step.
-4. On R stick, dominant axis wins: \|ry\| ≥ \|rx\|. With lean/torso disabled (the default), the ry-dominant branch returns `idle` and we **do not** fall through to the rx branch — operators pushing the right stick toward an upper corner won't accidentally trigger a turn.
-5. **A held** only modifies fwd/back to walk; it has no effect on side / lean / torso / turn.
-6. **X held** only modifies hard rx (\|rx\| ≥ 0.60) to a 90° turn; soft rx is ignored (or emits torso when `--enable-torso` is set), regardless of X.
+4. On R stick (continuous mode, the default): hard \|rx\| ≥ 0.75 → discrete `turn_*` (operator wants a real pivot). Otherwise both `ry` and `rx` are read simultaneously and composed into a single `hold_torso / continuous` target. Stick fully released → `(0, 0, 0)` neutral hold.
+5. **A held** modifies *two* paths: fwd/back L stick → `walk` (continuous gait); soft R stick X → re-mapped to **roll** instead of yaw (lateral lean instead of twist).
+6. **X held** only modifies hard rx (\|rx\| ≥ 0.75) to a 90° turn; soft rx is unaffected.
+7. **B press** in LOCOMOTION → ARM_MANIPULATION **latches** the current `(pitch, roll, yaw)` waist target so the planner stays in `STATIC_HOLD` at that pose while the operator drives arms via VR IK. **B press** in ARM_MANIPULATION → LOCOMOTION clears the latch and emits `idle / default`.
 
 ### What "hold the stick" does
 
 Most planner primitives are **single-stride**: one push of the L stick = one `fwd_step`. Holding the stick does **not** keep stepping — you must release and re-push to take another step. The exceptions are:
 
 - `walk / forward` and `walk / backward` (A + ly): planner loops the continuous walk primitive until you release.
-- `lean_fwd_*`, `torso_*_30deg`: static pose primitives; the planner blends in and holds. Releasing the stick blends back to standing.
+- **R stick (continuous)**: pitch / yaw / roll are *position-mapped*; holding the stick at +0.5 ry holds the body at the equivalent forward lean angle. Releasing slews the target back to neutral at 60 °/s. This is the v7 `hold_torso` path, not the legacy `lean_fwd_*` discrete bins.
 
 ---
 
@@ -116,13 +136,18 @@ Most planner primitives are **single-stride**: one push of the L stick = one `fw
 | Input | Action |
 |---|---|
 | **A press** | toggle arm IK engage / disengage (your VR wrists drive the X2 arms) |
+| **B press** | back to LOCOMOTION; clears the latched waist hold so the right stick takes over again |
 | **X press** | start episode  *(`--with-record` only; no-op if already recording)* |
 | **Y press** | stop & save episode  *(`--with-record` only; no-op if no open episode)* |
-| **R thumbstick click** | cycle deploy MuJoCo viewer's fixed cameras (Tab-equivalent; works in LOCOMOTION too) |
+| **L thumbstick click** | cycle deploy MuJoCo viewer's fixed cameras (Tab-equivalent; works in LOCOMOTION too). Pre-v7.1 this was the right click. |
+| **R thumbstick click** | toggle waist freeze on / off — same control as in LOCOMOTION. Useful to release a freeze without flipping back to LOCOMOTION first. |
+| **R stick** | **No-op for waist** while in this mode (the body is held at the latched pose). |
+
+> **Torso latch (v7)**: when the operator B-presses LOCOMOTION → ARM_MANIPULATION, the manager samples the live `(pitch, roll, yaw)` continuous waist target and pins the planner to `STATIC_HOLD(latched)`. The headset announces it with the `mode_torso_locked` audio cue (only when the latched pose is non-neutral; neutral latches just play the standard `mode_arm_manipulation` cue). This lets the operator pre-pose the body for additional reach (`pitch=15°, yaw=20°` extends the arm reach envelope by ~15 cm in the chosen direction) before driving the arms via VR IK. The reverse B-press clears the latch and emits `idle / default` so the planner cleanly blends back to standing.
 
 **All recording triggers are gated on ARM_MANIPULATION mode.** A held + walk in LOCOMOTION can never accidentally start an episode; X held + 90° turn in LOCOMOTION never fires start. The episode lifecycle (`start` → frames → `save`) is owned by the manager and forwarded to the recorder over ZMQ topic `recorder_cmd`.
 
-**The R thumbstick click is *not* gated on ARM_MAN** — it's active in any non-OFF mode so you can also re-frame the viewer while walking the robot into position. It's idle in OFF (which is consistent with the rest of the manager: OFF means "ignore controller events").
+**The L thumbstick click is *not* gated on ARM_MAN** — it's active in any non-OFF mode so you can re-frame the viewer while walking the robot into position. It's idle in OFF (which is consistent with the rest of the manager: OFF means "ignore controller events"). The R thumbstick click is similarly active in both LOCOMOTION and ARM_MANIPULATION, idle in OFF.
 
 > **Why no chord for start?** The previous `A+B same tick = start` design collided with the `B-single = mode toggle` rule: the same press both opened an episode AND immediately flipped to LOCOMOTION, yanking the planner reference out from under the new episode. Splitting `start` and `save` onto separate one-shot buttons makes `B` unambiguously a mode toggle.
 
@@ -212,7 +237,7 @@ Set on the manager (passed through to `IntentDecoder`):
 | Parameter | Default | Meaning |
 |---|---|---|
 | `stick_deadzone` | 0.30 | Per-axis deflection treated as neutral |
-| `turn_threshold` | 0.60 | Soft / hard rx boundary (torso vs turn) |
+| `turn_threshold` | 0.75 | Soft / hard rx boundary (continuous torso twist below; discrete `turn_*_45deg` at or above). At 0.75 the soft band reaches ~25.7° of continuous waist yaw before the discrete pivot fires. |
 | `lean_medium_threshold` | 0.55 | ry boundary between `lean_fwd_small` and `lean_fwd_medium` |
 | `lean_large_threshold` | 0.80 | ry boundary between `lean_fwd_medium` and `lean_fwd_large` |
 | `chord_debounce_s` | 0.5 | Quiet window after the A+B+X+Y chord puts you in LOCOMOTION |
@@ -251,6 +276,9 @@ The manager pushes a short voice prompt to the headset speakers on every mode tr
 | Mode → OFF (incl. estop chord)           | "Off."               | `mode_off`               |
 | Mode → LOCOMOTION                        | "Locomotion."        | `mode_locomotion`        |
 | Mode → ARM_MANIPULATION                  | "Arm manipulation."  | `mode_arm_manipulation`  |
+| LOCO → ARM_MAN with non-neutral waist    | "Torso locked."      | `mode_torso_locked`      |
+| R-thumbstick click — freeze ON           | "Torso frozen."      | `torso_frozen`           |
+| R-thumbstick click — freeze OFF          | "Torso released."    | `torso_released`         |
 | X press in ARM_MAN — start episode       | "Recording."         | `record_start`           |
 | Y press in ARM_MAN — stop & save episode | "Saved."             | `record_save`            |
 
@@ -264,9 +292,9 @@ If a cue is missing on the headset, check (1) the headset isn't muted in Quest S
 
 ---
 
-## Camera cycling (right thumbstick click → deploy viewer Tab)
+## Camera cycling (left thumbstick click → deploy viewer Tab)
 
-Manipulation work benefits a lot from re-framing — picking up a small object reads better from `obj_left` or `obj_right` than from `ego_view`. Pressing the **right thumbstick click** sends a synthetic `Tab` keystroke to the deploy MuJoCo viewer's GLFW window, cycling the same fixed cameras you'd cycle from the workstation keyboard.
+Manipulation work benefits a lot from re-framing — picking up a small object reads better from `obj_left` or `obj_right` than from `ego_view`. Pressing the **left thumbstick click** sends a synthetic `Tab` keystroke to the deploy MuJoCo viewer's GLFW window, cycling the same fixed cameras you'd cycle from the workstation keyboard. Pre-v7.1 this was on the right click, but the right click is now reserved for the waist freeze toggle so the operator can keep their right thumb on the lean / twist stick.
 
 | Camera (default order) | What it shows |
 |------------------------|---------------|

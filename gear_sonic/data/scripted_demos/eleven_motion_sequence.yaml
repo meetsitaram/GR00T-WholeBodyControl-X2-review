@@ -9,9 +9,9 @@
 #   6.  crouch medium                   crouch + medium          (-> crouch_medium)
 #   7.  step backward                   back_step + half_ft
 #   8.  lean forward medium             lean_fwd + medium
-#   9.  turn torso left 45              torso_left + deg_45
+#   9.  turn torso left 40              torso_left + deg_40
 #  10.  lean forward medium             lean_fwd + medium
-#  11.  turn torso right 45             torso_right + deg_45
+#  11.  turn torso right 40             torso_right + deg_40
 #
 # Each motion is followed by a 2.0 s idle settle (queued via
 # hold_seconds) so the robot returns to a stable square stance before
@@ -88,9 +88,9 @@ commands:
     magnitude: default
     hold_seconds: 2.0
 
-  # 9. turn torso left 45 deg
+  # 9. turn torso left 40 deg (was deg_45 pre-v6 cap)
   - intent: torso_left
-    magnitude: deg_45
+    magnitude: deg_40
   - intent: idle
     magnitude: default
     hold_seconds: 2.0
@@ -102,9 +102,9 @@ commands:
     magnitude: default
     hold_seconds: 2.0
 
-  # 11. turn torso right 45 deg
+  # 11. turn torso right 40 deg (was deg_45 pre-v6 cap)
   - intent: torso_right
-    magnitude: deg_45
+    magnitude: deg_40
   - intent: idle
     magnitude: default
     hold_seconds: 2.0

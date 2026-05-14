@@ -1,18 +1,21 @@
 # Canonical "static reach" demo for the static_upper_body primitive family.
 #
+# v6: covers the full reach ladder added with the synthesized-leans
+# rebuild -- forward (8/14/20 deg pitch), lateral (4/7/10 deg roll), and
+# twist (15/30/40 deg yaw). Every primitive is feet-planted; the only
+# motion is waist + small co-actuated hip / pelvis share.
+#
 # Designed to validate the lean-in / un-lean and torso-twist / un-twist
 # transitions that pick-and-place tasks rely on while the feet stay planted.
 #
-# Exercises:
-#   - idle -> lean_fwd_medium  (16 frame blend; static_upper_body family)
-#   - HOLD lean_fwd_medium     (apex held by the curated clip itself)
-#   - lean_fwd_medium -> idle  (16 frame blend = implicit "un-lean")
-#   - idle -> torso_left_30deg
-#   - HOLD torso twist
-#   - torso_left -> idle       (= implicit "un-twist")
-#   - idle -> torso_right_30deg
-#   - torso_right -> idle
-#   - idle -> lean_fwd_large -> idle
+# Exercises (forward family first, then lateral, then twist):
+#   - idle -> lean_fwd_{small,medium,large} -> idle  (sagittal reach ladder)
+#   - idle -> lean_left_medium -> idle               (lateral reach, left)
+#   - idle -> lean_right_medium -> idle              (lateral reach, right)
+#   - idle -> lean_left_large -> idle                (lateral reach AT CAP)
+#   - idle -> lean_right_large -> idle
+#   - idle -> torso_left_{30,40}deg -> idle          (twist ladder, both sides)
+#   - idle -> torso_right_{30,40}deg -> idle
 #
 # Acceptance criteria:
 #   - feet do not move (root XY drift <= 0.04 m total)
@@ -25,6 +28,14 @@ commands:
     magnitude: default
     hold_seconds: 1.0
 
+  # --- forward lean ladder (sagittal) ---
+  - intent: lean_fwd
+    magnitude: small
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
   - intent: lean_fwd
     magnitude: medium
 
@@ -32,6 +43,43 @@ commands:
     magnitude: default
     hold_seconds: 1.5
 
+  - intent: lean_fwd
+    magnitude: large
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  # --- lateral lean (NEW in v6) ---
+  - intent: lean_left
+    magnitude: medium
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: lean_right
+    magnitude: medium
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: lean_left
+    magnitude: large
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: lean_right
+    magnitude: large
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 2.0
+
+  # --- torso twist ladder ---
   - intent: torso_left
     magnitude: deg_30
 
@@ -46,8 +94,15 @@ commands:
     magnitude: default
     hold_seconds: 1.5
 
-  - intent: lean_fwd
-    magnitude: large
+  - intent: torso_left
+    magnitude: deg_40
+
+  - intent: idle
+    magnitude: default
+    hold_seconds: 1.5
+
+  - intent: torso_right
+    magnitude: deg_40
 
   - intent: idle
     magnitude: default

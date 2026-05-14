@@ -348,15 +348,15 @@ def test_right_stick_back_does_not_emit_lean():
 @pytest.mark.parametrize(
     "rx,expected",
     [
-        # Soft push (deadzone <= |rx| < turn_threshold(0.60)) -> torso
+        # Soft push (deadzone <= |rx| < turn_threshold(0.75)) -> torso
         (0.35,  LocomotionCmd("torso_right", "deg_30")),
-        (0.59,  LocomotionCmd("torso_right", "deg_30")),
+        (0.74,  LocomotionCmd("torso_right", "deg_30")),
         (-0.35, LocomotionCmd("torso_left",  "deg_30")),
-        (-0.59, LocomotionCmd("torso_left",  "deg_30")),
-        # Hard push (|rx| >= 0.60) -> 45° turn (default magnitude)
-        (0.60,  LocomotionCmd("turn_right", "deg_45")),
+        (-0.74, LocomotionCmd("torso_left",  "deg_30")),
+        # Hard push (|rx| >= 0.75) -> 45° turn (default magnitude)
+        (0.75,  LocomotionCmd("turn_right", "deg_45")),
         (0.90,  LocomotionCmd("turn_right", "deg_45")),
-        (-0.60, LocomotionCmd("turn_left",  "deg_45")),
+        (-0.75, LocomotionCmd("turn_left",  "deg_45")),
         (-0.90, LocomotionCmd("turn_left",  "deg_45")),
     ],
 )
@@ -447,9 +447,9 @@ def test_torso_disabled_by_default_emits_idle(rx):
     [
         # Hard rx still fires a turn even with torso disabled. This is
         # the operator's primary "pivot the robot" path for now.
-        (0.60,  LocomotionCmd("turn_right", "deg_45")),
+        (0.75,  LocomotionCmd("turn_right", "deg_45")),
         (0.95,  LocomotionCmd("turn_right", "deg_45")),
-        (-0.60, LocomotionCmd("turn_left",  "deg_45")),
+        (-0.75, LocomotionCmd("turn_left",  "deg_45")),
         (-0.95, LocomotionCmd("turn_left",  "deg_45")),
     ],
 )

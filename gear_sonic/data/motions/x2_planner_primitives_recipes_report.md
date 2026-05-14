@@ -2,8 +2,8 @@
 
 - Recipes: `/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_planner_primitives_recipes.yaml`
 - Source: `/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_bones_seed.pkl`
-- Bins built: **30**
-- Build wall time: 1.3s
+- Bins built: **36**
+- Build wall time: 1.4s
 
 ## Bin summary
 
@@ -20,17 +20,23 @@
 | `fwd_step_quarter_ft` | locomotion | 48 | 30.0 | `derive_from:fwd_step_1ft -> clip_window -> freeze -> scale_magnitude` | yes |
 | `fwd_walk_standard` | continuous_walk | 180 | 30.0 | `clip_window -> freeze` | yes |
 | `idle_stand` | idle | 45 | 30.0 | `clip_window -> freeze` | yes |
-| `lean_fwd_large` | static_upper_body | 75 | 30.0 | `derive_from:lean_fwd_medium -> clip_window -> freeze -> scale_magnitude` | yes |
-| `lean_fwd_medium` | static_upper_body | 75 | 30.0 | `clip_window -> freeze` | yes |
-| `lean_fwd_small` | static_upper_body | 75 | 30.0 | `derive_from:lean_fwd_medium -> clip_window -> freeze -> scale_magnitude` | yes |
+| `lean_fwd_large` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_fwd_medium` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_fwd_small` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_left_large` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_left_medium` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_left_small` | static_upper_body | 80 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `lean_right_large` | static_upper_body | 80 | 50.0 | `derive_from:lean_left_large -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
+| `lean_right_medium` | static_upper_body | 80 | 50.0 | `derive_from:lean_left_medium -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
+| `lean_right_small` | static_upper_body | 80 | 50.0 | `derive_from:lean_left_small -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
 | `side_left_step` | locomotion | 90 | 30.0 | `derive_from:side_right_step -> clip_window -> freeze -> mirror_lr` | yes |
 | `side_right_step` | locomotion | 90 | 30.0 | `clip_window -> freeze` | yes |
 | `torso_left_15deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
 | `torso_left_30deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
-| `torso_left_45deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
-| `torso_right_15deg` | static_upper_body | 70 | 50.0 | `derive_from:torso_left_15deg -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
-| `torso_right_30deg` | static_upper_body | 70 | 50.0 | `derive_from:torso_left_30deg -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
-| `torso_right_45deg` | static_upper_body | 70 | 50.0 | `derive_from:torso_left_45deg -> synthesize_waist_ramp -> freeze -> mirror_lr` | yes |
+| `torso_left_40deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `torso_right_15deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `torso_right_30deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
+| `torso_right_40deg` | static_upper_body | 70 | 50.0 | `synthesize_waist_ramp -> freeze` | yes |
 | `turn_left_15deg` | locomotion | 60 | 30.0 | `clip_window -> freeze` | yes |
 | `turn_left_30deg` | locomotion | 70 | 30.0 | `clip_window -> freeze` | yes |
 | `turn_left_45deg` | locomotion | 105 | 30.0 | `clip_window -> freeze` | yes |
@@ -171,29 +177,95 @@ dx=+4.09 m, dyaw -0.3 deg, fl_max 14.6 cm, planted endpoints.
   - `op:freeze(arms,head)`
 
 ### `lean_fwd_large` (static_upper_body)
-- notes: derived: 1.4 * lean_fwd_medium (~31 deg apex)
-- frames: 75 @ 30.0 fps
+- notes: synth: waist_pitch ramp 0->+20deg->0 (AT CAP) with
+hip_pitch_share=0.30. Apex hip flex +6 deg, pelvis tilts ~6 deg
+forward, torso ~26 deg in world. CG at hip height ~12 cm
+forward -- right at the foot half-length boundary. Anything
+beyond this needs a stepping recovery (use fwd_step_1ft +
+lean_fwd_medium chain instead).
+
+- frames: 80 @ 50.0 fps
 - sources:
-  - `loco__body_check_001__A474_M[752:827]`
+  - `synth:waist_pitch_ramp(peak=0.3491rad,hip_pitch_share=0.30)`
   - `op:freeze(arms,head)`
-  - `derive_from:lean_fwd_medium`
-  - `op:scale_magnitude(1.4)`
 
 ### `lean_fwd_medium` (static_upper_body)
-- notes: natural lean: body_check_001__A474_M frames [752, 827] (~22 deg apex)
-- frames: 75 @ 30.0 fps
+- notes: synth: waist_pitch ramp 0->+14deg->0 with hip_pitch_share=0.30.
+Apex hip flex +4.2 deg, pelvis tilts ~4 deg forward, torso
+~18 deg in world. Comparable to the v2 mocap apex (21.6 deg
+total fwd pitch) but with explicit reproducible geometry.
+
+- frames: 80 @ 50.0 fps
 - sources:
-  - `loco__body_check_001__A474_M[752:827]`
+  - `synth:waist_pitch_ramp(peak=0.2443rad,hip_pitch_share=0.30)`
   - `op:freeze(arms,head)`
 
 ### `lean_fwd_small` (static_upper_body)
-- notes: derived: 0.5 * lean_fwd_medium (~11 deg apex)
-- frames: 75 @ 30.0 fps
+- notes: synth: waist_pitch ramp 0->+8deg->0 with hip_pitch_share=0.30.
+Apex hip flex +2.4 deg, pelvis tilts ~2 deg forward, torso
+~10 deg in world. Conservative reach extension with negligible
+CG shift -- safe for any payload.
+
+- frames: 80 @ 50.0 fps
 - sources:
-  - `loco__body_check_001__A474_M[752:827]`
+  - `synth:waist_pitch_ramp(peak=0.1396rad,hip_pitch_share=0.30)`
   - `op:freeze(arms,head)`
-  - `derive_from:lean_fwd_medium`
-  - `op:scale_magnitude(0.5)`
+
+### `lean_left_large` (static_upper_body)
+- notes: synth: waist_roll ramp 0->+10deg->0 (AT CAP). Apex CG shift
+~10 cm laterally at hip height -- right at the foot half-WIDTH.
+Beyond this the contralateral foot will lift; use a side_step
+primitive instead for further lateral motion.
+
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.1745rad)`
+  - `op:freeze(arms,head)`
+
+### `lean_left_medium` (static_upper_body)
+- notes: synth: waist_roll ramp 0->+7deg->0. Apex CG shift ~7 cm
+laterally at hip height; mid-range lateral reach.
+
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.1222rad)`
+  - `op:freeze(arms,head)`
+
+### `lean_left_small` (static_upper_body)
+- notes: synth: waist_roll ramp 0->+4deg->0 (lean LEFT). Apex CG shift
+~4 cm laterally at hip height; well within the support polygon.
+
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.0698rad)`
+  - `op:freeze(arms,head)`
+
+### `lean_right_large` (static_upper_body)
+- notes: derived: mirror_lr(lean_left_large) -> waist_roll -10deg
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.1745rad)`
+  - `op:freeze(arms,head)`
+  - `derive_from:lean_left_large`
+  - `op:mirror_lr`
+
+### `lean_right_medium` (static_upper_body)
+- notes: derived: mirror_lr(lean_left_medium) -> waist_roll -7deg
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.1222rad)`
+  - `op:freeze(arms,head)`
+  - `derive_from:lean_left_medium`
+  - `op:mirror_lr`
+
+### `lean_right_small` (static_upper_body)
+- notes: derived: mirror_lr(lean_left_small) -> waist_roll -4deg
+- frames: 80 @ 50.0 fps
+- sources:
+  - `synth:waist_roll_ramp(peak=0.0698rad)`
+  - `op:freeze(arms,head)`
+  - `derive_from:lean_left_small`
+  - `op:mirror_lr`
 
 ### `side_left_step` (locomotion)
 - notes: derived: mirror_lr(side_right_step) -> back-left diagonal at ~45deg
@@ -228,52 +300,54 @@ A038_M frames [60, 150] (L knee span 12.9 deg) or revisit the
   - `op:freeze(arms,head)`
 
 ### `torso_left_15deg` (static_upper_body)
-- notes: synthesized: waist_yaw ramp 0->+15deg->0
+- notes: synth: waist_yaw ramp 0->+15deg->0 with hip_yaw_share=0.30
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.2618rad)`
+  - `synth:waist_yaw_ramp(peak=0.2618rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
 
 ### `torso_left_30deg` (static_upper_body)
-- notes: synthesized: waist_yaw ramp 0->+30deg->0
+- notes: synth: waist_yaw ramp 0->+30deg->0 with hip_yaw_share=0.30
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.5236rad)`
+  - `synth:waist_yaw_ramp(peak=0.5236rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
 
-### `torso_left_45deg` (static_upper_body)
-- notes: synthesized: waist_yaw ramp 0->+45deg->0
+### `torso_left_40deg` (static_upper_body)
+- notes: synth: waist_yaw ramp 0->+40deg->0 (AT CAP) with
+hip_yaw_share=0.30. Apex hip_yaw ~12 deg parallel rotation, so
+the pelvis follows ~12 deg and the upper body sees ~52 deg
+world-frame rotation about Z. Replaces v5 torso_left_45deg
+(peak_deg=45) which now exceeds the op-level yaw cap.
+
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.7854rad)`
+  - `synth:waist_yaw_ramp(peak=0.6981rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
 
 ### `torso_right_15deg` (static_upper_body)
-- notes: derived: mirror_lr(torso_left_15deg) -> waist_yaw -15deg
+- notes: synth: waist_yaw ramp 0->-15deg->0 with hip_yaw_share=0.30
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.2618rad)`
+  - `synth:waist_yaw_ramp(peak=-0.2618rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
-  - `derive_from:torso_left_15deg`
-  - `op:mirror_lr`
 
 ### `torso_right_30deg` (static_upper_body)
-- notes: derived: mirror_lr(torso_left_30deg) -> waist_yaw -30deg
+- notes: synth: waist_yaw ramp 0->-30deg->0 with hip_yaw_share=0.30
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.5236rad)`
+  - `synth:waist_yaw_ramp(peak=-0.5236rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
-  - `derive_from:torso_left_30deg`
-  - `op:mirror_lr`
 
-### `torso_right_45deg` (static_upper_body)
-- notes: derived: mirror_lr(torso_left_45deg) -> waist_yaw -45deg
+### `torso_right_40deg` (static_upper_body)
+- notes: synth: waist_yaw ramp 0->-40deg->0 (AT CAP) with hip_yaw_share=0.30.
+Mirror counterpart of torso_left_40deg; standalone synth (not
+mirror_lr-derived) -- see comment block above.
+
 - frames: 70 @ 50.0 fps
 - sources:
-  - `synth:waist_yaw_ramp(peak=0.7854rad)`
+  - `synth:waist_yaw_ramp(peak=-0.6981rad,hip_yaw_share=0.30)`
   - `op:freeze(arms,head)`
-  - `derive_from:torso_left_45deg`
-  - `op:mirror_lr`
 
 ### `turn_left_15deg` (locomotion)
 - notes: curator pick (score 0.745)

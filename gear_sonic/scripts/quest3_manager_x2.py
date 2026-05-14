@@ -320,19 +320,32 @@ class Quest3ManagerX2:
             enable_torso=cfg.intent_enable_torso,
             enable_continuous_torso=cfg.intent_enable_continuous_torso,
         )
-        # Latched continuous waist target. Captured at the moment the
-        # operator presses B to flip LOCOMOTION -> ARM_MANIPULATION;
-        # republished as a hold_torso command so the planner pins
-        # STATIC_HOLD at the same pose during arm manipulation. Cleared
-        # on the reverse transition. None means "no latch active".
+        # Latched continuous waist target. Set in two situations:
+        #   1) The operator presses B to flip LOCOMOTION ->
+        #      ARM_MANIPULATION (existing behavior; ARM_MAN is implicitly
+        #      a hold because the right stick is a no-op for waist there).
+        #   2) The operator presses the right thumbstick CLICK while in
+        #      LOCOMOTION (or ARM_MANIPULATION) to toggle ``_waist_frozen``
+        #      ON; the live waist target is captured here so the planner
+        #      can be re-pinned later if needed.
+        # ``None`` means "no latch active" (live stick drives the waist).
         self._latched_waist: tuple[float, float, float] | None = None
+        # R-thumbstick-click freeze toggle. Independent of mode: a press
+        # in LOCOMOTION freezes the body so the operator can keep
+        # leaning/twisting while walking with the L stick; the freeze
+        # persists across B-press mode flips so the body stays leaned
+        # through ARM_MANIPULATION and back. Toggled off by another
+        # R-click. Reset on any transition to OFF.
+        self._waist_frozen: bool = False
         self._button_sm = ButtonStateMachine(log_prefix="Input")
 
-        # Stick-click rising-edge tracker: the WebXR client polls the
+        # Stick-click rising-edge trackers. The WebXR client polls the
         # gamepad ~50 Hz so a click typically holds True for several
-        # ticks. We only want to fire ``cycle()`` on the press transition
-        # (False -> True), so we mirror the prevState-style detector
-        # ``ButtonStateMachine`` already does for the face buttons.
+        # ticks. We only fire on the press transition (False -> True);
+        # this mirrors the ``ButtonStateMachine`` debounce for the four
+        # face buttons. Left click cycles deploy MuJoCo viewer cameras
+        # (was on right click pre-v7); right click toggles waist freeze.
+        self._prev_left_stick_click = False
         self._prev_right_stick_click = False
 
         # Camera cycler. Always constructed (even when xdotool isn't
@@ -589,11 +602,20 @@ class Quest3ManagerX2:
                     self._publish_recorder_cmd("save", tick)
                     self._play_audio_prompt("record_save", fallback="Saved.")
 
-                # 4b) Camera cycler (right thumbstick click) --------------
-                #     Cycles the deploy MuJoCo viewer's fixed cameras
-                #     by synthesising a Tab keypress on the GLFW window
-                #     via xdotool. Active in LOCOMOTION + ARM_MAN, idle
-                #     in OFF (consistent with the rest of the manager:
+                # 4b) Stick clicks ------------------------------------------
+                #     LEFT thumbstick click  -> cycle deploy MuJoCo viewer
+                #         cameras (xdotool Tab keypress). Pre-v7 this was
+                #         the right click; moved here so the operator can
+                #         keep their right thumb on the lean / twist stick
+                #         while clicking the LEFT stick to re-frame.
+                #     RIGHT thumbstick click -> toggle ``_waist_frozen``.
+                #         While frozen, the right stick is suppressed for
+                #         waist control: the planner stays in STATIC_HOLD
+                #         at the pose the operator was holding when the
+                #         click landed. Another R-click releases it.
+                #
+                #     Both are active in LOCOMOTION + ARM_MAN, idle in
+                #     OFF (consistent with the rest of the manager:
                 #     OFF means "ignore controller events"). Rising-edge
                 #     tracked manually because ButtonStateMachine only
                 #     handles the four face buttons today.
@@ -602,18 +624,22 @@ class Quest3ManagerX2:
                 # publishes a unified ``vr_input`` ZMQ topic carrying
                 # the full controller state, the deploy viewer should
                 # subscribe directly and update mjvCamera in-process,
-                # making this xdotool hack unnecessary. See
+                # making the xdotool hack unnecessary. See
                 # ViewerCameraCycler.__doc__ for the rationale.
-                _l_click, r_click = self._quest.get_stick_clicks()
+                l_click, r_click = self._quest.get_stick_clicks()
+                l_click_edge = l_click and not self._prev_left_stick_click
                 r_click_edge = r_click and not self._prev_right_stick_click
+                self._prev_left_stick_click = l_click
                 self._prev_right_stick_click = r_click
                 if (
-                    r_click_edge
+                    l_click_edge
                     and self._intent.mode != StreamMode.OFF
                     and self._viewer_cycler is not None
                 ):
                     if self._viewer_cycler.cycle():
-                        log.info("[R-click] cycled deploy viewer camera (Tab)")
+                        log.info("[L-click] cycled deploy viewer camera (Tab)")
+                if r_click_edge and self._intent.mode != StreamMode.OFF:
+                    self._toggle_waist_freeze(live_waist_target)
 
                 # 3) Locomotion command ---------------------------------------
                 # Held-button modifiers (LOCOMOTION-only via decoder
@@ -630,8 +656,17 @@ class Quest3ManagerX2:
                     now=tick_now,
                 )
                 if cmd is not None:
-                    self._publish_planner_cmd(cmd)
-                    self._sidecar_emit(cmd, tick)
+                    # Drop live ``hold_torso`` updates while the operator
+                    # has the waist frozen (R-click toggle). The planner
+                    # stays in STATIC_HOLD at its current target because
+                    # no new hold_torso commands arrive; non-hold commands
+                    # (walk / turn / idle) still flow through so the
+                    # operator can keep walking with the body leaned.
+                    if self._waist_frozen and cmd.intent == "hold_torso":
+                        pass
+                    else:
+                        self._publish_planner_cmd(cmd)
+                        self._sidecar_emit(cmd, tick)
 
                 # In ARM_MANIPULATION we keep the planner held at idle by
                 # emitting an idle command on entry (handled in the mode
@@ -716,6 +751,46 @@ class Quest3ManagerX2:
             right_hand_source=r_src,
         )
 
+    def _toggle_waist_freeze(
+        self,
+        live_waist_target: tuple[float, float, float],
+    ) -> None:
+        """R-thumbstick-click handler: toggle waist freeze on/off.
+
+        On freeze ON: the live waist target at the moment of click is
+        captured into ``_latched_waist`` so subsequent code paths (e.g.
+        a B-press into ARM_MANIPULATION while frozen) source the
+        latched pose instead of resampling. The decoder keeps emitting
+        ``hold_torso`` updates internally, but the manager suppresses
+        them at publish time (see the ``_waist_frozen`` check in the
+        main loop), so the planner stays at its current STATIC_HOLD
+        target even as the operator's right stick drifts.
+
+        On freeze OFF: ``_latched_waist`` is cleared and the suppression
+        lifts. The next decoder tick re-emits the live target, so the
+        planner blends to whatever the operator is now holding (or to
+        neutral, if the stick is centered).
+        """
+        if self._waist_frozen:
+            self._waist_frozen = False
+            self._latched_waist = None
+            log.info("[R-click] waist freeze -> RELEASED")
+            self._play_audio_prompt(
+                "torso_released", fallback="Torso released.",
+            )
+        else:
+            pitch, roll, yaw = live_waist_target
+            self._waist_frozen = True
+            self._latched_waist = (pitch, roll, yaw)
+            log.info(
+                "[R-click] waist freeze -> FROZEN at "
+                "pitch=%+.1f roll=%+.1f yaw=%+.1f",
+                pitch, roll, yaw,
+            )
+            self._play_audio_prompt(
+                "torso_frozen", fallback="Torso frozen.",
+            )
+
     def _on_mode_transition(
         self,
         transition: ModeTransition,
@@ -750,8 +825,16 @@ class Quest3ManagerX2:
             transition.previous == StreamMode.LOCOMOTION
             and transition.current == StreamMode.ARM_MANIPULATION
         ):
-            pitch, roll, yaw = live_waist_target
-            self._latched_waist = (pitch, roll, yaw)
+            # Source the latch from whichever target is currently
+            # authoritative: if the operator already R-clicked to freeze
+            # in LOCOMOTION, use the frozen pose (so the B-press doesn't
+            # snap to a slightly different live sample). Otherwise, take
+            # the live continuous target as today.
+            if self._waist_frozen and self._latched_waist is not None:
+                pitch, roll, yaw = self._latched_waist
+            else:
+                pitch, roll, yaw = live_waist_target
+                self._latched_waist = (pitch, roll, yaw)
             self._publish_planner_cmd(
                 LocomotionCmd(
                     intent="hold_torso",
@@ -763,8 +846,10 @@ class Quest3ManagerX2:
             )
             self._retargeter.reset_finger_filter()
             log.info(
-                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f",
+                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f"
+                "%s",
                 pitch, roll, yaw,
+                " (R-click freeze active)" if self._waist_frozen else "",
             )
             # Audio cue: separate "torso_locked" prompt only when the
             # latched pose is meaningfully non-neutral (>= 1 deg on
@@ -778,8 +863,23 @@ class Quest3ManagerX2:
             transition.previous == StreamMode.ARM_MANIPULATION
             and transition.current == StreamMode.LOCOMOTION
         ):
-            self._latched_waist = None
-            self._publish_planner_cmd(LocomotionCmd("idle", "default"))
+            # If the operator R-click-froze the waist before / during
+            # ARM_MANIPULATION, KEEP the freeze across the transition
+            # back to LOCOMOTION: don't clear ``_latched_waist`` and
+            # don't blow the planner's STATIC_HOLD away with an idle
+            # cmd. The operator can now walk / turn with the L stick
+            # while the body stays at the locked pose. R-click again
+            # to release. If the freeze flag is OFF, fall through to
+            # the legacy release-into-idle path so the body smoothly
+            # blends back to standing.
+            if self._waist_frozen and self._latched_waist is not None:
+                log.info(
+                    "[manager-x2] ARM->LOCO with R-click freeze active; "
+                    "keeping STATIC_HOLD at latched pose"
+                )
+            else:
+                self._latched_waist = None
+                self._publish_planner_cmd(LocomotionCmd("idle", "default"))
         elif transition.current == StreamMode.ARM_MANIPULATION:
             # Reached ARM_MANIPULATION not via LOCOMOTION (e.g. would
             # only happen if a future chord adds a direct OFF -> ARM
@@ -789,9 +889,11 @@ class Quest3ManagerX2:
 
         # On leaving an active mode -> OFF: tell the recorder to drop
         # any in-progress episode (this is a hard E-stop semantic;
-        # operator can re-arm and start fresh).
+        # operator can re-arm and start fresh). Also drop the R-click
+        # freeze so the next engagement starts with a clean slate.
         if transition.current == StreamMode.OFF and transition.previous != StreamMode.OFF:
             self._latched_waist = None
+            self._waist_frozen = False
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
             self._publish_recorder_cmd("estop", tick)
 

@@ -95,6 +95,20 @@ PROMPT_TEXTS: dict[str, str] = {
     "mode_off":              "Off.",
     "mode_locomotion":       "Locomotion.",
     "mode_arm_manipulation": "Arm manipulation.",
+    # Played in addition to ``mode_arm_manipulation`` when the operator
+    # crosses LOCOMOTION -> ARM_MANIPULATION while holding a non-neutral
+    # waist pose (>= 1 deg on any axis). Tells the operator the planner
+    # has frozen their lean / twist so they can drive arms without
+    # losing the upper-body pose. See
+    # ``Quest3ManagerX2._on_mode_transition`` for the latch logic.
+    "mode_torso_locked":     "Torso locked.",
+    # R-thumbstick-click toggles the waist freeze independent of mode.
+    # ``torso_frozen`` plays on freeze ON (operator wants the body to
+    # stay at the current lean / twist while the right stick moves
+    # freely); ``torso_released`` plays on freeze OFF (right stick
+    # resumes driving the waist live).
+    "torso_frozen":          "Torso frozen.",
+    "torso_released":        "Torso released.",
     "record_start":          "Recording.",
     "record_save":           "Saved.",
 }
@@ -108,6 +122,9 @@ MANAGER_PROMPT_KEYS: tuple[str, ...] = (
     "mode_off",
     "mode_locomotion",
     "mode_arm_manipulation",
+    "mode_torso_locked",
+    "torso_frozen",
+    "torso_released",
     "record_start",
     "record_save",
 )

@@ -45,6 +45,8 @@ class BinSpec:
       target_yaw_deg: yaw delta target in degrees (locomotion only).
       target_waist_pitch_deg: peak waist pitch target (static only).
       target_waist_yaw_deg: peak waist yaw target (static only).
+      target_waist_roll_deg: peak waist roll target (static only;
+          lateral lean family).
       tol_xy_m: tolerance on net XY magnitude, meters (locomotion only).
       tol_yaw_deg: tolerance on net yaw, degrees (locomotion only).
       tol_waist_deg: tolerance on dominant waist axis, degrees (static only).
@@ -78,6 +80,7 @@ class BinSpec:
     target_yaw_deg: float = 0.0
     target_waist_pitch_deg: float = 0.0
     target_waist_yaw_deg: float = 0.0
+    target_waist_roll_deg: float = 0.0
     tol_xy_m: float = 0.05
     tol_yaw_deg: float = 5.0
     tol_waist_deg: float = 5.0
@@ -139,6 +142,7 @@ def load_bin_specs(path: Path) -> dict[str, BinSpec]:
                 target_yaw_deg=float(entry.get("target_yaw_deg", 0.0)),
                 target_waist_pitch_deg=float(entry.get("target_waist_pitch_deg", 0.0)),
                 target_waist_yaw_deg=float(entry.get("target_waist_yaw_deg", 0.0)),
+                target_waist_roll_deg=float(entry.get("target_waist_roll_deg", 0.0)),
                 tol_xy_m=float(entry.get("tol_xy_m", 0.05)),
                 tol_yaw_deg=float(entry.get("tol_yaw_deg", 5.0)),
                 tol_waist_deg=float(entry.get("tol_waist_deg", 5.0)),

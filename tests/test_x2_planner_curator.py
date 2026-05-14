@@ -65,6 +65,15 @@ def test_constants_match_eval_x2_mujoco() -> None:
     assert const.WAIST_PITCH_IDX == const.MUJOCO_JOINT_NAMES.index("waist_pitch_joint")
     assert const.WAIST_ROLL_IDX == const.MUJOCO_JOINT_NAMES.index("waist_roll_joint")
 
+    # Counter-balance index lookups used by op_synthesize_waist_ramp's
+    # hip_pitch_share / hip_yaw_share / ankle_roll_share knobs.
+    assert const.LEFT_HIP_YAW_IDX == const.MUJOCO_JOINT_NAMES.index("left_hip_yaw_joint")
+    assert const.RIGHT_HIP_YAW_IDX == const.MUJOCO_JOINT_NAMES.index("right_hip_yaw_joint")
+    assert const.LEFT_HIP_ROLL_IDX == const.MUJOCO_JOINT_NAMES.index("left_hip_roll_joint")
+    assert const.RIGHT_HIP_ROLL_IDX == const.MUJOCO_JOINT_NAMES.index("right_hip_roll_joint")
+    assert const.LEFT_ANKLE_ROLL_IDX == const.MUJOCO_JOINT_NAMES.index("left_ankle_roll_joint")
+    assert const.RIGHT_ANKLE_ROLL_IDX == const.MUJOCO_JOINT_NAMES.index("right_ankle_roll_joint")
+
 
 # ---------------------------------------------------------------------------
 # Synthetic fixtures
@@ -592,8 +601,16 @@ def test_bins_yaml_in_repo_loads_cleanly() -> None:
         "lean_fwd_small",
         "lean_fwd_medium",
         "lean_fwd_large",
+        # Lateral lean family (NEW in v6).
+        "lean_left_small",
+        "lean_left_medium",
+        "lean_left_large",
+        "lean_right_small",
+        "lean_right_medium",
+        "lean_right_large",
         "torso_left_15deg",
-        "torso_right_45deg",
+        # torso_*_45deg renamed to torso_*_40deg in v6 (yaw cap = 40 deg).
+        "torso_right_40deg",
     ):
         assert required in specs, f"bins.yaml missing required bin {required!r}"
         s = specs[required]
