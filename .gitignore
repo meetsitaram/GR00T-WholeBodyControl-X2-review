@@ -241,6 +241,16 @@ sonic_release/
 # (see gear_sonic/data/x2_planner_primitives_recipes.yaml etc).
 gear_sonic/data/motions/*.pkl
 
+# Synthetic-data-generation (SDG) USD assets. The `grab/` subtree is the
+# upstream GRAB hand-object capture archive (~855 MB, CC-BY-NC, fetched
+# externally), and `simple/` holds bulky binary `.usd` props (table /
+# tray / bottle ~ 14 MB total) sourced from Omniverse-style libraries.
+# Both are regenerable from upstream / re-downloaded on demand and would
+# blow up clone size if tracked. Any hand-authored SDG sources (Python
+# generators under gear_sonic/sdg/{robots,scenes}/, recipe YAMLs, etc.)
+# stay tracked -- only the binary/large asset payload is ignored.
+gear_sonic/sdg/assets/
+
 # Training output logs
 logs_rl/
 logs_eval/
