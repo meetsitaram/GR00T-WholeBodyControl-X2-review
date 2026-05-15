@@ -217,12 +217,14 @@ def get_features_x2_vla(
 
     Action surface (v1 schema, ``post_sonic_canonical=True``):
 
-    * ``action.motion_token`` (64-D) -- legacy / v1 surface kept for
-      cross-embodiment compat with ``unitree_g1_sonic``. During live
-      recording this field is filled with zeros and is meant to be
-      overwritten by an offline labeling pass that runs
-      ``SonicMotionTokenLabeler`` over ``action.body_q_mj`` (see
-      ``label_recorded_dataset.py``).
+    * ``action.motion_token`` (64-D) -- the SONIC FSQ encoding of the
+      *commanded* ``body_q_mj`` (operator intent), filled inline by the
+      recorder via
+      :class:`~gear_sonic.utils.teleop.online_sonic_tokenizer.OnlineSonicTokenizer`
+      when ``--sonic-checkpoint`` is set. **This is the supervision
+      target for VLA training on top of SONIC.** When the checkpoint is
+      not provided (kinematic-only smoke tests) this column is all
+      zeros and the recorder warns once at startup.
     * ``action.body_q_mj`` (``num_body``-D, MuJoCo joint ordering) --
       **CANONICAL training target**. The post-SONIC executed q (what
       the trained tracking policy actually achieved, i.e. what's

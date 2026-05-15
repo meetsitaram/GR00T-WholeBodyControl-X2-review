@@ -855,6 +855,357 @@ runs this same envelope without the C++ deploy and is suitable for CI.
 
 ---
 
+## 5a. SONIC architecture & dataset labeling
+
+The two preceding sections describe **what flows on the wire** at deploy
+time. This section steps back to explain **how the SONIC tracking model is
+split**, **which half lives where**, and **what the recorder writes into
+the LeRobot dataset as the VLA's supervision target** — i.e. why the next
+recorded episode is training-ready as written and not a kinematic-only
+shell that you have to label later.
+
+### 5a.1 SONIC is one model with two halves
+
+```
+   ┌──────────────────── SONIC tracking model ───────────────────┐
+   │                                                             │
+   │     ┌─────────────┐         ┌─────────────┐                 │
+   │     │   ENCODER   │ ──────► │    FSQ      │ ──► motion_token│
+   │     │  (10-frame  │         │  quantizer  │       (64-D)    │
+   │     │ future ref  │         │             │                 │
+   │     │  → latent)  │         │             │                 │
+   │     └─────────────┘         └─────────────┘                 │
+   │            ▲                                                │
+   │            │                                                │
+   │   tokenizer_obs (680-D)                                     │
+   │   = 10 future frames × (31 jpos + 31 jvel + 6 ori)          │
+   │                                                             │
+   │                       ┌─────────────┐                       │
+   │   motion_token ─────► │   DECODER   │ ──► joint targets     │
+   │                       │   (actor)   │     (delta_pos)       │
+   │                       └─────────────┘                       │
+   │                              ▲                              │
+   │                              │                              │
+   │                       proprio + history                     │
+   │                                                             │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+The encoder maps a 680-D 10-frame future-reference window to a 64-D
+FSQ-quantized token. The decoder ("actor") maps a token plus current
+proprio back to delta joint targets. Both halves were trained jointly,
+but they land in different artifact files for distribution:
+
+| File | Size | What's inside | Used by |
+|------|------|---------------|---------|
+| `model_step_NNNNNN_g1.onnx` | ~58 MB | **Fused** actor: SONIC encoder + FSQ + decoder, all stitched into one ONNX graph (PPO-style export) | C++ deploy actor at inference time |
+| `model_step_NNNNNN.pt` | ~398 MB | Full PyTorch checkpoint: actor + **encoder weights** + critic + optimizer state | Training, evaluation, **and the inline tokenizer in the recorder** |
+
+The encoder weights are inside the ONNX (fused into the actor graph),
+but they're also independently extractable from the `.pt` via the key
+prefix `actor_module.encoders.g1.module.*` (see
+[`gear_sonic/scripts/sonic_motion_token_labeler.py`](../../../gear_sonic/scripts/sonic_motion_token_labeler.py)
+`_load_actor`). The recorder reuses those `.pt` weights to label
+`action.motion_token` so the column the VLA learns to predict is
+byte-identical to what the deploy actor's internal encoder emits from
+the same wire snapshot.
+
+> **G1 vs X2 packaging note.** G1 ships *two separate ONNX files*
+> (`encoder.onnx` + `policy.onnx`) so a deploy can swap the encoder
+> at runtime via `--encoder-model` and a multi-modal observation
+> config. X2 ships *one fused ONNX* because the X2 release was
+> trained on a single encoder modality (retargeted body_q) and the
+> PPO export pipeline fuses the graph for inference simplicity. The
+> recorder closes the gap on the dataset side: the YAML config at
+> `gear_sonic/data/encoder/x2_observation_config.yaml` mirrors G1's
+> `observation_config.yaml` schema, so the artifact story is the
+> same across both robots even though the deploy packaging differs.
+
+### 5a.2 Where each half lives in your pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│   RECORDING TIME                                                         │
+│   (laptop / dev box)                                                     │
+│                                                                          │
+│   Quest 3 ──► quest3_manager ──► arm/hand body_q (commanded)             │
+│                                                                          │
+│   Quest 3 ──► quest3_manager ──► locomotion_cmd                          │
+│                                       │                                  │
+│                                       ▼                                  │
+│                              x2_heuristic_planner                        │
+│                                       │                                  │
+│                  body_pose +  joint_pos_mj_future (current + 9 future)   │
+│                                       │                                  │
+│                                       ▼                                  │
+│                          ┌─── X2DatasetRecorder ───┐                     │
+│                          │   ┌─────────────────┐   │                     │
+│                          │   │ X2EncoderObs    │ ◄─┼── YAML-driven      │
+│                          │   │ Builder         │   │   gather from      │
+│                          │   │ (registry)      │   │   x2_observation_  │
+│                          │   └────────┬────────┘   │   config.yaml      │
+│                          │            │            │                     │
+│                          │   tokenizer_obs (680-D) │                     │
+│                          │   = real planner future │                     │
+│                          │            │            │                     │
+│                          │            ▼            │                     │
+│                          │   ┌─────────────────┐   │                     │
+│                          │   │ SONIC ENCODER   │ ◄─┼── loaded from .pt  │
+│                          │   │ (encoder weights│   │   (extracted from  │
+│                          │   │  from 398 MB    │   │    actor_module.   │
+│                          │   │  checkpoint)    │   │    encoders.g1.*)  │
+│                          │   └────────┬────────┘   │                     │
+│                          │            │            │                     │
+│                          │       motion_token      │                     │
+│                          │            │            │                     │
+│                          └────────────┼────────────┘                     │
+│                                       ▼                                  │
+│                              parquet: action.motion_token (GT label)     │
+└──────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│   VLA TRAINING                                                           │
+│   (cloud / GPU box, batched)                                             │
+│                                                                          │
+│        parquet ──► VLA ──► predicted_token                               │
+│                                  │                                       │
+│                                  │   loss against action.motion_token    │
+│                                  ▼                                       │
+│                            (no SONIC involved here at all)               │
+└──────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│   INFERENCE / DEPLOY                                                     │
+│   (real robot or sim deploy)                                             │
+│                                                                          │
+│        camera + proprio ──► VLA ──► motion_token                         │
+│                                          │                               │
+│                                          │ ZMQ (pose topic, 5556)        │
+│                                          ▼                               │
+│                              ┌── C++ deploy ──┐                          │
+│                              │  ┌──────────┐  │                          │
+│                              │  │  SONIC   │ ◄┼── loaded from .onnx     │
+│                              │  │ DECODER  │  │                          │
+│                              │  │  (actor) │  │                          │
+│                              │  └────┬─────┘  │                          │
+│                              │       │        │                          │
+│                              │  joint targets │                          │
+│                              └───────┬────────┘                          │
+│                                      ▼                                   │
+│                              motors on the X2                            │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The `.pt` is your **dataset-building tool**: it runs on the recording
+laptop only. Once the labels are baked into the parquet, the `.pt`
+never needs to leave the dev box. The robot itself only ever sees the
+`.onnx`. Two practical consequences:
+
+* **No extra weight on the robot.** The deploy keeps shipping the same
+  ~58 MB ONNX. No new memory footprint at the edge.
+* **Encoder version is locked at record time.** The `.pt` you used to
+  label episode 0 is *baked into* the dataset (as the actual token
+  values). If you later swap to a newer SONIC checkpoint for the
+  deploy, your old recordings stay self-consistent — you just need to
+  re-record (or re-label offline) any data you want to use against the
+  new tracker.
+
+### 5a.3 Where retargeting happens (Quest 3 → X2 body_q)
+
+The "Quest 3 → quest3_manager → body_q" arrow in the diagrams above
+hides two distinct retargeting paths owned by separate components:
+
+```
+┌──────────────────────────────── quest3_manager_x2.py ───────────────────────────────┐
+│                                                                                     │
+│   raw Quest 3 frame                                                                 │
+│   { head_pose, L/R wrist_pose, L/R finger_curls, L/R trigger,                       │
+│     L/R thumbstick, A/B/X/Y/clicks }                                                │
+│                                                                                     │
+│       ┌────────────────────────────┐         ┌──────────────────────────────────┐   │
+│       │  IntentDecoder             │         │  Retargeter (x2_retarget_pipeline│   │
+│       │  (intent_decoder.py)       │         │    .py)                          │   │
+│       │                            │         │  ┌────────────────────────────┐  │   │
+│       │  Inputs:                   │         │  │ VRArmTeleopCalibrated      │  │   │
+│       │   • L/R thumbsticks        │         │  │ (calibrated DLS arm IK)    │  │   │
+│       │   • A/B/X/Y/clicks         │         │  │ wrist 6-DoF (head-rel.)    │  │   │
+│       │                            │         │  │   ──► 7 joints per arm     │  │   │
+│       │  Outputs:                  │         │  └─────────────┬──────────────┘  │   │
+│       │   • LocomotionCommand      │         │                │                 │   │
+│       │     (walk / turn / step /  │         │  ┌─────────────▼──────────────┐  │   │
+│       │      hold_torso(pitch,yaw))│         │  │ FingerSignalFilter +       │  │   │
+│       │   • mode transitions       │         │  │ x2_hand_retarget           │  │   │
+│       │                            │         │  │ XRHand 5 curls + thumb opp │  │   │
+│       │  ► sent over ZMQ to        │         │  │   ──► 10-DOF OmniHand cmd  │  │   │
+│       │    x2_heuristic_planner    │         │  └─────────────┬──────────────┘  │   │
+│       │    (separate process)      │         │                │                 │   │
+│       └────────────┬───────────────┘         │  ┌─────────────▼──────────────┐  │   │
+│                    │                         │  │ compose_body_q             │  │   │
+│                    │                         │  │ start: DEFAULT_STAND_POSE  │  │   │
+│                    │                         │  │   slot[15:22] ← left arm   │  │   │
+│                    │                         │  │   slot[22:29] ← right arm  │  │   │
+│                    │                         │  │ Output: 31-D X2 body_q     │  │   │
+│                    │                         │  └────────────────────────────┘  │   │
+│                    │                         └────────────────┬─────────────────┘   │
+│                    │  legs/waist sourced                      │  arms+hands         │
+│                    │  from planner via ZMQ                    │  sourced here       │
+│                    └──────────────► merge in publish loop ◄───┘                     │
+│                                                │                                    │
+│                                                ▼                                    │
+│                            merged 31-D X2 body_q (MuJoCo joint order)               │
+│                            + L/R hand 10-DOF                                        │
+└────────────────────────────────────────────────┬────────────────────────────────────┘
+                                                 │
+                                                 ▼
+                          (recorder, deploy, dataset all consume this)
+```
+
+The two pipelines are split by latency / planning-horizon needs:
+
+* **Arms** are direct kinematic retargeting (per-tick IK, no planning) —
+  happens in-process inside the manager via
+  [`Retargeter.step()`](../../../gear_sonic/utils/teleop/x2_retarget_pipeline.py).
+* **Legs / waist** need a state machine (gait cycle, primitive
+  sequencing) — that lives in a separate planner process and is driven
+  by **decoded operator intent** rather than raw poses.
+
+The merge point in
+[`gear_sonic/scripts/quest3_manager_x2.py`](../../../gear_sonic/scripts/quest3_manager_x2.py)
+is where the two paths fuse into the single 31-D X2 body_q vector that
+becomes `action.body_q_mj` and gets fed to the SONIC encoder for
+`action.motion_token`.
+
+### 5a.4 Why the label is encoded from *commanded* body_q, not *observed*
+
+The recorder feeds the encoder the **planner's real 10-frame future
+window** (current commanded `body_q_mj` stacked in front of 9 future
+planner frames) — not the observed body_q from `x2_debug`, and not a
+freeze-pose tile of the current body_q. `action.*` is the operator's
+intent; `observation.*` is the robot's result. The motion_token must
+live on the intent side. Four reasons, in order of importance:
+
+1. **Behavior cloning targets actions, not next-state observations.**
+   At inference time the VLA emits a control signal (motion_token).
+   Training labels must be in the same space — i.e. *what the operator
+   commanded*, encoded into the same token format the VLA must learn
+   to produce. Labels from observed body_q would teach the VLA to
+   predict where the robot *was*, not where the operator *wanted it
+   to go*.
+2. **Encoding observed body_q is circular.** The robot pose at frame
+   N is the *result* of the previous tick's token being decoded. Re-
+   encoding it asks "what token, when decoded, would best reproduce
+   the pose the previous token already produced?" — you'd be
+   training the VLA on the identity map of SONIC's own low-pass
+   behavior, with a one-tick lag baked in.
+3. **Tracking lag corrupts observed body_q for label purposes.** The
+   deploy's tracking actor has 50–200 ms of latency between command
+   and execution. Labeling frame N with observation N offsets the
+   label in time from the operator's intent, biasing the VLA toward
+   "where the robot catches up to the operator" rather than where
+   the operator went.
+4. **The encoder was trained on clean intent.** SONIC's encoder
+   consumed reference motion clips during training, not simulation
+   outputs with tracking error / contact noise / sensor drift.
+   Commanded body_q is in-distribution; observed body_q is
+   slightly off-manifold and produces noisier tokens.
+
+The dataset still captures the observed proprio — it just lives on
+the observation side of the row, where it belongs:
+
+```
+parquet row at frame N:
+   observation.state          ← from x2_debug (what the robot is doing)
+   observation.images.ego_view ← rendered against observation.state
+   observation.images.front_cam← world-fixed wide-angle view
+   action.body_q_mj            ← commanded (operator intent)
+   action.motion_token         ← SONIC.encode(planner 10-frame future
+                                              starting at frame N)
+                                              ↑ THE NEW LABEL
+   action.left_hand_q          ← commanded
+   action.right_hand_q         ← commanded
+   action.task                 ← language string
+```
+
+The supervision target is **multi-frame**: the encoder sees the next
+0.9 s of operator intent at every recorded tick, exactly mirroring the
+deploy actor's internal encoder input. So the VLA training pipeline
+gets a clean state→intent mapping with no temporal off-by-one, no
+double-pass through SONIC, and no observed-state leakage into the
+action namespace — and the labels are semantically aligned with the
+policy the deploy will run at inference time.
+
+### 5a.5 Wrapper integration: auto-resolving the .pt and the YAML
+
+The wrapper
+[`run_x2_quest3_planner_stack.sh`](../../../gear_sonic/scripts/run_x2_quest3_planner_stack.sh)
+auto-resolves both the SONIC `.pt` and the encoder-observation YAML.
+The `.pt` is derived from the deploy ONNX path it already takes via
+`--model` (verified against the live VLA demo path):
+
+```text
+ONNX:  /.../h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx
+PT:    /.../h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+— strip `/exported/` and the `_g1.onnx` suffix, append `.pt`. The
+YAML defaults to the canonical config that ships in the repo:
+
+```text
+ENCODER_CONFIG="${REPO_ROOT}/gear_sonic/data/encoder/x2_observation_config.yaml"
+```
+
+The wrapper preflights both paths: if the `.pt` is missing and the
+operator did not pass `--no-sonic-checkpoint` (the kinematic-only
+escape hatch for smoke tests), the run aborts before any process is
+spawned. Same gate for the YAML — missing file is a hard fail unless
+the operator passed `--encoder-config ''` (the freeze-pose escape
+hatch). The startup banner shows the result:
+
+```text
+motion_token     : ON  (.../model_step_025000.pt, cuda:0)
+encoder_config   : .../x2_observation_config.yaml, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D
+```
+
+The two escape hatches surface as:
+
+```text
+motion_token     : DISABLED (action.motion_token = zeros; dataset will not be VLA-trainable)
+encoder_config   : (unused; tokenizer DISABLED above)
+```
+
+```text
+motion_token     : ON  (.../model_step_025000.pt, cuda:0)
+encoder_config   : DEPRECATED freeze-pose (--encoder-config '' was passed)
+```
+
+— so an operator never silently produces a zero-token dataset *or* a
+freeze-pose-token dataset.
+
+### 5a.6 G1 parity: same schema, different deploy packaging
+
+X2 and G1 follow the **same labeling contract** at the dataset level
+even though their deploy artifacts are packaged differently:
+
+| Aspect | G1 (release) | X2 (release) |
+|---|---|---|
+| Deploy artifact | `encoder.onnx` + `policy.onnx` (two files) | `actor.onnx` (one fused file) |
+| Encoder modality switch | Multi-modal at runtime (g1, teleop, smpl) | Single modality at training time |
+| Encoder config | `gear_sonic_deploy/policy/release/observation_config.yaml` | `gear_sonic/data/encoder/x2_observation_config.yaml` |
+| YAML schema | `encoder.encoder_observations` + `encoder.encoder_modes` | Same fields, restricted to `retargeted_body_q` |
+| Inline tokenizer (recorder) | Not applicable — G1 ships a separate offline labeler | `OnlineSonicTokenizer.from_checkpoint_with_config` |
+
+The schema match is intentional: when the X2 release re-trains the
+encoder with additional modalities (e.g. SMPL human pose, VR-only
+sparse points), the recorder's
+[`X2EncoderObsBuilder`](../../../gear_sonic/utils/teleop/x2_encoder_obs_builder.py)
+registry can drop in additional gather functions without changing the
+recorder's API or the dataset schema — adding a modality is a YAML +
+registry edit, not a recorder rewrite.
+
+---
+
 ## 5b. Live closed-loop demo (M5 v0)
 
 Once M0–M4 are green, the M5 acceptance gate is the **first end-to-end

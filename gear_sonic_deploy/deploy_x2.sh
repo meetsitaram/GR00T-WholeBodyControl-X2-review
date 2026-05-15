@@ -1419,11 +1419,19 @@ fi
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
 
 # ────────────────────────────────────────────────────────────────────────
-# Smooth-handoff flags: only meaningful for real-robot modes (local/onbot).
-# In sim mode there is no MC to hand off to; the bridge owns the bus the
-# whole time, so HOLD_FOR_MC + the stand-pose YAML would be no-ops.
+# Stand-default pose YAML (RAMP_OUT / HOLD_FOR_MC target in the C++ node).
+#
+# Real-robot modes (local/onbot): always forward when the file exists.
+#
+# Sim: historically omitted under the assumption HOLD_FOR_MC is unused.
+# Sim + --vla still runs the handoff RAMP_OUT path against ``default_angles``
+# unless we pass the captured MC stand YAML — which logs a loud warning
+# and can snap elbows vs gantry_hang. Forward the shipped YAML for VLA sim
+# only; pure --motion sim stays unchanged.
+#
+# HOLD_FOR_MC sentinels + timeout remain local/onbot-only (no MC bus in sim).
 # ────────────────────────────────────────────────────────────────────────
-if [[ "$MODE" != "sim" ]]; then
+if [[ "$MODE" != "sim" ]] || [[ "${VLA_MODE:-false}" == "true" ]]; then
     if [[ -z "$STAND_POSE_YAML" ]]; then
         # Default to the captured pose shipped in the repo. The C++ binary
         # falls back to default_angles if the file is missing, but it also
@@ -1437,6 +1445,8 @@ if [[ "$MODE" != "sim" ]]; then
         echo -e "${YELLOW}NOTE: --stand-pose-yaml '$STAND_POSE_YAML' not found;${NC}"
         echo -e "${YELLOW}      deploy node will fall back to default_angles for HOLD_FOR_MC.${NC}"
     fi
+fi
+if [[ "$MODE" != "sim" ]]; then
     if [[ -n "$HOLD_FOR_MC_TIMEOUT_S" && "$HOLD_FOR_MC_TIMEOUT_S" != "0" ]]; then
         ROS2_ARGS+=("--hold-for-mc-timeout-s" "$HOLD_FOR_MC_TIMEOUT_S")
         # Sentinel goes in $RUN_LOG_DIR if available (per-run dir; gets

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X2 Quest3 stack — four logs, readiness, wire flow</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=Sora:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #161c26;
+      --ink: #e8ecf4;
+      --muted: #8b95a8;
+      --accent: #5eead4;
+      --wire-pose: #7dd3fc;
+      --wire-body: #c4b5fd;
+      --wire-debug: #fca5a5;
+      --wire-arms: #fde047;
+      --idle: #334155;
+      --hot: #22c55e;
+      --warn: #f97316;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Literata", Georgia, serif;
+      background: radial-gradient(1200px 800px at 10% -10%, #1a2332 0%, var(--bg) 55%);
+      color: var(--ink);
+      line-height: 1.55;
+      padding: 2.5rem clamp(1rem, 4vw, 3rem) 4rem;
+    }
+    h1, h2, h3, .label {
+      font-family: "Sora", system-ui, sans-serif;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    h1 {
+      font-size: clamp(1.35rem, 3vw, 2rem);
+      margin: 0 0 0.35rem;
+      color: var(--accent);
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 0.95rem;
+      max-width: 58rem;
+      margin-bottom: 2rem;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 14px;
+      padding: 1.5rem clamp(1rem, 2vw, 2rem) 2rem;
+      margin-bottom: 2.5rem;
+      box-shadow: 0 24px 48px rgba(0,0,0,0.35);
+    }
+    h2 { margin-top: 0; font-size: 1.15rem; color: #cbd5e1; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.5rem;
+      margin: 1rem 0 1.25rem;
+      font-size: 0.82rem;
+      font-family: "Sora", sans-serif;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .sw { width: 14px; height: 14px; border-radius: 3px; }
+    .sw-hot { background: var(--hot); }
+    .sw-idle { background: var(--idle); }
+    .sw-warn { background: var(--warn); }
+    .sw-pose { background: var(--wire-pose); }
+    .sw-body { background: var(--wire-body); }
+    .sw-debug { background: var(--wire-debug); }
+    .sw-arms { background: var(--wire-arms); }
+    svg.diagram {
+      width: 100%;
+      max-width: 920px;
+      height: auto;
+      display: block;
+      margin: 0.5rem 0;
+    }
+    .marker-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      margin-top: 1rem;
+      font-family: "Sora", sans-serif;
+    }
+    .marker-table th, .marker-table td {
+      border: 1px solid rgba(255,255,255,0.08);
+      padding: 0.45rem 0.6rem;
+      text-align: left;
+      vertical-align: top;
+    }
+    .marker-table th { background: rgba(255,255,255,0.04); color: #94a3b8; font-weight: 600; }
+    code {
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 0.78em;
+      background: rgba(0,0,0,0.35);
+      padding: 0.12rem 0.35rem;
+      border-radius: 4px;
+      color: #a5f3fc;
+    }
+    .note {
+      border-left: 3px solid var(--warn);
+      padding: 0.6rem 0 0.6rem 1rem;
+      margin-top: 1rem;
+      color: #fcd9bd;
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>Four-process timeline &amp; wire flow</h1>
+  <p class="sub">
+    Companion to <code>gear_sonic/scripts/run_x2_quest3_planner_stack.sh</code>.
+    Log files under <code>--log-dir</code> (default): <strong>deploy.log</strong>,
+    <strong>planner.log</strong> or <strong>vla_bridge.log</strong>, <strong>manager.log</strong>,
+    <strong>recorder.log</strong>. Horizontal axis is <em>bring-up order</em> (not wall-clock scale):
+    gaps on <code>pose</code> (:5556) starve the sim subscriber; non-empty but inconsistent reference
+    can still look like a “drop” after handoff — see note at bottom.
+  </p>
+
+  <section>
+    <h2>Mode A — Heuristic planner (deploy first)</h2>
+    <p style="color:var(--muted);font-size:0.9rem;margin:0 0 1rem;">
+      Spawn order: deploy → planner → manager → recorder. Readiness greps shown in bars.
+    </p>
+    <div class="legend">
+      <span><i class="sw sw-hot"></i> process up / marker seen</span>
+      <span><i class="sw sw-idle"></i> not yet spawned or no traffic</span>
+      <span><i class="sw sw-body"></i> <code>body_pose</code> :5565</span>
+      <span><i class="sw sw-arms"></i> arms/hands :5564</span>
+      <span><i class="sw sw-pose"></i> merged <code>pose</code> :5556 → deploy</span>
+      <span><i class="sw sw-debug"></i> <code>x2_debug</code> :5557 → recorder / VLA</span>
+    </div>
+    <svg class="diagram" viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" aria-label="Planner stack timeline">
+      <defs>
+        <pattern id="gridA" width="8" height="8" patternUnits="userSpaceOnUse">
+          <path d="M0 8 L8 0" stroke="rgba(255,255,255,0.03)" stroke-width="0.5"/>
+        </pattern>
+      </defs>
+      <rect width="920" height="340" fill="url(#gridA)"/>
+      <!-- time ticks -->
+      <g font-family="Sora,sans-serif" font-size="11" fill="#64748b">
+        <text x="10" y="18">0</text>
+        <text x="230" y="18">1</text>
+        <text x="450" y="18">2</text>
+        <text x="670" y="18">3</text>
+        <text x="860" y="18">4</text>
+        <line x1="10" y1="24" x2="910" y2="24" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+      </g>
+      <!-- rows labels -->
+      <g font-family="Sora,sans-serif" font-size="12" fill="#94a3b8">
+        <text x="8" y="58">deploy.log</text>
+        <text x="8" y="118">planner.log</text>
+        <text x="8" y="178">manager.log</text>
+        <text x="8" y="238">recorder.log</text>
+        <text x="8" y="308">ZMQ data</text>
+      </g>
+      <!-- deploy -->
+      <rect x="120" y="38" width="790" height="28" rx="4" fill="#334155"/>
+      <rect x="120" y="38" width="120" height="28" rx="4" fill="#22c55e" opacity="0.85"/>
+      <text x="128" y="56" font-family="Sora,sans-serif" font-size="10" fill="#052e16">spawn…</text>
+      <text x="250" y="56" font-family="Sora,sans-serif" font-size="10" fill="#e8ecf4">wait <tspan fill="#a7f3d0">Launching …</tspan></text>
+      <rect x="360" y="38" width="550" height="28" rx="4" fill="#15803d" opacity="0.5"/>
+      <text x="368" y="56" font-family="Sora,sans-serif" font-size="10" fill="#ecfdf5">x2_debug PUB ~control rate</text>
+      <!-- planner -->
+      <rect x="120" y="98" width="200" height="28" rx="4" fill="#334155"/>
+      <rect x="320" y="98" width="590" height="28" rx="4" fill="#6d28d9" opacity="0.75"/>
+      <text x="328" y="116" font-family="Sora,sans-serif" font-size="10" fill="#ede9fe">Phase 0 mode: publishing 'body_pose'</text>
+      <!-- manager -->
+      <rect x="120" y="158" width="80" height="28" rx="4" fill="#334155"/>
+      <rect x="200" y="158" width="710" height="28" rx="4" fill="#0e7490" opacity="0.8"/>
+      <text x="208" y="176" font-family="Sora,sans-serif" font-size="10" fill="#cffafe">recorder PUB bound at … / Quest3ManagerX2</text>
+      <!-- recorder -->
+      <rect x="120" y="218" width="100" height="28" rx="4" fill="#334155"/>
+      <rect x="220" y="218" width="690" height="28" rx="4" fill="#b45309" opacity="0.75"/>
+      <text x="228" y="236" font-family="Sora,sans-serif" font-size="10" fill="#ffedd5">first body_pose received → merge @ --rate</text>
+      <!-- wires -->
+      <rect x="320" y="278" width="590" height="24" rx="3" fill="#c4b5fd" opacity="0.35"/>
+      <text x="328" y="294" font-family="Sora,sans-serif" font-size="9" fill="#e9d5ff">5565 body_pose (planner → recorder)</text>
+      <rect x="200" y="278" width="110" height="24" rx="3" fill="#fde047" opacity="0.3"/>
+      <text x="206" y="294" font-family="Sora,sans-serif" font-size="9" fill="#422006">5564 arms</text>
+      <rect x="220" y="302" width="400" height="20" rx="3" fill="#7dd3fc" opacity="0.45"/>
+      <text x="228" y="316" font-family="Sora,sans-serif" font-size="9" fill="#082f49">5556 pose (recorder → deploy SUB) — must not go silent</text>
+      <rect x="640" y="302" width="270" height="20" rx="3" fill="#fca5a5" opacity="0.35"/>
+      <text x="648" y="316" font-family="Sora,sans-serif" font-size="9" fill="#450a0a">5557 x2_debug (deploy → recorder)</text>
+    </svg>
+    <table class="marker-table">
+      <thead>
+        <tr><th>Log</th><th>Typical readiness / health strings</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>deploy.log</code></td><td><code>Launching …</code> (stack waits up to 180s)</td></tr>
+        <tr><td><code>planner.log</code></td><td><code>Phase 0 mode: publishing 'body_pose'</code></td></tr>
+        <tr><td><code>manager.log</code></td><td><code>recorder PUB bound at</code> (fallback: <code>Quest3ManagerX2</code>)</td></tr>
+        <tr><td><code>recorder.log</code></td><td><code>first body_pose received</code> then steady merge lines</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Mode B — VLA closed-loop (deploy last)</h2>
+    <p style="color:var(--muted);font-size:0.9rem;margin:0 0 1rem;">
+      Spawn order: manager → <code>live_vla_publish_motion_token</code> → recorder → deploy.
+      VLA bridge binds <code>body_pose</code> PUB early; model load may still take minutes after the bind marker.
+    </p>
+    <div class="legend">
+      <span><i class="sw sw-body"></i> <code>body_pose</code> :5565 (VLA → recorder)</span>
+      <span><i class="sw sw-pose"></i> <code>pose</code> :5556</span>
+      <span><i class="sw sw-debug"></i> <code>x2_debug</code> :5557 (deploy → VLA SUB)</span>
+    </div>
+    <svg class="diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" aria-label="VLA stack timeline">
+      <rect width="920" height="360" fill="#121826"/>
+      <g font-family="Sora,sans-serif" font-size="11" fill="#64748b">
+        <text x="10" y="18">0</text>
+        <text x="230" y="18">1</text>
+        <text x="450" y="18">2</text>
+        <text x="670" y="18">3</text>
+        <text x="860" y="18">4</text>
+        <line x1="10" y1="24" x2="910" y2="24" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+      </g>
+      <g font-family="Sora,sans-serif" font-size="12" fill="#94a3b8">
+        <text x="8" y="58">manager.log</text>
+        <text x="8" y="118">vla_bridge.log</text>
+        <text x="8" y="188">recorder.log</text>
+        <text x="8" y="258">deploy.log</text>
+        <text x="8" y="328">ZMQ data</text>
+      </g>
+      <!-- manager first -->
+      <rect x="120" y="38" width="790" height="28" rx="4" fill="#0e7490" opacity="0.85"/>
+      <text x="128" y="56" font-family="Sora,sans-serif" font-size="10" fill="#cffafe">recorder PUB bound … (5564 publisher ready before VLA)</text>
+      <!-- vla -->
+      <rect x="120" y="98" width="90" height="28" rx="4" fill="#334155"/>
+      <rect x="210" y="98" width="140" height="28" rx="4" fill="#6d28d9" opacity="0.9"/>
+      <text x="218" y="116" font-family="Sora,sans-serif" font-size="10" fill="#faf5ff">pose PUB bound on … :5565</text>
+      <rect x="350" y="98" width="560" height="28" rx="4" fill="#4c1d95" opacity="0.55"/>
+      <text x="358" y="110" font-family="Sora,sans-serif" font-size="9" fill="#e9d5ff">50 Hz publisher (bootstrap zeros / chunk steps)</text>
+      <text x="358" y="122" font-family="Sora,sans-serif" font-size="9" fill="#ddd6fe">inference: x2_debug SUB → policy → chunk updates</text>
+      <!-- recorder -->
+      <rect x="120" y="168" width="130" height="28" rx="4" fill="#334155"/>
+      <rect x="250" y="168" width="660" height="28" rx="4" fill="#b45309" opacity="0.8"/>
+      <text x="258" y="186" font-family="Sora,sans-serif" font-size="10" fill="#ffedd5">first body_pose received → PUB pose @ --rate</text>
+      <!-- deploy last -->
+      <rect x="120" y="238" width="200" height="28" rx="4" fill="#334155"/>
+      <rect x="320" y="238" width="590" height="28" rx="4" fill="#15803d" opacity="0.55"/>
+      <text x="328" y="256" font-family="Sora,sans-serif" font-size="10" fill="#ecfdf5">Launching … → SUB :5556 pose + PUB :5557 x2_debug</text>
+      <!-- wires VLA -->
+      <rect x="210" y="298" width="700" height="22" rx="3" fill="#c4b5fd" opacity="0.4"/>
+      <text x="218" y="313" font-family="Sora,sans-serif" font-size="9" fill="#f5f3ff">5565 body_pose continuous (bootstrap then inference-driven token/hands)</text>
+      <rect x="250" y="324" width="420" height="22" rx="3" fill="#7dd3fc" opacity="0.5"/>
+      <text x="258" y="339" font-family="Sora,sans-serif" font-size="9" fill="#082f49">5556 pose — idle stand until merge; then merged stream</text>
+      <rect x="680" y="324" width="230" height="22" rx="3" fill="#fca5a5" opacity="0.35"/>
+      <text x="688" y="339" font-family="Sora,sans-serif" font-size="9" fill="#450a0a">5557 x2_debug → VLA (closes loop)</text>
+    </svg>
+    <table class="marker-table">
+      <thead>
+        <tr><th>Log</th><th>Typical readiness / flow strings</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>manager.log</code></td><td>Same PUB-bound markers as planner mode</td></tr>
+        <tr><td><code>vla_bridge.log</code></td><td><code>pose PUB bound on</code>; <code>x2_debug SUB connected</code>; <code>policy ready</code>; <code>[live-VLA] pub tick=</code></td></tr>
+        <tr><td><code>recorder.log</code></td><td><code>first body_pose received</code>; merge / publish diagnostics</td></tr>
+        <tr><td><code>deploy.log</code></td><td><code>Launching …</code>; sim stepping once loop runs</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <strong>“Something on the wire” vs “healthy tracking”.</strong>
+      An empty or stalled <code>pose</code> stream on :5556 is the classic reason the subscriber sees no fresh reference frames and the stack can go slack.
+      If packets arrive but <code>joint_pos_mj</code> / root do not track the sim, the policy can still diverge after band release — that is a consistency issue, not a silent socket.
+    </div>
+  </section>
+
+  <section>
+    <h2>How to use this with real logs</h2>
+    <p style="color:var(--muted);font-size:0.9rem;margin:0;">
+      Align four terminals: <code>tail -f log-dir/deploy.log</code> (and the other three per mode). When debugging a drop,
+      check whether <code>recorder</code> stopped PUBing (upstream planner/VLA died), whether the VLA <code>pub tick</code> lines freeze,
+      or whether <code>deploy</code> stopped emitting <code>x2_debug</code> (bridge / container exit).
+    </p>
+  </section>
+</body>
+</html>

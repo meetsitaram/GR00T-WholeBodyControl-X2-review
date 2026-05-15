@@ -14,6 +14,10 @@ recording. For the deeper architecture, see:
   — what the planner actually plays under the hood.
 - [`X2 Dataset Record and Replay`](x2_dataset_record_and_replay.md)
   — the v0 stationary-arms-only recorder (predecessor to this stack).
+- [`X2 VLA motion_token Decoder`](../references/x2_vla_motion_token_decoder.md)
+  — only relevant in `--vla-bridge` mode: why the bridge has to decode
+  SONIC tokens itself before the body will move under VLA authority,
+  and the operator runbook for the auto-resolved `--vla-bridge-sonic-checkpoint`.
 
 ---
 
@@ -192,6 +196,35 @@ Most planner primitives are **single-stride**: one push of the L stick = one `fw
 8. Repeat steps 5–7 for more episodes
 9. Ctrl-C the wrapper or **A + B + X + Y** to return to OFF; any open episode auto-saves on shutdown
 
+> **Datasets are training-ready as written.** Every recorded
+> `action.motion_token` is the SONIC FSQ encoding of the **planner's
+> real 10-frame future window** at that tick — produced inline by
+> the recorder, no offline labeling step required. The wrapper auto-
+> resolves the SONIC `.pt` sibling of `--model` and the YAML encoder
+> config (`gear_sonic/data/encoder/x2_observation_config.yaml`), and
+> fails pre-flight if either is missing (see the "Knobs" table for
+> the `--no-sonic-checkpoint` and `--encoder-config ''` smoke-test
+> escapes). Look for the banner lines:
+>
+> ```
+> motion_token     : ON  (/.../model_step_025000.pt, cuda:0)
+> encoder_config   : .../x2_observation_config.yaml, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D
+> ```
+>
+> to confirm both loaded. If `motion_token` says `DISABLED`, the
+> parquet's `motion_token` column will be all zeros; if
+> `encoder_config` says `DEPRECATED freeze-pose`, the column will be
+> tokens that encode static intent (every row tiled from the current
+> body_q). Both are smoke-test-only states — re-record with the
+> defaults restored before training a VLA on it.
+>
+> **VLA-grade recording requires this stack.** The single-process
+> direct-mode loop (no planner, no manager) intentionally falls back
+> to the freeze-pose path because there's no real future window to
+> source — that path emits a one-shot deprecation warning and is
+> **not** suitable for VLA datasets. Use this wrapper or another
+> subscribe-mode pipeline for any episode you intend to train on.
+
 ---
 
 ## What you'll see in the foreground
@@ -271,6 +304,97 @@ Set on the manager (passed through to `IntentDecoder`):
 | `enable_crouch` | `False` | Y-held → `crouch / medium` (currently destabilizes the policy; do not enable in sim until the planner-side fix lands) |
 
 These live in `gear_sonic/utils/teleop/vr/intent_decoder.py::IntentDecoder.__init__`. To expose them as CLI flags on the manager, add them to `ManagerConfig` and the argparse group in `quest3_manager_x2.py`.
+
+### Inline SONIC FSQ tokenizer (for `action.motion_token` in the LeRobot dataset)
+
+Wrapper-level flags that control whether `action.motion_token` is the
+real FSQ encoding of the planner's 10-frame future window (training-
+ready) or one of the two fallback paths (smoke-test only):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--sonic-checkpoint PATH` | auto-resolved sibling of `--model` | Override the SONIC `.pt` used to encode `action.motion_token`. The auto-resolve strips `/exported/` and the `_g1.onnx` suffix and appends `.pt`. |
+| `--no-sonic-checkpoint` | (unset) | Skip the tokenizer entirely. The recorder will write **zeros** for `action.motion_token` and the dataset is **NOT** VLA-trainable. Only use for kinematic-only smoke tests. |
+| `--sonic-tokenizer-device DEV` | `cuda:0` | Torch device for the inline tokenizer. Use `cpu` if `cuda:0` is contended by the deploy / VLA on the same GPU (~1 ms/tick CPU overhead, well within the 20 ms 50 Hz budget). |
+| `--encoder-config PATH` | `gear_sonic/data/encoder/x2_observation_config.yaml` | YAML that drives the inline tokenizer's gather (the 680-D 10-frame future window the SONIC encoder was trained on). The default mirrors G1's `observation_config.yaml` schema. Pass `--encoder-config ''` to fall back to the **deprecated freeze-pose** path (current body_q tiled 11 times) — semantically incorrect for VLA training. |
+
+The wrapper banner shows the resolved state on every launch:
+
+```
+motion_token     : ON  (/.../model_step_025000.pt, cuda:0)
+encoder_config   : /.../x2_observation_config.yaml, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D
+```
+
+or, when the tokenizer is off entirely:
+
+```
+motion_token     : DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)
+encoder_config   : (unused; tokenizer DISABLED above)
+```
+
+or, when the operator opted out of the multi-frame path:
+
+```
+motion_token     : ON  (/.../model_step_025000.pt, cuda:0)
+encoder_config   : DEPRECATED freeze-pose (--encoder-config '' was passed)
+```
+
+Verify the banner before pressing `X` — `DISABLED` is the operator's
+last chance to abort before producing a zero-token episode, and
+`DEPRECATED freeze-pose` is the last chance to abort before producing
+a static-intent episode.
+
+### Validating the inline tokenizer (Layers 3 + 4)
+
+The unit tests (`tests/test_x2_encoder_obs_builder.py` and
+`tests/test_x2_dataset_recorder_real_future_token.py`) cover Layers
+1 + 2 of the validation pyramid — those run on every push. Layers 3
++ 4 require a live planner stack and a recorded parquet
+respectively, so they're operator-driven incantations.
+
+**Layer 3 — byte-parity between recorder Python obs and deploy C++
+obs.** Run the planner stack with the deploy's `--obs-dump` enabled
+and the recorder's `--obs-dump-recorder` flag set, then diff the
+two snapshots:
+
+```bash
+# Terminal 1: planner stack with deploy obs-dump enabled
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 30 \
+    --extra-deploy-args "--obs-dump /tmp/x2_deploy_obs.bin"
+
+# Terminal 2: recorder side, same wire
+python -m gear_sonic.scripts.record_x2_dataset \
+    --teleop-only --body-pose-source zmq \
+    --sonic-checkpoint /path/to/model_step_NNNNN.pt \
+    --encoder-config gear_sonic/data/encoder/x2_observation_config.yaml \
+    --obs-dump-recorder /tmp/x2_recorder_obs.pt \
+    --duration 10
+
+# After both run, diff:
+python gear_sonic_deploy/scripts/compare_recorder_vs_deploy_obs.py \
+    --recorder /tmp/x2_recorder_obs.pt \
+    --deploy   /tmp/x2_deploy_obs.bin
+```
+
+Expect `max-abs diff < 1e-5`. Anything larger means the recorder's
+gather diverged from the deploy's `ZmqPoseInputSource`.
+
+**Layer 4 — encode-decode consistency on a recorded parquet.** Spot-
+check that re-encoding the parquet's `action.body_q_mj_pre_sonic` via
+the same `.pt` reproduces (close to) the stored `action.motion_token`:
+
+```bash
+python gear_sonic/scripts/validate_encode_decode_loop.py \
+    --parquet data/lerobot/x2_phase0_smoke_v0/data/chunk-000/episode_000000.parquet \
+    --checkpoint /path/to/model_step_NNNNN.pt \
+    --device cpu
+```
+
+Expect mean cosine similarity > 0.92 and bucket match >= 60 %. The
+recorder uses the planner future, while the validator uses a
+temporal-slice future from the parquet; they're not byte-equal but
+should be highly correlated.
 
 ---
 
@@ -554,6 +678,65 @@ gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
 3. Look at `planner.log` for `interactive command (<intent>, <magnitude>) from zmq`. If absent, the manager didn't publish; if present, the planner accepted it.
 4. Look for `WARNING ... no primitive for command (X,Y) -> bin 'X_Y'; falling back to idle_stand` in `planner.log` — that means the bin name doesn't exist in the curated YAML and the planner is silently skipping the request. (Historical example: `back_step / default → back_step_default` was unmapped pre-2026-05-13.)
 5. Look at `deploy.log` for `act_clip_ticks` — if it's keeping pace with `tick`, the policy is at its safety cap most of the time and the apparent immobility is a tracking issue downstream of the planner.
+
+---
+
+## Common errors
+
+### `SONIC tokenizer .pt not found at auto-resolved path`
+
+The wrapper failed to find the SONIC `.pt` next to the deploy ONNX
+during pre-flight, before any process was spawned. This is the
+guardrail that prevents you from silently producing a zero-token
+(non-VLA-trainable) dataset. Two valid fixes:
+
+* **You DO want the dataset to be VLA-trainable** (the usual case):
+  point at a real `.pt` explicitly via
+  `--sonic-checkpoint /path/to/model_step_NNNNN.pt`. The convention
+  is the `.pt` lives one directory above the ONNX (alongside the
+  Hydra config and `last.pt`); see
+  `~/x2_cloud_checkpoints/<run>/model_step_NNNNN.pt` on the dev box.
+* **You're doing a kinematic-only smoke test** and accept that
+  `action.motion_token` will be all zeros: pass `--no-sonic-checkpoint`.
+  The wrapper banner will switch to
+  `motion_token : DISABLED (action.motion_token = zeros; ...)`.
+
+The recorder also logs the resolved state at startup; look for
+`[recorder] motion_token tokenizer ready (...)` (success) or
+`[recorder] WARNING: no --sonic-checkpoint provided; ...` (zeros
+fallback) in `recorder.log`.
+
+### `Encoder-observation YAML not found at: ...`
+
+Pre-flight could not find the YAML config that drives the inline
+tokenizer's gather. The default lives at
+`gear_sonic/data/encoder/x2_observation_config.yaml` (it ships in
+the repo). Two valid fixes:
+
+* **You want the canonical multi-frame path** (the usual case):
+  restore the file from git (`git checkout
+  gear_sonic/data/encoder/x2_observation_config.yaml`) or point at
+  your own copy with `--encoder-config /path/to/your.yaml`.
+* **You're doing a smoke test and want the deprecated freeze-pose
+  path**: pass `--encoder-config ''` (empty string). The wrapper
+  banner will switch to `encoder_config   : DEPRECATED freeze-pose
+  (--encoder-config '' was passed)` and the recorder will write
+  static-intent tokens. **Not** suitable for VLA training.
+
+### `[recorder] DEPRECATED encode() called` warning in `recorder.log`
+
+The recorder's tokenizer fell back to the freeze-pose path (current
+body_q tiled 11 times) because either:
+
+* you passed `--encoder-config ''` to opt out of the multi-frame
+  path, **or**
+* the recorder is in **direct mode** (no `--body-pose-source zmq`,
+  no planner snapshot to source a real future window from).
+
+In both cases the resulting `action.motion_token` labels encode
+static intent — the VLA will only learn to predict "stay where you
+are". Re-record via the wrapper (which forces subscribe mode + the
+default YAML) to fix.
 
 ---
 

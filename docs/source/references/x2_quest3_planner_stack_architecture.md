@@ -24,6 +24,10 @@ Lower-level references this doc cites:
   LeRobot v1 / v2.1 schema for VLA training.
 * [`x2_deployment_code.md`](x2_deployment_code.md) — C++ deploy
   internals.
+* [`x2_vla_motion_token_decoder.md`](x2_vla_motion_token_decoder.md)
+  — why the live VLA bridge has its own SONIC decoder (the C++ deploy
+  ignores `motion_token`), how the bridge closes the body-motion loop
+  on the publish side, and the operator runbook.
 * [`bug-tracker/thumb-closing-bug.md`](../../../bug-tracker/thumb-closing-bug.md)
   — open issue tracker for the OmniHand thumb regression.
 

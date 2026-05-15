@@ -1,5 +1,44 @@
 # Standard Commands
 
+## custom quick commands
+- record
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 1200 --with-record \
+    --output-dir data/lerobot/x2_pick_place_apple_v1 \
+    --robocasa-env X2PickPlaceApple \
+    --sonic-tokenizer-device cpu
+```
+
+- replay videos:
+```sh
+xdg-open data/lerobot/x2_pick_place_apple_v1/videos/chunk-000/observation.images.ego_view/episode_000005.mp4 &
+xdg-open data/lerobot/x2_pick_place_apple_v1/videos/chunk-000/observation.images.front_cam/episode_000005.mp4 &
+```
+
+- train
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl
+
+deactivate              # leave .venv (uv-managed)
+conda deactivate         # leave whatever conda env is currently on top
+conda activate env_isaaclab
+
+# Verify python now resolves to env_isaaclab
+which python
+# Should print: /home/stickbot/miniconda3/envs/env_isaaclab/bin/python
+
+PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
+    external_dependencies/Isaac-GR00T/gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path data/lerobot/x2_pick_place_apple_v1 \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path gear_sonic/data/x2_modality_config_10dof.py \
+    --num-gpus 1 \
+    --output-dir /tmp/x2_pick_place_apple_v1_run1 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+```
+
 Top-level cheat-sheet for the X2 + Quest 3 teleop / record / replay
 loop. Defaults assume a `uv venv` at `.venv/` and the dataset
 landing under `data/lerobot/`.

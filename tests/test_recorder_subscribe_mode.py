@@ -71,6 +71,7 @@ def test_subscribe_state_initial_snapshot_is_empty() -> None:
     assert snap["left_hand_q"] is None
     assert snap["right_hand_q"] is None
     assert snap["stream_mode"] == "OFF"
+    assert snap["wire_motion_token"] is None
     assert state.drain_recorder_cmds() == []
 
 
@@ -101,6 +102,7 @@ def test_subscribe_state_updates_round_trip() -> None:
         snap["right_hand_q"], np.full(NUM_HAND_DOF_PER_SIDE, -0.5),
     )
     assert snap["stream_mode"] == "LOCOMOTION"
+    assert snap["wire_motion_token"] is None
 
     cmds = state.drain_recorder_cmds()
     assert cmds == [("start", 7), ("save", 42)]
@@ -133,6 +135,10 @@ def test_handle_body_pose_msg_decodes_packed_planner_payload() -> None:
     assert snap["body_pose_q_mj"] is not None
     np.testing.assert_allclose(
         snap["body_pose_q_mj"], payload["joint_pos_mj"], rtol=0, atol=0,
+    )
+    assert snap["wire_motion_token"] is not None
+    np.testing.assert_allclose(
+        snap["wire_motion_token"], payload["motion_token"], rtol=0, atol=0,
     )
 
 

@@ -78,11 +78,49 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sonic-checkpoint", type=Path, default=None,
-        help="(Reserved for offline post-processing.) The live recorder "
-             "does NOT load this; the deploy's tracking policy follows "
-             "joint_pos_mj as reference. Provide this only if you plan "
-             "to attach FSQ motion_token labels in a follow-up offline "
-             "pass; the recorder itself never reads it.",
+        help="SONIC tracker .pt checkpoint. When provided, the recorder "
+             "loads OnlineSonicTokenizer once at startup and encodes the "
+             "commanded body_q into action.motion_token in the LeRobot "
+             "dataset every tick. Required for VLA training; without it "
+             "the column is all zeros and the dataset is kinematic-only "
+             "(intentional for smoke tests, never correct for production "
+             "data collection). The wrapper "
+             "run_x2_quest3_planner_stack.sh auto-resolves this from the "
+             "deploy ONNX path.",
+    )
+    parser.add_argument(
+        "--sonic-tokenizer-device", type=str, default="cuda:0",
+        help="Torch device for the inline SONIC tokenizer ('cpu', "
+             "'cuda:0', 'cuda:N'). Default cuda:0 keeps per-tick cost "
+             "<100 us; cpu adds ~1 ms per tick (still well under the "
+             "20 ms 50 Hz budget). Use cpu if cuda:0 is contended by "
+             "the deploy / VLA on the same GPU.",
+    )
+    parser.add_argument(
+        "--encoder-config", type=Path,
+        default=Path("gear_sonic/data/encoder/x2_observation_config.yaml"),
+        help="YAML encoder-observation config (G1-style schema). When "
+             "set AND --body-pose-source=zmq (subscribe mode), the "
+             "inline tokenizer builds the same 680-D 10-frame future "
+             "observation the deploy actor's internal encoder consumes "
+             "and runs the encoder on that exact obs. The default "
+             "ships at gear_sonic/data/encoder/x2_observation_config"
+             ".yaml. Pass --encoder-config '' to disable and fall "
+             "back to the deprecated freeze-pose path (one body_q "
+             "tiled 11 times -- semantically incorrect for VLA "
+             "training, kept for backward compat with the v0 direct-"
+             "mode loop).",
+    )
+    parser.add_argument(
+        "--obs-dump-recorder", type=Path, default=None,
+        help="Layer 3 byte-parity probe. When set, the subscribe-mode "
+             "loop writes a torch .pt snapshot (snap dict + 680-D "
+             "builder obs) on the first fully-populated tick to this "
+             "path and continues running. Pair with the deploy's "
+             "--obs-dump and run "
+             "gear_sonic_deploy/scripts/compare_recorder_vs_deploy"
+             "_obs.py to assert byte-equal observations between the "
+             "Python gather and the C++ ZmqPoseInputSource.",
     )
     parser.add_argument(
         "--task", type=str, default="",
@@ -96,6 +134,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "and watch the SONIC + deploy follow them in MuJoCo, but do "
              "NOT build an exporter / renderer / write any dataset files. "
              "B/X/Y buttons become no-ops; A still engages IK calibration.",
+    )
+    parser.add_argument(
+        "--no-idle-publish", action="store_true",
+        help="Subscribe-mode only: while waiting for the first body_pose "
+             "from the upstream planner / VLA bridge, do NOT publish the "
+             "static DEFAULT_STAND_POSE on the pose wire. The deploy's "
+             "ZmqPoseInputSource then never sees a frame, has_body_reference_ "
+             "stays False, and Sample() falls back to its prefilled "
+             "default_angles (the trained stand pose). Pair with the "
+             "bridge's --silent-wire under --vla-no-policy to validate "
+             "the 'no upstream' fallback path: wrist_bypass_ticks should "
+             "stay at 0 for the whole run and grav_z should pin at -1.00.",
     )
 
     # ZMQ
@@ -481,6 +531,14 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         task=args.task,
         sonic_checkpoint=args.sonic_checkpoint,
+        sonic_tokenizer_device=args.sonic_tokenizer_device,
+        sonic_encoder_config=(
+            None
+            if args.encoder_config is None
+            or str(args.encoder_config).strip() == ""
+            else args.encoder_config
+        ),
+        obs_dump_recorder_path=args.obs_dump_recorder,
         teleop_only=args.teleop_only,
         pub_host=args.pub_host,
         pub_port=args.pub_port,
@@ -527,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         body_pose_sub_topic=args.body_pose_sub_topic,
         arm_and_hands_sub_host=args.arm_and_hands_sub_host,
         arm_and_hands_sub_port=args.arm_and_hands_sub_port,
+        idle_publish_enabled=(not args.no_idle_publish),
         verbose=(not args.quiet),
     )
 
