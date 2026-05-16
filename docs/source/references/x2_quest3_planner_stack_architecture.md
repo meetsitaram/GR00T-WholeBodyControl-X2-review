@@ -14,6 +14,19 @@ This is the engineering reference. Operator-facing tutorials live in:
 
 Lower-level references this doc cites:
 
+* [`x2_split_deploy_pc2.md`](x2_split_deploy_pc2.md) — split-topology
+  deployment where the C++ deploy + hand bridge + motor monitor run
+  on the robot's Jetson (PC2) while only the operator-side
+  manager / planner / recorder stack stays on the laptop. Use the
+  `--remote-deploy HOST` flag on the wrapper described below to
+  switch into split mode. Strongly recommended for any real-robot
+  test run; the SAFE_IDLE state and pose-ref starvation watchdog
+  documented there are the hardware-side recovery path for the
+  laptop-WiFi-blink freeze that motivated the split.
+* [`x2_motor_monitoring.md`](x2_motor_monitoring.md) — JSONL schema +
+  ZMQ summary contract for the new `x2_motor_monitor.py` daemon
+  (PC2 side; events forward into `manager_sidecar.jsonl` on the
+  laptop).
 * [`x2_zmq_protocol.md`](x2_zmq_protocol.md) — packed-message wire
   format spec (`pack_pose_message` / `unpack_message`).
 * [`x2_heuristic_planner.md`](x2_heuristic_planner.md) — planner FSM,

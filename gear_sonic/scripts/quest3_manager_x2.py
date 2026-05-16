@@ -146,6 +146,42 @@ class ManagerConfig:
     stream_mode_topic: str = "stream_mode"
     recorder_cmd_topic: str = "recorder_cmd"
 
+    # --- Split-topology SAFE_IDLE resume chord (Phase 3a-b) ----------------
+    # PUB socket the deploy on PC2 subscribes to. The manager publishes a
+    # single multipart message [topic, ts_ns_le_i64] whenever the operator
+    # holds A+B (right controller) for >= resume_chord_hold_s seconds with
+    # X+Y not pressed. The chord is recognised across ALL modes because it
+    # operates at the safety layer (operator -> deploy "you can come back"),
+    # not the policy layer.
+    #
+    # Defaults reflect "split topology by default": bind on 0.0.0.0:5566
+    # but DON'T enable the PUB unless explicitly requested via CLI flag.
+    # The wrapper (run_x2_quest3_planner_stack.sh --remote-deploy) sets the
+    # flag automatically; manual launches that want it must pass
+    # ``--resume-pub-enabled``.
+    resume_pub_enabled: bool = False
+    resume_pub_host: str = "*"        # bind address (0.0.0.0 in PUB land)
+    resume_pub_port: int = 5566
+    resume_pub_topic: str = "pose_resume"
+    resume_chord_hold_s: float = 1.0  # hold-duration before first publish
+    resume_chord_rep_s:  float = 0.5  # min republish interval during sustained hold
+
+    # --- Motor monitor SUB (Phase 5c) -------------------------------------
+    # SUB socket connecting to the x2_motor_monitor daemon running in a
+    # tmux session on PC2 (port 5567). Each received message is JSON-
+    # decoded and appended to ``sidecar_log_path`` (the same JSONL the
+    # ``_sidecar_emit`` planner_cmd writer uses) under the key
+    # ``motor_monitor`` so a single grep across the file surfaces both
+    # operator intents and motor-side events on the same timeline.
+    #
+    # Disabled by default; the wrapper flips it on for --remote-deploy
+    # runs with --pc2-host set. No WebXR UX, no terminal tail -- log-only
+    # sink (matches the user's "minimal" preference).
+    motor_monitor_sub_enabled: bool = False
+    motor_monitor_sub_host: str = ""
+    motor_monitor_sub_port: int = 5567
+    motor_monitor_sub_topic: str = "motor_monitor"
+
     # IntentDecoder
     intent_stick_deadzone: float = 0.30
     intent_repeat_interval_s: float = 0.0
@@ -445,9 +481,71 @@ class Quest3ManagerX2:
         if cfg.sidecar_log_path is not None:
             cfg.sidecar_log_path.parent.mkdir(parents=True, exist_ok=True)
             self._sidecar = cfg.sidecar_log_path.open("a", buffering=1)
+            self._sidecar_lock = threading.Lock()
             log.info("sidecar log -> %s", cfg.sidecar_log_path)
         else:
             self._sidecar = None
+            self._sidecar_lock = threading.Lock()
+
+        # --- Resume chord PUB (split-topology safety) ---------------------
+        self._resume_sock = None
+        if cfg.resume_pub_enabled:
+            self._resume_sock = self._ctx.socket(zmq.PUB)
+            self._resume_sock.setsockopt(zmq.LINGER, 0)
+            self._resume_sock.bind(
+                f"tcp://{cfg.resume_pub_host}:{cfg.resume_pub_port}"
+            )
+            log.info(
+                "[safety] pose_resume PUB bound at tcp://%s:%d (topic=%s) -- "
+                "operator chord A+B held for >=%.1fs republishes every %.2fs.",
+                cfg.resume_pub_host, cfg.resume_pub_port, cfg.resume_pub_topic,
+                cfg.resume_chord_hold_s, cfg.resume_chord_rep_s,
+            )
+        # Chord-hold state. ``_resume_chord_active_since`` is the
+        # monotonic timestamp when A+B (without X+Y) was first seen;
+        # cleared the moment the chord breaks. ``_resume_last_pub`` is
+        # the last time we published a pose_resume frame (used to limit
+        # republish rate while the operator continues to hold the chord).
+        # ``_resume_press_count`` is for diagnostics on the periodic log line.
+        self._resume_chord_active_since: Optional[float] = None
+        self._resume_last_pub: float = -1.0
+        self._resume_press_count: int = 0
+
+        # --- Motor monitor SUB (Phase 5c forensic sidecar) ---------------
+        self._motor_monitor_sock = None
+        self._motor_monitor_thread = None
+        self._motor_monitor_msg_count = 0
+        if cfg.motor_monitor_sub_enabled and cfg.motor_monitor_sub_host:
+            try:
+                self._motor_monitor_sock = self._ctx.socket(zmq.SUB)
+                self._motor_monitor_sock.setsockopt(zmq.LINGER, 0)
+                self._motor_monitor_sock.setsockopt(zmq.RCVHWM, 10)
+                self._motor_monitor_sock.setsockopt_string(
+                    zmq.SUBSCRIBE, cfg.motor_monitor_sub_topic,
+                )
+                self._motor_monitor_sock.connect(
+                    f"tcp://{cfg.motor_monitor_sub_host}:{cfg.motor_monitor_sub_port}"
+                )
+                self._motor_monitor_thread = threading.Thread(
+                    target=self._motor_monitor_loop,
+                    name="motor_monitor_sub",
+                    daemon=True,
+                )
+                self._motor_monitor_thread.start()
+                log.info(
+                    "[safety] motor_monitor SUB connected to tcp://%s:%d "
+                    "(topic=%s). Each message appended to sidecar JSONL.",
+                    cfg.motor_monitor_sub_host, cfg.motor_monitor_sub_port,
+                    cfg.motor_monitor_sub_topic,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[safety] failed to start motor_monitor SUB on "
+                    "tcp://%s:%d: %s. Sidecar will not record motor-side events.",
+                    cfg.motor_monitor_sub_host, cfg.motor_monitor_sub_port, exc,
+                )
+                self._motor_monitor_sock = None
+                self._motor_monitor_thread = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -489,6 +587,21 @@ class Quest3ManagerX2:
             self._recorder_sock.close(linger=0)
         except Exception:
             pass
+        if self._motor_monitor_sock is not None:
+            try:
+                self._motor_monitor_sock.close(linger=0)
+            except Exception:
+                pass
+        if self._motor_monitor_thread is not None:
+            try:
+                self._motor_monitor_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._resume_sock is not None:
+            try:
+                self._resume_sock.close(linger=0)
+            except Exception:
+                pass
         if self._sidecar is not None:
             try:
                 self._sidecar.close()
@@ -560,6 +673,10 @@ class Quest3ManagerX2:
 
                 ev = self._button_sm.tick(*buttons)
                 a_held, _b_held, x_held, y_held = buttons
+
+                # Split-topology SAFE_IDLE resume: A+B (without X+Y) held
+                # for >= resume_chord_hold_s. No-op unless --resume-pub-enabled.
+                self._tick_resume_chord(buttons, tick_now)
 
                 # Live continuous waist target derived from the right
                 # stick. We compute this BEFORE the mode transition
@@ -1147,7 +1264,156 @@ class Quest3ManagerX2:
             "magnitude": cmd.magnitude,
             "stream_mode": self._intent.mode.name,
         }
-        self._sidecar.write(json.dumps(rec) + "\n")
+        self._sidecar_write(rec)
+
+    def _sidecar_write(self, rec: dict) -> None:
+        """Thread-safe append to the manager sidecar JSONL.
+
+        Used by ``_sidecar_emit`` (called from the 50 Hz main loop) AND by
+        ``_motor_monitor_loop`` (background SUB thread). Without the lock
+        a half-written line from one writer can be interleaved with a
+        line from the other, breaking JSONL parsers downstream.
+        """
+        if self._sidecar is None:
+            return
+        try:
+            line = json.dumps(rec) + "\n"
+            with self._sidecar_lock:
+                self._sidecar.write(line)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[sidecar] write failed: %s", exc)
+
+    # -- resume chord (split-topology safety) --------------------------------
+
+    def _tick_resume_chord(self, buttons: tuple[bool, bool, bool, bool],
+                           now_mono: float) -> None:
+        """Detect A+B held >= ``resume_chord_hold_s`` and PUB pose_resume.
+
+        Triggered every 50 Hz tick. Disambiguation rules (chosen to avoid
+        colliding with the existing A+B+X+Y "engage" chord):
+
+          * Requires A AND B held simultaneously.
+          * Requires X AND Y NOT held (the engage chord includes both).
+          * Requires continuous hold for ``resume_chord_hold_s`` seconds
+            before the FIRST publish lands (default 1.0 s -- longer than
+            any typical button press).
+          * Sustained holds republish every ``resume_chord_rep_s`` seconds
+            so a brief packet drop on wifi doesn't strand the deploy in
+            SAFE_IDLE waiting for a frame that already passed.
+
+        Chord lifecycle log lines fire only on rising edge (transitioning
+        from "no chord" to "chord active") and on the first successful
+        publish, to keep the per-tick log noise out of the steady state.
+        """
+        if self._resume_sock is None:
+            return
+        a_held, b_held, x_held, y_held = buttons
+        chord_now = a_held and b_held and (not x_held) and (not y_held)
+        if not chord_now:
+            self._resume_chord_active_since = None
+            return
+        if self._resume_chord_active_since is None:
+            self._resume_chord_active_since = now_mono
+            log.debug("[safety] A+B chord rising edge; counting hold...")
+            return
+        held = now_mono - self._resume_chord_active_since
+        if held < self._cfg.resume_chord_hold_s:
+            return
+        if (self._resume_last_pub > 0.0
+                and (now_mono - self._resume_last_pub) < self._cfg.resume_chord_rep_s):
+            return
+        # Publish the resume frame. Payload is the publisher-side
+        # monotonic ns timestamp (cosmetic only -- the deploy stamps its
+        # own steady_clock on receipt for freshness calculations, see
+        # ZmqResumeSubscriber).
+        try:
+            ts_ns = int(time.monotonic_ns())
+            payload = ts_ns.to_bytes(8, byteorder="little", signed=False)
+            self._resume_sock.send_multipart(
+                [self._cfg.resume_pub_topic.encode("utf-8"), payload]
+            )
+            self._resume_last_pub = now_mono
+            self._resume_press_count += 1
+            if self._resume_press_count == 1 or self._resume_press_count % 10 == 0:
+                log.info(
+                    "[safety] published pose_resume (press #%d, held %.2fs).",
+                    self._resume_press_count, held,
+                )
+            self._sidecar_write({
+                "ts": time.time(),
+                "_kind": "resume_chord",
+                "press_count": self._resume_press_count,
+                "held_s": held,
+            })
+            # One-shot audio cue for operator feedback. Suppressed when
+            # the headset isn't connected (the helper is best-effort).
+            self._play_audio_prompt(
+                "resume_published",
+                fallback="Resume sent.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[safety] pose_resume send failed: %s", exc)
+
+    # -- motor monitor SUB (background JSONL appender) -----------------------
+
+    def _motor_monitor_loop(self) -> None:
+        """Background loop draining the motor_monitor SUB into the sidecar.
+
+        Each received frame is a multipart message [topic_bytes, json_bytes]
+        where ``json_bytes`` is the UTF-8 JSON the ``x2_motor_monitor.py``
+        daemon emits. We decode and append it under the ``motor_monitor``
+        key so a single grep "motor_monitor" across the sidecar surfaces
+        all motor-side events that landed during the session.
+
+        Errors are logged at WARN once (subsequent failures are debug-
+        suppressed via ``_motor_monitor_err_logged``) -- a flaky connection
+        should NOT spam the operator's terminal.
+        """
+        err_logged = False
+        sock = self._motor_monitor_sock
+        if sock is None:
+            return
+        # Internal poller for short non-blocking waits; lets stop() join
+        # within ~200 ms even if the publisher is silent.
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        while not self._stop.is_set():
+            try:
+                events = dict(poller.poll(200))
+                if sock not in events:
+                    continue
+                parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+                if len(parts) < 2:
+                    continue
+                topic = parts[0].decode("utf-8", errors="replace")
+                payload_bytes = parts[1]
+                try:
+                    payload = json.loads(payload_bytes.decode("utf-8"))
+                except Exception:
+                    payload = {"_decode_error": True,
+                               "raw_len": len(payload_bytes)}
+                self._motor_monitor_msg_count += 1
+                self._sidecar_write({
+                    "ts": time.time(),
+                    "_kind": "motor_monitor",
+                    "topic": topic,
+                    "motor_monitor": payload,
+                })
+                if self._motor_monitor_msg_count == 1:
+                    log.info(
+                        "[safety] motor_monitor: first message received "
+                        "(topic=%s, %d bytes).",
+                        topic, len(payload_bytes),
+                    )
+            except zmq.Again:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not err_logged:
+                    log.warning(
+                        "[safety] motor_monitor receive error: %s. "
+                        "Subsequent errors suppressed.", exc,
+                    )
+                    err_logged = True
 
     @staticmethod
     def _sleep_until(deadline_mono: float) -> None:
@@ -1252,7 +1518,57 @@ def _build_parser() -> argparse.ArgumentParser:
     # Sidecar
     p.add_argument(
         "--sidecar-log", type=Path, default=None,
-        help="Path to write a JSONL sidecar of emitted planner_cmds",
+        help=(
+            "Path to write a JSONL sidecar of emitted planner_cmds. When "
+            "--motor-monitor-host is set the sidecar also receives one "
+            "line per motor_monitor message (key=motor_monitor)."
+        ),
+    )
+
+    # Split-topology safety (Phase 3 + 5c)
+    sft_grp = p.add_argument_group("split-topology safety (Phase 3 + 5c)")
+    sft_grp.add_argument(
+        "--resume-pub-enabled", dest="resume_pub_enabled",
+        action="store_true", default=False,
+        help=(
+            "Bind a PUB socket on tcp://<--resume-pub-host>:<--resume-pub-port> "
+            "and publish a pose_resume frame whenever the operator holds A+B "
+            "(without X+Y) for >= --resume-chord-hold-s seconds. The deploy on "
+            "PC2 SUBs to this to exit SAFE_IDLE. Default OFF; the wrapper "
+            "(run_x2_quest3_planner_stack.sh --remote-deploy) flips this on "
+            "automatically."
+        ),
+    )
+    sft_grp.add_argument("--resume-pub-host", default="*")
+    sft_grp.add_argument("--resume-pub-port", type=int, default=5566)
+    sft_grp.add_argument("--resume-pub-topic", default="pose_resume")
+    sft_grp.add_argument(
+        "--resume-chord-hold-s", type=float, default=1.0,
+        help="Continuous A+B hold (s) before the first pose_resume publish.",
+    )
+    sft_grp.add_argument(
+        "--resume-chord-rep-s", type=float, default=0.5,
+        help=(
+            "Min interval (s) between republished pose_resume frames during a "
+            "sustained chord hold. Compensates for ZMQ frame loss on flaky wifi."
+        ),
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-host", dest="motor_monitor_sub_host", default="",
+        help=(
+            "If set, SUB to tcp://<host>:5567 topic 'motor_monitor' for the "
+            "PC2 x2_motor_monitor daemon's compact summaries. Each message is "
+            "decoded as JSON and appended to --sidecar-log under the "
+            "'motor_monitor' key. Empty string disables (default)."
+        ),
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-port", dest="motor_monitor_sub_port",
+        type=int, default=5567,
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-topic", dest="motor_monitor_sub_topic",
+        default="motor_monitor",
     )
 
     # Episode lifecycle audio cues
@@ -1349,6 +1665,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         enable_finger_filter=not args.no_finger_filter,
         sidecar_log_path=args.sidecar_log,
         recorder_enabled=args.recorder_enabled,
+        resume_pub_enabled=args.resume_pub_enabled,
+        resume_pub_host=args.resume_pub_host,
+        resume_pub_port=args.resume_pub_port,
+        resume_pub_topic=args.resume_pub_topic,
+        resume_chord_hold_s=args.resume_chord_hold_s,
+        resume_chord_rep_s=args.resume_chord_rep_s,
+        motor_monitor_sub_enabled=bool(args.motor_monitor_sub_host),
+        motor_monitor_sub_host=args.motor_monitor_sub_host,
+        motor_monitor_sub_port=args.motor_monitor_sub_port,
+        motor_monitor_sub_topic=args.motor_monitor_sub_topic,
         verbose=args.verbose,
     )
 

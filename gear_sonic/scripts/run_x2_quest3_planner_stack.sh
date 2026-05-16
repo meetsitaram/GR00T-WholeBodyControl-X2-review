@@ -57,6 +57,8 @@
 #       [--vla-bridge MODEL_DIR --vla-prompt STR
 #        [--vla-device DEV] [--vla-rate FLOAT] [--vla-inference-period-s S]
 #        [--vla-python PATH] [--vla-max-target-dev RAD] [--vla-target-lpf-hz HZ]]
+#       [--remote-deploy HOST [--resume-pub-port PORT]
+#                              [--motor-monitor-port PORT]]
 #
 # Defaults to --teleop-only (no dataset writes). Pass --with-record
 # (along with --output-dir and --task) to capture a LeRobot v2.1
@@ -129,6 +131,16 @@
 #       --robocasa-env X2PickPlaceApple \
 #       --vla-bridge /tmp/x2_pick_place_apple_v1_run1 \
 #       --vla-prompt "pick up the apple from the table"
+#
+#   # Split-topology / remote-deploy mode: laptop runs only the
+#   # operator-side stack (manager + planner + recorder); the C++
+#   # deploy + hand bridge + motor monitor are already running on PC2
+#   # via gear_sonic_deploy/scripts/x2_pc2_daemons.sh start. The
+#   # recorder's x2_debug SUB is auto-redirected to PC2; the manager
+#   # binds the resume PUB on :5566 and SUBs the motor monitor at
+#   # tcp://PC2_HOST:5567.
+#   ./run_x2_quest3_planner_stack.sh --duration 0 \
+#       --remote-deploy 10.0.1.41
 #
 #   # Play a scripted YAML demo at startup, then idle-stand and wait
 #   # for VR takeover (operator straps on the headset and chord-presses
@@ -295,6 +307,36 @@ SIDECAR_LOG=""          # default: <log-dir>/manager_sidecar.jsonl
 PLANNER_DEMO=""
 
 # --------------------------------------------------------------------------
+# Split-topology / remote-deploy mode. When --remote-deploy HOST is set
+# we treat the laptop as the operator-side stack ONLY (manager + planner
+# + recorder); the C++ deploy + hand bridge + motor monitor are assumed
+# to be already running on PC2 (the robot's Jetson Orin NX) under
+# x2_pc2_daemons.sh start. The wrapper flips three things to make this
+# work over the wire:
+#
+#   1. WITH_DEPLOY is forced to 0 (no local sim docker spawn).
+#   2. The recorder's x2_debug SUB is pointed at tcp://${REMOTE_DEPLOY_HOST}
+#      :${DEBUG_PORT} so it consumes the deploy's telemetry from PC2.
+#   3. The manager binds the resume PUB on tcp://0.0.0.0:${RESUME_PUB_PORT}
+#      (so the deploy on PC2 can SUB the A+B chord) and SUBs the motor
+#      monitor at tcp://${REMOTE_DEPLOY_HOST}:${MOTOR_MONITOR_PORT} so
+#      every JSONL frame the on-bot monitor publishes lands in the
+#      manager_sidecar.jsonl on the laptop.
+#
+# Use it like:
+#
+#   ./run_x2_quest3_planner_stack.sh --remote-deploy 10.0.1.41 --duration 0
+#
+# The --robocasa-env path is ignored in remote-deploy mode (the real
+# robot has no robocasa scene).
+# --------------------------------------------------------------------------
+REMOTE_DEPLOY_HOST=""
+RESUME_PUB_PORT=5566
+MOTOR_MONITOR_PORT=5567
+RESUME_PUB_TOPIC="pose_resume"
+MOTOR_MONITOR_TOPIC="motor_monitor"
+
+# --------------------------------------------------------------------------
 # VLA closed-loop mode (NEW). When --vla-bridge MODEL_DIR is passed,
 # the wrapper REPLACES the heuristic_planner + quest3_manager +
 # recorder trio with a single live_vla_publish_motion_token bridge
@@ -430,6 +472,9 @@ while [[ $# -gt 0 ]]; do
         --vla-target-lpf-hz) VLA_TARGET_LPF_HZ="$2"; VLA_DEPLOY_FILTERS=1; shift 2 ;;
         --vla-deploy-filters) VLA_DEPLOY_FILTERS=1; shift ;;
         --vla-no-policy) VLA_NO_POLICY=1; shift ;;
+        --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
+        --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
+        --motor-monitor-port) MOTOR_MONITOR_PORT="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
@@ -443,6 +488,27 @@ if [[ -n "${VLA_BRIDGE_MODEL}" || "${VLA_NO_POLICY}" -eq 1 ]]; then
     VLA_MODE=1
 else
     VLA_MODE=0
+fi
+
+# Remote-deploy gating. Keep this BEFORE the --validate-only short-
+# circuit so the operator can sanity-check the resolved banner with
+# both --remote-deploy and --validate-only set together.
+if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
+    if [[ "${VLA_MODE}" -eq 1 ]]; then
+        echo "ERROR: --remote-deploy is not yet supported with --vla-bridge / --vla-no-policy" >&2
+        echo "       (VLA mode runs the bridge alongside the deploy on the laptop;" >&2
+        echo "        split-topology requires both to live on PC2)." >&2
+        exit 1
+    fi
+    if [[ "${ROBOCASA_ENV}" != "none" ]]; then
+        echo "ERROR: --remote-deploy is for the real robot (PC2); --robocasa-env is sim-only." >&2
+        exit 1
+    fi
+    if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
+        # Operator passed --remote-deploy without explicit --no-deploy --
+        # quietly imply it.
+        WITH_DEPLOY=0
+    fi
 fi
 
 if [[ -z "${LOG_DIR}" ]]; then
@@ -1181,6 +1247,7 @@ ${C_GREEN}┌──────────────────────�
   planner demo     : ${PLANNER_DEMO:-(none -- planner sits in IDLE_LOOP at startup, awaits VR planner_cmd)}
   finger comp      : curl=$([[ "${APPLY_CURL_COMP}" -eq 1 ]] && echo on || echo off)  oppose=$([[ "${APPLY_OPPOSE_COMP}" -eq 1 ]] && echo on || echo off)$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)" || echo "  (pass --apply-{curl,oppose}-compensation to enable)")
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
+  remote-deploy    : $([[ -n "${REMOTE_DEPLOY_HOST}" ]] && echo "ON  -> ${REMOTE_DEPLOY_HOST} (recorder x2_debug SUB redirected; manager resume PUB :${RESUME_PUB_PORT}; manager motor_monitor SUB tcp://${REMOTE_DEPLOY_HOST}:${MOTOR_MONITOR_PORT})" || echo "off")
   ONNX model       : ${SIM_MODEL}
   motion_token     : $([[ -n "${SONIC_CHECKPOINT}" ]] && echo "ON  (${SONIC_CHECKPOINT}, ${SONIC_TOKENIZER_DEVICE})" || echo "DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)")
   encoder_config   : $([[ -n "${SONIC_CHECKPOINT}" && -n "${ENCODER_CONFIG}" ]] && echo "${ENCODER_CONFIG}, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D" || ([[ -n "${SONIC_CHECKPOINT}" ]] && echo "DEPRECATED freeze-pose (--encoder-config '' was passed)" || echo "(unused; tokenizer DISABLED above)"))
@@ -1377,11 +1444,20 @@ if [[ "${VLA_MODE}" -eq 0 ]]; then
 
 PLANNER_LOG="${LOG_DIR}/planner.log"
 
+if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
+    # body_pose still goes to the local recorder, but bind on '*' so
+    # someone debugging from a third host can SUB if needed. Recorder
+    # is on the laptop, so localhost connects back through 127.0.0.1.
+    PLANNER_PUB_HOST='*'
+else
+    PLANNER_PUB_HOST=127.0.0.1
+fi
+
 PLANNER_ARGS=(
     -m gear_sonic.scripts.x2_heuristic_planner
     --primitives "${PRIMITIVES_PKL}"
     --bins "${BINS_YAML}"
-    --pub-host 127.0.0.1
+    --pub-host "${PLANNER_PUB_HOST}"
     --body-pose-port "${BODY_POSE_PORT}"
     --zmq-cmd-host localhost
     --zmq-cmd-port "${PLANNER_CMD_PORT}"
@@ -1439,6 +1515,22 @@ MANAGER_ARGS=(
     --rate "${RATE}"
     --sidecar-log "${SIDECAR_LOG}"
 )
+# Remote-deploy split-topology flags. When --remote-deploy HOST is set
+# we (a) enable the resume PUB so the operator's A+B chord on the
+# Quest 3 reaches the deploy on PC2, and (b) point the motor-monitor
+# SUB at PC2's :5567 so every JSONL frame the on-bot monitor publishes
+# lands in the manager_sidecar.jsonl on the laptop.
+if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
+    MANAGER_ARGS+=(
+        --resume-pub-enabled
+        --resume-pub-host '*'
+        --resume-pub-port "${RESUME_PUB_PORT}"
+        --resume-pub-topic "${RESUME_PUB_TOPIC}"
+        --motor-monitor-host "${REMOTE_DEPLOY_HOST}"
+        --motor-monitor-port "${MOTOR_MONITOR_PORT}"
+        --motor-monitor-topic "${MOTOR_MONITOR_TOPIC}"
+    )
+fi
 # Finger-curl / thumb-oppose compensations live on the MANAGER in
 # subscribe-mode (the manager owns the Retargeter; the recorder just
 # forwards what arrives on hand_finger_cmd). Forwarding these flags
@@ -1546,6 +1638,12 @@ EOF
 
 RECORDER_LOG="${LOG_DIR}/recorder.log"
 
+if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
+    RECORDER_DEBUG_SUB_HOST="${REMOTE_DEPLOY_HOST}"
+else
+    RECORDER_DEBUG_SUB_HOST="localhost"
+fi
+
 RECORDER_ARGS=(
     -m gear_sonic.scripts.record_x2_dataset
     --body-pose-source zmq
@@ -1558,7 +1656,7 @@ RECORDER_ARGS=(
     --pub-host '*'
     --pub-port "${POSE_PORT}"
     --pub-topic "${POSE_TOPIC}"
-    --sub-host localhost
+    --sub-host "${RECORDER_DEBUG_SUB_HOST}"
     --sub-port "${DEBUG_PORT}"
     --sub-topic "${DEBUG_TOPIC}"
     --rate "${RATE}"

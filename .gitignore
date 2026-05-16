@@ -30,6 +30,14 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# ROS 2 / colcon build artefacts created at repo root when the workspace
+# is built in-place (only happens on dev machines / PC2 mirror; CI uses
+# isolated build dirs under /home/run/getsolo/ on PC2). The install/ and
+# log/ dirs carry COLCON_IGNORE markers, so colcon itself treats them
+# as terminal -- safe to drop from version control.
+/install/
+/log/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -80,6 +88,10 @@ data/*
 # matching plots, and per-anchor SUMMARY docs). Tracked in git so the
 # paper artefacts travel with the repo.
 !data/sim_to_real_anchors/
+# Whitelist: shipped deploy policies (each individually re-included
+# down in the model-checkpoints section below, since the *.onnx
+# blanket rule there would otherwise re-ignore them).
+!data/policies/
 
 # …but inside the whitelisted sim-to-real anchors, the heavy per-run
 # binaries (motion bakes, replay videos, raw obs npz, per-tick csv logs)
@@ -199,6 +211,11 @@ huggingface/
 *.engine
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
+# X2 SONIC deploy policy (trained on H200, iter 25000, sphere-feet 2026-05-01).
+# Source checkpoint: model_step_025000_g1.onnx from the h200-iter-25000-sphere-feet-20260501
+# run; renamed here for an embodiment-stable filename the deploy can default to.
+# Stored via git-lfs (see .gitattributes *.onnx rule).
+!data/policies/agibot_x2_sonic.onnx
 !motionbricks/out/**/*.ckpt
 
 

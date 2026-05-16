@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kinematic playback of a motion-lib PKL in the MuJoCo viewer.
+"""Kinematic playback of a motion-lib PKL (or baked X2M2) in the MuJoCo viewer.
 
 No physics, no policy: at each frame we write the recorded ``root_trans_offset``,
 ``root_rot``, and per-joint ``dof`` straight into ``mj_data.qpos``, call
@@ -9,14 +9,27 @@ the cleanest way to *see* what a reference motion actually contains
 that joint ordering / quaternion convention are right).
 
 Usage:
+    # Source PKL (full motion-lib dict, has root translation):
     python gear_sonic/scripts/play_motion_mujoco.py \
         --motion gear_sonic/data/motions/x2_ultra_idle_stand.pkl
+
+    # Baked X2M2 (the binary the C++ deploy actually loads). The X2M2
+    # bake drops root_trans_offset (PklMotionReference in C++ doesn't
+    # consume it), so we render every frame at a fixed standing-height
+    # pelvis (override with --fixed-root-z 0.91 or whatever the MJCF
+    # spawns at).
+    python gear_sonic/scripts/play_motion_mujoco.py \
+        --motion gear_sonic_deploy/data/motions_x2m2/x2_ultra_idle_stand.x2m2
 
 Optional:
     --mjcf PATH        Override MJCF (defaults to gear_sonic x2_ultra.xml)
     --speed 1.0        Playback speed multiplier (e.g. 0.25 for slow-mo)
     --loop / --no-loop Loop at end (default: loop)
     --start-frame N    Start from frame N (default 0)
+    --fixed-root-z Z   (X2M2 only) z-height of the floating-base anchor
+                       in metres. Default 0.91 (canonical X2 stand
+                       pelvis height). Pass --fixed-root-z auto to read
+                       the MJCF's <freejoint> default pose, if present.
 
 Controls:
     SPACE - viewer pause/resume (the script keeps stepping; you just freeze
@@ -26,6 +39,7 @@ Controls:
 from __future__ import annotations
 
 import argparse
+import struct
 import sys
 import time
 from pathlib import Path
@@ -43,6 +57,70 @@ DEFAULT_MJCF = str(
 )
 
 NUM_DOFS = 31
+
+# Must match gear_sonic_deploy/scripts/export_motion_for_deploy.py +
+# reference_motion.hpp. Keep this duplicated rather than importing the
+# deploy script so this tool stays usable in a fresh checkout without
+# colcon-built deploy aux deps.
+X2M2_MAGIC = 0x58324D32  # "X2M2" little-endian
+# Default pelvis z (m) used when an X2M2 is loaded; the bake drops
+# root_trans_offset and the X2 normally spawns ~0.91 m up at MJCF init.
+# Operators can override via --fixed-root-z.
+X2M2_DEFAULT_PELVIS_Z = 0.91
+
+
+def _load_x2m2(path: Path) -> dict:
+    """Read an X2M2 binary into the same dict-of-arrays shape PKL loads use.
+
+    The .x2m2 file format (see reference_motion.hpp / export_motion_for_deploy
+    .py) is a deliberately compact little-endian binary. It does NOT carry
+    root_trans_offset (PklMotionReference in C++ doesn't use it), so we
+    synthesize a constant root translation at X2M2_DEFAULT_PELVIS_Z to keep
+    the viewer happy. Caller can override via the wrapping playback loop.
+    """
+    raw = path.read_bytes()
+    if len(raw) < 16:
+        raise ValueError(
+            f"X2M2 {path} too small ({len(raw)} bytes); header alone is 16."
+        )
+    magic, n_frames, n_dofs = struct.unpack_from("<III", raw, 0)
+    if magic != X2M2_MAGIC:
+        raise ValueError(
+            f"X2M2 {path}: bad magic 0x{magic:08X}, expected 0x{X2M2_MAGIC:08X}."
+        )
+    if n_dofs != NUM_DOFS:
+        raise ValueError(
+            f"X2M2 {path}: num_dofs={n_dofs} but expected {NUM_DOFS}."
+        )
+    (fps,) = struct.unpack_from("<d", raw, 12)
+    per_frame_bytes = 8 * (NUM_DOFS + 4)
+    expected = 4 * 3 + 8 + n_frames * per_frame_bytes
+    if len(raw) != expected:
+        raise ValueError(
+            f"X2M2 {path}: byte count {len(raw)} != expected {expected} "
+            f"(n_frames={n_frames}, fps={fps})."
+        )
+    dof = np.empty((n_frames, NUM_DOFS), dtype=np.float64)
+    rot = np.empty((n_frames, 4), dtype=np.float64)
+    offset = 20  # 12 (header ints) + 8 (fps)
+    for i in range(n_frames):
+        dof[i] = np.frombuffer(raw, dtype=np.float64,
+                               count=NUM_DOFS, offset=offset)
+        offset += 8 * NUM_DOFS
+        rot[i] = np.frombuffer(raw, dtype=np.float64, count=4, offset=offset)
+        offset += 8 * 4
+    return {
+        path.stem: {
+            "dof": dof,
+            "root_rot": rot,
+            # Synthesized root translation -- constant z, zero x/y.
+            "root_trans_offset": np.tile(
+                np.array([0.0, 0.0, X2M2_DEFAULT_PELVIS_Z]),
+                (n_frames, 1),
+            ),
+            "fps": fps,
+        }
+    }
 
 
 def _take_first_motion(pkl_data: dict):
@@ -76,9 +154,24 @@ def play(
     speed: float = 1.0,
     loop: bool = True,
     start_frame: int = 0,
+    fixed_root_z: float | None = None,
 ) -> int:
     print(f"[play_motion] loading {motion_path} ...", flush=True)
-    data = joblib.load(motion_path)
+    suffix = motion_path.suffix.lower()
+    if suffix == ".x2m2":
+        data = _load_x2m2(motion_path)
+        if fixed_root_z is not None:
+            for m in data.values():
+                m["root_trans_offset"][:, 2] = fixed_root_z
+        print(
+            f"[play_motion] X2M2 detected: no root_trans_offset in file; "
+            f"rendering at pelvis_z="
+            f"{next(iter(data.values()))['root_trans_offset'][0, 2]:.3f} m "
+            f"(override via --fixed-root-z).",
+            flush=True,
+        )
+    else:
+        data = joblib.load(motion_path)
     name, motion = _take_first_motion(data)
     _validate(motion)
 
@@ -144,7 +237,7 @@ def play(
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--motion", required=True, type=Path,
-                   help="Motion-lib .pkl path.")
+                   help="Motion-lib .pkl path or baked .x2m2 path.")
     p.add_argument("--mjcf", type=Path, default=Path(DEFAULT_MJCF),
                    help=f"MJCF to load (default: {DEFAULT_MJCF})")
     p.add_argument("--speed", type=float, default=1.0,
@@ -153,6 +246,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Stop at the end instead of looping.")
     p.add_argument("--start-frame", type=int, default=0,
                    help="Start from this frame (default 0).")
+    p.add_argument(
+        "--fixed-root-z", type=float, default=None,
+        help=(
+            "X2M2 only: render the floating base at this pelvis z (m). "
+            f"Default {X2M2_DEFAULT_PELVIS_Z}; ignored when --motion is a PKL "
+            "(PKL carries its own root_trans_offset)."
+        ),
+    )
     args = p.parse_args(argv)
     return play(
         motion_path=args.motion,
@@ -160,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         speed=args.speed,
         loop=args.loop,
         start_frame=args.start_frame,
+        fixed_root_z=args.fixed_root_z,
     )
 
 

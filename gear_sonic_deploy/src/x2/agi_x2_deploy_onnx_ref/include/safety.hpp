@@ -101,6 +101,97 @@ class TiltWatchdog {
   std::string reason_;
 };
 
+/// Pose-ref starvation watchdog: monitors the age of the most recent ZMQ
+/// pose-reference frame received from the operator-side stack (planner /
+/// recorder / Quest 3 manager) and trips into a *recoverable* idle state
+/// when the wire goes silent for longer than ``stale_threshold_s`` seconds.
+///
+/// Unlike ``TiltWatchdog`` (which is terminal -- once tripped the robot
+/// goes to SAFE_HOLD until the deploy is restarted), this watchdog is
+/// designed for the split-topology deploy where the operator stack runs on
+/// a separate machine and crosses wifi: a transient drop should land the
+/// robot in a safe idle pose (legs locked, default angles, 4x kd) without
+/// shutting down the deploy, and an explicit operator chord on the Quest 3
+/// (delivered out-of-band on a separate ZMQ topic) brings it back online.
+///
+/// State machine on the watchdog side:
+///
+///   not-tripped  --(age >= stale_threshold_s)-->  tripped
+///        ^                                            |
+///        |                                            v
+///   ClearTrip()  <--(operator chord OK AND          ReadyToResume()
+///                    fresh frames flowing >=          returns true after
+///                    min_fresh_window_s)              fresh frames have
+///                                                     been arriving for
+///                                                     ``min_fresh_window_s``
+///                                                     continuously
+///
+/// The min-fresh window prevents a flapping wifi link from re-engaging
+/// CONTROL on a single fresh frame and then immediately starving again
+/// (which would produce repeated SAFE_IDLE entries with full PD ramps in
+/// between -- worse than just holding idle).
+class PoseRefStarvationWatchdog {
+ public:
+  /// @param stale_threshold_s   Pose-ref age (seconds) at which Update()
+  ///                            trips. Typical 0.3-1.0 s on wifi.
+  /// @param min_fresh_window_s  After a trip, ReadyToResume() returns true
+  ///                            only after fresh frames have been arriving
+  ///                            continuously for this long. Typical 0.5-2.0 s.
+  PoseRefStarvationWatchdog(double stale_threshold_s = 0.5,
+                            double min_fresh_window_s = 1.0)
+      : stale_threshold_s_(stale_threshold_s),
+        min_fresh_window_s_(min_fresh_window_s) {}
+
+  void   Reset()        { tripped_ = false; fresh_since_s_ = -1.0; reason_.clear(); }
+  void   ClearTrip()    { tripped_ = false; fresh_since_s_ = -1.0; reason_.clear(); }
+  bool   Tripped()      const { return tripped_; }
+  double StaleThresholdS()  const { return stale_threshold_s_; }
+  double MinFreshWindowS()  const { return min_fresh_window_s_; }
+  const std::string& Reason() const { return reason_; }
+
+  /// Returns true if the watchdog fires ON THIS TICK (transitioned from
+  /// not-tripped to tripped). Subsequent calls return false but Tripped()
+  /// stays true until ClearTrip() (or Reset()).
+  ///
+  /// @param now_s               Current monotonic time (steady_clock).
+  /// @param last_rx_monotonic_s steady_clock time of the most recent ZMQ
+  ///                            frame received. If the wire has never
+  ///                            received a frame, callers should pass a
+  ///                            value <= 0; we treat that as ``age = +inf``
+  ///                            and trip immediately (the deploy is in
+  ///                            split-topology CONTROL state without any
+  ///                            operator-side input, which is unsafe).
+  bool Update(double now_s, double last_rx_monotonic_s);
+
+  /// Returns true when fresh pose-ref frames have been arriving for at
+  /// least ``min_fresh_window_s`` seconds continuously, signalling that
+  /// the operator side is healthy and the deploy can safely re-engage
+  /// CONTROL on receipt of the operator's resume chord.
+  ///
+  /// Must be called every tick (even when not tripped) so the watchdog
+  /// can maintain the fresh-since-when bookkeeping. Returns false when
+  /// not tripped (no need to "resume" if we're already running).
+  ///
+  /// @param now_s    Current monotonic time (steady_clock).
+  /// @param ref_age_s  Pose-ref age (seconds) at this tick.
+  bool ReadyToResume(double now_s, double ref_age_s);
+
+  /// Latest computed pose-ref age. Updated by Update() on every call;
+  /// reported via x2_debug for the operator/forensic tooling.
+  double LatestAgeS() const { return latest_age_s_; }
+
+ private:
+  double      stale_threshold_s_;
+  double      min_fresh_window_s_;
+  bool        tripped_      = false;
+  // Monotonic time when fresh frames started arriving again. -1 = no fresh
+  // frame seen since the last trip (or since startup). Used by
+  // ReadyToResume() to gate exit-from-SAFE_IDLE on a stable wire.
+  double      fresh_since_s_ = -1.0;
+  double      latest_age_s_  = 0.0;
+  std::string reason_;
+};
+
 /// Build the post-safety command for one control tick. Encapsulates the
 /// dry-run / ramp / watchdog interaction so the main loop stays small.
 ///

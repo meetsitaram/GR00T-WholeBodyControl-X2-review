@@ -12,6 +12,15 @@ of [`x2-ultra-onnx-deploy_9dde7da2.plan.md`](.cursor/plans/x2-ultra-onnx-deploy_
 For an end-to-end "first time on the real robot" walkthrough, see
 [`x2_first_real_robot.md`](../user_guide/x2_first_real_robot.md).
 
+For the **split-topology** variant where this binary runs on PC2 (Jetson
+AGX) under tmux while the operator-side stack stays on the laptop, see
+[`x2_split_deploy_pc2.md`](x2_split_deploy_pc2.md). That document also
+covers the new `SAFE_IDLE` state, the `PoseRefStarvationWatchdog`, and
+the operator's A+B (no X+Y) resume chord that the deploy SUBs on
+`pose_resume`. The `x2_debug` ZMQ telemetry has been bumped to v5 to
+include `pose_ref_age_s`, `in_safe_idle`, `mc_action_mode` (1 Hz poll
+of `GetMcAction`), and `resume_*` counters.
+
 ## Architecture overview
 
 ```

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace agi_x2 {
@@ -48,6 +49,70 @@ bool TiltWatchdog::Update(double gravity_body_z)
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// PoseRefStarvationWatchdog
+// ---------------------------------------------------------------------------
+bool PoseRefStarvationWatchdog::Update(double now_s, double last_rx_monotonic_s)
+{
+  // No frame has ever arrived since the deploy connected. In the split-
+  // topology CONTROL path that's unsafe by construction -- the policy is
+  // running with the stand-pose default, but the operator wire is dark.
+  // Treat as infinitely stale.
+  if (last_rx_monotonic_s <= 0.0) {
+    latest_age_s_ = std::numeric_limits<double>::infinity();
+  } else {
+    latest_age_s_ = std::max(0.0, now_s - last_rx_monotonic_s);
+  }
+
+  if (tripped_) {
+    return false;  // already tripped; subsequent calls return false
+  }
+  if (latest_age_s_ >= stale_threshold_s_) {
+    tripped_ = true;
+    fresh_since_s_ = -1.0;
+    std::ostringstream os;
+    if (std::isinf(latest_age_s_)) {
+      os << "pose-ref starvation watchdog tripped: no frames received "
+         << "since deploy connected (threshold " << stale_threshold_s_
+         << " s)";
+    } else {
+      os << "pose-ref starvation watchdog tripped: age " << latest_age_s_
+         << " s >= threshold " << stale_threshold_s_ << " s";
+    }
+    reason_ = os.str();
+    return true;
+  }
+  return false;
+}
+
+bool PoseRefStarvationWatchdog::ReadyToResume(double now_s, double ref_age_s)
+{
+  // Update the latest_age_s_ from this call so x2_debug reflects the
+  // current age even when the deploy is in SAFE_IDLE and the per-tick
+  // Update() above isn't being called (we centralise stale checks here
+  // while in SAFE_IDLE).
+  latest_age_s_ = ref_age_s;
+  if (!tripped_) {
+    fresh_since_s_ = -1.0;  // not in starved mode; bookkeeping irrelevant
+    return false;
+  }
+  // Frames count as "fresh" while their age is comfortably under the trip
+  // threshold. We use the same threshold for both directions (no hysteresis)
+  // because the min-fresh window already enforces stability -- a flapping
+  // link can't satisfy ``min_fresh_window_s_`` seconds of continuous
+  // freshness if it keeps re-crossing the threshold.
+  const bool fresh_now = (ref_age_s < stale_threshold_s_);
+  if (!fresh_now) {
+    fresh_since_s_ = -1.0;  // freshness streak broken
+    return false;
+  }
+  if (fresh_since_s_ < 0.0) {
+    fresh_since_s_ = now_s;
+    return false;
+  }
+  return (now_s - fresh_since_s_) >= min_fresh_window_s_;
 }
 
 // ---------------------------------------------------------------------------

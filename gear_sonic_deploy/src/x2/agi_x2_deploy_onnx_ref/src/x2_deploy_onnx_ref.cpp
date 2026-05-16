@@ -73,6 +73,10 @@
 #include "wrist_bypass.hpp"
 #include "zmq/zmq_debug_publisher.hpp"
 #include "zmq/zmq_pose_input_source.hpp"
+#include "zmq/zmq_resume_subscriber.hpp"
+
+#include <aimdk_msgs/srv/get_mc_action.hpp>
+#include <aimdk_msgs/msg/common_request.hpp>
 
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -88,6 +92,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -452,6 +457,64 @@ struct CliArgs {
   int         zmq_debug_port    = 0;               // 0 = disabled
   std::string zmq_debug_topic   = "x2_debug";
   // ────────────────────────────────────────────────────────────────────
+  // Pose-ref starvation watchdog (split-topology safety, --input-type=zmq).
+  //
+  // Active only when --input-type=zmq AND the deploy has reached CONTROL.
+  // Trips into the recoverable SAFE_IDLE state when the age of the most
+  // recent received pose frame exceeds ``pose_ref_stale_s`` seconds (= the
+  // operator-side stack is dead, wifi dropped, or the publisher froze).
+  // In SAFE_IDLE the deploy holds ``default_angles`` with 4x kd and does
+  // NOT run policy inference. Exiting SAFE_IDLE requires BOTH:
+  //   (a) fresh pose frames arriving for ``pose_ref_min_fresh_s`` seconds
+  //       (watchdog reports ReadyToResume() == true), AND
+  //   (b) an operator chord (A+B held 1 s on the Quest 3 left controller)
+  //       delivered via ZMQ pose_resume topic (see --zmq-resume-*).
+  // Both gates are required so a wifi flicker mid-task cannot silently
+  // re-engage CONTROL.
+  // ────────────────────────────────────────────────────────────────────
+  // Watchdog trip threshold (seconds). Pose-ref age >= this → trip.
+  // Default 0.5 s is comfortable for wifi: planner runs at 50 Hz (20 ms
+  // per frame), so a single dropped frame doesn't trip; sustained drops
+  // of ~25 frames do. Set <= 0 to disable the watchdog entirely
+  // (equivalent to --disable-pose-ref-watchdog; useful for benchmarks).
+  double      pose_ref_stale_s     = 0.5;
+  // After a trip, the wire must carry fresh frames for at least this many
+  // seconds continuously before ReadyToResume() returns true. Default
+  // 1.0 s is enough to confirm a stable link (50 fresh frames at 50 Hz).
+  // Pairs with the resume chord; both must hold to re-engage CONTROL.
+  double      pose_ref_min_fresh_s = 1.0;
+  // Hard-disable the pose-ref watchdog regardless of other flags. Keeps
+  // the legacy "ZmqPoseInputSource just holds the last good frame on
+  // starvation" behaviour for parity tests / benchmarks. NOT recommended
+  // for split-topology production runs -- a stale operator pose is the
+  // freeze-while-leaning failure mode that motivated this whole feature.
+  bool        disable_pose_ref_watchdog = false;
+  // ────────────────────────────────────────────────────────────────────
+  // Operator resume chord (companion to the starvation watchdog above).
+  //
+  // The deploy SUBs to a ``pose_resume`` topic on tcp://<host>:<port> and
+  // a single received message bumps an internal monotonic timestamp.
+  // The SAFE_IDLE exit logic gates on ``LatestFresh(0.5 s)`` AND the
+  // watchdog's ReadyToResume(), so the chord only takes effect when the
+  // operator side is currently healthy. See zmq_resume_subscriber.hpp.
+  // ────────────────────────────────────────────────────────────────────
+  std::string zmq_resume_host   = "localhost";
+  int         zmq_resume_port   = 5566;
+  std::string zmq_resume_topic  = "pose_resume";
+  // ────────────────────────────────────────────────────────────────────
+  // MC mode poller (Phase 5b observability).
+  //
+  // Polls the AimRT MC service ``/aimdk_5Fmsgs/srv/GetMcAction`` at this
+  // rate and surfaces the current ``McAction.value`` enum on x2_debug as
+  // an int (alongside body_q / dq / action). Pure observability: the
+  // deploy does not act on MC mode changes (the x2_motor_monitor.py
+  // daemon on PC2 owns the alert + JSONL persistence; this just gets
+  // the signal aligned to the policy tick clock for forensic
+  // cross-correlation). Set <= 0 to disable polling entirely.
+  // ────────────────────────────────────────────────────────────────────
+  double      mc_mode_poll_s    = 1.0;
+  std::string mc_mode_service   = "/aimdk_5Fmsgs/srv/GetMcAction";
+  // ────────────────────────────────────────────────────────────────────
   // Wrist bypass (VR-teleop quality-of-life switch).
   //
   // SONIC's training distribution does not include diverse wrist motion
@@ -703,6 +766,46 @@ void PrintUsage()
       << "                             attractor masks the operator's hand pose;\n"
       << "                             keep 'off' for sim-to-real fidelity tests so\n"
       << "                             the policy's own commands reach every joint.\n"
+      << "  --pose-ref-stale-s SEC     Split-topology safety (--input-type=zmq).\n"
+      << "                             Pose-ref age (s) at which the deploy trips\n"
+      << "                             into SAFE_IDLE (legs locked, default angles,\n"
+      << "                             4x kd, no policy inference). Default 0.5 s\n"
+      << "                             (~25 dropped frames at 50 Hz). Set <=0 to\n"
+      << "                             disable (equivalent to --disable-pose-ref-\n"
+      << "                             watchdog). Pairs with --pose-ref-min-fresh-s\n"
+      << "                             and the resume chord for recovery.\n"
+      << "  --pose-ref-min-fresh-s SEC After a SAFE_IDLE trip, the wire must carry\n"
+      << "                             fresh frames for this many seconds continuously\n"
+      << "                             before ReadyToResume() flips true. Default 1.0.\n"
+      << "                             Prevents a flapping wifi link from oscillating\n"
+      << "                             in/out of SAFE_IDLE on each fresh frame.\n"
+      << "  --disable-pose-ref-watchdog Hard-disable the pose-ref watchdog regardless\n"
+      << "                             of other flags. Restores legacy 'hold last good\n"
+      << "                             frame on starvation' behaviour. Use only for\n"
+      << "                             parity tests / benchmarks; NOT recommended for\n"
+      << "                             split-topology production (the freeze-while-\n"
+      << "                             leaning failure mode is exactly what this\n"
+      << "                             watchdog catches).\n"
+      << "  --zmq-resume-host HOST     Operator chord PUB host (the laptop running\n"
+      << "                             quest3_manager_x2.py). Default 'localhost'.\n"
+      << "                             In split topology pass the laptop IP.\n"
+      << "  --zmq-resume-port PORT     Resume PUB port (default 5566).\n"
+      << "  --zmq-resume-topic TOPIC   Resume topic (default 'pose_resume'). The\n"
+      << "                             Quest 3 manager publishes a single multipart\n"
+      << "                             message [topic, ts_monotonic_ns_le_i64]\n"
+      << "                             when the operator holds A+B for 1 s on the\n"
+      << "                             left controller.\n"
+      << "  --mc-mode-poll-s SEC       Poll the MC GetMcAction service every SEC\n"
+      << "                             seconds in a background timer (default 1.0).\n"
+      << "                             Publishes the current McAction.value on\n"
+      << "                             x2_debug as mc_action_mode for forensic\n"
+      << "                             cross-correlation with policy/state. Set <=0\n"
+      << "                             to disable (e.g. for sim runs where MC isn't\n"
+      << "                             present). Pure observability -- the deploy\n"
+      << "                             never acts on the result; the motor monitor\n"
+      << "                             daemon owns the alerts + JSONL persistence.\n"
+      << "  --mc-mode-service NAME     Override the MC mode service name\n"
+      << "                             (default '/aimdk_5Fmsgs/srv/GetMcAction').\n"
       << "  --help, -h                 show this help\n";
 }
 
@@ -797,6 +900,22 @@ CliArgs ParseCli(int argc, char** argv)
       else throw std::runtime_error(
           "--wrist-bypass must be 'off' or 'ik', got: " + v);
     }
+    else if (s == "--pose-ref-stale-s")
+      a.pose_ref_stale_s = std::stod(next("--pose-ref-stale-s"));
+    else if (s == "--pose-ref-min-fresh-s")
+      a.pose_ref_min_fresh_s = std::stod(next("--pose-ref-min-fresh-s"));
+    else if (s == "--disable-pose-ref-watchdog")
+      a.disable_pose_ref_watchdog = true;
+    else if (s == "--zmq-resume-host")
+      a.zmq_resume_host = next("--zmq-resume-host");
+    else if (s == "--zmq-resume-port")
+      a.zmq_resume_port = std::stoi(next("--zmq-resume-port"));
+    else if (s == "--zmq-resume-topic")
+      a.zmq_resume_topic = next("--zmq-resume-topic");
+    else if (s == "--mc-mode-poll-s")
+      a.mc_mode_poll_s = std::stod(next("--mc-mode-poll-s"));
+    else if (s == "--mc-mode-service")
+      a.mc_mode_service = next("--mc-mode-service");
     else {
       throw std::runtime_error("unknown argument: " + s);
     }
@@ -1020,16 +1139,48 @@ class X2Deploy {
     INIT,
     WAIT_FOR_CONTROL,
     CONTROL,
+    SAFE_IDLE,    // ← NEW: recoverable starvation hold (split-topology safety)
     RAMP_OUT,
     HOLD_FOR_MC,
     SAFE_HOLD,
   };
+
+  // ────────────────────────────────────────────────────────────────────
+  // SAFE_IDLE (Phase 2 of the split-topology safety plan).
+  //
+  // Reached from CONTROL when the pose-ref starvation watchdog trips
+  // (PoseRefStarvationWatchdog::Update returns true on the
+  // current age == now - LastReceivedMonotonicS()). In SAFE_IDLE:
+  //
+  //   * the writer keeps publishing at 500 Hz, latched to default_angles
+  //     with deploy-mode kp and 4x kd (matches the tilt-trip slump
+  //     branch), so the body stays under torque -- it doesn't go limp
+  //     like PASSIVE_DEFAULT would on MC. Operator can let go of the
+  //     gantry and the robot continues to hold the standing pose.
+  //   * the policy is NOT inferred (we skip the rest of the OnControl
+  //     fast path, including obs construction). The deploy is "alive
+  //     but coasting" -- minimal CPU + no commitment to whatever
+  //     stale pose the operator was last commanding.
+  //   * pose-ref freshness keeps being tracked. As soon as the wire
+  //     resumes and the watchdog's ReadyToResume() flips true AND an
+  //     operator chord arrives on the resume topic within the last
+  //     0.5 s, deploy re-enters CONTROL with ramp_alpha reset to 0
+  //     (so SoftStartRamp blends back from default to the live policy
+  //     output over --ramp-seconds; no torque shock).
+  //
+  // Unlike SAFE_HOLD (which is terminal -- deploy stays there until
+  // restart), SAFE_IDLE is explicitly recoverable. The dual-gate exit
+  // (fresh wire + operator chord) is a deliberate design choice: a wifi
+  // flicker on its own can never re-engage CONTROL silently, no matter
+  // how briefly the link recovers.
+  // ────────────────────────────────────────────────────────────────────
 
   X2Deploy(rclcpp::Node::SharedPtr node, const CliArgs& cli)
       : node_(node),
         cli_(cli),
         ramp_(cli.ramp_seconds),
         watchdog_(cli.tilt_cos),
+        pose_ref_watchdog_(cli.pose_ref_stale_s, cli.pose_ref_min_fresh_s),
         logger_(cli.log_dir.empty() ? std::string{} : cli.log_dir,
                 /*enabled=*/!cli.log_dir.empty())
   {
@@ -1470,6 +1621,101 @@ class X2Deploy {
     if (cli_.autostart_seconds >= 0.0) {
       autostart_target_s_ = SteadyNow() + cli_.autostart_seconds;
     }
+
+    // ─── Pose-ref starvation watchdog (split-topology safety) ──────────
+    // Active only on the ZMQ input path. Logging is loud-and-proud at
+    // startup so the operator can confirm the thresholds before saying
+    // "go". The actual per-tick Update() lives in OnControl below, so
+    // there is nothing else to wire here.
+    pose_ref_watchdog_active_ =
+        (cli_.input_type == "zmq")
+        && (cli_.pose_ref_stale_s > 0.0)
+        && (!cli_.disable_pose_ref_watchdog);
+    if (cli_.input_type == "zmq") {
+      if (pose_ref_watchdog_active_) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog ENABLED. CONTROL "
+                    "trips into SAFE_IDLE when pose-ref age >= %.3f s; "
+                    "exit requires fresh frames for >= %.3f s AND an "
+                    "operator resume chord. SAFE_IDLE holds default_angles "
+                    "with 4x kd (no policy inference).",
+                    cli_.pose_ref_stale_s, cli_.pose_ref_min_fresh_s);
+      } else if (cli_.disable_pose_ref_watchdog) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog DISABLED "
+                    "(--disable-pose-ref-watchdog). Legacy 'hold last good "
+                    "frame' behaviour active; freeze-while-leaning failure "
+                    "mode is possible if the operator wire stalls.");
+      } else {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog DISABLED "
+                    "(--pose-ref-stale-s <= 0). Set --pose-ref-stale-s 0.5 "
+                    "for split-topology production.");
+      }
+    } else {
+      // motion_file path; watchdog doesn't apply.
+      RCLCPP_INFO(node_->get_logger(),
+                  "SAFETY: pose-ref starvation watchdog NOT applicable "
+                  "(--input-type=motion_file). Watchdog activates only "
+                  "on the ZMQ input path.");
+    }
+
+    // ─── Operator resume chord SUB (split-topology safety) ─────────────
+    // Bound only when the watchdog is active. The subscriber listens for
+    // a single multipart message on tcp://<zmq_resume_host>:<zmq_resume_port>
+    // topic <zmq_resume_topic>; the receipt itself (not the payload value)
+    // is what counts. Connect failures are warned-and-continued so a
+    // missing operator stack at deploy startup doesn't block the whole
+    // CONTROL path -- the watchdog will simply trip into SAFE_IDLE on
+    // the first starvation, and re-bind happens on every deploy restart.
+    if (pose_ref_watchdog_active_) {
+      try {
+        zmq_resume_sub_ = ZmqResumeSubscriber::Connect(
+            cli_.zmq_resume_host, cli_.zmq_resume_port, cli_.zmq_resume_topic);
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: operator resume SUB bound to %s topic='%s'. "
+                    "SAFE_IDLE exit requires a resume frame within the "
+                    "last 0.5 s.",
+                    zmq_resume_sub_->Endpoint().c_str(),
+                    zmq_resume_sub_->Topic().c_str());
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "SAFETY: failed to bind operator resume SUB on "
+                     "tcp://%s:%d topic='%s': %s. SAFE_IDLE will be reachable "
+                     "but recovery requires deploy restart until this is "
+                     "fixed.",
+                     cli_.zmq_resume_host.c_str(), cli_.zmq_resume_port,
+                     cli_.zmq_resume_topic.c_str(), e.what());
+      }
+    }
+
+    // ─── MC mode poller (Phase 5b observability) ───────────────────────
+    // Async service client + a wall timer that fires every mc_mode_poll_s
+    // seconds. Each tick either: (a) starts a new async request if the
+    // previous one finished or never started, OR (b) reaps the pending
+    // future when it completes. mc_action_mode_ is the latest known
+    // McAction.value (= int enum, see McAction.msg). Published on
+    // x2_debug as ``mc_action_mode``. Pure observability -- the deploy
+    // never reads mc_action_mode_ to make control decisions.
+    if (cli_.mc_mode_poll_s > 0.0) {
+      mc_get_action_client_ =
+          node_->create_client<aimdk_msgs::srv::GetMcAction>(
+              cli_.mc_mode_service);
+      const auto period_ms = static_cast<int>(
+          std::lround(cli_.mc_mode_poll_s * 1000.0));
+      mc_mode_poll_timer_ = node_->create_wall_timer(
+          std::chrono::milliseconds(std::max(period_ms, 100)),
+          std::bind(&X2Deploy::OnMcModePoll, this));
+      RCLCPP_WARN(node_->get_logger(),
+                  "OBS: MC mode poller ENABLED at %.2f s on '%s'. "
+                  "Latest value published on x2_debug as mc_action_mode "
+                  "(-1 = unknown / service not yet seen).",
+                  cli_.mc_mode_poll_s, cli_.mc_mode_service.c_str());
+    } else {
+      RCLCPP_INFO(node_->get_logger(),
+                  "OBS: MC mode poller DISABLED (--mc-mode-poll-s <= 0). "
+                  "x2_debug mc_action_mode field will be -1 throughout.");
+    }
   }
 
   State state() const { return state_.load(); }
@@ -1649,6 +1895,55 @@ class X2Deploy {
       }
       case State::SAFE_HOLD: {
         // Stay here forever; writer publishes the latched safe command.
+        return;
+      }
+      case State::SAFE_IDLE: {
+        // Recoverable starvation hold (split-topology safety). Writer
+        // keeps publishing the latched safe_idle_cmd_ (default_angles
+        // + deploy-mode kp + 4x kd) at 500 Hz so the body stays under
+        // torque. We update the pose-ref age + ReadyToResume() every
+        // tick so x2_debug reflects the live state, then check whether
+        // BOTH gates (fresh wire AND recent operator chord) have closed
+        // -- if so, transition back to CONTROL with a fresh soft-start
+        // ramp and a reset starvation watchdog.
+        double age_s = std::numeric_limits<double>::infinity();
+        if (zmq_pose_source_ != nullptr) {
+          const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+          if (last_rx > 0.0) age_s = std::max(0.0, now - last_rx);
+        }
+        const bool ready_to_resume =
+            pose_ref_watchdog_.ReadyToResume(now, age_s);
+        const bool resume_chord_fresh =
+            (zmq_resume_sub_ != nullptr)
+            && zmq_resume_sub_->LatestFresh(now, /*window_s=*/0.5);
+        if (ready_to_resume && resume_chord_fresh) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "SAFE_IDLE -> CONTROL: resume chord received "
+                      "(latest %.3f s ago) AND pose-ref fresh for >= %.3f s "
+                      "(current age %.3f s). Re-engaging policy with a "
+                      "fresh soft-start ramp.",
+                      now - zmq_resume_sub_->LastReceivedMonotonicS(),
+                      cli_.pose_ref_min_fresh_s, age_s);
+          // Reset the soft-start ramp so the policy target blends back
+          // from default_angles over --ramp-seconds. The CONTROL state
+          // will pick up from the next tick exactly as if we'd just
+          // entered from WAIT_FOR_CONTROL.
+          ramp_.Reset();
+          pose_ref_watchdog_.ClearTrip();
+          safe_idle_entry_s_ = -1.0;
+          control_entry_s_   = now;
+          state_.store(State::CONTROL);
+        }
+        // Logger snapshot so the CSV captures SAFE_IDLE dwell explicitly
+        // (operators looking at tick.csv will see ramp_alpha=0 +
+        // reason="safe_idle" for the duration).
+        logger_.Log(now, rs.joint_pos_mj, rs.joint_vel_mj,
+                    rs.base_quat_wxyz, rs.base_ang_vel,
+                    last_action_il_, safe_idle_cmd_);
+        if (zmq_debug_pub_) {
+          PublishDebugFrame(now, rs, last_action_il_, safe_idle_cmd_,
+                            /*policy_time=*/now);
+        }
         return;
       }
       case State::RAMP_OUT: {
@@ -1976,6 +2271,50 @@ class X2Deploy {
       return;
     }
 
+    // ---- Pose-ref starvation watchdog (split-topology safety) -------------
+    // Active only on the ZMQ input path. Trips CONTROL -> SAFE_IDLE the
+    // moment the wire goes stale. We measure age as
+    //   now - ZmqPoseInputSource::LastReceivedMonotonicS()
+    // (both in the same steady_clock seconds frame) and pass that to
+    // ``pose_ref_watchdog_.Update`` which is idempotent on repeat calls
+    // (latched until ClearTrip() in SAFE_IDLE). Has to run BEFORE the
+    // ``!fresh`` IMU guard below because a missing IMU sample is a
+    // legitimate "deploy is alive but doing nothing" condition; missing
+    // pose-ref frames are not, and SAFE_IDLE entry doesn't need a fresh
+    // IMU snapshot to latch its safe-hold target (default_angles is
+    // independent of body state).
+    if (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr) {
+      const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+      const bool trip_now  = pose_ref_watchdog_.Update(now, last_rx);
+      if (trip_now) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "CONTROL -> SAFE_IDLE: %s. Holding default_angles "
+                     "with 4x kd; awaiting operator resume chord on "
+                     "'%s' AND >= %.3f s of fresh pose frames.",
+                     pose_ref_watchdog_.Reason().c_str(),
+                     cli_.zmq_resume_topic.c_str(),
+                     cli_.pose_ref_min_fresh_s);
+        // Build the latched safe-idle command once.
+        for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+          safe_idle_cmd_.target_pos_mj[i] = default_angles[i];
+          safe_idle_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps_scaled_[i];
+          safe_idle_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds_scaled_[i] * 4.0;
+        }
+        safe_idle_cmd_.dry_run    = cli_.dry_run;
+        safe_idle_cmd_.tilt_trip  = false;
+        safe_idle_cmd_.ramp_alpha = 0.0;
+        safe_idle_cmd_.reason     = "safe_idle";
+        {
+          std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
+          latest_cmd_ = safe_idle_cmd_;
+        }
+        latest_cmd_ready_.store(true, std::memory_order_release);
+        safe_idle_entry_s_ = now;
+        state_.store(State::SAFE_IDLE);
+        return;
+      }
+    }
+
     if (!fresh) {
       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
                            "CONTROL: stale or missing state, skipping tick");
@@ -2160,16 +2499,23 @@ class X2Deploy {
 
     // ---- Periodic status ---------------------------------------------------
     if (++control_tick_ % 50 == 0) {
+      const int32_t mode_now = mc_action_mode_.load(std::memory_order_acquire);
+      const double  pose_ref_age =
+          (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr)
+              ? pose_ref_watchdog_.LatestAgeS()
+              : -1.0;
       RCLCPP_INFO(node_->get_logger(),
                   "CONTROL tick=%lu policy_t=%.2fs alpha=%.2f grav_z=%+.2f "
                   "act_clip_ticks=%lu max_pre_clip=%.2f "
-                  "wrist_bypass_ticks=%lu wrist_bypass_max_dev_rad=%.3f",
+                  "wrist_bypass_ticks=%lu wrist_bypass_max_dev_rad=%.3f "
+                  "pose_ref_age=%.3fs mc_mode=%d",
                   static_cast<unsigned long>(control_tick_),
                   policy_time, sc.ramp_alpha, grav[2],
                   static_cast<unsigned long>(action_clip_tick_count_),
                   action_clip_max_pre_clip_,
                   static_cast<unsigned long>(wrist_bypass_tick_count_),
-                  wrist_bypass_max_delta_);
+                  wrist_bypass_max_delta_,
+                  pose_ref_age, static_cast<int>(mode_now));
     }
   }
 
@@ -2187,6 +2533,9 @@ class X2Deploy {
       // commands would make the firmware see a dual-publisher fight.
       return;
     }
+    // SAFE_IDLE, SAFE_HOLD, RAMP_OUT, HOLD_FOR_MC, CONTROL all publish.
+    // SAFE_IDLE in particular MUST keep the writer alive at 500 Hz so the
+    // body stays under torque while the operator wire is dark.
     // Skip publishing until OnControl (or RAMP_OUT/SAFE_HOLD) has latched
     // a real command. Without this guard, the first ~15 ms after WAIT ->
     // CONTROL would publish a default-zero command (kp=0, kd=0, target=0),
@@ -2227,6 +2576,55 @@ class X2Deploy {
     }
     latest_cmd_ready_.store(true, std::memory_order_release);
     state_.store(State::SAFE_HOLD);
+  }
+
+  // ─── MC mode poller (Phase 5b observability) ────────────────────────
+  // Fires every cli_.mc_mode_poll_s seconds. Strictly best-effort: if MC's
+  // service isn't up yet (or the call times out), we silently leave
+  // mc_action_mode_ at its previous value (-1 if never seen). The deploy
+  // never makes control decisions based on this value; it is only
+  // surfaced on x2_debug for forensic alignment with deploy CSVs +
+  // motor_monitor.jsonl (Phase 5).
+  void OnMcModePoll()
+  {
+    if (!mc_get_action_client_) return;
+    if (!mc_get_action_client_->service_is_ready()) {
+      // MC service hasn't come up yet (or went away). Keep the previous
+      // value; the periodic deploy status line will show -1 until it
+      // does. We deliberately do NOT spam-log here -- the operator can
+      // tail x2_debug or the motor_monitor JSONL for real-time visibility.
+      return;
+    }
+    // Drain any prior async future. The async path is single-shot per
+    // tick; if a request from the previous tick is still in flight we
+    // skip this tick (the rclcpp executor will eventually deliver it).
+    if (mc_mode_request_in_flight_) {
+      if (mc_mode_pending_future_.valid()
+          && mc_mode_pending_future_.wait_for(std::chrono::seconds(0))
+                 == std::future_status::ready) {
+        try {
+          auto resp = mc_mode_pending_future_.get();
+          if (resp) {
+            mc_action_mode_.store(resp->info.current_action.value,
+                                  std::memory_order_release);
+            mc_action_status_.store(resp->info.status.value,
+                                    std::memory_order_release);
+          }
+        } catch (const std::exception& e) {
+          RCLCPP_DEBUG(node_->get_logger(),
+                       "OBS: MC mode poll future threw: %s", e.what());
+        }
+        mc_mode_request_in_flight_ = false;
+      } else {
+        // Still pending; skip issuing a duplicate.
+        return;
+      }
+    }
+    auto req = std::make_shared<aimdk_msgs::srv::GetMcAction::Request>();
+    req->request = aimdk_msgs::msg::CommonRequest();
+    req->request.header.stamp = node_->now();
+    mc_mode_pending_future_ = mc_get_action_client_->async_send_request(req).future.share();
+    mc_mode_request_in_flight_ = true;
   }
 
   // ─── HOLD_FOR_MC support ────────────────────────────────────────────
@@ -2359,6 +2757,41 @@ class X2Deploy {
 
   SoftStartRamp                     ramp_;
   TiltWatchdog                      watchdog_;
+  // Split-topology pose-ref starvation watchdog. Active only when
+  // ``pose_ref_watchdog_active_`` is true (set in the ctor from CLI).
+  // OnControl checks it on every CONTROL tick using the age computed
+  // from the ZmqPoseInputSource's monotonic last-recv timestamp; a trip
+  // transitions CONTROL -> SAFE_IDLE and latches a default-pose hold
+  // with 4x kd. Exit (back to CONTROL) requires both ReadyToResume()
+  // and a recent operator chord on ``zmq_resume_sub_``.
+  PoseRefStarvationWatchdog         pose_ref_watchdog_;
+  bool                              pose_ref_watchdog_active_ = false;
+  // Operator-side resume chord SUB. Constructed when the pose-ref
+  // watchdog is active. Holds its own background thread + ZMQ socket;
+  // tears down cleanly in the destructor via std::unique_ptr.
+  std::unique_ptr<ZmqResumeSubscriber> zmq_resume_sub_;
+  // Most recent SAFE_IDLE entry time (steady_clock seconds). Used by
+  // the periodic status line and the x2_debug ``in_safe_idle`` ms
+  // counter. -1 = never been in SAFE_IDLE (or already exited).
+  double                            safe_idle_entry_s_ = -1.0;
+  // Latched SafeCommand that the writer keeps publishing while in
+  // SAFE_IDLE. Built once at entry to avoid recomputing default_angles
+  // + 4x kd on every 500 Hz tick.
+  SafeCommand                       safe_idle_cmd_;
+
+  // MC mode poller (Phase 5b observability). Background timer fires
+  // every cli_.mc_mode_poll_s seconds; mc_action_mode_ holds the latest
+  // McAction.value enum (-1 = unknown). Published on x2_debug.
+  rclcpp::Client<aimdk_msgs::srv::GetMcAction>::SharedPtr
+                                    mc_get_action_client_;
+  rclcpp::TimerBase::SharedPtr      mc_mode_poll_timer_;
+  std::shared_future<
+      aimdk_msgs::srv::GetMcAction::Response::SharedPtr>
+                                    mc_mode_pending_future_;
+  bool                              mc_mode_request_in_flight_ = false;
+  std::atomic<int32_t>              mc_action_mode_{-1};
+  std::atomic<int32_t>              mc_action_status_{-1};
+
   DeployLogger                      logger_;
 
   // Per-DOF max_target_dev clamp synthesised once from the global +
@@ -2538,8 +2971,41 @@ class X2Deploy {
     std::uint8_t dry_run   = sc.dry_run   ? 1 : 0;
     double ramp_alpha = sc.ramp_alpha;
 
+    // ─── v5 split-topology / forensic fields ───────────────────────────
+    // Computed once per tick so the dump_x2_debug.py consumer (and the
+    // x2_motor_monitor sidecar) can correlate the policy clock with
+    // operator-side stack health.
+    double  pose_ref_age_s = -1.0;  // sentinel: no ZMQ source / no frames
+    if (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr) {
+      const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+      if (last_rx > 0.0) {
+        pose_ref_age_s = std::max(0.0, now - last_rx);
+      } else {
+        // Watchdog active but no frame yet: report a large finite age
+        // (NOT +inf, which decodes awkwardly on the Python side). 1e9
+        // is "obviously starved" without breaking JSON encoders.
+        pose_ref_age_s = 1.0e9;
+      }
+    }
+    std::uint8_t in_safe_idle =
+        (state_.load() == State::SAFE_IDLE) ? 1 : 0;
+    std::uint8_t pose_ref_starved =
+        (pose_ref_watchdog_active_ && pose_ref_watchdog_.Tripped()) ? 1 : 0;
+    // Resume chord telemetry: age in seconds since most recent press
+    // (sentinel -1 = no press / no SUB). Operator can correlate visible
+    // SAFE_IDLE entries with chord receipt timing.
+    double  resume_age_s = -1.0;
+    int64_t resume_total = 0;
+    if (zmq_resume_sub_) {
+      const double last_press = zmq_resume_sub_->LastReceivedMonotonicS();
+      if (last_press > 0.0) resume_age_s = std::max(0.0, now - last_press);
+      resume_total = static_cast<int64_t>(zmq_resume_sub_->total_received());
+    }
+    int32_t mc_action_mode   = mc_action_mode_.load(std::memory_order_acquire);
+    int32_t mc_action_status = mc_action_status_.load(std::memory_order_acquire);
+
     std::vector<PackedField> fields;
-    fields.reserve(13);
+    fields.reserve(21);
     fields.push_back({"control_tick",   "i64", {1},                     &tick_i64,            sizeof(int64_t)});
     fields.push_back({"ros_timestamp",  "f64", {1},                     &now_f64,             sizeof(double)});
     fields.push_back({"policy_time",    "f64", {1},                     &policy_time_f64,     sizeof(double)});
@@ -2554,11 +3020,22 @@ class X2Deploy {
     fields.push_back({"ramp_alpha",     "f64", {1},                     &ramp_alpha,          sizeof(double)});
     fields.push_back({"tilt_trip",      "u8",  {1},                     &tilt_trip,           sizeof(std::uint8_t)});
 
-    // Note: dry_run is intentionally LAST so dump_x2_debug.py can detect
-    // an old protocol version (without dry_run) by short-message-length.
-    fields.push_back({"dry_run",        "u8",  {1},                     &dry_run,             sizeof(std::uint8_t)});
+    // dry_run was previously LAST in the v4 protocol. v5 keeps it BEFORE
+    // the new fields so the protocol number reflects the schema and old
+    // dump_x2_debug.py consumers either upgrade or short-read cleanly at
+    // the dry_run boundary (the message length tells them which protocol
+    // version landed).
+    fields.push_back({"dry_run",         "u8",  {1}, &dry_run,         sizeof(std::uint8_t)});
+    // v5 forensic fields (Phase 2 + 5b).
+    fields.push_back({"pose_ref_age_s",  "f64", {1}, &pose_ref_age_s,  sizeof(double)});
+    fields.push_back({"pose_ref_starved","u8",  {1}, &pose_ref_starved,sizeof(std::uint8_t)});
+    fields.push_back({"in_safe_idle",    "u8",  {1}, &in_safe_idle,    sizeof(std::uint8_t)});
+    fields.push_back({"resume_age_s",    "f64", {1}, &resume_age_s,    sizeof(double)});
+    fields.push_back({"resume_total",    "i64", {1}, &resume_total,    sizeof(int64_t)});
+    fields.push_back({"mc_action_mode",  "i32", {1}, &mc_action_mode,  sizeof(int32_t)});
+    fields.push_back({"mc_action_status","i32", {1}, &mc_action_status,sizeof(int32_t)});
 
-    if (zmq_debug_pub_->Publish(fields, /*version=*/4, /*count=*/1)) {
+    if (zmq_debug_pub_->Publish(fields, /*version=*/5, /*count=*/1)) {
       ++zmq_debug_frames_published_;
     }
   }
