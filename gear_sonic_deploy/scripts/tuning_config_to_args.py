@@ -48,14 +48,67 @@ def _check_nonneg(name: str, v: Any) -> None:
         raise ValueError(f"{name}: expected >= 0, got {v!r}")
 
 
+def _check_pos(name: str, v: Any) -> None:
+    if float(v) <= 0:
+        raise ValueError(
+            f"{name}: PD scales must be > 0 (got {v!r}); use 1.0 for no trim"
+        )
+
+
 KEY_TO_FLAG: dict[str, tuple[str, Callable[[Any], str], Callable[[str, Any], None] | None]] = {
     # Existing C++ binary flags. Pulling them into the YAML lets one preset
     # capture an entire real-deploy scenario in a single file.
     "action_clip":     ("--action-clip",      _fmt_float, None),
     "max_target_dev":  ("--max-target-dev",   _fmt_float, None),
+    # Per-group max_target_dev overrides (added 2026-05). Each one wins
+    # over the global ``max_target_dev`` for joints in its group:
+    #   max_target_dev_leg   -> MJ joints  0..11 (hip/knee/ankle, both sides)
+    #   max_target_dev_waist -> MJ joints 12..14 (yaw/pitch/roll)
+    #   max_target_dev_arm   -> MJ joints 15..28 (shoulder/elbow/wrist, both)
+    #   max_target_dev_head  -> MJ joints 29..30 (yaw/pitch)
+    # Negative / null = inherit the global.  Typical tight-legs/wide-arms
+    # teleop preset: max_target_dev: 0.30, max_target_dev_arm: 1.50.
+    "max_target_dev_leg":   ("--max-target-dev-leg",   _fmt_float, None),
+    "max_target_dev_waist": ("--max-target-dev-waist", _fmt_float, None),
+    "max_target_dev_arm":   ("--max-target-dev-arm",   _fmt_float, None),
+    "max_target_dev_head":  ("--max-target-dev-head",  _fmt_float, None),
     "ramp_seconds":    ("--ramp-seconds",     _fmt_float, _check_nonneg),
     "return_seconds":  ("--return-seconds",   _fmt_float, _check_nonneg),
     "tilt_cos":        ("--tilt-cos",         _fmt_float, None),
+    # Deployment-time PD trim (added 2026-05). Mirrors the
+    # ``--kp-scale-*`` / ``--kd-scale-*`` flags in eval_x2_mujoco.py.
+    # Each value is multiplicative; default 1.0 (no trim). The G16b-
+    # validated default for X2 Ultra is ``kp_scale_ankle=1.5``;
+    # operators often need ``kp_scale_waist=1.5`` on the real robot
+    # to clear torso wobble on nudge (no Python-sim equivalent).
+    # See gear_sonic/scripts/eval_x2_mujoco.py:155-200 for the full
+    # IsaacLab-implicit-PD vs MuJoCo/real-robot-explicit-PD background.
+    "kp_scale":          ("--kp-scale",          _fmt_float, _check_pos),
+    "kp_scale_hip":      ("--kp-scale-hip",      _fmt_float, _check_pos),
+    "kp_scale_knee":     ("--kp-scale-knee",     _fmt_float, _check_pos),
+    "kp_scale_ankle":       ("--kp-scale-ankle",       _fmt_float, _check_pos),
+    "kp_scale_ankle_pitch": ("--kp-scale-ankle-pitch", _fmt_float, _check_pos),
+    "kp_scale_ankle_roll":  ("--kp-scale-ankle-roll",  _fmt_float, _check_pos),
+    "kp_scale_waist":       ("--kp-scale-waist",       _fmt_float, _check_pos),
+    "kp_scale_waist_yaw": ("--kp-scale-waist-yaw", _fmt_float, _check_pos),
+    "kp_scale_waist_pr":  ("--kp-scale-waist-pr",  _fmt_float, _check_pos),
+    "kp_scale_shoulder":  ("--kp-scale-shoulder",  _fmt_float, _check_pos),
+    "kp_scale_elbow":    ("--kp-scale-elbow",    _fmt_float, _check_pos),
+    "kp_scale_wrist":    ("--kp-scale-wrist",    _fmt_float, _check_pos),
+    "kp_scale_head":     ("--kp-scale-head",     _fmt_float, _check_pos),
+    "kd_scale":          ("--kd-scale",          _fmt_float, _check_pos),
+    "kd_scale_hip":      ("--kd-scale-hip",      _fmt_float, _check_pos),
+    "kd_scale_knee":     ("--kd-scale-knee",     _fmt_float, _check_pos),
+    "kd_scale_ankle":       ("--kd-scale-ankle",       _fmt_float, _check_pos),
+    "kd_scale_ankle_pitch": ("--kd-scale-ankle-pitch", _fmt_float, _check_pos),
+    "kd_scale_ankle_roll":  ("--kd-scale-ankle-roll",  _fmt_float, _check_pos),
+    "kd_scale_waist":       ("--kd-scale-waist",       _fmt_float, _check_pos),
+    "kd_scale_waist_yaw": ("--kd-scale-waist-yaw", _fmt_float, _check_pos),
+    "kd_scale_waist_pr":  ("--kd-scale-waist-pr",  _fmt_float, _check_pos),
+    "kd_scale_shoulder":  ("--kd-scale-shoulder",  _fmt_float, _check_pos),
+    "kd_scale_elbow":    ("--kd-scale-elbow",    _fmt_float, _check_pos),
+    "kd_scale_wrist":    ("--kd-scale-wrist",    _fmt_float, _check_pos),
+    "kd_scale_head":     ("--kd-scale-head",     _fmt_float, _check_pos),
     # New post-policy filters (parity-safe by construction; see C++ comment
     # next to CliArgs::target_lpf_hz for why this is dump-invisible).
     "target_lpf_hz":   ("--target-lpf-hz",    _fmt_float, _check_nonneg),

@@ -15,6 +15,11 @@ Companion documents:
 - [`x2_deployment_code.md`](../references/x2_deployment_code.md) — reference
   for the deploy package's architecture, CLI, observation/action contract,
   and ROS 2 topics.
+- [`x2_pd_tuning_with_mc_scan.md`](x2_pd_tuning_with_mc_scan.md) —
+  procedure for picking the deployment-time PD scale knobs and per-group
+  target clamps used by `--tuning-config`. Includes the
+  `x2_scan_mc_motors.sh` MC-scan helper, the nudge-test loop, and how
+  to read the per-joint oscillation summary.
 
 The deploy package itself is `gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/`.
 

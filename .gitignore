@@ -279,6 +279,15 @@ logs/x2/
 # obs-dump blobs, ad-hoc captures). Never check in.
 scratch/
 
+# X2 MC-motor scan output (gear_sonic_deploy/scripts/x2_scan_mc_motors.sh).
+# Each run drops one mc_motor_scan_<unix_ts>.jsonl in the working
+# directory (typically the repo root). They're per-operator-session
+# captures of the MC's published kp/kd/target plus measured joint state
+# for a nudge test, used to derive the values shipped in
+# gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml. Re-run
+# the scanner to regenerate; the YAML preset is the durable artifact.
+mc_motor_scan_*.jsonl
+
 # Standalone CMake build dir we use for the offline unit tests in
 # gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/. The colcon build/
 # directory is already covered by the toplevel build/ rule, but
