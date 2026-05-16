@@ -52,6 +52,7 @@
 #       [--no-apply-curl-compensation] [--no-apply-oppose-compensation]
 #       [--sonic-checkpoint PATH] [--no-sonic-checkpoint]
 #       [--sonic-tokenizer-device DEV] [--encoder-config PATH]
+#       [--planner-demo PATH.yaml]
 #       [--rate FLOAT] [--log-dir PATH] [--cleanup-only] [--validate-only]
 #       [--vla-bridge MODEL_DIR --vla-prompt STR
 #        [--vla-device DEV] [--vla-rate FLOAT] [--vla-inference-period-s S]
@@ -60,6 +61,20 @@
 # Defaults to --teleop-only (no dataset writes). Pass --with-record
 # (along with --output-dir and --task) to capture a LeRobot v2.1
 # episode through the subscribe-mode pipeline.
+#
+# Scripted-motion mode: pass --planner-demo PATH.yaml to pre-load a
+# scripted-demo YAML (same schema as gear_sonic/data/scripted_demos/
+# *.yaml; see x2_heuristic_planner.md "Scripted demo gallery") into
+# the planner's command queue at startup. Once the deploy + planner +
+# manager + recorder come up and the warmup completes, the planner
+# plays through the YAML commands in order; when the queue empties it
+# falls back to IDLE_LOOP (idle_stand) and stays there until the
+# operator takes over via the Quest 3 headset (button chord A+B+X+Y
+# enters LOCOMOTION). The first VR-driven planner_cmd that arrives
+# during playback REPLACES the pending YAML queue (the operator's
+# intent always wins), so a half-played demo is interruptable.
+# Mutually exclusive with --vla-bridge (VLA mode replaces the
+# planner with the VLA bridge; there's no command queue to seed).
 #
 # VLA closed-loop mode: pass --vla-bridge MODEL_DIR --vla-prompt STR
 # (with --robocasa-env, which is REQUIRED here). The heuristic planner
@@ -74,6 +89,9 @@
 # Examples:
 #   # Smoke test (no writes), 5 min teleop session:
 #   ./run_x2_quest3_planner_stack.sh --duration 300
+#
+#   # Run forever (no auto-shutdown; Ctrl-C to stop):
+#   ./run_x2_quest3_planner_stack.sh --duration 0
 #
 #   # Recorded session writing into data/lerobot/x2_phase0_smoke_v0:
 #   ./run_x2_quest3_planner_stack.sh --duration 600 --with-record \
@@ -111,6 +129,12 @@
 #       --robocasa-env X2PickPlaceApple \
 #       --vla-bridge /tmp/x2_pick_place_apple_v1_run1 \
 #       --vla-prompt "pick up the apple from the table"
+#
+#   # Play a scripted YAML demo at startup, then idle-stand and wait
+#   # for VR takeover (operator straps on the headset and chord-presses
+#   # A+B+X+Y to enter LOCOMOTION whenever they're ready):
+#   ./run_x2_quest3_planner_stack.sh --duration 0 \
+#       --planner-demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml
 #
 # Pre-flight (verified before any spawn):
 #   - data/operator_calibrations/<operator-id>.yaml exists
@@ -198,7 +222,7 @@ SCENE_RESET_PORT=5560   # recorder PUB -> deploy bridge SUB (re-randomise objs)
 # CLI defaults
 # --------------------------------------------------------------------------
 
-DURATION_S=600
+DURATION_S=0  # 0 = unlimited (run until Ctrl-C). Pass --duration N for a fixed N-sec cap.
 WITH_RECORD=0
 OUTPUT_DIR=""
 TASK=""
@@ -258,6 +282,17 @@ LOG_DIR=""              # auto-resolved to /tmp/<script>-<timestamp>
 CLEANUP_ONLY=0
 VALIDATE_ONLY=0         # exit 0 right after pre-flight; spawns nothing
 SIDECAR_LOG=""          # default: <log-dir>/manager_sidecar.jsonl
+# Optional scripted-demo YAML pre-loaded into the planner's command
+# queue at startup. When set the planner is spawned with --demo PATH,
+# which appends the YAML's commands to the planner queue at boot. The
+# state machine then plays them through (returning to idle_stand at
+# the end of the queue) before sitting in IDLE_LOOP waiting for the
+# manager's planner_cmd stream. The first interactive VR command
+# (source="zmq" via replace_pending) drops any still-pending YAML
+# entries, so a half-played demo is preemptible the moment the
+# operator takes manual control. Mutually exclusive with VLA mode
+# (no heuristic planner is spawned in that path).
+PLANNER_DEMO=""
 
 # --------------------------------------------------------------------------
 # VLA closed-loop mode (NEW). When --vla-bridge MODEL_DIR is passed,
@@ -368,6 +403,7 @@ while [[ $# -gt 0 ]]; do
         --sidecar-log) SIDECAR_LOG="$2"; shift 2 ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
         --validate-only) VALIDATE_ONLY=1; shift ;;
+        --planner-demo) PLANNER_DEMO="$2"; shift 2 ;;
         --vla-bridge) VLA_BRIDGE_MODEL="$2"; shift 2 ;;
         --vla-bridge-sonic-checkpoint)
             VLA_BRIDGE_SONIC_CKPT_MODE="explicit"
@@ -765,6 +801,28 @@ if [[ "${WITH_RECORD}" -eq 1 ]]; then
         exit 1
     fi
 fi
+# --planner-demo: validate YAML existence + reject in VLA mode (no
+# heuristic planner is spawned there; the bridge owns body_pose and
+# has no command queue to seed). Keep this gate close to the rest of
+# the input-file checks so a stale absolute path fails fast at boot
+# rather than after deploy / planner spawn (which would burn the
+# ~30 s sim docker bring-up before surfacing the typo).
+if [[ -n "${PLANNER_DEMO}" ]]; then
+    if [[ "${VLA_MODE}" -eq 1 ]]; then
+        err "--planner-demo is incompatible with --vla-bridge / --vla-no-policy"
+        err "(VLA mode replaces the heuristic planner with the live VLA bridge;"
+        err "there is no planner command queue to seed with a YAML demo)."
+        exit 1
+    fi
+    if [[ ! -f "${PLANNER_DEMO}" ]]; then
+        err "--planner-demo YAML not found: ${PLANNER_DEMO}"
+        err "Available curated demos:"
+        for f in "${REPO_ROOT}"/gear_sonic/data/scripted_demos/*.yaml; do
+            [[ -f "$f" ]] && err "  - ${f#${REPO_ROOT}/}"
+        done
+        exit 1
+    fi
+fi
 
 # --------------------------------------------------------------------------
 # VLA-mode preflight. Runs AFTER the deploy / record gate above so the
@@ -1093,7 +1151,7 @@ ${C_GREEN}┌──────────────────────�
 │  (heuristic_planner omitted; manager + recorder merge + VLA bridge)  │
 └──────────────────────────────────────────────────────────────────────┘${C_RESET}
   log dir          : ${LOG_DIR}
-  duration         : ${DURATION_S}s
+  duration         : $([[ "${DURATION_S}" -eq 0 ]] && echo "unlimited (run until Ctrl-C)" || echo "${DURATION_S}s")
   scene            : ${ROBOCASA_ENV} -> ${ROBOCASA_SCENE_XML}
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
   ONNX model       : ${SIM_MODEL}
@@ -1116,10 +1174,11 @@ ${C_GREEN}┌──────────────────────�
 │  X2 Quest 3 planner-driven stack runner (Phase 0)                    │
 └──────────────────────────────────────────────────────────────────────┘${C_RESET}
   log dir          : ${LOG_DIR}
-  duration         : ${DURATION_S}s
+  duration         : $([[ "${DURATION_S}" -eq 0 ]] && echo "unlimited (run until Ctrl-C)" || echo "${DURATION_S}s")
   mode             : $([[ "${WITH_RECORD}" -eq 1 ]] && echo "RECORD -> ${OUTPUT_DIR}" || echo "TELEOP-ONLY")
   task             : ${TASK:-(none -- robocasa auto-fills from scene metadata)}
   scene            : $([[ "${ROBOCASA_ENV}" == "none" ]] && echo "(flat floor, no robocasa scene)" || echo "${ROBOCASA_ENV} -> ${ROBOCASA_SCENE_XML}")
+  planner demo     : ${PLANNER_DEMO:-(none -- planner sits in IDLE_LOOP at startup, awaits VR planner_cmd)}
   finger comp      : curl=$([[ "${APPLY_CURL_COMP}" -eq 1 ]] && echo on || echo off)  oppose=$([[ "${APPLY_OPPOSE_COMP}" -eq 1 ]] && echo on || echo off)$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)" || echo "  (pass --apply-{curl,oppose}-compensation to enable)")
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
   ONNX model       : ${SIM_MODEL}
@@ -1177,7 +1236,14 @@ fi
 
 if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
     DEPLOY_LOG="${LOG_DIR}/deploy.log"
-    DEPLOY_DURATION_S=$(( DURATION_S + 30 ))
+    # DURATION_S=0 means "run forever". Skip --max-duration entirely so
+    # deploy_x2.sh inherits its own no-limit behaviour (matches the same
+    # convention live_vla_publish_motion_token.py uses for --duration 0).
+    if (( DURATION_S > 0 )); then
+        DEPLOY_DURATION_S=$(( DURATION_S + 30 ))
+    else
+        DEPLOY_DURATION_S=0
+    fi
 
     # Parity profile needs the bridge RSI PKL. Auto-bake on first use
     # so a fresh checkout / primitive rebuild doesn't fail at boot.
@@ -1210,8 +1276,10 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
         --wrist-bypass "${WRIST_BYPASS}"
         --model "${SIM_MODEL}"
         --autostart-after 0
-        --max-duration "${DEPLOY_DURATION_S}"
     )
+    if (( DEPLOY_DURATION_S > 0 )); then
+        DEPLOY_ARGS+=(--max-duration "${DEPLOY_DURATION_S}")
+    fi
     if [[ "${SIM_PROFILE}" == "parity" ]]; then
         DEPLOY_ARGS+=(--motion "${SIM_RSI_PKL}")
     fi
@@ -1322,8 +1390,22 @@ PLANNER_ARGS=(
     --pid-file "${PLANNER_PID_FILE}"
     --duration-s "${DURATION_S}"
 )
+# Optional --demo: pre-loads the YAML's command sequence into the
+# planner's queue at boot. Commands play in order through the FSM
+# (idle -> blend -> primitive -> blend -> idle ...) and the queue
+# drains naturally back to IDLE_LOOP. The first manager-emitted
+# planner_cmd that lands while the queue is non-empty calls
+# replace_pending() and drops anything still pending so the operator
+# always wins (see x2_heuristic_planner.py "Source semantics").
+if [[ -n "${PLANNER_DEMO}" ]]; then
+    PLANNER_ARGS+=(--demo "${PLANNER_DEMO}")
+fi
 
 log "Step 2/4 — spawning x2_heuristic_planner -> ${PLANNER_LOG}"
+if [[ -n "${PLANNER_DEMO}" ]]; then
+    log "  (--planner-demo ${PLANNER_DEMO}: queue will drain to idle_stand"
+    log "   on its own; first VR planner_cmd preempts via replace_pending)"
+fi
 "${PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
 PLANNER_PID=$!
 
@@ -1889,16 +1971,21 @@ while :; do
 
     NOW_TS=$(date +%s)
     ELAPSED=$((NOW_TS - START_TS))
-    if (( ELAPSED >= DURATION_S )); then
+    if (( DURATION_S > 0 )) && (( ELAPSED >= DURATION_S )); then
         log "duration ${DURATION_S}s reached; shutting down stack ..."
         exit 0
     fi
     if (( NOW_TS - LAST_HEARTBEAT_TS >= 30 )); then
         LAST_HEARTBEAT_TS=${NOW_TS}
-        if [[ "${VLA_MODE}" -eq 1 ]]; then
-            log "alive: t=${ELAPSED}s/${DURATION_S}s  pids[deploy=${DEPLOY_PID:-skipped} manager=${MANAGER_PID} recorder=${RECORDER_PID} vla-bridge=${VLA_BRIDGE_PID}]"
+        if (( DURATION_S > 0 )); then
+            DURATION_TAG="${ELAPSED}s/${DURATION_S}s"
         else
-            log "alive: t=${ELAPSED}s/${DURATION_S}s  pids[deploy=${DEPLOY_PID:-skipped} planner=${PLANNER_PID} manager=${MANAGER_PID} recorder=${RECORDER_PID}]"
+            DURATION_TAG="${ELAPSED}s (no limit)"
+        fi
+        if [[ "${VLA_MODE}" -eq 1 ]]; then
+            log "alive: t=${DURATION_TAG}  pids[deploy=${DEPLOY_PID:-skipped} manager=${MANAGER_PID} recorder=${RECORDER_PID} vla-bridge=${VLA_BRIDGE_PID}]"
+        else
+            log "alive: t=${DURATION_TAG}  pids[deploy=${DEPLOY_PID:-skipped} planner=${PLANNER_PID} manager=${MANAGER_PID} recorder=${RECORDER_PID}]"
         fi
     fi
     sleep 1

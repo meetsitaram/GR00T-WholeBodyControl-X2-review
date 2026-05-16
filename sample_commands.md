@@ -334,6 +334,45 @@ after a fresh checkout to confirm planner / manager / deploy come up.
 gear_sonic/scripts/run_x2_quest3_planner_stack.sh --duration 300
 ```
 
+### Auto-play a scripted demo at startup, then idle for VR takeover
+
+Pre-loads a scripted YAML demo into the planner's command queue at
+boot. The planner plays through the sequence (each `intent: ...`
+entry runs through the FSM blend / play / blend cycle), drains back
+to `idle_stand` when the queue empties, and sits in `IDLE_LOOP`
+indefinitely waiting for the operator. The first VR-driven
+`planner_cmd` (operator straps on the headset, chord-presses
+**A+B+X+Y** to enter LOCOMOTION, then nudges a stick) calls
+`replace_pending` and preempts whatever's still queued, so a
+half-played demo can be interrupted mid-flight without restarting the
+stack.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 0 \
+    --planner-demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml
+```
+
+Available demos (full inventory in
+[`x2_heuristic_planner.md` § Scripted demo gallery](docs/source/references/x2_heuristic_planner.md#scripted-demo-gallery)):
+
+| Demo | What it plays |
+| --- | --- |
+| `eleven_motion_sequence.yaml` | 11-bin smoke covering every working family (fwd_step, turns, side steps, crouch, leans, torso twists). |
+| `forward_back_turn.yaml` | continuous walk fwd / back + two turns. |
+| `static_reach.yaml` | full lean + torso-twist reach ladder, no locomotion. |
+| `gallery_crouch.yaml` | crouch_medium ×3. |
+| `gallery_fwd_back_shuffle.yaml` | fwd_step + back_step variants. |
+| `manipulation_approach.yaml` | locomanipulation approach + reach. |
+| `side_steps_only_smoke.yaml` | side_left_step + side_right_step. |
+| `six_motion_smoke.yaml` | shorter 6-bin smoke. |
+
+Mutually exclusive with `--vla-bridge` / `--vla-no-policy` (those
+modes replace the heuristic planner with the live VLA bridge and have
+no command queue to seed). Compatible with `--with-record` if you
+want the auto-played intro stitched into the same LeRobot episode the
+operator records afterward.
+
 ### Record mobile-manipulation episodes (flat floor)
 
 Same scene as the kinematic / SONIC recorders above (no table, no
@@ -458,7 +497,7 @@ crashed deploy.
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
-| `--duration N` | `600` | Auto-shutdown after N seconds (deploy `--max-duration`). |
+| `--duration N` | `0` (unlimited; Ctrl-C to stop) | Auto-shutdown after N seconds (deploy `--max-duration`). Pass `0` (or omit) for no limit. |
 | `--with-record` | off | Spawn the LeRobot recorder. Requires `--output-dir`. |
 | `--output-dir PATH` | — | Required with `--with-record`. |
 | `--task STR` | required in flat-floor; **optional in robocasa** | Language instruction stamped on every frame. Robocasa mode auto-fills from scene metadata. |
@@ -470,6 +509,7 @@ crashed deploy.
 | `--operator-id NAME` | `default` | Loads `data/operator_calibrations/<NAME>.yaml`. |
 | `--calibration PATH` | auto from `--operator-id` | Explicit calibration override. |
 | `--wrist-bypass {off,ik}` | `ik` | Override SONIC's wrist target with the operator's IK reference. Same semantics as `record_x2_dataset.sh`. |
+| `--planner-demo PATH.yaml` | (none) | Pre-load a scripted-demo YAML into the planner's command queue at startup. The planner plays through it, returns to `idle_stand`, and waits for the operator's first VR `planner_cmd` (which preempts via `replace_pending`). Same YAML schema as `gear_sonic/data/scripted_demos/*.yaml`. Mutually exclusive with `--vla-bridge` / `--vla-no-policy`. |
 | `--no-deploy` | off | Skip launching `deploy_x2.sh` (assume external). |
 | `--no-sim-viewer` | off | Run the deploy headless (no MuJoCo viewer; headset still required). |
 | `--sim-profile {parity,manual}` | `parity` | Deploy SONIC profile. `parity` matches the bake-vs-planner reference; `manual` skips the RSI anchor. |
