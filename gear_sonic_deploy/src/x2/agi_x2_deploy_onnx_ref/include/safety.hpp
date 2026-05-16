@@ -108,13 +108,22 @@ class TiltWatchdog {
 /// published by the 500 Hz writer (which simply re-publishes the latest
 /// SafeCommand without modification).
 ///
-/// @param max_target_dev_rad  Per-joint hard clamp on |target - default|.
-///   Applied AFTER the soft-start ramp blend, BEFORE the dry-run gain
-///   zeroing. A non-positive value disables the clamp entirely (back to the
-///   pre-clamp behaviour). Use a small value (e.g. 0.05 rad ~= 3 deg) for the
-///   first powered bring-up runs so a divergent policy or obs-construction
-///   bug cannot drive any joint more than `max_target_dev_rad` away from the
-///   trained standing pose, regardless of what the ONNX session emits.
+/// Two ApplySafetyStack overloads exist:
+///
+///   * Scalar (legacy): one ``max_target_dev_rad`` applied to all 31 DOFs.
+///     Negative value disables the clamp. Kept for callers that don't care
+///     about per-group differentiation.
+///
+///   * Per-DOF (preferred for real-robot deploys): a 31-element array
+///     where ``per_dof[i]`` is the clamp on joint ``i`` (MuJoCo order, see
+///     ``policy_parameters.hpp::mujoco_joint_names``). Entry < 0 disables
+///     the clamp on that joint. Used by ``--max-target-dev-{leg,waist,
+///     arm,head}`` so legs (kp ~99) can be tightly clamped while arms
+///     (kp ~14) get the room they need to reach operator IK targets.
+///
+/// In both cases the clamp is applied AFTER the soft-start ramp blend
+/// and BEFORE the dry-run gain zeroing. Skipped on a tilt-trip because
+/// that branch already pinned the target to ``default_angles``.
 SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
                              double current_gravity_body_z,
                              SoftStartRamp& ramp,
@@ -122,6 +131,39 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
                              bool dry_run,
                              double now_s,
                              double max_target_dev_rad = -1.0);
+
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof);
+
+/// Full-control overload. Same semantics as the per-DOF max_target_dev
+/// variant above, but ALSO takes per-DOF kp / kd arrays instead of using
+/// the trained ``kps`` / ``kds`` from policy_parameters.hpp directly.
+///
+/// Use this overload when the operator wants to bump deployment-time PD
+/// per joint group (e.g. ``--kp-scale-ankle 1.5`` to recover the loop gain
+/// IsaacLab's implicit PD lent training). The values passed here ARE the
+/// final effective gains the safety stack will publish on the bus -- any
+/// per-group scaling should already be folded in by the caller (see
+/// ``BuildPdScalesPerDof`` in x2_deploy_onnx_ref.cpp).
+///
+/// On a tilt-trip the kd part of the returned SafeCommand is still boosted
+/// by 4x (over-damped slump-back), so callers don't need to reproduce that
+/// branch. The dry-run zeroing also still applies AFTER the per-DOF kp/kd
+/// landed, so dry-run + custom gains gives kp=0/kd=0 like before.
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof,
+                             const std::array<double, NUM_DOFS>& kp_per_dof,
+                             const std::array<double, NUM_DOFS>& kd_per_dof);
 
 }  // namespace agi_x2
 

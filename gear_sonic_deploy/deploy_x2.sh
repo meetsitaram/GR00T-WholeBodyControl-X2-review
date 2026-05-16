@@ -70,6 +70,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # motion path against gear_sonic_deploy/ and fails to find the file.
 USER_CWD="$(pwd)"
 
+# Repo root (parent of gear_sonic_deploy/). Prefer ``.venv/bin/python`` for
+# auxiliary Python (hand bridge, tuning YAML translator, sim MuJoCo bridge,
+# --record helper, MC escalator) so we do not silently use the host's
+# unconfigured ``python3``. Inside docker_x2, the repo mount may or may not
+# include a .venv; when absent we fall back to ``python3`` (ROS image).
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEPLOY_REPO_VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+if [[ -x "$DEPLOY_REPO_VENV_PYTHON" ]]; then
+    DEPLOY_AUX_PYTHON="$DEPLOY_REPO_VENV_PYTHON"
+else
+    DEPLOY_AUX_PYTHON="python3"
+fi
+
 # ============================================================================
 # Auto-relaunch inside the docker_x2/x2sim container if invoked from a host
 # shell that doesn't have ROS / aimdk_msgs sourced. Lets the user run
@@ -264,10 +277,95 @@ MAX_DURATION=""
 TILT_COS=""
 RAMP_SECONDS=""
 # Per-joint hard clamp on |target - default_angles|, in radians. Empty string
-# = leave it disabled (legacy behaviour). Recommended for first powered runs:
-# --max-target-dev 0.05 (about 3 deg). See policy_parameters.hpp for the
-# trained standing pose this clamps around.
+# = leave it disabled (legacy behaviour). Historically grounded values from
+# this repo's recorded runs (see docs/source/user_guide/x2_sim_to_real_wip.md
+# §"Recordings inventory" and the milestones under
+# docs/source/user_guide/milestones/):
+#   * 0.30  -- "first powered run with a new checkpoint OR new motion playlist"
+#              (the conservative.yaml preset value). This is what every actual
+#              first-powered run on this robot has used: iter-4k minimal_v1
+#              stand (2026-05-02), all early take_a_sip shakeouts, and is the
+#              right starting point for the first powered Quest 3 teleop run
+#              (operator-driven motion = "new motion playlist" by the rule).
+#   * 0.80  -- the expressive.yaml preset; switch to this once conservative
+#              has cleared on the same model+motion class (paired with
+#              --target-lpf-hz 8 for real-sensor jitter tame).
+#   * 1.50  -- the value used for the first iter-22000 powered walk
+#              (2026-05-03 casual_walk_v1) and shipped in the published
+#              sim-to-real anchors b/c/d. Settled "play freely" value once
+#              the full pipeline is trusted.
+# Cleaner than inlining: pass --tuning-config configs/real_deploy_tuning/
+# {conservative,expressive}.yaml (also gives the matching ramp_seconds /
+# return_seconds / tilt_cos). See policy_parameters.hpp for the trained
+# standing pose this clamps around.
 MAX_TARGET_DEV=""
+
+# Per-group max_target_dev overrides, forwarded to the deploy binary as
+# --max-target-dev-{leg,waist,arm,head}. Empty = inherit MAX_TARGET_DEV
+# (the global) for that group; positive number = clamp this group at the
+# given radian deviation. Designed for the case where one joint family
+# can safely take more travel than another -- e.g. on X2 Ultra the legs
+# run kp ~99 Nm/rad and the arms kp ~14 Nm/rad, so a 1.50 rad uniform
+# clamp produces ~7x the leg torque for the same nominal travel as the
+# arms. Tight legs/waist + wide arms is the natural setting for any
+# teleop-driven session (see configs/real_deploy_tuning/expressive.yaml,
+# which now sets leg=0.30, arm=1.50 by default).
+MAX_TARGET_DEV_LEG=""
+MAX_TARGET_DEV_WAIST=""
+MAX_TARGET_DEV_ARM=""
+MAX_TARGET_DEV_HEAD=""
+
+# Deployment-time PD trim, forwarded to the binary as --kp-scale[-FAMILY]
+# and --kd-scale[-FAMILY]. Empty string = use binary default (1.0, no
+# trim) unless the tuning config sets a value. Real-deploy only -- the
+# wrapper does NOT block these flags in sim mode the way it blocks
+# --tuning-config, because the operator might want to A/B a PD bump in
+# MuJoCo before pushing to robot; just be aware that doing so DEFEATS
+# sim-profile parity with eval_x2_mujoco.py for the duration of that run.
+#
+# Why this exists: IsaacLab integrates PD implicitly against the joint-
+# space inertia + armature at training, while MuJoCo and real X2 apply
+# explicit ctrl-driven torque, so the same numerical KP behaves softer
+# at deploy than at training. Symptom: robot stands fine but wobbles on
+# nudge. Standard fix is to bump deployed PD per joint family: G16b for
+# X2 has set ankle=1.5 since November 2025 (in eval_x2_mujoco.py); real-
+# robot operators commonly need waist=1.5 on top of that. See
+# configs/real_deploy_tuning/expressive.yaml.
+KP_SCALE=""
+KP_SCALE_HIP=""
+KP_SCALE_KNEE=""
+# Ankle alias + split. The alias (KP_SCALE_ANKLE) multiplies both
+# subgroups for backward compat; KP_SCALE_ANKLE_PITCH and
+# KP_SCALE_ANKLE_ROLL target the sagittal vs frontal axes respectively.
+# MC publishes asymmetric PD (pitch 40/3.0, roll 30/2.0), so the split
+# knobs are the only way to match MC exactly.
+KP_SCALE_ANKLE=""
+KP_SCALE_ANKLE_PITCH=""
+KP_SCALE_ANKLE_ROLL=""
+# Waist alias + split. The alias (KP_SCALE_WAIST) multiplies both
+# subgroups for backward compat; KP_SCALE_WAIST_YAW and KP_SCALE_WAIST_PR
+# target waist_yaw_joint vs waist_pitch_joint + waist_roll_joint
+# respectively. See expressive.yaml for the MC-matched values.
+KP_SCALE_WAIST=""
+KP_SCALE_WAIST_YAW=""
+KP_SCALE_WAIST_PR=""
+KP_SCALE_SHOULDER=""
+KP_SCALE_ELBOW=""
+KP_SCALE_WRIST=""
+KP_SCALE_HEAD=""
+KD_SCALE=""
+KD_SCALE_HIP=""
+KD_SCALE_KNEE=""
+KD_SCALE_ANKLE=""
+KD_SCALE_ANKLE_PITCH=""
+KD_SCALE_ANKLE_ROLL=""
+KD_SCALE_WAIST=""
+KD_SCALE_WAIST_YAW=""
+KD_SCALE_WAIST_PR=""
+KD_SCALE_SHOULDER=""
+KD_SCALE_ELBOW=""
+KD_SCALE_WRIST=""
+KD_SCALE_HEAD=""
 
 # Output-side target LPF cutoff in Hz, forwarded to the deploy binary as
 # --target-lpf-hz. Empty string = use binary default (0 = bypass = parity-
@@ -337,6 +435,37 @@ HOLD_FOR_MC_EXIT_SENTINEL=""
 MC_FIRST_PUBLISH_SENTINEL=""
 ESCALATOR_OK_SENTINEL=""
 ESCALATOR_PID=""
+# Soft-shutdown trigger sentinel. On Ctrl-C, bash touches this file to
+# tell deploy "please RAMP_OUT + HOLD_FOR_MC gracefully" instead of
+# exiting immediately. Empty disables the graceful path (legacy
+# behaviour: Ctrl-C -> immediate exit -> ~1-2 s zero-torque drop while
+# MC reboots through PASSIVE_DEFAULT). Auto-populated alongside the
+# other HOLD_FOR_MC sentinels in the launch-prep block below.
+SOFT_SHUTDOWN_SENTINEL=""
+# Max seconds to wait in the cleanup trap for deploy to acknowledge
+# the soft-shutdown trigger and reach HOLD_FOR_MC before we POST
+# start_app. Should be larger than --return-seconds (RAMP_OUT
+# duration). Default is generous; the trap exits early as soon as
+# HOLD_FOR_MC_SENTINEL appears.
+SOFT_SHUTDOWN_WAIT_S="6"
+# Set to true once we've touched the soft-shutdown trigger, so a
+# second Ctrl-C inside the wait loop knows to abort the wait and fall
+# through to the legacy hard-exit path. (Escape hatch in case the
+# graceful path hangs.)
+SOFT_SHUTDOWN_TRIGGERED=false
+SOFT_SHUTDOWN_ABORTED=false
+# Soft-shutdown opt-in. DEFAULT IS DISABLED (2026-05-15) -- field
+# testing showed the graceful RAMP_OUT path was producing 4-6 s of
+# motor whir on Ctrl-C and the robot still collapsed at the end
+# (because MC restarts in PASSIVE_DEFAULT regardless of our graceful
+# exit). The hard-exit path is shorter in total motor activity and
+# therefore safer for the actuators until the bash<->deploy<->MC
+# handoff is reworked to avoid the dual-publisher window during
+# MC's PASSIVE->JOINT->STAND boot. Pass --enable-soft-shutdown to
+# opt back in (e.g. for development of the handoff fix). The legacy
+# --no-soft-shutdown flag is retained as a no-op for any scripts
+# already passing it.
+SOFT_SHUTDOWN_DISABLED=true
 # When true, abort with a friendly error if MC is not currently in
 # STAND_DEFAULT mode at script entry. The smooth handoff assumes MC is
 # alive and balancing the robot before we take the bus -- if MC is in
@@ -373,7 +502,7 @@ PREFLIGHT_ARGS=""
 # Sim mode (MuJoCo bridge is the only sim driver)
 SIM_DOMAIN_ID="$SIM_DOMAIN_ID_DEFAULT"
 SIM_BRIDGE_REL="scripts/x2_mujoco_ros_bridge.py"
-SIM_PYTHON="${SIM_PYTHON:-python3}"
+SIM_PYTHON="${SIM_PYTHON:-$DEPLOY_AUX_PYTHON}"
 SIM_MJCF=""
 SIM_MOTION=""
 SIM_INIT_FRAME=""
@@ -438,6 +567,32 @@ SIM_NO_HAND_ZMQ=false
 # Bookkeeping for child PIDs we must clean up on exit
 SIM_BRIDGE_PID=""
 SIM_RECORD_PID=""
+
+# Hand bridge (REAL-ROBOT only). Republishes ZMQ pose
+# left_hand_joints / right_hand_joints onto /aima/hal/joint/hand/command
+# (aimdk_msgs/HandCommandArray) so the OmniHand HAL drives finger
+# motors. The C++ deploy harness reads these wire fields into
+# x2_debug echoes only -- it does NOT publish them to AimDK -- so
+# without this bridge real-robot teleop fingers never close even
+# though sim does (sim's MuJoCo bridge has its own
+# _omnihand_zmq_thread that writes finger qpos directly; this script
+# is the real-robot equivalent of that thread).
+#
+# Only auto-spawned in MODE=local: it's started AFTER MC has been
+# verified silent (so its engage burst isn't eaten by mc's own hand
+# republish loop) and reaped via the same restart_mc_on_exit trap
+# the deploy uses. sim mode uses the existing --with-omnihand path
+# instead. onbot users should launch the bridge manually -- the SSH
+# topology there has no laptop-side handoff hook to wire it into.
+HAND_BRIDGE_ENABLED=true
+HAND_BRIDGE_SIDES="auto"
+HAND_BRIDGE_ENGAGE_SHOTS=3
+HAND_BRIDGE_MAX_STALE_S="0.20"
+HAND_BRIDGE_PUBLISH_HZ="50"
+HAND_BRIDGE_PYTHON=""
+HAND_BRIDGE_SCRIPT_REL="scripts/x2_hand_zmq_to_aimdk_bridge.py"
+HAND_BRIDGE_PID=""
+HAND_BRIDGE_LOG=""
 
 # Run recorder (--record) -- a sibling background process that subscribes to
 # /aima/hal/joint/{leg,waist,arm,head}/{state,command} + the IMU and dumps
@@ -540,6 +695,87 @@ Optional deploy flags (forwarded to ros2 run):
                               obs-construction bug cannot drive any joint
                               more than RAD away from the trained standing
                               pose, regardless of what the ONNX session emits.
+                              Acts as the GLOBAL default for joints with no
+                              per-group override below.
+  --max-target-dev-leg RAD    Per-group override (MJ joints 0..11 = both
+                              hips, knees, ankles). >0 wins over the global
+                              --max-target-dev for these joints; omitted =
+                              inherit the global. Typical pairing for VR
+                              teleop: leg=0.30 (~17 deg), arm=1.50 (~86 deg).
+                              Legs need to stay tight: kp ~99 Nm/rad means
+                              the same nominal travel produces ~7x the
+                              torque arms do.
+  --max-target-dev-waist RAD  Per-group override (MJ joints 12..14 = waist
+                              yaw/pitch/roll). Same semantics as --leg.
+  --max-target-dev-arm RAD    Per-group override (MJ joints 15..28 = both
+                              shoulders, elbows, wrists). Set this loose
+                              (e.g. 1.50) for teleop where IK can drive
+                              the wrist far from default.
+  --max-target-dev-head RAD   Per-group override (MJ joints 29..30 = head
+                              yaw, pitch). Same semantics as --leg.
+  --kp-scale FACTOR           REAL-DEPLOY ONLY (parity-breaking in sim).
+                              Multiplicative trim on every joint's KP.
+                              Default 1.0 = ship trained kps[] from
+                              policy_parameters.hpp as-is. The trained
+                              KP is the value IsaacLab used at training;
+                              IsaacLab integrates PD implicitly against
+                              joint inertia + armature, so the same
+                              numerical KP behaves softer at deploy
+                              (MuJoCo + real X2 both apply explicit
+                              ctrl). Symptom of leaving this at 1.0 on
+                              the real robot: stands fine static, wobbles
+                              when nudged. Standard fix: per-family bumps
+                              below.
+  --kp-scale-FAMILY FACTOR    Per-family override; FAMILY is one of
+                              hip / knee / ankle / waist / shoulder /
+                              elbow / wrist / head (substring match on
+                              joint name; mirrors eval_x2_mujoco.py).
+                              Effective scale on a joint = global *
+                              family. The ankle and waist families have
+                              FURTHER subgroup knobs (see below).
+  --kp-scale-ankle-pitch FACTOR ankle_pitch_joint ONLY. Trained kp=21.38;
+                              1.87 matches MC's 40 N*m/rad sagittal KP.
+                              The G16b-validated default for fwd/back
+                              recovery.
+  --kp-scale-ankle-roll FACTOR ankle_roll_joint ONLY. Trained kp=21.38;
+                              1.40 matches MC's 30 N*m/rad frontal KP.
+                              Deliberately softer than pitch so sideways
+                              disturbances absorb without snapping the
+                              foot.
+  --kp-scale-waist-yaw FACTOR waist_yaw_joint ONLY. Trained kp=40.18
+                              matches MC's published 40 exactly, so the
+                              typical value is 1.00 -- bumping is more
+                              likely to ring than to help.
+  --kp-scale-waist-pr FACTOR  waist_pitch + waist_roll. Trained kp=14.25
+                              but MC publishes 40 N*m/rad -> 2.81 matches
+                              MC exactly. This is the recommended knob
+                              if you're chasing forward/back nudge
+                              wobble. Pre-set in expressive.yaml.
+  --kd-scale FACTOR           Same as --kp-scale but for damping.
+                              Default 1.0 (no trim). Watch the kp/kd
+                              ratio: bumping kp without kd lowers the
+                              effective damping ratio. If a kp-bumped
+                              run rings, try matching kd-scale 1.2 as
+                              a first knob before backing off kp.
+  --kd-scale-FAMILY FACTOR    Per-family kd override; same FAMILY set
+                              as --kp-scale-FAMILY. The ankle and waist
+                              families have split subgroup knobs (below).
+  --kd-scale-ankle-pitch FACTOR ankle_pitch_joint ONLY. MC publishes
+                              kd=3.0 vs trained 0.907 -> 3.31 matches
+                              MC. Under-damped pitch is the usual cause
+                              of 'foot-feels-springy' on fwd/back
+                              ankle-direct nudges.
+  --kd-scale-ankle-roll FACTOR ankle_roll_joint ONLY. MC publishes
+                              kd=2.0 vs trained 0.907 -> 2.20 matches
+                              MC. Less damping than pitch (frontal plane
+                              is intrinsically more rigid).
+  --kd-scale-waist-yaw FACTOR waist_yaw_joint ONLY. MC publishes kd=8.0
+                              vs trained 2.56 -> 3.13 matches MC exactly.
+  --kd-scale-waist-pr FACTOR  waist_pitch + waist_roll. MC publishes
+                              kd=5.0 vs trained 0.907 -> 5.51 matches MC.
+                              This is the SINGLE biggest knob for
+                              closing the fwd/back nudge gap on the real
+                              robot. Pre-set in expressive.yaml.
   --target-lpf-hz HZ          REAL-DEPLOY ONLY. First-order EMA cutoff (Hz)
                               applied to the published joint targets AFTER the
                               safety stack and BEFORE the bus, to tame jitter
@@ -735,7 +971,8 @@ Sim mode (only applies when 'sim' is selected; all optional):
   --sim-dt SECS               Physics step (default: 0.001 = 1 kHz).
   --sim-print-scene           Dump bodies/joints/actuators/sensors on start.
   --sim-python PATH           Python interpreter for the bridge
-                              (default: \$SIM_PYTHON or python3).
+                              (default: repo .venv/bin/python when that
+                              file is executable, else python3).
   --sim-record-commands PATH  Record the deploy's command topics to this
                               rosbag2 directory (handy for diffing sim/real).
   --sim-domain-id N           ROS_DOMAIN_ID to isolate the sim from any real
@@ -772,6 +1009,36 @@ docs/source/references/x2_zmq_protocol.md):
                               sim-to-real fidelity tests. Default: empty
                               (= binary default of 'off').
 
+OmniHand bridge (REAL ROBOT, MODE=local only -- sim uses --with-omnihand instead):
+  --no-hand-bridge            Skip auto-spawning the ZMQ -> AimDK
+                              HandCommandArray bridge. The C++ deploy
+                              never publishes /aima/hal/joint/hand/command
+                              on its own, so without the bridge real-robot
+                              teleop cannot close fingers (wire fields land
+                              in x2_debug only). Default: bridge is ON.
+                              Pass this for arm/leg-only sessions where
+                              the hands aren't connected.
+  --hand-bridge-sides STR     {auto,left,right,both,off}. 'auto' detects
+                              attached sides from the latched HandStateArray
+                              on /aima/hal/joint/hand/state. (default: auto)
+  --hand-bridge-engage-shots N
+                              Number of position=0 shots to fire at startup
+                              so the OmniHand HAL exits its 'no command yet'
+                              state and enables motors. Set 0 only when
+                              piggy-backing on an already-engaged HAL.
+                              (default: 3, 1Hz spacing)
+  --hand-bridge-max-stale-s S Wire frame is considered stale after this
+                              many seconds with no update. Stale -> the
+                              bridge republishes last-good positions
+                              instead of dribbling zeros. (default: 0.20s)
+  --hand-bridge-publish-hz HZ Publish loop rate (default: 50, matches the
+                              deploy CONTROL tick).
+  --hand-bridge-python PATH   Python interpreter to launch the bridge with.
+                              Default: same as other auxiliary Python in
+                              this script (repo .venv/bin/python when that
+                              file is executable, otherwise python3; in
+                              docker_x2 the image python3 carries rclpy).
+
 Pre-flight + behaviour toggles:
   --no-stop-mc                Skip the stop_app POST (assume MC is already
                               stopped, or you're using JOINT_DEFAULT mode).
@@ -797,6 +1064,30 @@ Pre-flight + behaviour toggles:
                               disables HOLD_FOR_MC entirely (legacy:
                               deploy exits on RAMP_OUT, then bash starts
                               MC -- there will be a zero-torque window).
+  --soft-shutdown-wait-s N    (Only relevant with --enable-soft-shutdown.)
+                              Seconds the bash cleanup trap waits for
+                              deploy to reach HOLD_FOR_MC after Ctrl-C
+                              before falling through and POSTing
+                              start_app anyway (default 6). Should be
+                              larger than --return-seconds (RAMP_OUT
+                              duration) plus a small DDS-discovery
+                              margin. The wait is interruptible: a
+                              second Ctrl-C bails immediately to the
+                              legacy hard-exit path.
+  --enable-soft-shutdown      OPT IN to the graceful Ctrl-C / RAMP_OUT
+                              path. DISABLED BY DEFAULT as of
+                              2026-05-15: field testing showed the
+                              graceful path causes 4-6 s of motor whir
+                              on Ctrl-C and the robot still collapses
+                              at the end (because MC restarts in
+                              PASSIVE_DEFAULT regardless). The hard-
+                              exit path is shorter in total motor
+                              activity and therefore safer for the
+                              actuators. Use this flag only when
+                              actively developing the soft-shutdown
+                              handoff.
+  --no-soft-shutdown          Legacy no-op (kept for backward compat).
+                              Soft-shutdown is now off by default.
   --no-confirm                Skip the final "proceed?" prompt (for CI)
   --no-build                  Skip the colcon build step (use the existing
                               install/ tree as-is)
@@ -873,11 +1164,57 @@ while [[ $# -gt 0 ]]; do
         --tilt-cos)           TILT_COS="$2"; shift 2 ;;
         --ramp-seconds)       RAMP_SECONDS="$2"; shift 2 ;;
         --max-target-dev)     MAX_TARGET_DEV="$2"; shift 2 ;;
+        --max-target-dev-leg)   MAX_TARGET_DEV_LEG="$2"; shift 2 ;;
+        --max-target-dev-waist) MAX_TARGET_DEV_WAIST="$2"; shift 2 ;;
+        --max-target-dev-arm)   MAX_TARGET_DEV_ARM="$2"; shift 2 ;;
+        --max-target-dev-head)  MAX_TARGET_DEV_HEAD="$2"; shift 2 ;;
+        --kp-scale)             KP_SCALE="$2"; shift 2 ;;
+        --kp-scale-hip)         KP_SCALE_HIP="$2"; shift 2 ;;
+        --kp-scale-knee)        KP_SCALE_KNEE="$2"; shift 2 ;;
+        --kp-scale-ankle)       KP_SCALE_ANKLE="$2"; shift 2 ;;
+        --kp-scale-ankle-pitch) KP_SCALE_ANKLE_PITCH="$2"; shift 2 ;;
+        --kp-scale-ankle-roll)  KP_SCALE_ANKLE_ROLL="$2"; shift 2 ;;
+        --kp-scale-waist)       KP_SCALE_WAIST="$2"; shift 2 ;;
+        --kp-scale-waist-yaw)   KP_SCALE_WAIST_YAW="$2"; shift 2 ;;
+        --kp-scale-waist-pr)    KP_SCALE_WAIST_PR="$2"; shift 2 ;;
+        --kp-scale-shoulder)    KP_SCALE_SHOULDER="$2"; shift 2 ;;
+        --kp-scale-elbow)       KP_SCALE_ELBOW="$2"; shift 2 ;;
+        --kp-scale-wrist)       KP_SCALE_WRIST="$2"; shift 2 ;;
+        --kp-scale-head)        KP_SCALE_HEAD="$2"; shift 2 ;;
+        --kd-scale)             KD_SCALE="$2"; shift 2 ;;
+        --kd-scale-hip)         KD_SCALE_HIP="$2"; shift 2 ;;
+        --kd-scale-knee)        KD_SCALE_KNEE="$2"; shift 2 ;;
+        --kd-scale-ankle)       KD_SCALE_ANKLE="$2"; shift 2 ;;
+        --kd-scale-ankle-pitch) KD_SCALE_ANKLE_PITCH="$2"; shift 2 ;;
+        --kd-scale-ankle-roll)  KD_SCALE_ANKLE_ROLL="$2"; shift 2 ;;
+        --kd-scale-waist)       KD_SCALE_WAIST="$2"; shift 2 ;;
+        --kd-scale-waist-yaw)   KD_SCALE_WAIST_YAW="$2"; shift 2 ;;
+        --kd-scale-waist-pr)    KD_SCALE_WAIST_PR="$2"; shift 2 ;;
+        --kd-scale-shoulder)    KD_SCALE_SHOULDER="$2"; shift 2 ;;
+        --kd-scale-elbow)       KD_SCALE_ELBOW="$2"; shift 2 ;;
+        --kd-scale-wrist)       KD_SCALE_WRIST="$2"; shift 2 ;;
+        --kd-scale-head)        KD_SCALE_HEAD="$2"; shift 2 ;;
         --target-lpf-hz)      TARGET_LPF_HZ="$2"; shift 2 ;;
         --action-clip)        ACTION_CLIP="$2"; shift 2 ;;
         --return-seconds)     RETURN_SECONDS="$2"; shift 2 ;;
         --stand-pose-yaml)    STAND_POSE_YAML="$2"; shift 2 ;;
         --hold-for-mc-timeout-s) HOLD_FOR_MC_TIMEOUT_S="$2"; shift 2 ;;
+        --soft-shutdown-wait-s) SOFT_SHUTDOWN_WAIT_S="$2"; shift 2 ;;
+        --no-soft-shutdown)
+            # Legacy no-op: soft-shutdown is now DISABLED by default
+            # (see SOFT_SHUTDOWN_DISABLED definition above). Kept so
+            # existing CI / wrapper scripts that already pass this
+            # flag don't break.
+            SOFT_SHUTDOWN_DISABLED=true
+            shift ;;
+        --enable-soft-shutdown)
+            # Opt back IN to the graceful Ctrl-C / RAMP_OUT path. Use
+            # only when actively developing / debugging the soft-shutdown
+            # handoff -- field-tested behaviour as of 2026-05-15 is
+            # WORSE than hard-exit (4-6 s motor whir + still collapses
+            # on MC PASSIVE_DEFAULT boot). See deploy_x2.sh head comment.
+            SOFT_SHUTDOWN_DISABLED=false
+            shift ;;
         --no-require-stand-default) REQUIRE_STAND_DEFAULT=false; shift ;;
         --imu-topic)          IMU_TOPIC="$2"; shift 2 ;;
         --intra-op-threads)   INTRA_OP_THREADS="$2"; shift 2 ;;
@@ -930,6 +1267,12 @@ while [[ $# -gt 0 ]]; do
         --vla-debug-port)     VLA_DEBUG_PORT="$2"; shift 2 ;;
         --vla-debug-topic)    VLA_DEBUG_TOPIC="$2"; shift 2 ;;
         --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
+        --no-hand-bridge)             HAND_BRIDGE_ENABLED=false; shift ;;
+        --hand-bridge-sides)          HAND_BRIDGE_SIDES="$2"; shift 2 ;;
+        --hand-bridge-engage-shots)   HAND_BRIDGE_ENGAGE_SHOTS="$2"; shift 2 ;;
+        --hand-bridge-max-stale-s)    HAND_BRIDGE_MAX_STALE_S="$2"; shift 2 ;;
+        --hand-bridge-publish-hz)     HAND_BRIDGE_PUBLISH_HZ="$2"; shift 2 ;;
+        --hand-bridge-python)         HAND_BRIDGE_PYTHON="$2"; shift 2 ;;
         local|onbot|sim)      MODE="$1"; shift ;;
         *)
             echo -e "${RED}Error: unknown argument: $1${NC}" >&2
@@ -1408,7 +1751,37 @@ fi
 [[ -n "$MAX_DURATION" ]]      && ROS2_ARGS+=("--max-duration" "$MAX_DURATION")
 [[ -n "$TILT_COS" ]]          && ROS2_ARGS+=("--tilt-cos" "$TILT_COS")
 [[ -n "$RAMP_SECONDS" ]]      && ROS2_ARGS+=("--ramp-seconds" "$RAMP_SECONDS")
-[[ -n "$MAX_TARGET_DEV" ]]    && ROS2_ARGS+=("--max-target-dev" "$MAX_TARGET_DEV")
+[[ -n "$MAX_TARGET_DEV" ]]       && ROS2_ARGS+=("--max-target-dev" "$MAX_TARGET_DEV")
+[[ -n "$MAX_TARGET_DEV_LEG" ]]   && ROS2_ARGS+=("--max-target-dev-leg"   "$MAX_TARGET_DEV_LEG")
+[[ -n "$MAX_TARGET_DEV_WAIST" ]] && ROS2_ARGS+=("--max-target-dev-waist" "$MAX_TARGET_DEV_WAIST")
+[[ -n "$MAX_TARGET_DEV_ARM" ]]   && ROS2_ARGS+=("--max-target-dev-arm"   "$MAX_TARGET_DEV_ARM")
+[[ -n "$MAX_TARGET_DEV_HEAD" ]]  && ROS2_ARGS+=("--max-target-dev-head"  "$MAX_TARGET_DEV_HEAD")
+[[ -n "$KP_SCALE" ]]             && ROS2_ARGS+=("--kp-scale"             "$KP_SCALE")
+[[ -n "$KP_SCALE_HIP" ]]         && ROS2_ARGS+=("--kp-scale-hip"         "$KP_SCALE_HIP")
+[[ -n "$KP_SCALE_KNEE" ]]        && ROS2_ARGS+=("--kp-scale-knee"        "$KP_SCALE_KNEE")
+[[ -n "$KP_SCALE_ANKLE" ]]       && ROS2_ARGS+=("--kp-scale-ankle"       "$KP_SCALE_ANKLE")
+[[ -n "$KP_SCALE_ANKLE_PITCH" ]] && ROS2_ARGS+=("--kp-scale-ankle-pitch" "$KP_SCALE_ANKLE_PITCH")
+[[ -n "$KP_SCALE_ANKLE_ROLL" ]]  && ROS2_ARGS+=("--kp-scale-ankle-roll"  "$KP_SCALE_ANKLE_ROLL")
+[[ -n "$KP_SCALE_WAIST" ]]       && ROS2_ARGS+=("--kp-scale-waist"       "$KP_SCALE_WAIST")
+[[ -n "$KP_SCALE_WAIST_YAW" ]]   && ROS2_ARGS+=("--kp-scale-waist-yaw"   "$KP_SCALE_WAIST_YAW")
+[[ -n "$KP_SCALE_WAIST_PR" ]]    && ROS2_ARGS+=("--kp-scale-waist-pr"    "$KP_SCALE_WAIST_PR")
+[[ -n "$KP_SCALE_SHOULDER" ]]    && ROS2_ARGS+=("--kp-scale-shoulder"    "$KP_SCALE_SHOULDER")
+[[ -n "$KP_SCALE_ELBOW" ]]       && ROS2_ARGS+=("--kp-scale-elbow"       "$KP_SCALE_ELBOW")
+[[ -n "$KP_SCALE_WRIST" ]]       && ROS2_ARGS+=("--kp-scale-wrist"       "$KP_SCALE_WRIST")
+[[ -n "$KP_SCALE_HEAD" ]]        && ROS2_ARGS+=("--kp-scale-head"        "$KP_SCALE_HEAD")
+[[ -n "$KD_SCALE" ]]             && ROS2_ARGS+=("--kd-scale"             "$KD_SCALE")
+[[ -n "$KD_SCALE_HIP" ]]         && ROS2_ARGS+=("--kd-scale-hip"         "$KD_SCALE_HIP")
+[[ -n "$KD_SCALE_KNEE" ]]        && ROS2_ARGS+=("--kd-scale-knee"        "$KD_SCALE_KNEE")
+[[ -n "$KD_SCALE_ANKLE" ]]       && ROS2_ARGS+=("--kd-scale-ankle"       "$KD_SCALE_ANKLE")
+[[ -n "$KD_SCALE_ANKLE_PITCH" ]] && ROS2_ARGS+=("--kd-scale-ankle-pitch" "$KD_SCALE_ANKLE_PITCH")
+[[ -n "$KD_SCALE_ANKLE_ROLL" ]]  && ROS2_ARGS+=("--kd-scale-ankle-roll"  "$KD_SCALE_ANKLE_ROLL")
+[[ -n "$KD_SCALE_WAIST" ]]       && ROS2_ARGS+=("--kd-scale-waist"       "$KD_SCALE_WAIST")
+[[ -n "$KD_SCALE_WAIST_YAW" ]]   && ROS2_ARGS+=("--kd-scale-waist-yaw"   "$KD_SCALE_WAIST_YAW")
+[[ -n "$KD_SCALE_WAIST_PR" ]]    && ROS2_ARGS+=("--kd-scale-waist-pr"    "$KD_SCALE_WAIST_PR")
+[[ -n "$KD_SCALE_SHOULDER" ]]    && ROS2_ARGS+=("--kd-scale-shoulder"    "$KD_SCALE_SHOULDER")
+[[ -n "$KD_SCALE_ELBOW" ]]       && ROS2_ARGS+=("--kd-scale-elbow"       "$KD_SCALE_ELBOW")
+[[ -n "$KD_SCALE_WRIST" ]]       && ROS2_ARGS+=("--kd-scale-wrist"       "$KD_SCALE_WRIST")
+[[ -n "$KD_SCALE_HEAD" ]]        && ROS2_ARGS+=("--kd-scale-head"        "$KD_SCALE_HEAD")
 [[ -n "$TARGET_LPF_HZ" ]]     && ROS2_ARGS+=("--target-lpf-hz" "$TARGET_LPF_HZ")
 [[ -n "$ACTION_CLIP" ]]       && ROS2_ARGS+=("--action-clip" "$ACTION_CLIP")
 [[ -n "$RETURN_SECONDS" ]]    && ROS2_ARGS+=("--return-seconds" "$RETURN_SECONDS")
@@ -1467,6 +1840,21 @@ if [[ "$MODE" != "sim" ]]; then
         ROS2_ARGS+=("--hold-for-mc-sentinel" "$HOLD_FOR_MC_SENTINEL")
         ROS2_ARGS+=("--hold-for-mc-exit-sentinel" "$HOLD_FOR_MC_EXIT_SENTINEL")
         ROS2_ARGS+=("--mc-first-publish-sentinel" "$MC_FIRST_PUBLISH_SENTINEL")
+        # Soft-shutdown trigger sentinel: touched on Ctrl-C by the cleanup
+        # trap so deploy can enter RAMP_OUT -> HOLD_FOR_MC instead of
+        # exiting immediately. Co-located with the other HOLD_FOR_MC
+        # sentinels so the same RUN_LOG_DIR cleanup picks it up.
+        # Skipped when --no-soft-shutdown is passed; in that case deploy
+        # uses rclcpp's default SIGINT handler (legacy hard-exit path).
+        if ! $SOFT_SHUTDOWN_DISABLED; then
+            if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+                SOFT_SHUTDOWN_SENTINEL="$RUN_LOG_DIR/soft_shutdown.sentinel"
+            else
+                SOFT_SHUTDOWN_SENTINEL="/tmp/x2_soft_shutdown.$$.sentinel"
+            fi
+            rm -f "$SOFT_SHUTDOWN_SENTINEL"
+            ROS2_ARGS+=("--soft-shutdown-trigger-sentinel" "$SOFT_SHUTDOWN_SENTINEL")
+        fi
     fi
 
     # ────────────────────────────────────────────────────────────────────
@@ -1548,7 +1936,7 @@ if [[ -n "$TUNING_CONFIG" ]]; then
         echo -e "${RED}ERROR: tuning translator missing: $TUNING_TRANSLATOR${NC}" >&2
         exit 1
     fi
-    if ! mapfile -t TUNING_ARGS < <(python3 "$TUNING_TRANSLATOR" "$TUNING_CONFIG"); then
+    if ! mapfile -t TUNING_ARGS < <("$DEPLOY_AUX_PYTHON" "$TUNING_TRANSLATOR" "$TUNING_CONFIG"); then
         echo -e "${RED}ERROR: failed to parse tuning config $TUNING_CONFIG${NC}" >&2
         exit 1
     fi
@@ -2006,7 +2394,7 @@ start_run_recorder() {
     # to pull the analysis. Inheriting our shell's ROS env (sourced by the
     # docker auto-relaunch) means the recorder lands on the same domain as
     # the deploy with no extra setup.
-    python3 "$recorder" \
+    "$DEPLOY_AUX_PYTHON" "$recorder" \
         --out "$RECORD_OUT" \
         --note "deploy_x2.sh $MODE @ $(date -Iseconds)" \
         --quiet &
@@ -2029,6 +2417,100 @@ stop_run_recorder() {
     RUN_RECORD_PID=""
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Hand bridge (ZMQ pose -> AimDK HandCommandArray) lifecycle
+# ─────────────────────────────────────────────────────────────────────
+# Spawned in MODE=local AFTER MC has been verified silenced (so its
+# engage burst lands cleanly on a quiet bus). Reaped via the same
+# restart_mc_on_exit trap that handles the deploy + run recorder, so
+# Ctrl-C / abort / normal exit all converge on the same teardown path.
+# Sim mode does NOT call this -- the MuJoCo bridge with --with-omnihand
+# already writes finger qpos directly into MuJoCo and there's no AimDK
+# HAL to publish to. onbot mode does not call this either -- onbot has
+# no laptop-side handoff hook to wire into; onbot users should launch
+# the bridge manually.
+start_hand_bridge() {
+    $HAND_BRIDGE_ENABLED || return 0
+    if [[ "$MODE" != "local" ]]; then
+        return 0
+    fi
+    if [[ "$HAND_BRIDGE_SIDES" == "off" ]]; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} --hand-bridge-sides=off; not starting."
+        return 0
+    fi
+
+    local script_path="$SCRIPT_DIR/$HAND_BRIDGE_SCRIPT_REL"
+    if [[ ! -f "$script_path" ]]; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} script not found: $script_path -- skipping." >&2
+        return 0
+    fi
+
+    local py="${HAND_BRIDGE_PYTHON:-$DEPLOY_AUX_PYTHON}"
+    if ! command -v "$py" &>/dev/null; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} python interpreter '$py' not on PATH; skipping." >&2
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} pass --hand-bridge-python /path/to/python or --no-hand-bridge to silence." >&2
+        return 0
+    fi
+
+    if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+        HAND_BRIDGE_LOG="$RUN_LOG_DIR/hand_bridge.log"
+    else
+        HAND_BRIDGE_LOG="/tmp/x2_hand_bridge.$$.log"
+    fi
+
+    local args=(
+        "$script_path"
+        --zmq-host "${VLA_ZMQ_HOST:-localhost}"
+        --zmq-port "${VLA_ZMQ_PORT:-5556}"
+        --zmq-topic "${VLA_ZMQ_TOPIC:-pose}"
+        --sides "$HAND_BRIDGE_SIDES"
+        --engage-shots "$HAND_BRIDGE_ENGAGE_SHOTS"
+        --max-stale-s "$HAND_BRIDGE_MAX_STALE_S"
+        --publish-hz "$HAND_BRIDGE_PUBLISH_HZ"
+        --duration 0
+    )
+
+    echo -e "$(ts) ${BLUE}[hand-bridge]${NC} spawning: $py ${args[*]}"
+    echo -e "$(ts) ${BLUE}[hand-bridge]${NC} stdout/stderr -> $HAND_BRIDGE_LOG"
+    "$py" "${args[@]}" >"$HAND_BRIDGE_LOG" 2>&1 &
+    HAND_BRIDGE_PID=$!
+
+    # Best-effort liveness check: if the bridge died inside the
+    # detect-timeout window (e.g. aimdk_msgs missing on PYTHONPATH or
+    # zmq import failed), surface that immediately so the operator
+    # isn't surprised at the first failed grasp.
+    sleep 0.5
+    if ! kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} exited immediately; tail of log:" >&2
+        tail -n 20 "$HAND_BRIDGE_LOG" 2>/dev/null | sed 's/^/  /' >&2 || true
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} continuing without hand publishing -- fingers will not move." >&2
+        HAND_BRIDGE_PID=""
+        return 0
+    fi
+    echo -e "$(ts) ${GREEN}[hand-bridge]${NC} pid $HAND_BRIDGE_PID up (sides=$HAND_BRIDGE_SIDES)."
+}
+
+stop_hand_bridge() {
+    [[ -z "$HAND_BRIDGE_PID" ]] && return 0
+    if kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} stopping hand bridge (pid $HAND_BRIDGE_PID) ..."
+        kill -INT "$HAND_BRIDGE_PID" 2>/dev/null || true
+        # Bridge handles SIGINT cleanly; small grace then SIGTERM if it
+        # didn't notice (engage timer mid-tick, etc).
+        local i
+        for i in 1 2 3 4 5; do
+            kill -0 "$HAND_BRIDGE_PID" 2>/dev/null || break
+            sleep 0.2
+        done
+        if kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+            kill -TERM "$HAND_BRIDGE_PID" 2>/dev/null || true
+            wait "$HAND_BRIDGE_PID" 2>/dev/null || true
+        fi
+        echo -e "$(ts) ${GREEN}[cleanup]${NC} hand bridge stopped."
+    fi
+    HAND_BRIDGE_PID=""
+}
+
 cleanup_sim() {
     local rc=$?
     if [[ -n "$SIM_BRIDGE_PID" ]] && kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
@@ -2046,14 +2528,94 @@ cleanup_sim() {
     exit $rc
 }
 
+soft_shutdown_wait() {
+    # Graceful Ctrl-C path. Cooperates with the C++ deploy's custom
+    # SIGINT/SIGTERM handler (--soft-shutdown-trigger-sentinel) so the
+    # robot stays under torque all the way through MC's PASSIVE_DEFAULT
+    # boot -- no zero-torque drop.
+    #
+    # Flow:
+    #   1. Touch SOFT_SHUTDOWN_SENTINEL (belt + suspenders: if deploy's
+    #      in-process flag missed for any reason, the next OnControl
+    #      tick will see the file and still RAMP_OUT).
+    #   2. Wait up to SOFT_SHUTDOWN_WAIT_S for HOLD_FOR_MC_SENTINEL to
+    #      appear, which means deploy has finished RAMP_OUT and is now
+    #      publishing MC's STAND_DEFAULT pose with MC-stand gains.
+    #   3. While waiting, a SECOND Ctrl-C sets SOFT_SHUTDOWN_ABORTED and
+    #      we bail out early -- the caller falls through to the legacy
+    #      hard-exit cleanup (POST start_app immediately).
+    #
+    # Safe no-op when:
+    #   * soft-shutdown was never wired (SOFT_SHUTDOWN_SENTINEL empty)
+    #   * deploy has already exited (no PID alive)
+    #   * we've already run once this exit (SOFT_SHUTDOWN_TRIGGERED true)
+    if [[ -z "${SOFT_SHUTDOWN_SENTINEL:-}" ]]; then
+        return 0
+    fi
+    if $SOFT_SHUTDOWN_TRIGGERED; then
+        return 0
+    fi
+    SOFT_SHUTDOWN_TRIGGERED=true
+    if [[ -z "${DEPLOY_PID:-}" ]] || ! kill -0 "$DEPLOY_PID" 2>/dev/null; then
+        # Deploy already gone. Nothing to coordinate with; let the
+        # legacy MC-restart path run.
+        return 0
+    fi
+    # Re-trap SIGINT inside the wait loop so a second Ctrl-C trips
+    # SOFT_SHUTDOWN_ABORTED instead of immediately re-firing the EXIT
+    # trap (which would loop us back here). On exit from this function
+    # the caller will install the next trap as appropriate.
+    trap 'SOFT_SHUTDOWN_ABORTED=true; echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} second Ctrl-C -> aborting graceful wait, falling through to MC restart."' INT
+    echo ""
+    echo -e "$(ts) ${BLUE}[soft-shutdown]${NC} touching trigger sentinel '$SOFT_SHUTDOWN_SENTINEL' -> deploy RAMP_OUT -> HOLD_FOR_MC."
+    echo -e "$(ts) ${BLUE}[soft-shutdown]${NC}   Press Ctrl-C again within ${SOFT_SHUTDOWN_WAIT_S}s to abort the graceful wait and force MC restart immediately."
+    : > "$SOFT_SHUTDOWN_SENTINEL"
+    # Poll for HOLD_FOR_MC_SENTINEL (deploy has reached HOLD_FOR_MC and
+    # is publishing the stand pose). We sleep 0.1s between checks for
+    # snappy response to the second-Ctrl-C abort. Total budget is
+    # SOFT_SHUTDOWN_WAIT_S seconds.
+    local deadline_ns
+    deadline_ns=$(( $(date +%s%N) + SOFT_SHUTDOWN_WAIT_S * 1000000000 ))
+    while ! $SOFT_SHUTDOWN_ABORTED; do
+        if [[ -n "${HOLD_FOR_MC_SENTINEL:-}" && -f "$HOLD_FOR_MC_SENTINEL" ]]; then
+            echo -e "$(ts) ${GREEN}[soft-shutdown]${NC} deploy reached HOLD_FOR_MC -> safe to restart MC."
+            break
+        fi
+        # Deploy died mid-RAMP_OUT (uncaught crash, segfault, OOM, ...).
+        # No point waiting further; fall through to MC restart.
+        if ! kill -0 "$DEPLOY_PID" 2>/dev/null; then
+            echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} deploy exited before reaching HOLD_FOR_MC -> falling through to MC restart."
+            break
+        fi
+        if [[ $(date +%s%N) -ge $deadline_ns ]]; then
+            echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} timed out after ${SOFT_SHUTDOWN_WAIT_S}s waiting for HOLD_FOR_MC sentinel -> falling through to MC restart. (Deploy may still be in RAMP_OUT -- check the deploy log.)"
+            break
+        fi
+        sleep 0.1
+    done
+}
+
 restart_mc_on_exit() {
     # Always called via the trap once we've stopped MC. Idempotent + safe to
     # call multiple times. Preserves the original exit code so a failing
     # deploy run still surfaces its non-zero status to the caller / CI.
     local rc=$?
-    # Stop the run recorder FIRST so it captures the deploy's RAMP_OUT and
+    # Graceful Ctrl-C: give deploy time to RAMP_OUT and reach HOLD_FOR_MC
+    # BEFORE we POST start_app to MC. Without this step, deploy exits on
+    # SIGINT (~50 ms) and the bus goes silent for the 1-2 s MC takes to
+    # boot through PASSIVE_DEFAULT -- robot drops under gravity. With it,
+    # deploy keeps publishing the stand pose with MC-stand gains
+    # throughout MC's boot. No-op if --soft-shutdown-trigger-sentinel
+    # wasn't wired (SOFT_SHUTDOWN_SENTINEL empty) or deploy already exited.
+    soft_shutdown_wait
+    # Stop the run recorder so it captures the deploy's RAMP_OUT and
     # the silence between deploy-exit and MC-restart in the same npz.
     stop_run_recorder
+    # Stop the hand bridge BEFORE MC restarts, so MC's own hand
+    # republish loop owns /aima/hal/joint/hand/command exclusively
+    # again and we don't dual-publish for the brief window between
+    # mc start_app and the bridge's SIGINT-driven exit.
+    stop_hand_bridge
     # Clear all sentinels so stale files from a crashed run cannot
     # mis-trigger the next invocation. Best-effort.
     if [[ -n "${HOLD_FOR_MC_SENTINEL:-}" ]]; then
@@ -2064,6 +2626,9 @@ restart_mc_on_exit() {
     fi
     if [[ -n "${MC_FIRST_PUBLISH_SENTINEL:-}" ]]; then
         rm -f "$MC_FIRST_PUBLISH_SENTINEL"
+    fi
+    if [[ -n "${SOFT_SHUTDOWN_SENTINEL:-}" ]]; then
+        rm -f "$SOFT_SHUTDOWN_SENTINEL"
     fi
     if [[ -n "${ESCALATOR_OK_SENTINEL:-}" ]]; then
         rm -f "$ESCALATOR_OK_SENTINEL"
@@ -2464,6 +3029,15 @@ if [[ "$MODE" == "sim" ]]; then
         echo -e "  Record commands:    ${GREEN}$SIM_RECORD_COMMANDS${NC}"
     echo -e "  DDS isolation:      ${GREEN}ROS_LOCALHOST_ONLY=1, ROS_DOMAIN_ID=$SIM_DOMAIN_ID${NC}"
 fi
+if [[ "$MODE" == "local" ]]; then
+    if $HAND_BRIDGE_ENABLED && [[ "$HAND_BRIDGE_SIDES" != "off" ]]; then
+        echo -e "  Hand bridge:        ${GREEN}ON${NC} (py=${HAND_BRIDGE_PYTHON:-$DEPLOY_AUX_PYTHON}, sides=$HAND_BRIDGE_SIDES, engage=${HAND_BRIDGE_ENGAGE_SHOTS}x@1Hz, publish=${HAND_BRIDGE_PUBLISH_HZ}Hz, max_stale=${HAND_BRIDGE_MAX_STALE_S}s)"
+    else
+        echo -e "  Hand bridge:        ${YELLOW}OFF${NC} (real-robot hands will not move)"
+    fi
+elif [[ "$MODE" == "onbot" ]]; then
+    echo -e "  Hand bridge:        ${YELLOW}skipped${NC} (onbot mode -- launch x2_hand_zmq_to_aimdk_bridge.py manually if hands needed)"
+fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
 echo ""
@@ -2808,6 +3382,15 @@ else
         : > "$START_TRIGGER_SENTINEL"
         echo -e "$(ts) ${GREEN}[handoff]${NC} start-trigger sentinel touched -> deploy entering CONTROL."
 
+        # Hand bridge: MC has been silenced and the deploy is about to
+        # publish its first body command; this is the right moment to
+        # bring the OmniHand HAL up. Spawning earlier would let MC
+        # eat the engage burst (mc republishes its own HandCommandArray
+        # at high rate); spawning later means the first user grasp
+        # fires before motors are enabled. Reaped via stop_hand_bridge
+        # in restart_mc_on_exit. Sim mode does not call this.
+        start_hand_bridge
+
         # Now stream the deploy's pre-trigger output (everything from
         # boot through STANDBY) and tail-follow it for the rest of the
         # run. Tail is killed when the bg deploy exits.
@@ -2857,6 +3440,10 @@ else
             trap restart_mc_on_exit EXIT INT TERM
             sleep 1
         fi
+        # Same rationale as the STANDBY-path call above: spawn the
+        # hand bridge after MC is verified silenced so its engage
+        # burst doesn't get clobbered by mc's own hand publish loop.
+        start_hand_bridge
         echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC sentinel:        $HOLD_FOR_MC_SENTINEL"
         echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC exit-sentinel:   $HOLD_FOR_MC_EXIT_SENTINEL"
         echo -e "$(ts) ${BLUE}[handoff]${NC} MC first-publish sentinel:   $MC_FIRST_PUBLISH_SENTINEL"
@@ -2970,7 +3557,7 @@ else
                         fi
                         ESCALATOR_PID=""
                         if [[ -f "$ESCALATOR_SCRIPT" ]]; then
-                            python3 "$ESCALATOR_SCRIPT" \
+                            "$DEPLOY_AUX_PYTHON" "$ESCALATOR_SCRIPT" \
                                 --target JOINT_DEFAULT \
                                 --rate-hz 20 \
                                 --timeout-s 30 \
