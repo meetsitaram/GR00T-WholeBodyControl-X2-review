@@ -987,6 +987,33 @@ class Quest3ManagerX2:
         # planner clears any stale queue entries and goes to idle_stand.
         if transition.previous == StreamMode.OFF:
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
+            # Snap the arm + hand freeze caches back to neutral so the
+            # very next arm_targets / hand_finger_cmd publish carries a
+            # clean default pose. Without this, OFF held the LAST
+            # commanded arm + hand targets from the prior session (eg.
+            # mid-grasp, wrist twisted from a manipulation pose), and
+            # re-entering LOCOMOTION via A+B+X+Y would continue to
+            # publish that stale pose. The deploy's wrist-bypass=ik
+            # would then drive the wrist motors to those stale IK
+            # values -- they'd "stick" wherever the prior run left
+            # them, even though the operator just engaged a fresh
+            # session. Reset gives a predictable starting position
+            # (X2 neutral stand-pose arms, fingers fully open) before
+            # the operator presses B->ARM and A->engage to start
+            # actively teleoperating.
+            #
+            # Safety: the C++ deploy slews PD targets via its soft-
+            # start ramp + per-tick step clamp, so this neutral target
+            # blends in smoothly rather than commanding an instant jump.
+            self._frozen_left_arm_q = self._retargeter._teleop.left_neutral_q
+            self._frozen_right_arm_q = self._retargeter._teleop.right_neutral_q
+            self._frozen_left_hand_q = np.zeros(10, dtype=np.float64)
+            self._frozen_right_hand_q = np.zeros(10, dtype=np.float64)
+            log.info(
+                "[manager-x2] OFF -> %s: snap arm + hand freeze to neutral "
+                "(arms=X2 stand pose, fingers=open)",
+                transition.current.name,
+            )
 
         # ----- LOCOMOTION <-> ARM_MANIPULATION transitions ---------------
         # Going INTO ARM_MANIPULATION: latch whatever pitch / roll / yaw
