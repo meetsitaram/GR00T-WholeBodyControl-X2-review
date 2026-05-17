@@ -8,6 +8,15 @@
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml
 
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.21
+
+# Express Auto Wifi
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+    --pc2-host 192.168.4.79 --laptop-host 192.168.4.91 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml
+
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.4.79
+
 === end of pure manual notes section
 
 ## Topology A — split (laptop = planner stack; PC2 = deploy + idle proxy)
