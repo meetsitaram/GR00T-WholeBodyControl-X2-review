@@ -687,10 +687,24 @@ cmd_start() {
     if [[ "${NO_HAND}" -eq 0 ]]; then
         local hand_log="${PC2_LOG_ROOT}/hand_bridge_${now_tag}.log"
         local hand_script="${PC2_WS}/src/${PC2_PKG_SRC_REL}/scripts/x2_hand_zmq_to_aimdk_bridge.py"
+        # Hand bridge subscribes to the SAME pose stream as the deploy:
+        # the laptop's planner-stack publish_motion_token message carries
+        # finger joint angles inside the pose payload, NOT on a separate
+        # hand-only topic. This mirrors deploy_x2.sh local-mode (which
+        # uses ${VLA_ZMQ_HOST}/${VLA_ZMQ_PORT}/${VLA_ZMQ_TOPIC} with
+        # default topic "pose") and gives the bridge the same idle-stand
+        # fallback the deploy gets when upstream goes silent (proxy
+        # injects idle frames that include neutral finger joints).
+        # NOTE: LAPTOP_HAND_PORT (5564) on quest3_manager_x2 carries
+        # separate `arm_targets` / `hand_finger_cmd` / `stream_mode`
+        # topics in a DIFFERENT message format -- the bridge expects
+        # pose-format messages and would silently drop everything from
+        # 5564 (which is what happened pre-2026-05-17).
         local hand_cmd="${python_env} && \
             ${python_bin} ${hand_script} \
-                --zmq-host ${LAPTOP_HOST} \
-                --zmq-port ${LAPTOP_HAND_PORT} \
+                --zmq-host ${deploy_vla_host} \
+                --zmq-port ${deploy_vla_port} \
+                --zmq-topic pose \
                 2>&1 | tee -a ${hand_log}"
         tmux_start_session "${HAND_SESSION}" "${hand_cmd}"
     else
