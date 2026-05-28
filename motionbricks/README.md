@@ -197,6 +197,11 @@ For details on the motion feature representation, skeleton system, coordinate co
 
 For a step-by-step guide to training MotionBricks on your own motion data and adapting it to a new robot, see [docs/adding_your_own_dataset.md](docs/adding_your_own_dataset.md).
 
+### AgiBot X2 Ultra (walk / turn planner scope)
+
+X2 skeleton classes, BONES-SEED walk/turn filtering, and training entrypoints live under
+[docs/x2_walk_turn_training.md](docs/x2_walk_turn_training.md).
+
 ## Related Work
 
 **Kimodo** — A sibling project focused on offline motion generation, complementary to MotionBricks' real-time runtime.
