@@ -33,6 +33,11 @@
 #   REPO_DIR         where to clone it                                 (default: $HOME/GR00T-WholeBodyControl)
 #   CONDA_ENV        conda env name                                    (default: motionbricks)
 #   PYTHON_VERSION   python version inside conda env                   (default: 3.10)
+#   GH_TOKEN         GitHub PAT, used for cloning private repos        (default: empty)
+#                    On your workstation: GH_TOKEN=$(gh auth token)
+#                    Forward via ssh:    ssh ... GH_TOKEN=$GH_TOKEN bash bootstrap...
+#                    Tokens are scrubbed from the on-disk remote URL after the
+#                    clone so they don't show up in `git remote -v` later.
 
 set -euo pipefail
 
@@ -41,6 +46,7 @@ REPO_BRANCH=${REPO_BRANCH:-main}
 REPO_DIR=${REPO_DIR:-$HOME/GR00T-WholeBodyControl}
 CONDA_ENV=${CONDA_ENV:-motionbricks}
 PYTHON_VERSION=${PYTHON_VERSION:-3.10}
+GH_TOKEN=${GH_TOKEN:-}
 
 CONDA_PREFIX_DIR=${CONDA_PREFIX_DIR:-$HOME/miniconda3}
 
@@ -156,13 +162,38 @@ else
     exit 1
   fi
   step "cloning ${REPO_URL} (branch ${REPO_BRANCH}) into ${REPO_DIR}"
-  git clone --branch "${REPO_BRANCH}" "${REPO_URL}" "${REPO_DIR}"
+  # Inject the PAT into the URL if the repo is private. We strip it back out
+  # after the clone so the remote URL stored in .git/config doesn't carry
+  # secrets across the rest of the node lifetime.
+  CLONE_URL="${REPO_URL}"
+  if [[ -n "${GH_TOKEN}" && "${REPO_URL}" =~ ^https://github\.com/ ]]; then
+    CLONE_URL="${REPO_URL/https:\/\//https://x-access-token:${GH_TOKEN}@}"
+    step "GH_TOKEN provided -> using authenticated clone URL"
+  fi
+  # --depth 1 --single-branch: this monorepo has ~3GB of history (large
+  # binaries committed directly to git, not LFS). We only need the latest
+  # snapshot of the planner branch for training. GIT_LFS_SKIP_SMUDGE=1 keeps
+  # the clone from auto-pulling every LFS object; we explicitly fetch only
+  # the X2 robot description below.
+  GIT_LFS_SKIP_SMUDGE=1 git clone \
+    --depth 1 --single-branch \
+    --branch "${REPO_BRANCH}" \
+    "${CLONE_URL}" \
+    "${REPO_DIR}"
 fi
 
 # Pull the X2 MJCF + meshes (~110 MB). The MotionBricks pipeline needs the
 # x2_ultra.xml and its referenced STL meshes for FK extraction.
-step "git lfs pull (X2 MJCF + meshes)"
+# NOTE: we deliberately do this BEFORE scrubbing the token from the remote URL,
+# because git-lfs follows the remote and will hit the same auth wall on private
+# repos otherwise.
+step "git lfs pull (X2 MJCF + meshes only)"
 (cd "${REPO_DIR}" && git lfs pull --include "gear_sonic/data/assets/robot_description/**")
+
+if [[ -d "${REPO_DIR}/.git" && -n "${GH_TOKEN}" ]]; then
+  (cd "${REPO_DIR}" && git remote set-url origin "${REPO_URL}")
+  step "scrubbed token from .git/config (remote.origin.url reset to public form)"
+fi
 
 mesh_check="${REPO_DIR}/gear_sonic/data/assets/robot_description/urdf/x2_ultra/meshes/pelvis.STL"
 if [[ -f "${mesh_check}" ]]; then

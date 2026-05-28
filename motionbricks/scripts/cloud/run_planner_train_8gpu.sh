@@ -31,8 +31,11 @@
 #   FILTER                 dataset filter ('none' or 'loco')        (default: none)
 #   MAX_CLIPS              cap dataset size for debug                (default: <unset> = all)
 #   MIN_FRAMES/MAX_FRAMES  per-clip frame range                      (default: 80 / 200)
-#   BATCH_PER_GPU          batch size per GPU per stage              (default: 4)
-#   NUM_WORKERS            DataLoader workers per rank               (default: 4)
+#   BATCH_PER_GPU          batch size per GPU (used as fallback)     (default: 4)
+#   VQVAE_BATCH_PER_GPU    overrides BATCH_PER_GPU for VQVAE          (default: $BATCH_PER_GPU)
+#   POSE_BATCH_PER_GPU     overrides BATCH_PER_GPU for Pose           (default: $BATCH_PER_GPU)
+#   ROOT_BATCH_PER_GPU     overrides BATCH_PER_GPU for Root           (default: $BATCH_PER_GPU)
+#   NUM_WORKERS            DataLoader workers per rank                (default: 4)
 #   VQVAE_STEPS            VQVAE training steps                      (default: 500000)
 #   POSE_STEPS             pose backbone training steps              (default: 200000)
 #   ROOT_STEPS             root backbone training steps              (default: 200000)
@@ -58,6 +61,9 @@ MAX_CLIPS=${MAX_CLIPS:-}
 MIN_FRAMES=${MIN_FRAMES:-80}
 MAX_FRAMES=${MAX_FRAMES:-200}
 BATCH_PER_GPU=${BATCH_PER_GPU:-4}
+VQVAE_BATCH_PER_GPU=${VQVAE_BATCH_PER_GPU:-$BATCH_PER_GPU}
+POSE_BATCH_PER_GPU=${POSE_BATCH_PER_GPU:-$BATCH_PER_GPU}
+ROOT_BATCH_PER_GPU=${ROOT_BATCH_PER_GPU:-$BATCH_PER_GPU}
 NUM_WORKERS=${NUM_WORKERS:-4}
 VQVAE_STEPS=${VQVAE_STEPS:-500000}
 POSE_STEPS=${POSE_STEPS:-200000}
@@ -83,7 +89,7 @@ echo "  pkl            : $PKL"
 echo "  filter         : $FILTER"
 echo "  max_clips      : ${MAX_CLIPS:-<all>}"
 echo "  frames         : [$MIN_FRAMES, $MAX_FRAMES]"
-echo "  batch_per_gpu  : $BATCH_PER_GPU"
+echo "  batch_per_gpu  : $BATCH_PER_GPU (vqvae=$VQVAE_BATCH_PER_GPU pose=$POSE_BATCH_PER_GPU root=$ROOT_BATCH_PER_GPU)"
 echo "  num_workers    : $NUM_WORKERS"
 echo "  vqvae_steps    : $VQVAE_STEPS"
 echo "  pose_steps     : $POSE_STEPS"
@@ -145,7 +151,7 @@ if [[ "$RUN_VQVAE" == "1" ]]; then
     --pkl "$PKL" \
     --filter "$FILTER" \
     --max_steps "$VQVAE_STEPS" \
-    --batch_size "$BATCH_PER_GPU" \
+    --batch_size "$VQVAE_BATCH_PER_GPU" \
     --num_workers "$NUM_WORKERS" \
     --min_frames "$MIN_FRAMES" \
     --max_frames "$MAX_FRAMES" \
@@ -183,7 +189,7 @@ if [[ "$RUN_POSE" == "1" ]]; then
     --pkl "$PKL" \
     --filter "$FILTER" \
     --max_steps "$POSE_STEPS" \
-    --batch_size "$BATCH_PER_GPU" \
+    --batch_size "$POSE_BATCH_PER_GPU" \
     --num_workers "$NUM_WORKERS" \
     --min_frames "$MIN_FRAMES" \
     --max_frames "$MAX_FRAMES" \
@@ -214,7 +220,7 @@ if [[ "$RUN_ROOT" == "1" ]]; then
     --pkl "$PKL" \
     --filter "$FILTER" \
     --max_steps "$ROOT_STEPS" \
-    --batch_size "$BATCH_PER_GPU" \
+    --batch_size "$ROOT_BATCH_PER_GPU" \
     --num_workers "$NUM_WORKERS" \
     --min_frames "$MIN_FRAMES" \
     --max_frames "$MAX_FRAMES" \
