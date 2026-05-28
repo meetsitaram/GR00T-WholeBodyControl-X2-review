@@ -52,12 +52,46 @@ skip() { printf '  ~ skip: %s\n' "$*"; }
 # Phase 0 — pre-flight
 #-------------------------------------------------------------------------------
 log "Phase 0: pre-flight"
-if ! command -v nvidia-smi >/dev/null; then
-  echo "FATAL: nvidia-smi not found. This script assumes the boot image already" >&2
-  echo "       has the NVIDIA driver + CUDA toolkit (e.g. Nebius ubuntu24.04-cuda13.0)." >&2
-  exit 1
+
+# Phase 0a: install the NVIDIA kernel driver on the boot image if missing.
+# As of May 2026 Nebius retired the standalone 'ubuntu24.04-cuda13.0' image
+# family across most regions, leaving 'ubuntu24.04-driverless' (eu-north1 only)
+# as the only workable public family. On a driverless image we have to bring
+# the driver ourselves; PyTorch wheels ship the CUDA *runtime*, so we only
+# need the kernel module + libcuda, not the full toolkit.
+if command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=driver_version --format=csv,noheader >/dev/null 2>&1; then
+  step "NVIDIA driver already present:"
+  nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
+else
+  log "Phase 0a: NVIDIA driver missing -> installing (driverless image path)"
+  sudo apt-get update -q
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    "linux-headers-$(uname -r)" build-essential ca-certificates curl wget gnupg
+
+  # NVIDIA CUDA keyring + repo (Ubuntu 24.04). Pinning to the keyring package
+  # bootstraps the right apt source automatically.
+  if [[ ! -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list ]]; then
+    KEYRING=/tmp/cuda-keyring_1.1-1_all.deb
+    wget -q -O "$KEYRING" \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    sudo dpkg -i "$KEYRING"
+    sudo apt-get update -q
+  fi
+
+  step "installing cuda-drivers (just the driver, not the full toolkit)"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cuda-drivers
+
+  # Try to load the module without rebooting; cuda-drivers usually leaves the
+  # kernel ready immediately, but if it fails we fall back to a reboot hint.
+  sudo modprobe nvidia 2>/dev/null || true
+  if ! command -v nvidia-smi >/dev/null || ! nvidia-smi >/dev/null 2>&1; then
+    echo "WARN: nvidia-smi still not working after install; a reboot may be required." >&2
+    echo "      Run: sudo reboot, then re-execute this bootstrap script." >&2
+    exit 1
+  fi
+  step "post-install nvidia-smi:"
+  nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
 fi
-nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
 
 #-------------------------------------------------------------------------------
 # Phase 1 — OS packages
