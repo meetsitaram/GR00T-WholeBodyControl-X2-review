@@ -33,6 +33,9 @@
 #
 # Override knobs:
 #   OUT_TAR                path to write the bundle             (default: /tmp/x2_planner_bundle.tar.gz)
+#   PKL_GLOB               glob of PKLs to bundle                (default: gear_sonic/data/motions/x2_ultra_*.pkl
+#                          - matches per-tier PKLs locowalk/locopost/locomanip/locobal AND merged
+#                          bones_seed PKL. Set to a single path to ship just one.)
 #   INCLUDE_SMOKE          bundle the smoke PKL too             (default: 1; set 0 to skip)
 #   INCLUDE_ASSETS         bundle prebuilt skeleton/stats/hparams (default: 1; set 0 to skip
 #                          and force a fresh build_x2_skeleton_assets.py run on the cloud node)
@@ -43,6 +46,7 @@
 set -euo pipefail
 
 OUT_TAR=${OUT_TAR:-/tmp/x2_planner_bundle.tar.gz}
+PKL_GLOB=${PKL_GLOB:-gear_sonic/data/motions/x2_ultra_*.pkl}
 INCLUDE_SMOKE=${INCLUDE_SMOKE:-1}
 INCLUDE_ASSETS=${INCLUDE_ASSETS:-1}
 INCLUDE_FEATURE_CACHE=${INCLUDE_FEATURE_CACHE:-1}
@@ -50,19 +54,21 @@ INCLUDE_FEATURE_CACHE=${INCLUDE_FEATURE_CACHE:-1}
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-BONES_PKL="gear_sonic/data/motions/x2_ultra_bones_seed.pkl"
 SMOKE_PKL="gear_sonic/data/motions/x2_ultra_planner_smoke.pkl"
 
-if [[ ! -f "$BONES_PKL" ]]; then
-  echo "FATAL: $BONES_PKL not found." >&2
-  echo "       Build it first with gear_sonic/data_process/build_x2_bones_seed_motion_lib.py" >&2
-  echo "       (or the existing SONIC pipeline)." >&2
+# Resolve the PKL glob (nullglob so missing matches expand to nothing instead
+# of the literal pattern).
+shopt -s nullglob
+pkl_paths=( $PKL_GLOB )
+shopt -u nullglob
+
+if [[ ${#pkl_paths[@]} -eq 0 ]]; then
+  echo "FATAL: no PKLs matched $PKL_GLOB." >&2
+  echo "       Build them first with gear_sonic/data_process/build_x2_bones_seed_motion_lib.py" >&2
   exit 1
 fi
 
-paths=(
-  "$BONES_PKL"
-)
+paths=( "${pkl_paths[@]}" )
 
 if [[ "$INCLUDE_SMOKE" == "1" ]]; then
   if [[ ! -f "$SMOKE_PKL" ]]; then
@@ -107,18 +113,37 @@ fi
 # scripts each look at their own variant dir, so we ship 3 copies (deduped
 # by tar's hard-link detection — see -h flag below).
 if [[ "$INCLUDE_FEATURE_CACHE" == "1" ]]; then
-  vqvae_cache="motionbricks/out/motionbricks_vqvae_x2/version_1/feature_cache"
-  if [[ -d "$vqvae_cache" ]] && [[ -f "$vqvae_cache/manifest.json" ]]; then
-    cache_count=$(ls "$vqvae_cache"/*.pt 2>/dev/null | wc -l)
-    echo "INFO: shipping VQVAE feature_cache ($cache_count clips, $(du -sh "$vqvae_cache" | awk '{print $1}'))"
-    paths+=("$vqvae_cache")
-    # Pose + root share the same FK output; symlink on the cloud node side.
-    # We only ship the vqvae copy and let the cloud-side runner symlink
-    # pose/root/feature_cache → vqvae/feature_cache to avoid 3x bundle bloat.
+  vqvae_cache_root="motionbricks/out/motionbricks_vqvae_x2/version_1/feature_cache"
+  if [[ -d "$vqvae_cache_root" ]]; then
+    # Per-PKL convention: feature_cache/<pkl_stem>/manifest.json.
+    # Ship every populated subdir so any of the PKLs (locowalk, locopost, ...)
+    # in the bundle can find its matching cache. Cross-contamination is
+    # impossible because each cache is in its own dir.
+    shipped=0
+    for sub in "$vqvae_cache_root"/*/; do
+      [[ -d "$sub" ]] || continue
+      manifest="$sub/manifest.json"
+      if [[ -f "$manifest" ]]; then
+        cache_count=$(ls "$sub"/*.pt 2>/dev/null | wc -l)
+        echo "INFO: shipping feature_cache: $sub  ($cache_count clips, $(du -sh "$sub" | awk '{print $1}'))"
+        paths+=("$sub")
+        shipped=$((shipped + 1))
+      fi
+    done
+    # Legacy flat layout: feature_cache/manifest.json (no subdir). Still ship
+    # so older bundles work, but warn since this is unsafe for multi-PKL setups.
+    if [[ -f "$vqvae_cache_root/manifest.json" ]]; then
+      echo "WARN: legacy flat feature_cache/ detected -> shipping but recommend rebuilding under per-PKL convention" >&2
+      paths+=("$vqvae_cache_root/manifest.json")
+      paths+=($(ls "$vqvae_cache_root"/*.pt 2>/dev/null))
+      shipped=$((shipped + 1))
+    fi
+    if [[ "$shipped" -eq 0 ]]; then
+      echo "WARN: no populated feature_cache/<pkl>/ subdir found under $vqvae_cache_root" >&2
+      echo "      run motionbricks/scripts/build_feature_cache_x2.py first" >&2
+    fi
   else
-    echo "WARN: $vqvae_cache missing manifest.json -> skipping feature_cache bundling" >&2
-    echo "      run train_vqvae_x2.py once locally (even just to dataset construction)" >&2
-    echo "      to populate it, then rerun this bundle script." >&2
+    echo "WARN: $vqvae_cache_root missing -> skipping feature_cache bundling" >&2
   fi
 fi
 
@@ -142,8 +167,8 @@ echo "  scp $OUT_TAR ubuntu@<cloud-ip>:~/"
 echo "  # then on the cloud node, from the repo root:"
 echo "  cd ~/GR00T-WholeBodyControl && tar -xzf ~/$(basename "$OUT_TAR")"
 if [[ "$INCLUDE_FEATURE_CACHE" == "1" ]]; then
-  echo "  # if you bundled feature_cache, also symlink pose+root to the vqvae copy"
-  echo "  # to avoid the trainer rebuilding the cache for each stage:"
+  echo "  # symlink pose+root feature_cache subdirs to the vqvae copy"
+  echo "  # (per-PKL layout — preserves the safe-naming convention)"
   echo "  for v in pose root; do"
   echo "    src=\"\$PWD/motionbricks/out/motionbricks_vqvae_x2/version_1/feature_cache\""
   echo "    dst=\"motionbricks/out/motionbricks_\${v}_x2/version_1/feature_cache\""

@@ -75,8 +75,9 @@ For the X2 planner training, the bundle contains:
 
 | Path | Purpose | Why not in git |
 |---|---|---|
-| `gear_sonic/data/motions/x2_ultra_bones_seed.pkl` | 2,584-clip training corpus (~210 MB) | gitignored (`data/`) |
+| `gear_sonic/data/motions/x2_ultra_bones_seed.pkl` | 37,968-clip training corpus (~3 GB) — full BONES-SEED minus dances, curated into 4 tiers (`locowalk`, `locopost`, `locomanip`, `locobal`) by `agibot-x2-references/bones-seed/scripts/curate_x2_planner.py` | gitignored (`data/`) |
 | `gear_sonic/data/motions/x2_ultra_planner_smoke.pkl` | 30-clip smoke PKL (~3 MB; optional but recommended) | gitignored |
+| `motionbricks/out/motionbricks_vqvae_x2/version_1/feature_cache/` | Pre-computed MuJoCo FK + motion-rep features (one `.pt` per clip + `manifest.json`) — built locally by `motionbricks/scripts/build_feature_cache_x2.py` to avoid burning H200 time on CPU FK | gitignored (large & deterministic) |
 
 Build the bundle from the repo root with the helper:
 
@@ -174,7 +175,7 @@ tar -xzf ~/x2_planner_bundle.tar.gz
 ls -lh gear_sonic/data/motions/*.pkl
 ```
 
-## 5. One-time setup: skeleton assets + stats
+## 5. One-time setup: skeleton assets + stats + feature cache
 
 MotionBricks needs a per-skeleton bundle of: kinematic-tree definition,
 canonical T-pose, motion-feature normalization stats. For X2 these live
@@ -191,10 +192,30 @@ python motionbricks/scripts/build_x2_skeleton_assets.py
 If you ever change the X2 skeleton class or the motion-feature pipeline,
 re-run this. Otherwise it's strictly one-time per node.
 
+### 5a. Pre-compute the FK feature cache (run **locally**, not on the H200)
+
+Each clip's MuJoCo forward kinematics + motion-rep tensor is CPU-bound
+(no GPU needed). Computing it serially inside `X2MotionDataset.__init__`
+on the H200 wastes ~30+ minutes of GPU time per training launch. Instead,
+run the parallel builder once locally and ship the cache in the bundle:
+
+```bash
+python motionbricks/scripts/build_feature_cache_x2.py \
+  --pkl gear_sonic/data/motions/x2_ultra_bones_seed.pkl \
+  --out-dir motionbricks/out/motionbricks_vqvae_x2/version_1/feature_cache \
+  --workers 24 \
+  --recompute
+# 38k clips on a 32-core workstation: ~10-15 min
+```
+
+The bundle script (`build_planner_bundle.sh`) auto-detects this cache and
+ships it; on the cloud node, training will see `manifest.json` in
+`feature_cache/` and skip the FK extraction entirely.
+
 > **DDP-safety note.** The skeleton-assets step is single-process and runs
 > outside DDP. The training launcher (`run_planner_train_8gpu.sh`)
-> auto-runs it if missing, so you can skip this step manually if you
-> want.
+> auto-runs it if missing, so you can skip step 5 manually if you want;
+> step 5a should still be run locally to save cloud GPU time.
 
 ## 6. Configure W&B (optional)
 
@@ -278,18 +299,22 @@ it bottlenecks first. If pose OOMs at `BATCH_PER_GPU=4`, drop to 2.
 | Root | 200K | ~3 hr | ~$90 |
 | **Total** | | **~14 hr** | **~$420** |
 
-For Path A (filtered locomotion-only training), set `FILTER=loco` to apply
-the BONES-SEED walk/turn include patterns (~700 clips instead of 2,584):
+The default is `FILTER=none`, which uses the full 37,968-clip curated
+corpus. This is the recommended setup — the dataset is already curated at
+the metadata level by `curate_x2_planner.py` (4 tiers: `locowalk`,
+`locopost`, `locomanip`, `locobal`; dances explicitly excluded). Setting
+`FILTER=loco` further narrows to the regex include/exclude patterns in
+`motionbricks/data/x2_loco_filters.py`, which is rarely useful given the
+metadata curation already done upstream.
 
 ```bash
+# default — train on all 37,968 curated clips
+bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
+
+# narrow further (rarely needed)
 FILTER=loco \
-VQVAE_STEPS=300000 POSE_STEPS=150000 ROOT_STEPS=150000 \
   bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
 ```
-
-This trades coverage for faster convergence on the locomotion-only
-deployment task. Use the full corpus if you want the planner to also
-support body-check / aggressive motions.
 
 **Always launch inside `tmux`** (the helper scripts already use it) so an
 SSH drop does not kill the multi-stage run.

@@ -88,12 +88,42 @@ class X2MotionDataset(Dataset):
     self._features: List[torch.Tensor] = []
 
     cache_dir = Path(cache_dir) if cache_dir else None
+
+    # Loud "what am I loading" summary — paranoia after a smoke-PKL was
+    # accidentally used for full training in a prior run. We print BOTH the
+    # PKL identity AND the cache_dir path so any mismatch is human-visible
+    # before training step 1.
+    print("=== X2MotionDataset ===")
+    for p in pkl_list:
+      try:
+        size_gb = p.stat().st_size / (1024**3)
+        print(f"  PKL:        {p}  ({size_gb:.2f} GB)")
+      except OSError:
+        print(f"  PKL:        {p}  (size unavailable)")
+    if cache_dir is None:
+      print("  cache_dir:  <none — in-process FK extraction>")
+    else:
+      hit = (cache_dir / "manifest.json").is_file() and not recompute_cache
+      print(f"  cache_dir:  {cache_dir}  ({'HIT' if hit else 'MISS / will build'})")
+      # Cross-check: the cache_dir basename should match (one of) the PKL
+      # stems under the per-PKL convention. If it doesn't, warn loudly.
+      pkl_stems = {p.stem for p in pkl_list}
+      cache_basename = cache_dir.name
+      legacy_flat = cache_basename == "feature_cache"
+      if not legacy_flat and cache_basename not in pkl_stems and cache_basename != "__".join(sorted(pkl_stems)):
+        print(
+          f"  WARNING:    cache_dir basename {cache_basename!r} does not match any "
+          f"PKL stem {sorted(pkl_stems)!r}. If this is unintentional, training will "
+          "use features from a DIFFERENT PKL than the one passed in."
+        )
+
     manifest_path = None
     if cache_dir is not None:
       cache_dir.mkdir(parents=True, exist_ok=True)
       manifest_path = cache_dir / "manifest.json"
       if manifest_path.is_file() and not recompute_cache:
         if self._load_from_cache(manifest_path, cache_dir):
+          print(f"  loaded:     {len(self._keys):,} clips from cache")
           return
 
     extractor = X2MujocoFkExtractor(mjcf)
@@ -189,6 +219,29 @@ class X2MotionDataset(Dataset):
 # implicit walk/turn filter must now pass ``include_patterns=DEFAULT_INCLUDE_PATTERNS``
 # explicitly.
 X2LocoMotionDataset = X2MotionDataset
+
+
+def default_cache_dir_for(version_dir: PathLike, pkl_paths: Union[PathLike, Sequence[PathLike]]) -> Path:
+  """Return the per-PKL feature-cache directory.
+
+  Convention: ``<version_dir>/feature_cache/<pkl_stem>/`` for a single PKL,
+  or ``<version_dir>/feature_cache/<stem1>__<stem2>__.../`` for multiple PKLs.
+  Putting the cache under a PKL-named subdirectory makes cross-contamination
+  (e.g. smoke-PKL cache used for full-PKL training) physically impossible —
+  the directory paths simply don't collide.
+
+  Use this helper from training scripts and the bundle/build pipeline so the
+  builder, dataset class, and bundle script all agree on where the cache
+  lives.
+  """
+  if isinstance(pkl_paths, (str, Path)):
+    stems = [Path(pkl_paths).stem]
+  else:
+    stems = sorted({Path(p).stem for p in pkl_paths})
+  if not stems:
+    raise ValueError("default_cache_dir_for requires at least one PKL path")
+  subdir = stems[0] if len(stems) == 1 else "__".join(stems)
+  return Path(version_dir) / "feature_cache" / subdir
 
 
 def _safe_key(key: str) -> str:

@@ -33,7 +33,10 @@ REPO_ROOT = MB_ROOT.parent
 sys.path.insert(0, str(MB_ROOT))
 
 from motionbricks.data.synthetic_dataset import collate_batch  # noqa: E402
-from motionbricks.data.x2_bones_seed_dataset import X2MotionDataset  # noqa: E402
+from motionbricks.data.x2_bones_seed_dataset import (  # noqa: E402
+  X2MotionDataset,
+  default_cache_dir_for,
+)
 from motionbricks.data.x2_loco_filters import (  # noqa: E402
   DEFAULT_EXCLUDE_PATTERNS,
   DEFAULT_INCLUDE_PATTERNS,
@@ -171,7 +174,7 @@ def main() -> None:
   dataset = X2MotionDataset(
     pkls,
     motion_rep,
-    cache_dir=version_dir / "feature_cache",
+    cache_dir=default_cache_dir_for(version_dir, pkls),
     min_frames=args.min_frames,
     max_frames=args.max_frames,
     max_clips=args.max_clips,
