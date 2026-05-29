@@ -34,3 +34,9 @@ Thumbs.db
 !motionbricks/motion_backbone/models/**
 !motionbricks/vqvae/models/
 !motionbricks/vqvae/models/**
+
+# Re-exclude bytecode that the negation rules above accidentally pull
+# back in (`!motionbricks/data/**` etc. would otherwise track every
+# `__pycache__/*.pyc` Python writes alongside the source files).
+__pycache__/
+*.py[cod]
