@@ -56,6 +56,12 @@ Usage
     # Dry-run: show the exact `nebius` commands without running them
     python gear_sonic/scripts/cloud/nebius_parallel_provision.py --dry-run
 
+    # Loop until success: probe nebius_gpu_scan.py every 20s for 8-GPU on-demand
+    # capacity; when capacity appears, fire the parallel provisioner; on no
+    # winner, cool down 120s and re-probe. Exits 0 on first winner.
+    python gear_sonic/scripts/cloud/nebius_parallel_provision.py \\
+        --retry-until-success --probe-interval 20
+
     # Cleanup after a previous run (resume from state file)
     python gear_sonic/scripts/cloud/nebius_parallel_provision.py \\
         --cleanup /tmp/nebius_parallel_<ts>/state.json
@@ -106,7 +112,7 @@ DEFAULT_VARIANTS: list[tuple[str, str, str]] = [
 ]
 
 PUBLIC_IMAGES_PARENT = "project-e00public-images"
-DEFAULT_IMAGE_FAMILY = "ubuntu24.04-cuda13.0"
+DEFAULT_IMAGE_FAMILY = "ubuntu24.04-driverless"
 DEFAULT_DISK_SIZE_GIB = 500
 DEFAULT_DISK_TYPE = "network_ssd"
 DEFAULT_USER = "ubuntu"
@@ -776,6 +782,83 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scan_has_capacity(scan_script: Path, gpus: int, min_on_demand: int) -> tuple[bool, str]:
+    """Run nebius_gpu_scan.py and return (has_capacity, summary_line).
+
+    Treats output containing ``(no rows match)`` as no capacity. Otherwise
+    returns the first non-header data row as a one-line summary so the loop
+    log gives at-a-glance context on which platforms/regions are open.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable, str(scan_script),
+            "--gpus", str(gpus),
+            "--min-on-demand", str(min_on_demand),
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if "(no rows match)" in out:
+        return False, "no on-demand capacity"
+    # Extract the first data row (begins with right-justified GPU count).
+    for line in out.splitlines():
+        s = line.strip()
+        if s and s[0].isdigit() and "|" in s:
+            return True, s
+    # Fallback: scan produced no recognized rows — treat as no capacity to be safe.
+    return False, "scan output unparseable"
+
+
+def cmd_retry_provision(args: argparse.Namespace) -> int:
+    """Loop: probe scan -> if capacity, call cmd_provision; else sleep and retry.
+
+    Exits 0 on first winner, 1 on max-attempts exhaustion or interrupt.
+    """
+    scan_script = Path(args.scan_script).expanduser()
+    if not scan_script.is_file():
+        log(f"ERROR: scan script not found: {scan_script}")
+        return 1
+
+    log(
+        f"=== RETRY-UNTIL-SUCCESS LOOP STARTED  "
+        f"max_attempts={args.max_attempts}  probe_interval={args.probe_interval}s  "
+        f"retry_cooldown={args.retry_cooldown}s  probe_gpus={args.probe_gpus}  "
+        f"probe_min_od={args.probe_min_od} ==="
+    )
+
+    for i in range(1, args.max_attempts + 1):
+        log(f"--- attempt {i}/{args.max_attempts} ---")
+
+        # 1) Gate on scan unless explicitly disabled.
+        if not args.no_scan_gate:
+            try:
+                has_cap, summary = _scan_has_capacity(
+                    scan_script, args.probe_gpus, args.probe_min_od
+                )
+            except Exception as e:  # noqa: BLE001
+                log(f"  scan error: {e} (treating as no-capacity)")
+                has_cap, summary = False, str(e)
+            if not has_cap:
+                log(f"  scan: {summary}; sleeping {args.probe_interval}s")
+                time.sleep(args.probe_interval)
+                continue
+            log(f"  scan: capacity detected -> {summary}")
+
+        # 2) Reset the win-event between attempts (it's module-global).
+        _WIN_EVENT.clear()
+
+        rc = cmd_provision(args)
+        if rc == 0:
+            log(f"=== WINNER on attempt {i} ===")
+            return 0
+
+        log(f"  provision failed; sleeping {args.retry_cooldown}s before retry")
+        time.sleep(args.retry_cooldown)
+
+    log(f"=== EXHAUSTED {args.max_attempts} attempts; giving up ===")
+    return 1
+
+
 # -----------------------------------------------------------------------------#
 # CLI                                                                          #
 # -----------------------------------------------------------------------------#
@@ -866,6 +949,63 @@ def _parse_args() -> argparse.Namespace:
         help="Cleanup mode: delete all instances+disks listed in a previous run's "
              "state.json (no provisioning).",
     )
+    # ---- retry-until-success mode (loop scan -> provision -> retry) -------------#
+    p.add_argument(
+        "--retry-until-success",
+        action="store_true",
+        help="Loop forever (up to --max-attempts): probe nebius_gpu_scan.py for "
+             "8-GPU on-demand capacity; when capacity exists, fire the parallel "
+             "provisioner; on no winner, sleep --retry-cooldown and retry. Exits "
+             "0 on first winner.",
+    )
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=600,
+        help="Cap for --retry-until-success (default 600 ≈ many hours at "
+             "--probe-interval 20).",
+    )
+    p.add_argument(
+        "--probe-interval",
+        type=int,
+        default=20,
+        help="Seconds between scan probes when there's no on-demand capacity "
+             "(default 20 = ~3 probes/min).",
+    )
+    p.add_argument(
+        "--retry-cooldown",
+        type=int,
+        default=120,
+        help="Seconds to wait after a failed provision attempt before re-probing "
+             "(default 120). Lower than typical instance-create timeout to keep "
+             "the loop moving.",
+    )
+    p.add_argument(
+        "--probe-gpus",
+        type=int,
+        default=8,
+        help="GPU count passed to scan as --gpus (default 8).",
+    )
+    p.add_argument(
+        "--probe-min-od",
+        type=int,
+        default=1,
+        help="Min on-demand availability passed to scan as --min-on-demand "
+             "(default 1). Set to 0 to also accept preemptible-only inventory "
+             "(NOTE: this script still creates on-demand instances; preempt "
+             "is informational only).",
+    )
+    p.add_argument(
+        "--scan-script",
+        default=str(Path(__file__).resolve().parent / "nebius_gpu_scan.py"),
+        help="Path to nebius_gpu_scan.py (default: sibling in same dir).",
+    )
+    p.add_argument(
+        "--no-scan-gate",
+        action="store_true",
+        help="In --retry-until-success mode, skip the scan probe and always "
+             "attempt provision. Useful when scan API itself is down.",
+    )
     return p.parse_args()
 
 
@@ -873,6 +1013,8 @@ def main() -> int:
     args = _parse_args()
     if args.cleanup:
         return cmd_cleanup(args)
+    if args.retry_until_success:
+        return cmd_retry_provision(args)
     return cmd_provision(args)
 
 
