@@ -71,6 +71,10 @@ ROOT_STEPS=${ROOT_STEPS:-200000}
 SAVE_EVERY=${SAVE_EVERY:-5000}
 USE_WANDB=${USE_WANDB:-0}
 WANDB_PROJECT=${WANDB_PROJECT:-TRL_X2Ultra_Planner}
+# PROGRESS_BAR=1 enables tqdm step/loss output to stdout. Default 0 (off) keeps
+# the log clean on long detached runs; set to 1 for interactive debugging or
+# when you want to see per-step loss without spinning up W&B.
+PROGRESS_BAR=${PROGRESS_BAR:-0}
 RUN_VQVAE=${RUN_VQVAE:-1}
 RUN_POSE=${RUN_POSE:-1}
 RUN_ROOT=${RUN_ROOT:-1}
@@ -138,6 +142,11 @@ if [[ -n "$MAX_CLIPS" ]]; then
   MAX_CLIPS_FLAGS+=(--max_clips "$MAX_CLIPS")
 fi
 
+PROGRESS_FLAGS=()
+if [[ "$PROGRESS_BAR" != "1" ]]; then
+  PROGRESS_FLAGS+=(--no-progress-bar)
+fi
+
 #-------------------------------------------------------------------------------
 # Stage 1 — VQVAE
 #-------------------------------------------------------------------------------
@@ -156,9 +165,9 @@ if [[ "$RUN_VQVAE" == "1" ]]; then
     --min_frames "$MIN_FRAMES" \
     --max_frames "$MAX_FRAMES" \
     --save-every-n-steps "$SAVE_EVERY" \
-    --no-progress-bar \
     --devices "$NUM_GPUS" \
     --num-nodes 1 \
+    "${PROGRESS_FLAGS[@]}" \
     "${MAX_CLIPS_FLAGS[@]}" \
     "${WANDB_FLAGS[@]}" \
     "${RESUME_FLAGS[@]}" \
@@ -195,9 +204,9 @@ if [[ "$RUN_POSE" == "1" ]]; then
     --max_frames "$MAX_FRAMES" \
     --save-every-n-steps "$SAVE_EVERY" \
     --vqvae-ckpt "$VQVAE_CKPT" \
-    --no-progress-bar \
     --devices "$NUM_GPUS" \
     --num-nodes 1 \
+    "${PROGRESS_FLAGS[@]}" \
     "${MAX_CLIPS_FLAGS[@]}" \
     "${WANDB_FLAGS[@]}" \
     "${RESUME_FLAGS[@]}" \
@@ -225,9 +234,9 @@ if [[ "$RUN_ROOT" == "1" ]]; then
     --min_frames "$MIN_FRAMES" \
     --max_frames "$MAX_FRAMES" \
     --save-every-n-steps "$SAVE_EVERY" \
-    --no-progress-bar \
     --devices "$NUM_GPUS" \
     --num-nodes 1 \
+    "${PROGRESS_FLAGS[@]}" \
     "${MAX_CLIPS_FLAGS[@]}" \
     "${WANDB_FLAGS[@]}" \
     "${RESUME_FLAGS[@]}" \
