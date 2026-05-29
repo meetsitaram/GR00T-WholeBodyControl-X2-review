@@ -178,6 +178,8 @@ def main() -> None:
     num_workers=args.num_workers,
     collate_fn=collate_batch,
     persistent_workers=args.num_workers > 0,
+    pin_memory=True,
+    prefetch_factor=4 if args.num_workers > 0 else None,
   )
 
   model_conf = copy.deepcopy(conf.model)
