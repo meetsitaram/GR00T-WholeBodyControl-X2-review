@@ -51,12 +51,14 @@ def load_config(
   devices: int = 1,
   num_nodes: int = 1,
   strategy: str = "auto",
+  out_name: str = "motionbricks_pose_x2",
 ):
-  version_dir = result_dir / "motionbricks_pose_x2" / "version_1"
+  version_dir = result_dir / out_name / "version_1"
   hparams_path = version_dir / "hparams.yaml"
   if not hparams_path.is_file():
     raise FileNotFoundError(
-      f"Missing {hparams_path}. Run: python scripts/build_x2_skeleton_assets.py"
+      f"Missing {hparams_path}. Run: python scripts/build_x2_skeleton_assets.py "
+      f"(or scaffold the {out_name}/version_1 dir manually for an alt config)."
     )
   conf = OmegaConf.load(hparams_path)
 
@@ -77,7 +79,7 @@ def load_config(
     conf.model.args.vqvae_model_ckpt_path = str(vqvae_ckpt)
     conf.id = "x2"
     conf.run_dir = "."
-    conf.out_dir = str(result_dir / "motionbricks_pose_x2")
+    conf.out_dir = str(result_dir / out_name)
 
   resolved = OmegaConf.to_container(conf, resolve=True)
   conf = OmegaConf.create(resolved)
@@ -116,6 +118,16 @@ def main() -> None:
     "--vqvae-ckpt",
     type=Path,
     default=MB_ROOT / "out/motionbricks_vqvae_x2/version_1/checkpoints/last.ckpt",
+  )
+  parser.add_argument(
+    "--out-name",
+    default="motionbricks_pose_x2",
+    help=(
+      "Output sub-directory under --result_dir. Reads "
+      "<result_dir>/<out_name>/version_1/hparams.yaml and writes checkpoints "
+      "next to it. Use a non-default value (e.g. motionbricks_pose_x2_v2) to "
+      "run an alternate config without disturbing the main version_1 outputs."
+    ),
   )
   parser.add_argument("--no-progress-bar", action="store_true")
   parser.add_argument(
@@ -156,6 +168,7 @@ def main() -> None:
     devices=args.devices,
     num_nodes=args.num_nodes,
     strategy=strategy,
+    out_name=args.out_name,
   )
 
   motion_rep = load_motion_rep(conf)
