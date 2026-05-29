@@ -213,7 +213,7 @@ ships it; on the cloud node, training will see `manifest.json` in
 `feature_cache/` and skip the FK extraction entirely.
 
 > **DDP-safety note.** The skeleton-assets step is single-process and runs
-> outside DDP. The training launcher (`run_planner_train_8gpu.sh`)
+> outside DDP. The training launcher (`run_planner_train.sh`)
 > auto-runs it if missing, so you can skip step 5 manually if you want;
 > step 5a should still be run locally to save cloud GPU time.
 
@@ -267,7 +267,7 @@ tmux new -d -s plan_train "
   BATCH_PER_GPU=4 \
   USE_WANDB=1 \
   LOG_FILE=\$HOME/plan_train.log \
-  bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
+  bash motionbricks/scripts/cloud/run_planner_train.sh
 "
 tmux a -t plan_train     # attach; Ctrl-b d to detach
 ```
@@ -309,11 +309,11 @@ metadata curation already done upstream.
 
 ```bash
 # default — train on all 37,968 curated clips
-bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
+bash motionbricks/scripts/cloud/run_planner_train.sh
 
 # narrow further (rarely needed)
 FILTER=loco \
-  bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
+  bash motionbricks/scripts/cloud/run_planner_train.sh
 ```
 
 **Always launch inside `tmux`** (the helper scripts already use it) so an
@@ -395,7 +395,7 @@ Example — resume a crashed pose stage:
 ```bash
 RUN_VQVAE=0 RUN_ROOT=0 \
 RESUME_POSE=motionbricks/out/motionbricks_pose_x2/version_1/checkpoints/last.ckpt \
-  bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh
+  bash motionbricks/scripts/cloud/run_planner_train.sh
 ```
 
 ## 10. Adapting this guide to a different embodiment / dataset

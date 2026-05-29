@@ -11,8 +11,9 @@
 # nothing parallelizes for free — we keep it sequential to maximize per-stage
 # DDP throughput. Set RUN_ROOT=0 / RUN_POSE=0 to skip stages.
 #
-# Defaults are tuned for an 8x H200 (or H100 80GB) SXM node, full Path A run
-# on the BONES-SEED corpus. For a smoke test, prefer
+# Works on any GPU count via NUM_GPUS (default 8 to match the historical 8x H200
+# SXM full-corpus path). 1-GPU runs (e.g. a single H200 SXM with the locowalk
+# corpus) just need NUM_GPUS=1. For a smoke test, prefer
 # ``run_planner_smoke_8gpu.sh`` instead.
 #
 # Usage (run on the cloud node, from the repo root):
@@ -21,7 +22,7 @@
 #   python motionbricks/scripts/build_x2_skeleton_assets.py
 #
 #   # launch the full pipeline (detached, in tmux):
-#   tmux new -d -s plan_train "bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh"
+#   tmux new -d -s plan_train "bash motionbricks/scripts/cloud/run_planner_train.sh"
 #   tmux a -t plan_train         # attach to watch
 #   tail -f ~/plan_train.log     # ...or tail the log file
 #

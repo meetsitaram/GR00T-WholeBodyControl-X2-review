@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bootstrap a fresh Nebius (or any Ubuntu 24.04 + CUDA 13) GPU node into a
-# state where ``run_planner_train_8gpu.sh`` can train the MotionBricks-based
+# state where ``run_planner_train.sh`` can train the MotionBricks-based
 # X2 kinematic planner.
 #
 # This is the planner counterpart of
@@ -274,7 +274,7 @@ Next steps:
        tmux new -d -s smoke "bash motionbricks/scripts/cloud/run_planner_smoke_8gpu.sh"
        tmux a -t smoke
   5. Full training run:
-       tmux new -d -s plan_train "bash motionbricks/scripts/cloud/run_planner_train_8gpu.sh"
+       tmux new -d -s plan_train "bash motionbricks/scripts/cloud/run_planner_train.sh"
        tmux a -t plan_train
 ================================================================================
 EOF

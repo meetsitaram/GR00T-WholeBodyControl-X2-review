@@ -24,7 +24,7 @@
 #   tmux a -t smoke              # attach to watch, Ctrl-b d to detach
 #   tail -f ~/plan_smoke.log     # ...or tail the log file
 #
-# Override knobs (env vars passed straight through to run_planner_train_8gpu.sh):
+# Override knobs (env vars passed straight through to run_planner_train.sh):
 #   NUM_GPUS, PKL, BATCH_PER_GPU, NUM_WORKERS, USE_WANDB, WANDB_PROJECT,
 #   VQVAE_STEPS, POSE_STEPS, ROOT_STEPS, SAVE_EVERY, LOG_FILE, STAGE_LOG_DIR
 
@@ -55,4 +55,4 @@ if [[ ! -f "$REPO_ROOT/$PKL" ]]; then
 fi
 
 # Delegate to the full training launcher with smoke-tier step counts.
-bash "$(dirname "${BASH_SOURCE[0]}")/run_planner_train_8gpu.sh"
+bash "$(dirname "${BASH_SOURCE[0]}")/run_planner_train.sh"
