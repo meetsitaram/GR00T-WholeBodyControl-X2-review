@@ -822,6 +822,30 @@ LOCO_DECOUPLED_ARMS=1 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh
 LOCO_DECOUPLED_ARMS=0 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh
 ```
 
+**Convenience wrapper for walk-only sessions**: since the
+``LOCO_DECOUPLED_ARMS=0`` config gave a subjectively cleaner walk on
+the first A/B trial (2026-05-30), a thin exec-wrapper hard-codes that
+value as the default so operators can launch a walking-friendly
+stack without remembering the env var:
+
+```bash
+./gear_sonic/scripts/run_x2_quest3_wholebody_walk.sh
+```
+
+All flags accepted by the main stack are forwarded transparently
+(it ends in an ``exec`` to the main script), and an operator can
+still flip back to the override path for a same-session regression
+check by supplying the env var or wrapper CLI flag explicitly:
+
+```bash
+LOCO_DECOUPLED_ARMS=1 ./gear_sonic/scripts/run_x2_quest3_wholebody_walk.sh
+./gear_sonic/scripts/run_x2_quest3_wholebody_walk.sh --loco-decoupled-arms 1
+```
+
+The walk wrapper is intentionally a tiny shim and contains no
+stack-level logic -- bug fixes and feature changes land in
+``run_x2_quest3_planner_stack.sh`` so both stacks benefit.
+
 Compare on:
 
 | Axis | What to watch |
