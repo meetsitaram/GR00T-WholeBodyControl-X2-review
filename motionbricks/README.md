@@ -202,6 +202,11 @@ For a step-by-step guide to training MotionBricks on your own motion data and ad
 X2 skeleton classes, BONES-SEED walk/turn filtering, and training entrypoints live under
 [docs/x2_walk_turn_training.md](docs/x2_walk_turn_training.md).
 
+The evaluation harness for the trained planner (per-model isolation tests,
+end-to-end velocity sweeps, X2-vs-G1 parity comparison, scripted-demo runner,
+dual-skeleton MuJoCo viewer) is documented in
+[docs/x2_kplanner_evaluation.md](docs/x2_kplanner_evaluation.md).
+
 ## Related Work
 
 **Kimodo** — A sibling project focused on offline motion generation, complementary to MotionBricks' real-time runtime.
