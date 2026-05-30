@@ -1227,6 +1227,109 @@ def _load_warmup_qpos(path: Optional[Path]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+# Default time constant for the cold-start velocity ramp (s). See
+# ``_ColdStartVelocityRamp`` for the full rationale; 0.0 disables the
+# ramp (the worker passes intent through verbatim, matching the
+# pre-2026-05-30 behavior). Operators tune this via the kplanner CLI
+# (``--cold-start-ramp-tau-s``) or the Quest 3 / PKL wrappers'
+# ``KPLANNER_COLD_START_RAMP_TAU_S`` env var.
+_DEFAULT_COLD_START_RAMP_TAU_S: float = 0.20
+
+
+class _ColdStartVelocityRamp:
+    """Per-channel EWMA velocity ramp to smooth idle -> playing transitions.
+
+    The kplanner's neural root model trains exclusively on steady-state
+    walking loops (e.g. ``Loop_Forward_Walk_001__A018``); it never sees
+    a static-stand -> walking transition. When the operator's L-stick
+    first crosses the deadzone, the state machine fires IDLE_LOOP ->
+    PLAYING which:
+
+    1. calls ``planner_core.reset(warm)``, wiping the 4-frame context
+       ring buffer and refilling it with 4 identical static-stand
+       poses;
+    2. forwards the raw operator target (e.g. ``vel_z = +0.5 m/s``)
+       to ``replan_with_velocity``.
+
+    ``NeuralPlannerCore`` then builds an implied target position at
+    ``current_xy + vel * TARGET_HORIZON_S`` (= ``current_xy + 0.5 *
+    2.13 = current_xy + 1.07 m`` in this example), meaning the model is
+    asked to project from "4 frames of static stand" to "1 m ahead in
+    2.13 s" in a single replan. Because the model has no training
+    coverage for that regime, the highest-likelihood prediction
+    channel is **pelvis x-translation rather than leg swing**; the
+    deploy policy faithfully tracks that and the operator sees
+    "torso bends forward, no step". After ~2-4 replans the buffer is
+    filled with the model's own (now non-static) predictions and the
+    gait stabilises.
+
+    The ramp keeps (yaw_rate, vel_x, vel_z) close to zero for the
+    first few replans after PLAYING entry, so the implied target stays
+    close to the robot's actual position and the model emits gentler
+    forward motion the policy can step into. ``hip_h`` (channel 3) is
+    NOT ramped -- it's a posture target, not a velocity, and the
+    model needs the correct walking pelvis height from frame 1.
+
+    Time constant defaults to 0.2 s. At a 200 ms replan period
+    (``--replan-threshold-frames 2`` + 30 FPS output) that yields
+    alpha ~= 0.5, reaching ~95% of the operator's target in ~3
+    replans (600 ms). Operators wanting snappier acceleration can
+    drop this; ``tau = 0`` disables the ramp entirely (pre-fix
+    behaviour).
+
+    Deceleration is handled by the IDLE gate, not by this ramp:
+    releasing the stick makes ``intent_to_velocity`` resolve to
+    ``_IDLE_INTENT``, the state machine fires PLAYING -> IDLE_LOOP,
+    and the publisher freezes the anchor pose immediately. The
+    ramper's idle-detection (``last_was_idle``) just makes sure the
+    NEXT idle->playing transition starts the ramp from zero again.
+    """
+
+    def __init__(self, tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S) -> None:
+        self.tau_s = float(tau_s)
+        # (yaw_rate, vel_x, vel_z) -- hip_h passed through verbatim.
+        self._smoothed = np.zeros(3, dtype=np.float64)
+        self._last_was_idle = True
+
+    @property
+    def enabled(self) -> bool:
+        return self.tau_s > 0.0
+
+    def step(
+        self,
+        target: tuple[float, float, float, float],
+        dt_s: float,
+    ) -> tuple[float, float, float, float]:
+        """Advance the ramp by ``dt_s`` and return the smoothed target.
+
+        When the previous tick was idle (== the operator just started
+        pushing the stick or we're in the very first PLAYING entry)
+        the smoothed state is reset to zero so the new push gets the
+        full ramp. ``hip_h`` is forwarded verbatim from ``target``.
+        """
+        yaw, vx, vz, hip = target
+        if self._last_was_idle:
+            self._smoothed.fill(0.0)
+        target_vec = np.array([yaw, vx, vz], dtype=np.float64)
+        if self.tau_s <= 0.0 or dt_s <= 0.0:
+            self._smoothed = target_vec
+        else:
+            alpha = float(dt_s) / (self.tau_s + float(dt_s))
+            self._smoothed += alpha * (target_vec - self._smoothed)
+        self._last_was_idle = False
+        return (
+            float(self._smoothed[0]),
+            float(self._smoothed[1]),
+            float(self._smoothed[2]),
+            float(hip),
+        )
+
+    def reset_idle(self) -> None:
+        """Mark the next ``step()`` as a fresh idle->playing entry."""
+        self._smoothed.fill(0.0)
+        self._last_was_idle = True
+
+
 class IntentState:
     """Thread-safe holder for the current velocity-intent target."""
 
@@ -1255,6 +1358,7 @@ def _planner_worker(
     pose_lock: Optional[threading.Lock] = None,
     pose_max_age_s: float = 0.5,
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
+    cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
 ) -> None:
     """Replan refill loop. Runs predict() each time the buffer drops below
     threshold, holding ``replan_lock`` only for the cursor swap (the predict
@@ -1283,6 +1387,22 @@ def _planner_worker(
     else:
         log.info("planner worker: closed-loop pose reseed DISABLED (open-loop)")
 
+    cold_start_ramp = _ColdStartVelocityRamp(tau_s=cold_start_ramp_tau_s)
+    if cold_start_ramp.enabled:
+        log.info(
+            "planner worker: cold-start velocity ramp ENABLED (tau=%.3fs); "
+            "applies EWMA to (yaw_rate, vel_x, vel_z) channels on every "
+            "idle -> playing entry so the model's implied target stays "
+            "close to current pose for the first 2-3 replans",
+            cold_start_ramp.tau_s,
+        )
+    else:
+        log.info(
+            "planner worker: cold-start velocity ramp DISABLED (tau=0); "
+            "raw operator intent is forwarded verbatim (pre-fix behaviour)"
+        )
+    last_replan_mono: Optional[float] = None
+
     reseed_stats = {
         "applied": 0,
         "skipped_insufficient": 0,
@@ -1307,7 +1427,42 @@ def _planner_worker(
         if tuple(target) == _IDLE_INTENT:
             # Idle -- publisher holds the static anchor; no neural frames
             # are being consumed. Don't replan.
+            #
+            # Mark the cold-start ramp idle so the NEXT non-idle replan
+            # starts ramping from zero again. Without this the ramp's
+            # smoothed state would persist across idle gaps and the
+            # operator's "release then re-push" pattern would skip the
+            # ramp on the second push -- which IS what we want for
+            # brief blips through idle, but breaks for sustained idle
+            # where the buffer drifts away from walking context. The
+            # idle gate in the worker doesn't track time-in-idle, so
+            # we conservatively reset on every idle tick: a 1-tick
+            # idle blip costs <50 ms of ramp time on resumption.
+            cold_start_ramp.reset_idle()
+            last_replan_mono = None
             continue
+
+        # Cold-start velocity ramp: smooth (yaw_rate, vel_x, vel_z) on
+        # idle -> playing transitions so the model's implied target
+        # (= current_xy + vel * 2.13 s) doesn't jump 1 m+ ahead while
+        # the context buffer still holds 4 frames of static stand
+        # pose. hip_h (channel 3) passes through verbatim. See
+        # ``_ColdStartVelocityRamp`` docstring for the full mechanism.
+        now_mono = time.monotonic()
+        if last_replan_mono is None:
+            dt_s = 1.0 / OUTPUT_FPS  # first replan in this PLAYING segment
+        else:
+            dt_s = max(1e-3, now_mono - last_replan_mono)
+        smoothed_target = cold_start_ramp.step(tuple(target), dt_s)
+        last_replan_mono = now_mono
+        if smoothed_target != tuple(target) and log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "worker: cold-start ramp dt=%.3fs raw=%s -> smoothed=%s",
+                dt_s, tuple(target), smoothed_target,
+            )
+        # Use the smoothed target from here on -- the model and the
+        # closed-loop reseed both operate on the same vector.
+        target = smoothed_target
 
         if feedback_enabled:
             with replan_lock:
@@ -1399,6 +1554,7 @@ def run(
     pose_feedback_max_age_s: float = 0.5,
     pose_feedback_deque_maxlen: int = 32,
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
+    cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
 ) -> int:
     _setup_logging(verbose)
 
@@ -1587,6 +1743,7 @@ def run(
             "pose_lock": pose_lock,
             "pose_max_age_s": float(pose_feedback_max_age_s),
             "pose_reseed_scope": pose_reseed_scope,
+            "cold_start_ramp_tau_s": float(cold_start_ramp_tau_s),
         },
         name="kplanner-worker",
         daemon=True,
@@ -2134,6 +2291,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "'full_root'."
         ),
     )
+    p.add_argument(
+        "--cold-start-ramp-tau-s",
+        type=float,
+        default=_DEFAULT_COLD_START_RAMP_TAU_S,
+        help=(
+            "Time constant (s) for the cold-start velocity ramp applied on "
+            "every idle -> playing transition. Smooths (yaw_rate, vel_x, "
+            "vel_z) via per-channel EWMA so the model's implied 2.13 s target "
+            "doesn't jump 1 m+ ahead while the context buffer still holds 4 "
+            "frames of static stand pose. Default 0.20 s ~= 95%% of operator "
+            "target after ~3 replans at threshold=2. Set 0.0 to disable the "
+            "ramp (raw intent verbatim; pre-fix behaviour). hip_h is never "
+            "ramped -- it's a posture target, not a velocity."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -2173,6 +2345,7 @@ def main(argv: list[str] | None = None) -> int:
         pose_feedback_max_age_s=args.pose_feedback_max_age_s,
         pose_feedback_deque_maxlen=args.pose_feedback_deque_maxlen,
         pose_reseed_scope=args.pose_reseed_scope,
+        cold_start_ramp_tau_s=args.cold_start_ramp_tau_s,
     )
 
 

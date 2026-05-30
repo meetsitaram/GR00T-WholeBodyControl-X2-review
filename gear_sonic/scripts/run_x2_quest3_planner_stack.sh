@@ -392,6 +392,15 @@ KPLANNER_LATERAL_SCALE="${KPLANNER_LATERAL_SCALE:-}"
 # deadzone-feel (need to push the stick hard to move). Set via env
 # ``KPLANNER_STICK_SHAPE_EXP=0.5`` for a faster walking feel.
 KPLANNER_STICK_SHAPE_EXP="${KPLANNER_STICK_SHAPE_EXP:-}"
+# Cold-start velocity ramp time constant (s). Smooths (yaw_rate, vel_x,
+# vel_z) on every idle -> playing transition so the model's implied
+# 2.13 s target doesn't jump 1 m+ ahead while the context buffer still
+# holds 4 frames of static stand pose -- the "torso bends forward, no
+# step on cold start" failure mode reported on 2026-05-30. Default
+# empty -> x2_kplanner.py default (0.20 s, ~3-replan ramp at thresh=2).
+# Set ``KPLANNER_COLD_START_RAMP_TAU_S=0`` to disable the ramp and
+# reproduce the pre-fix behaviour.
+KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
 
 # --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
@@ -580,6 +589,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-backward-scale) KPLANNER_BACKWARD_SCALE="$2"; shift 2 ;;
         --kplanner-lateral-scale) KPLANNER_LATERAL_SCALE="$2"; shift 2 ;;
         --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
+        --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
         --vla-bridge) VLA_BRIDGE_MODEL="$2"; shift 2 ;;
         --vla-bridge-sonic-checkpoint)
@@ -1838,6 +1848,9 @@ else
     fi
     if [[ -n "${KPLANNER_LATERAL_SCALE}" ]]; then
         PLANNER_ARGS+=(--lateral-scale "${KPLANNER_LATERAL_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
+        PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
     fi
     if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
         PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")

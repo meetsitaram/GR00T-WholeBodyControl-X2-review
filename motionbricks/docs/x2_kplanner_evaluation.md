@@ -557,3 +557,88 @@ order) are:
   documented above; the per-replan yaw bias and the model's
   preference for stand-pose-shaped predictions both live in the
   trained weights.
+
+#### Cold-start velocity ramp (2026-05-30, follow-up)
+
+**Symptom**: even after the hip-height fix, the operator reports a
+distinct startup signature -- *"robot struggles to start moving
+from standing and the torso ends up bending forward trying for the
+movement. once it starts taking steps, things look decent"*. This
+is the same root cause as the hip-height bug (model trained only on
+steady-state walking loops, never sees a stand-to-walk transition)
+but expresses through a different channel.
+
+**Mechanism**. At the moment the L-stick crosses the deadzone:
+
+1. The state machine fires IDLE_LOOP → PLAYING, calls
+   ``planner_core.reset(warm)``, and the 4-frame context ring
+   buffer is refilled with 4 identical copies of the warm stand
+   pose (``hip_z = 0.636 m``, joints = ``default_angles``).
+2. ``intent_state`` is set to the operator's full target velocity
+   in one tick (e.g. ``vel_z = +0.5 m/s`` on a sharp forward push).
+3. The worker calls ``replan_with_velocity((0, 0, 0.5, 0.687))``.
+4. ``NeuralPlannerCore`` builds ``implied_target_y = 0.687`` and
+   ``implied_target_x = context_global_root_pos[-1, 0] + 0.5 *
+   TARGET_HORIZON_S = current_x + 1.07 m``.
+5. The model is asked to project from "4 frames of static stand" to
+   "1.07 m ahead in 2.13 s". The training distribution is
+   *Loop_Forward_Walk_001__A018* -- pure steady-state gait -- so
+   the model has no calibrated coverage for this regime. The
+   highest-likelihood prediction channel becomes **pelvis
+   x-translation** (root pose moves forward) rather than leg swing;
+   the deploy policy tracks the moving pelvis reference, the feet
+   stay planted (because the model didn't shape a step into the
+   first prediction), and the operator sees the torso bow forward.
+6. After ~2-4 replans the ring buffer fills with the model's own
+   (now non-static) predictions, the model has in-distribution
+   context, and a real gait emerges -- which is the "once it starts
+   taking steps, things look decent" phase.
+
+**Fix**: a per-channel EWMA velocity ramp
+(``_ColdStartVelocityRamp`` in ``x2_kplanner.py``) sits between
+``intent_state.get()`` and ``replan_with_velocity`` in the worker.
+On every idle → playing transition (detected by an
+``intent_state.get() == _IDLE_INTENT`` tick) the ramper's smoothed
+state is reset to zero; subsequent ticks advance via the standard
+discrete EWMA update ``smoothed += alpha * (target - smoothed)``
+with ``alpha = dt / (tau + dt)``. ``hip_h`` (channel 3) is NOT
+ramped -- it's a posture target, not a velocity, and the model
+needs the correct walking pelvis height from frame 1.
+
+Default ``tau = 0.20 s``. At a 200 ms replan period
+(``--replan-threshold-frames 2`` + 30 FPS output) this yields
+``alpha = 0.5``, reaching ~95% of the operator's target after
+~3 replans (~600 ms). Empirically: the implied target jump on the
+first replan drops from 1.07 m → 0.53 m, which is well inside the
+model's training distribution. The full ramp sequence on a step
+input of 0.5 m/s is:
+
+| replan | smoothed vel_z | implied 2.13 s target ahead |
+|-------:|---------------:|----------------------------:|
+| 1 | 0.250 m/s | 0.53 m |
+| 2 | 0.375 m/s | 0.80 m |
+| 3 | 0.4375 m/s | 0.93 m |
+| 4 | 0.469 m/s | 1.00 m |
+| 5 | 0.484 m/s | 1.03 m (steady-state ~1.07 m) |
+
+**Tunables**:
+
+* ``--cold-start-ramp-tau-s SEC`` on ``x2_kplanner.py`` directly.
+* ``KPLANNER_COLD_START_RAMP_TAU_S`` env var or
+  ``--kplanner-cold-start-ramp-tau-s SEC`` flag on both
+  ``run_x2_quest3_planner_stack.sh`` and
+  ``run_x2_pkl_planner_stack.sh``.
+* ``tau = 0`` reproduces the pre-fix verbatim behaviour and is
+  retained for regression testing.
+
+**Why this isn't a workaround masking the real issue**. The
+underlying gap is "model has no stand-to-walk transition coverage".
+The proper fix is model retraining with an explicit start-of-motion
+curriculum. The ramp is a lossless adapter that maps the operator's
+step-input intent onto a target profile the model *does* have
+coverage for; once a future checkpoint ships with transition
+coverage, raising ``tau`` to 0 (or removing the ramp entirely)
+won't regress steady-state behaviour. The ramper class is unit
+tested in ``tests/test_x2_kplanner_cold_start_ramp.py`` (EWMA
+arithmetic, hip_h passthrough, reset_idle semantics, release-then-
+repush patterns).

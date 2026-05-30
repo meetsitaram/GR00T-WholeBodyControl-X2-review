@@ -154,6 +154,13 @@ KPLANNER_WARMUP_QPOS=""
 KPLANNER_DEVICE="cuda"
 KPLANNER_REPLAN_THRESHOLD_FRAMES="16"
 KPLANNER_YAW_LOCK_EPSILON="0.0"
+# Cold-start velocity ramp time constant (s). PKL replay uses
+# constant-intent / mean-intent which already produces a steady
+# velocity, so the ramp matters less here than for Quest 3 -- but
+# leaving it accessible lets capture sweeps quantify the effect
+# without re-editing x2_kplanner.py. Default empty -> daemon default
+# (0.20 s); set to 0 to bypass the ramp entirely.
+KPLANNER_COLD_START_RAMP_TAU_S=""
 
 WARMUP_QUIET_STAND_S="2.0"
 SIM_RSI_PKL="${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_kplanner_rsi_anchor.pkl"
@@ -190,6 +197,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-device) KPLANNER_DEVICE="$2"; shift 2 ;;
         --kplanner-replan-threshold-frames) KPLANNER_REPLAN_THRESHOLD_FRAMES="$2"; shift 2 ;;
         --kplanner-yaw-lock-epsilon) KPLANNER_YAW_LOCK_EPSILON="$2"; shift 2 ;;
+        --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --kplanner-python) KPLANNER_PYTHON="$2"; shift 2 ;;
         --model) SIM_MODEL="$2"; shift 2 ;;
         --log-dir) LOG_DIR="$2"; shift 2 ;;
@@ -675,6 +683,9 @@ PLANNER_ARGS=(
     --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
     --yaw-lock-epsilon "${KPLANNER_YAW_LOCK_EPSILON}"
 )
+if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
+    PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
+fi
 if [[ "${WITH_POSE_FEEDBACK}" -eq 1 ]]; then
     PLANNER_ARGS+=(
         --pose-feedback-host "${POSE_FEEDBACK_HOST}"
