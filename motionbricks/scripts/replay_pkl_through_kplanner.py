@@ -131,9 +131,12 @@ def _intent_from_clip(qpos: np.ndarray, fps: float, n_context: int) -> tuple[flo
     dy_body = s * dx_world + c * dy_world
     hip_h = float(trans[:, 2].mean())
     yaw_rate = dyaw / duration_s
-    vel_x_body = dx_body / duration_s
-    vel_z_body = dy_body / duration_s  # MuJoCo +Y == motion-rep +Z (the lateral axis)
-    return yaw_rate, vel_x_body, vel_z_body, hip_h
+    # Channel convention (matches NeuralPlannerCore._predict_with_velocity):
+    #   vel_x = motion-rep X = MuJoCo body-Y = LATERAL  -> dy_body
+    #   vel_z = motion-rep Z = MuJoCo body-X = FORWARD  -> dx_body
+    vel_x_lateral = dy_body / duration_s
+    vel_z_forward = dx_body / duration_s
+    return yaw_rate, vel_x_lateral, vel_z_forward, hip_h
 
 
 def _per_joint_rms(pred: np.ndarray, actual: np.ndarray) -> np.ndarray:
@@ -183,9 +186,12 @@ def _instant_intent_from_clip(
     dy_body = s * dx_world + c * dy_world
     hip_h = float(trans[:, 2].mean())
     yaw_rate = dyaw / duration_s
-    vel_x = dx_body / duration_s
-    vel_z = dy_body / duration_s
-    return yaw_rate, vel_x, vel_z, hip_h
+    # Channel convention (matches NeuralPlannerCore._predict_with_velocity):
+    #   vel_x = motion-rep X = MuJoCo body-Y = LATERAL  -> dy_body
+    #   vel_z = motion-rep Z = MuJoCo body-X = FORWARD  -> dx_body
+    vel_x_lateral = dy_body / duration_s
+    vel_z_forward = dx_body / duration_s
+    return yaw_rate, vel_x_lateral, vel_z_forward, hip_h
 
 
 def _run_full_clip_replay(

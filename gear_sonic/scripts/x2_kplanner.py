@@ -77,9 +77,22 @@ log = logging.getLogger("x2_kplanner")
 
 # ---------------------------------------------------------------------------
 # Intent -> velocity dispatcher. The neural model consumes a continuous
-# 4-D vector ``(yaw_rate_rad_s, vel_x_m_s, vel_z_m_s, hip_height_m)``;
-# ``vel_z`` is lateral (positive = +Z = robot's left, see
-# local_root_local_body.py:38 for the canonical channel order).
+# 4-D vector ``(yaw_rate_rad_s, vel_x_m_s, vel_z_m_s, hip_height_m)``.
+#
+# CHANNEL CONVENTION (verified against the X2 + G1 mujoco converter and
+# the LocalRootLocalBody motion-rep, see
+# ``motionbricks/scripts/probe_root_constraint_modes.py``):
+#
+#   * ``vel_x`` = motion-rep X = MuJoCo Y = **lateral** (positive = +X
+#     in the motion-rep frame = robot's LEFT after canonicalization).
+#   * ``vel_z`` = motion-rep Z = MuJoCo X = **forward** (positive = +Z
+#     in the motion-rep frame = robot's FORWARD after canonicalization).
+#
+# The earlier docstring claim that "vel_z is lateral" was WRONG and the
+# original ``_BASE_VELOCITY`` table fed forward speed into vel_x, which
+# the model interpreted as a lateral command. Combined with the
+# velocity-only target masking in NeuralPlannerCore (now fixed), this
+# explains the historical "robot doesn't walk forward" symptom.
 #
 # Vocabulary contract with ``quest3_manager_x2``: the manager's
 # ``IntentDecoder`` was authored for the heuristic planner's curated
@@ -127,11 +140,12 @@ _IDLE_INTENT: tuple[float, float, float, float] = (0.0, 0.0, 0.0, _HIP_HEIGHT_M)
 # Direction-explicit 1× velocity vector per intent. Magnitude is applied
 # separately via ``_TRANSLATIONAL_SCALE`` / ``_TURN_SCALE`` below.
 _BASE_VELOCITY: dict[str, tuple[float, float, float, float]] = {
+    # (yaw_rate, vel_x=lateral, vel_z=forward, hip_h).
     "idle":       (0.0,             0.0,                  0.0,                _HIP_HEIGHT_M),
-    "fwd_step":   (0.0,             _WALK_SPEED_MPS,      0.0,                _HIP_HEIGHT_M),
-    "back_step":  (0.0,            -_BACK_SPEED_MPS,      0.0,                _HIP_HEIGHT_M),
-    "side_left":  (0.0,             0.0,                  _SIDE_SPEED_MPS,    _HIP_HEIGHT_M),
-    "side_right": (0.0,             0.0,                 -_SIDE_SPEED_MPS,    _HIP_HEIGHT_M),
+    "fwd_step":   (0.0,             0.0,                  _WALK_SPEED_MPS,    _HIP_HEIGHT_M),
+    "back_step":  (0.0,             0.0,                 -_BACK_SPEED_MPS,    _HIP_HEIGHT_M),
+    "side_left":  (0.0,             _SIDE_SPEED_MPS,      0.0,                _HIP_HEIGHT_M),
+    "side_right": (0.0,            -_SIDE_SPEED_MPS,      0.0,                _HIP_HEIGHT_M),
     "turn_left":  ( _TURN_45_RAD_S, 0.0,                  0.0,                _HIP_HEIGHT_M),
     "turn_right": (-_TURN_45_RAD_S, 0.0,                  0.0,                _HIP_HEIGHT_M),
 }
@@ -168,9 +182,10 @@ _ROTATIONAL_INTENTS: frozenset[str] = frozenset({"turn_left", "turn_right"})
 # semantics. Unknown ``walk`` magnitudes idle out (safe default for
 # unrecognised direction).
 _WALK_VELOCITY_BY_MAGNITUDE: dict[str, tuple[float, float, float, float]] = {
-    "forward":  (0.0,  _WALK_SPEED_MPS,      0.0, _HIP_HEIGHT_M),
-    "backward": (0.0, -_BACK_SPEED_MPS,      0.0, _HIP_HEIGHT_M),
-    "fast":     (0.0,  _FAST_WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
+    # (yaw_rate, vel_x=lateral, vel_z=forward, hip_h).
+    "forward":  (0.0, 0.0,  _WALK_SPEED_MPS,      _HIP_HEIGHT_M),
+    "backward": (0.0, 0.0, -_BACK_SPEED_MPS,      _HIP_HEIGHT_M),
+    "fast":     (0.0, 0.0,  _FAST_WALK_SPEED_MPS, _HIP_HEIGHT_M),
 }
 
 # Runtime tuning scalars applied on top of the resolved velocity. Defaults

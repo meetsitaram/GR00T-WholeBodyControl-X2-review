@@ -90,6 +90,12 @@ class NeuralPlannerCore(nn.Module):
     DEFAULT_PRED_OFFSETS: int = 4
     NUM_MIN_FRAMES_IN_BUFFER: int = 64
     DEFAULT_PLANNING_HORIZON_S: float = 1.0
+    # Default time-horizon over which to integrate velocity_intent into the
+    # implied target_global_root_values constraint. ~2.13 s matches the
+    # model's MASKED_NUM_TOKENS * NUM_FRAMES_PER_TOKEN / fps default at
+    # 30 fps, i.e. the natural full-horizon length the model was
+    # trained to predict per replan window.
+    DEFAULT_TARGET_HORIZON_S: float = 2.0
 
     def __init__(
         self,
@@ -101,6 +107,8 @@ class NeuralPlannerCore(nn.Module):
         force_canonicalization: bool = True,
         skip_ending_target_cond: bool = True,
         replan_threshold_frames: int = 16,
+        use_implied_target_pos: bool = True,
+        target_horizon_s: float = DEFAULT_TARGET_HORIZON_S,
     ) -> None:
         super().__init__()
         self._inferencer = inferencer.eval().to(device)
@@ -113,6 +121,15 @@ class NeuralPlannerCore(nn.Module):
         self.FILTER_QPOS = filter_qpos
         self.FORCE_CANONICALIZATION = force_canonicalization
         self.SKIP_ENDING_TARGET_COND = skip_ending_target_cond
+        # When True, build target_global_root_values from
+        # ``last_context_pos + velocity_intent * target_horizon_s`` and
+        # mark has_global_root_values[:, -NUM_FT:] = True. This matches
+        # the training distribution (the G1 demo's
+        # ``target_root_realignment=True`` path) and is what unlocks
+        # actual velocity tracking. Set to False only to reproduce the
+        # legacy velocity-only behavior for ablation diagnostics.
+        self.USE_IMPLIED_TARGET_POS = use_implied_target_pos
+        self.TARGET_HORIZON_S = float(target_horizon_s)
         self.REPLAN_THRESHOLD_FRAMES = replan_threshold_frames
 
         self.frames: dict = {
@@ -228,11 +245,27 @@ class NeuralPlannerCore(nn.Module):
 
         Args:
             velocity_intent: [4] or [B, 4] tensor with channels
-                `[yaw_rate_rad_s, vel_x_m_s, vel_z_m_s, hip_height_m]`. This is
-                broadcast across all 4 target frames in the constraint window.
-                Note Y is the gravity axis in the local-motion-rep coordinate
-                frame; the lateral channel is `vel_z`, not `vel_y`. See the
-                channel order assertion below.
+                ``[yaw_rate_rad_s, vel_x_m_s, vel_z_m_s, hip_height_m]``,
+                broadcast across all 4 target frames in the constraint
+                window.
+
+                **Channel semantics** (verified against the X2 + G1
+                mujoco converter via
+                ``scripts/probe_root_constraint_modes.py``):
+
+                * Y is the gravity axis in the local-motion-rep coordinate
+                  frame.
+                * ``vel_x`` = motion-rep X axis = MuJoCo Y =
+                  **lateral** body-frame velocity (positive = robot's
+                  left after canonicalization).
+                * ``vel_z`` = motion-rep Z axis = MuJoCo X =
+                  **forward** body-frame velocity (positive = robot's
+                  forward after canonicalization).
+
+                Earlier docs (incorrectly) called vel_z lateral; the
+                converter rotation ``mujoco_to_motion`` maps mujoco-X
+                (mjcf forward) -> motion-Z, so velocity_intent[2] is
+                what walks the robot forward.
             num_tokens: Override the model's MASKED_NUM_TOKENS sentinel. Default
                 None lets the root model predict the horizon length.
 
@@ -352,13 +385,49 @@ class NeuralPlannerCore(nn.Module):
         )
 
         # ----------------------------------------------------------------
-        # Target 4 frames: only target_local_root_values is meaningful
-        # (broadcast from velocity_intent). target_global_root_values and
-        # target_local_poses are zeros + masked off (no world-frame target
-        # pose, no joint-pose constraint -- the VQVAE free-samples).
+        # Target 4 frames.
+        #
+        # ``target_local_root_values`` is broadcast from velocity_intent
+        # (per-frame velocity / yaw_rate / hip_height the model should
+        # see across the target window).
+        #
+        # ``target_global_root_values``:
+        #   * In ``USE_IMPLIED_TARGET_POS`` mode (default, matches the
+        #     G1 demo's ``target_root_realignment=True`` training-time
+        #     distribution): set the target world-frame xz / heading
+        #     to the *implied* position after integrating velocity_intent
+        #     forward by ``TARGET_HORIZON_S`` seconds, and KEEP
+        #     ``has_global_root_values[:, -NUM_FT:] = True``. Empirically
+        #     this jumps the per-token forward-tracking slope from
+        #     ~0.07 to ~0.95 on both X2 and G1 reference checkpoints
+        #     (see ``scripts/probe_root_constraint_modes.py``).
+        #   * In legacy mode (``use_implied_target_pos=False``): zero +
+        #     mask off, reproducing the original velocity-only behavior.
         # ----------------------------------------------------------------
-        target_global_root_values = t.zeros([batch_size, NUM_FT, 5], device=device)
         target_local_root_values = velocity_intent[:, None, :].expand([batch_size, NUM_FT, 4]).contiguous()
+
+        if self.USE_IMPLIED_TARGET_POS:
+            # Build implied target_global_root_values from velocity intent.
+            # Layout: [x, y_up_hip_height, z, cos_heading, sin_heading].
+            implied_target_x = context_global_root_pos[:, -1:, 0] + velocity_intent[:, 1:2] * self.TARGET_HORIZON_S
+            implied_target_z = context_global_root_pos[:, -1:, 2] + velocity_intent[:, 2:3] * self.TARGET_HORIZON_S
+            implied_target_y = velocity_intent[:, 3:4]  # hip_height (channel 3 of intent)
+            implied_target_pos = t.cat([implied_target_x, implied_target_y, implied_target_z], dim=-1)
+            implied_target_pos = implied_target_pos[:, None, :].expand([batch_size, NUM_FT, 3])
+            implied_target_heading = (
+                context_rotation_angle[:, -1:] + velocity_intent[:, 0:1] * self.TARGET_HORIZON_S
+            )
+            implied_target_heading = implied_target_heading.expand([batch_size, NUM_FT])
+            target_global_root_values = t.cat(
+                [
+                    implied_target_pos,
+                    t.cos(implied_target_heading)[..., None],
+                    t.sin(implied_target_heading)[..., None],
+                ],
+                dim=-1,
+            )
+        else:
+            target_global_root_values = t.zeros([batch_size, NUM_FT, 5], device=device)
         target_local_poses = t.zeros_like(context_local_poses)
 
         # ----------------------------------------------------------------
@@ -374,11 +443,17 @@ class NeuralPlannerCore(nn.Module):
         # Last differenced velocity in the context window is invalid (no t+1
         # to differentiate against). Matches full_agent.py:457.
         has_local_root_values[:, NUM_FT - 1] = False
-        # No target world-frame position constraint: let the network integrate
-        # the velocity to find the end pose itself.
-        has_global_root_values[:, -NUM_FT:] = False
+        if not self.USE_IMPLIED_TARGET_POS:
+            # Legacy velocity-only mode: drop the world-frame target so the
+            # network is free to integrate however it wants. Empirically
+            # this collapses forward-tracking slope to ~0.07; kept only
+            # for ablation diagnostics.
+            has_global_root_values[:, -NUM_FT:] = False
         # No target keyframe pose: free-sample locomotion poses consistent
-        # with the velocity constraint.
+        # with the velocity + target_pos constraints. (Including a
+        # target keyframe pose adds only ~3% tracking improvement on the
+        # probe, and would require shipping a robot-specific stand-pose
+        # template here; not worth the coupling.)
         has_local_poses[:, -NUM_FT:] = False
 
         if self.diagnostic_mask_hook is not None:
