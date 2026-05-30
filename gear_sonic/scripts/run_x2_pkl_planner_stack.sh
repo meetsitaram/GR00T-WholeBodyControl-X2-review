@@ -51,6 +51,8 @@
 #       [--model PATH]
 #       [--velocity-window N]
 #       [--with-capture] [--capture-out DIR]
+#       [--no-pose-feedback] [--pose-feedback-host H] [--pose-feedback-port P]
+#       [--pose-feedback-topic T] [--pose-feedback-max-age-s S]
 #       [--cleanup-only]
 #       [--log-dir PATH]
 #
@@ -130,6 +132,21 @@ CAPTURE_OUT=""
 CONSTANT_INTENT=""
 USE_MEAN_INTENT=0
 
+# Closed-loop pose feedback: ON by default. The kplanner subscribes to
+# the sim bridge's robot_pose:5570 PUB and reseeds its 4-frame root
+# context from the robot's actually-observed pelvis pose just before
+# each replan. Pass --no-pose-feedback to fall back to the open-loop
+# behaviour (regression-test the diagnostic baseline).
+WITH_POSE_FEEDBACK=1
+POSE_FEEDBACK_HOST="127.0.0.1"
+POSE_FEEDBACK_PORT="5570"
+POSE_FEEDBACK_TOPIC="robot_pose"
+POSE_FEEDBACK_MAX_AGE_S="0.5"
+# 'full_root' overwrites xyz + quat (default). 'quat_only' overwrites
+# just the quat -- preserves the planner's xy overshoot which the
+# diagnostic runs showed actually HELPS forward tracking.
+POSE_RESEED_SCOPE="full_root"
+
 KPLANNER_VQVAE_CKPT=""
 KPLANNER_POSE_CKPT=""
 KPLANNER_ROOT_CKPT=""
@@ -181,6 +198,13 @@ while [[ $# -gt 0 ]]; do
         --capture-out) CAPTURE_OUT="$2"; WITH_CAPTURE=1; shift 2 ;;
         --constant-intent) CONSTANT_INTENT="$2"; shift 2 ;;
         --use-mean-intent) USE_MEAN_INTENT=1; shift ;;
+        --no-pose-feedback) WITH_POSE_FEEDBACK=0; shift ;;
+        --with-pose-feedback) WITH_POSE_FEEDBACK=1; shift ;;
+        --pose-feedback-host) POSE_FEEDBACK_HOST="$2"; shift 2 ;;
+        --pose-feedback-port) POSE_FEEDBACK_PORT="$2"; shift 2 ;;
+        --pose-feedback-topic) POSE_FEEDBACK_TOPIC="$2"; shift 2 ;;
+        --pose-feedback-max-age-s) POSE_FEEDBACK_MAX_AGE_S="$2"; shift 2 ;;
+        --pose-reseed-scope) POSE_RESEED_SCOPE="$2"; shift 2 ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
@@ -489,6 +513,7 @@ ${C_GREEN}┌──────────────────────�
   kplanner device  : ${KPLANNER_DEVICE}  python: ${KPLANNER_PYTHON}
   ports            : pose=${POSE_PORT}  x2_debug=${DEBUG_PORT}  planner_cmd=${PLANNER_CMD_PORT}
   capture          : $([[ "${WITH_CAPTURE}" -eq 1 ]] && echo "ON  -> ${CAPTURE_OUT}" || echo "OFF (pass --with-capture to record sim motion + compare to pkl)")
+  pose feedback    : $([[ "${WITH_POSE_FEEDBACK}" -eq 1 ]] && echo "ON  (closed-loop reseed scope=${POSE_RESEED_SCOPE} from ${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT}/${POSE_FEEDBACK_TOPIC}, max_age=${POSE_FEEDBACK_MAX_AGE_S}s)" || echo "OFF (open-loop baseline; pass --no-pose-feedback to keep this)")
 EOF
 echo
 
@@ -650,6 +675,15 @@ PLANNER_ARGS=(
     --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
     --yaw-lock-epsilon "${KPLANNER_YAW_LOCK_EPSILON}"
 )
+if [[ "${WITH_POSE_FEEDBACK}" -eq 1 ]]; then
+    PLANNER_ARGS+=(
+        --pose-feedback-host "${POSE_FEEDBACK_HOST}"
+        --pose-feedback-port "${POSE_FEEDBACK_PORT}"
+        --pose-feedback-topic "${POSE_FEEDBACK_TOPIC}"
+        --pose-feedback-max-age-s "${POSE_FEEDBACK_MAX_AGE_S}"
+        --pose-reseed-scope "${POSE_RESEED_SCOPE}"
+    )
+fi
 if [[ -n "${KPLANNER_VQVAE_CKPT}" ]]; then
     PLANNER_ARGS+=(--vqvae-ckpt "${KPLANNER_VQVAE_CKPT}")
 fi

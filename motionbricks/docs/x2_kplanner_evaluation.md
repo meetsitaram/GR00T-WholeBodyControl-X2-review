@@ -408,6 +408,67 @@ so the open-loop baseline above remains the regression target.
 
 #### Closed-loop reseed: results
 
-*(populated once the validation matrix from the closed-loop commit
-lands; placeholder so future readers see both hypothesis and outcome
-in one place)*
+**Verdict: the hypothesis is empirically wrong**. The mechanism works
+(reseed correctly overwrites the context indices the model is about
+to read; unit-tested in
+``tests/test_x2_kplanner_pose_feedback.py``), but in *every*
+measured configuration closed-loop reseed REGRESSES the open-loop
+baseline rather than improving it.
+
+Validation matrix (25 s runs on ``Loop_Forward_Walk_001__A018``;
+deploy = MuJoCo + SONIC policy, no viewer):
+
+| config                                                          | fwd tracking | sim yaw drift |
+|-----------------------------------------------------------------|--------------|---------------|
+| **A.** open-loop, mean intent + thresh=2 *(best-shippable)*     | **71.7%**    | **+57 deg**   |
+| B. open-loop, default per-frame intent + thresh=16              | 6.2%         | -124 deg      |
+| C. closed-loop **full_root**, mean intent + thresh=2            | 46.0%        | -72 deg       |
+| C'. closed-loop **quat_only**, mean intent + thresh=2           | 61.0%        | +96 deg       |
+| D. closed-loop **full_root**, default per-frame + thresh=16     | -7.5%        | -181 deg      |
+
+Run logs and raw captures under
+``/tmp/validation_runs/{A_openloop,B_openloop_default,C_v2,C_quat_only,D_closedloop_default}/``
+(each directory has ``capture/compare.json``, ``capture/capture.npz``,
+``capture/trajectory.png``).
+
+**Why the hypothesis was wrong.** Three reasons surfaced from the
+runs above:
+
+1. **The planner's xy overshoot was a feature, not a bug.** Open-loop
+   the planner's internal-model xy continuously runs slightly ahead of
+   the deploy's actual position (the policy can't track perfectly).
+   That overshoot acts as a *forward lure* the policy chases. Closed-
+   loop with ``full_root`` scope removes the overshoot (the planner's
+   xy is pinned to the deploy's lagging xy every replan) and forward
+   tracking drops 71.7% -> 46.0%.
+
+2. **``quat_only`` preserves the overshoot but doesn't help yaw drift
+   either.** The per-replan yaw bias lives in the model's prediction
+   head, not in the context. Feeding observed yaw context every replan
+   still lets the model output its biased prediction; the bias
+   compounds at the *predict()*-time scale rather than the
+   accumulate-across-replans scale, but the magnitude is the same.
+   Yaw drift went 71.7% -> 61.0% fwd with quat_only and yaw drift
+   GREW (+57 deg open-loop -> +96 deg closed-loop).
+
+3. **Context coherence matters more than context recency.** The
+   planner's own predictions are *self-consistent* (root xyz + joints
+   describe one body executing a smooth motion). The reseed creates
+   an inconsistency: root = observed (real, lagging), joints = model
+   predicted (assumed-ahead). The model's pose head sees this
+   mismatch and produces lower-quality predictions.
+
+The first-principles fix is **model retraining with longer rollouts**
+so the per-replan output is no longer biased. The architectural cap
+at 2.13 s prediction window is a hard constraint, but the *training*
+recipe can be changed to sample longer chained rollouts where the
+model sees its own prior outputs as context (closing the train/test
+gap that closed-loop reseed was trying to compensate for). Until
+that retrain ships, **open-loop config A (mean intent + thresh=2) is
+the current shippable recipe**.
+
+The closed-loop machinery (``--pose-feedback-host/port``,
+``--pose-reseed-scope full_root|quat_only``) is preserved in the
+codebase as an opt-in capability for future use cases (e.g. coarse
+re-localization after a deploy reset) and as a regression target so
+the negative result stays measurable.

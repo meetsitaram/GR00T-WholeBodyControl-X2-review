@@ -42,6 +42,7 @@ launcher that wires this up with the recorder + deploy + Quest3 stack.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -714,6 +716,207 @@ def _zmq_command_thread(
         sock.close(linger=0)
 
 
+# ---------------------------------------------------------------------------
+# Closed-loop pose feedback. The kplanner's chain of self-conditioned
+# replans accumulates yaw drift (see "Deploy-integration diagnostics" in
+# motionbricks/docs/x2_kplanner_evaluation.md). To break the loop we
+# subscribe to the sim bridge's ``robot_pose`` topic and, just before
+# each replan, overwrite the root rows the planner is about to read as
+# context with the robot's *actually observed* pelvis pose.
+#
+# Joint slots [7:] stay model-predicted on purpose: the policy's
+# joint-level tracking error would inject high-frequency noise into the
+# context if those were reseeded too. We only reseed the root because:
+#   1. It is the only channel where compounding drift was measured.
+#   2. Pelvis qpos is what robot_pose actually exposes.
+#   3. Joint reseed would require a separate observability path.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PoseObservation:
+    """One ``robot_pose`` sample.
+
+    ``pelvis_qpos_wxyz`` matches the bridge's wire format:
+    ``[x, y, z, qw, qx, qy, qz]`` (length 7), the same wxyz quat
+    convention NeuralPlannerCore stores in ``frames['mujoco_qpos']``.
+
+    ``t_mono`` is ``time.monotonic()`` at receive time. Used for staleness
+    checks so a frozen bridge doesn't keep feeding ancient observations
+    into the planner forever.
+    """
+
+    t_mono: float
+    pelvis_qpos_wxyz: np.ndarray  # shape (7,)
+
+
+def _pose_feedback_thread(
+    pose_deque: "collections.deque[PoseObservation]",
+    pose_lock: threading.Lock,
+    host: str,
+    port: int,
+    topic: str,
+    stop_event: threading.Event,
+) -> None:
+    """SUB on ``robot_pose:port`` and append observations to ``pose_deque``.
+
+    Drains as fast as the bridge publishes (~50 Hz). Deque has a maxlen
+    upstream so we don't grow unbounded if the worker stops draining.
+    """
+    import zmq
+    from gear_sonic.utils.teleop.zmq.robot_pose_zmq import unpack_robot_pose
+
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt_string(zmq.SUBSCRIBE, topic)
+    sock.setsockopt(zmq.RCVTIMEO, 200)
+    sock.connect(f"tcp://{host}:{port}")
+    log.info("pose feedback source: SUB %r on tcp://%s:%d", topic, host, port)
+    warn_once = False
+    msg_count = 0
+    try:
+        while not stop_event.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            try:
+                payload = unpack_robot_pose(raw)
+                qpos = payload.get("pelvis_qpos_wxyz")
+                if not isinstance(qpos, list) or len(qpos) != 7:
+                    continue
+                obs = PoseObservation(
+                    t_mono=time.monotonic(),
+                    pelvis_qpos_wxyz=np.asarray(qpos, dtype=np.float32),
+                )
+                with pose_lock:
+                    pose_deque.append(obs)
+                msg_count += 1
+                if msg_count == 1:
+                    log.info(
+                        "pose feedback: first observation received "
+                        "(xyz=%.3f,%.3f,%.3f qw=%.3f)",
+                        float(qpos[0]), float(qpos[1]), float(qpos[2]),
+                        float(qpos[3]),
+                    )
+            except Exception as exc:
+                if not warn_once:
+                    log.warning("pose feedback: decode error %s (suppressed)", exc)
+                    warn_once = True
+    finally:
+        sock.close(linger=0)
+
+
+_RESEED_SCOPE_FULL_ROOT = "full_root"
+_RESEED_SCOPE_QUAT_ONLY = "quat_only"
+_VALID_RESEED_SCOPES = (_RESEED_SCOPE_FULL_ROOT, _RESEED_SCOPE_QUAT_ONLY)
+
+
+def _reseed_root_from_observations(
+    planner_core,
+    pose_deque: "collections.deque[PoseObservation]",
+    pose_lock: threading.Lock,
+    max_age_s: float,
+    scope: str = _RESEED_SCOPE_FULL_ROOT,
+) -> Optional[str]:
+    """Overwrite the root rows the planner is about to read as context.
+
+    Mirrors the index math in
+    ``NeuralPlannerCore.get_context_mujoco_qpos`` so the context indices
+    computed here match the indices that ``replan_with_velocity`` will
+    read on its next call. Writes to ``frames['mujoco_qpos'][0, ctx_i,
+    0:7]`` only -- joints (slots 7:) stay model-predicted.
+
+    Caller MUST hold ``replan_lock`` because we mutate the in-place
+    tensor that the next ``predict()`` reads.
+
+    **Sampling strategy.** The model's 4-frame context window is
+    *trained* at 30 fps spacing (1/30 = 33 ms between frames). The
+    bridge's ``robot_pose`` stream runs at 50 Hz (20 ms spacing). Sampling
+    "the last 4 observations" would feed the model a 60 ms window
+    that it would interpret as a 100 ms window (with ~1.66x inflated
+    implied velocity) -- and worse, near the buffer tail the planner's
+    context indices collapse to ``[idx, last, last, last]`` so the
+    second-through-fourth writes simply overwrite each other, giving
+    the model a "robot teleported then froze" context that nothing in
+    training resembles.
+
+    Instead we walk backwards from "now" in 1/fps increments and pick
+    the deque entry closest to each target timestamp. For duplicate
+    context indices (common at the buffer tail) we let the per-slot
+    selection naturally collapse to the same observation -- the model
+    sees coherent "the robot is here, walking at the trained fps"
+    context.
+
+    Returns ``None`` on success, or a short skip-reason string.
+    """
+    import torch
+
+    buf = planner_core.frames.get("mujoco_qpos")
+    if buf is None:
+        return "buffer_uninitialized"
+
+    n_ft = int(planner_core.NUM_FRAMES_PER_TOKEN)
+
+    with pose_lock:
+        obs_list = list(pose_deque)
+
+    if len(obs_list) < n_ft:
+        return f"insufficient_obs ({len(obs_list)}/{n_ft})"
+
+    newest = obs_list[-1]
+    newest_age = time.monotonic() - newest.t_mono
+    if newest_age > max_age_s:
+        return f"stale_obs (age={newest_age:.3f}s > {max_age_s:.3f}s)"
+
+    model_fps = float(getattr(planner_core, "fps", 30.0) or 30.0)
+    target_spacing_s = 1.0 / model_fps
+
+    target_times = [
+        newest.t_mono - (n_ft - 1 - k) * target_spacing_s
+        for k in range(n_ft)
+    ]
+    selected: list[PoseObservation] = []
+    for tt in target_times:
+        best = min(obs_list, key=lambda o, _tt=tt: abs(o.t_mono - _tt))
+        selected.append(best)
+
+    idx = int(planner_core._current_frame_idx)
+    pred_off = int(planner_core.PRED_OFFSETS)
+    last_idx = int(buf.shape[1]) - 1
+    context_indices = [
+        max(0, min(idx - n_ft + i + pred_off, last_idx))
+        for i in range(n_ft)
+    ]
+
+    if scope not in _VALID_RESEED_SCOPES:
+        raise ValueError(
+            f"unknown reseed scope {scope!r}; want one of {_VALID_RESEED_SCOPES}"
+        )
+
+    device = buf.device
+    dtype = buf.dtype
+    # ``full_root`` rewrites xyz + quat; the open-loop diagnostic that
+    # motivated this work showed the model's INTERNAL xy prediction
+    # actually overshoots in a way that helps the deploy track forward
+    # (the policy chases a slightly-ahead reference). Pinning xy to
+    # the deploy's observed position removes that lure and forward
+    # tracking regresses. ``quat_only`` preserves the helpful xy
+    # overshoot while still anchoring the planner's heading to
+    # observed reality.
+    for ctx_i, obs in zip(context_indices, selected):
+        obs_t = torch.from_numpy(np.asarray(obs.pelvis_qpos_wxyz, dtype=np.float64)).to(
+            device=device, dtype=dtype,
+        )
+        if scope == _RESEED_SCOPE_FULL_ROOT:
+            buf[0, ctx_i, 0:7] = obs_t
+        else:
+            buf[0, ctx_i, 3:7] = obs_t[3:7]
+
+    return None
+
+
 _KPLANNER_KEYBOARD_HELP = """
 X2 kplanner — keyboard commands (mirrors heuristic):
    w        walk forward
@@ -1024,6 +1227,10 @@ def _planner_worker(
     replan_lock: threading.Lock,
     stop_event: threading.Event,
     replan_event: threading.Event,
+    pose_deque: "Optional[collections.deque[PoseObservation]]" = None,
+    pose_lock: Optional[threading.Lock] = None,
+    pose_max_age_s: float = 0.5,
+    pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
 ) -> None:
     """Replan refill loop. Runs predict() each time the buffer drops below
     threshold, holding ``replan_lock`` only for the cursor swap (the predict
@@ -1035,8 +1242,32 @@ def _planner_worker(
     frames nobody consumes -- and would also drift the buffer further
     from default_angles every call. Skip the replan while idle so the
     buffer's last-good state stays fresh for the next non-idle command.
+
+    Closed-loop pose reseed: if ``pose_deque`` is provided, just before
+    each replan we overwrite the 4 root rows the model will read as
+    context with the robot's actually-observed pelvis qpos. Breaks the
+    chain of self-conditioned predictions that compounds yaw drift.
     """
     log.info("planner worker thread started")
+    feedback_enabled = pose_deque is not None and pose_lock is not None
+    if feedback_enabled:
+        log.info(
+            "planner worker: closed-loop pose reseed ENABLED "
+            "(scope=%s, max_age=%.3fs)",
+            pose_reseed_scope, pose_max_age_s,
+        )
+    else:
+        log.info("planner worker: closed-loop pose reseed DISABLED (open-loop)")
+
+    reseed_stats = {
+        "applied": 0,
+        "skipped_insufficient": 0,
+        "skipped_stale": 0,
+        "skipped_buffer_uninit": 0,
+        "skipped_other": 0,
+    }
+    stats_log_every = 50
+
     while not stop_event.is_set():
         # Wait until the publisher signals it's draining the buffer, OR a
         # 50 ms timeout so we still check on stale buffers periodically.
@@ -1053,6 +1284,36 @@ def _planner_worker(
             # Idle -- publisher holds the static anchor; no neural frames
             # are being consumed. Don't replan.
             continue
+
+        if feedback_enabled:
+            with replan_lock:
+                reason = _reseed_root_from_observations(
+                    planner_core, pose_deque, pose_lock, pose_max_age_s,
+                    scope=pose_reseed_scope,
+                )
+            if reason is None:
+                reseed_stats["applied"] += 1
+            elif reason.startswith("insufficient"):
+                reseed_stats["skipped_insufficient"] += 1
+            elif reason.startswith("stale"):
+                reseed_stats["skipped_stale"] += 1
+            elif reason.startswith("buffer_uninit"):
+                reseed_stats["skipped_buffer_uninit"] += 1
+            else:
+                reseed_stats["skipped_other"] += 1
+            total = sum(reseed_stats.values())
+            if total > 0 and total % stats_log_every == 0:
+                log.info(
+                    "reseed stats: total=%d applied=%d "
+                    "insufficient=%d stale=%d buf_uninit=%d other=%d",
+                    total,
+                    reseed_stats["applied"],
+                    reseed_stats["skipped_insufficient"],
+                    reseed_stats["skipped_stale"],
+                    reseed_stats["skipped_buffer_uninit"],
+                    reseed_stats["skipped_other"],
+                )
+
         log.debug("worker: replan intent v=%d target=%s", ver, target)
         t0 = time.monotonic()
         try:
@@ -1108,6 +1369,12 @@ def run(
     backward_scale: float = 1.0,
     lateral_scale: float = 1.0,
     stick_shape_exp: float = _DEFAULT_STICK_SHAPING_EXPONENT,
+    pose_feedback_host: Optional[str] = None,
+    pose_feedback_port: Optional[int] = None,
+    pose_feedback_topic: str = "robot_pose",
+    pose_feedback_max_age_s: float = 0.5,
+    pose_feedback_deque_maxlen: int = 32,
+    pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
 ) -> int:
     _setup_logging(verbose)
 
@@ -1259,9 +1526,44 @@ def run(
         thr.start()
         threads.append(thr)
 
+    pose_deque: "Optional[collections.deque[PoseObservation]]" = None
+    pose_lock: Optional[threading.Lock] = None
+    if pose_feedback_host is not None and pose_feedback_port is not None:
+        pose_deque = collections.deque(maxlen=int(pose_feedback_deque_maxlen))
+        pose_lock = threading.Lock()
+        log.info(
+            "closed-loop pose reseed: subscribing to %r on tcp://%s:%d "
+            "(maxlen=%d, max_age=%.3fs)",
+            pose_feedback_topic, pose_feedback_host, pose_feedback_port,
+            int(pose_feedback_deque_maxlen), float(pose_feedback_max_age_s),
+        )
+        thr = threading.Thread(
+            target=_pose_feedback_thread,
+            args=(
+                pose_deque, pose_lock,
+                pose_feedback_host, pose_feedback_port, pose_feedback_topic,
+                stop_event,
+            ),
+            name="pose-feedback",
+            daemon=True,
+        )
+        thr.start()
+        threads.append(thr)
+    else:
+        log.info(
+            "closed-loop pose reseed: DISABLED "
+            "(no --pose-feedback-host/port) -- running open-loop"
+        )
+
     worker_thread = threading.Thread(
         target=_planner_worker,
         args=(planner_core, intent_state, replan_lock, stop_event, replan_event),
+        kwargs={
+            "pose_deque": pose_deque,
+            "pose_lock": pose_lock,
+            "pose_max_age_s": float(pose_feedback_max_age_s),
+            "pose_reseed_scope": pose_reseed_scope,
+        },
         name="kplanner-worker",
         daemon=True,
     )
@@ -1755,6 +2057,59 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "bucketed feel (50%% stick already at 71%% velocity)."
         ),
     )
+    fb_grp = p.add_argument_group(
+        "closed-loop pose feedback",
+        "Break the kplanner's chain of self-conditioned predictions by "
+        "refreshing the context window from the robot's actually-observed "
+        "pelvis pose before each replan. See 'Deploy-integration diagnostics' "
+        "in motionbricks/docs/x2_kplanner_evaluation.md for the why.",
+    )
+    fb_grp.add_argument(
+        "--pose-feedback-host", default=None,
+        help=(
+            "Sim bridge host that publishes the 'robot_pose' topic. "
+            "When set together with --pose-feedback-port enables closed-loop "
+            "pose reseed; default (None) keeps the open-loop behaviour."
+        ),
+    )
+    fb_grp.add_argument(
+        "--pose-feedback-port", type=int, default=None,
+        help="ZMQ PUB port for 'robot_pose' (sim bridge default: 5570).",
+    )
+    fb_grp.add_argument(
+        "--pose-feedback-topic", default="robot_pose",
+        help="Topic name on the pose-feedback SUB socket. Default 'robot_pose'.",
+    )
+    fb_grp.add_argument(
+        "--pose-feedback-max-age-s", type=float, default=0.5,
+        help=(
+            "If the newest pose observation is older than this many seconds "
+            "we skip the reseed for this replan and let the planner fall "
+            "back to its own predictions. Default 0.5 s (15 frames @ 30 Hz)."
+        ),
+    )
+    fb_grp.add_argument(
+        "--pose-feedback-deque-maxlen", type=int, default=32,
+        help=(
+            "Capacity of the rolling buffer of observations the feedback "
+            "thread fills. Each replan reads the latest 4 entries. Default "
+            "32 = ~640 ms of headroom at the bridge's 50 Hz publish rate."
+        ),
+    )
+    fb_grp.add_argument(
+        "--pose-reseed-scope",
+        choices=list(_VALID_RESEED_SCOPES),
+        default=_RESEED_SCOPE_FULL_ROOT,
+        help=(
+            "Which root channels the reseed rewrites. 'full_root' (default) "
+            "overwrites xyz + quat (4 root rows, 7 floats each). 'quat_only' "
+            "overwrites just the quaternion -- preserves the planner's "
+            "internal-model xy overshoot (which empirically helps the policy "
+            "track forward motion) while still anchoring heading to observed "
+            "reality. Use 'quat_only' when forward tracking regresses under "
+            "'full_root'."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -1788,6 +2143,12 @@ def main(argv: list[str] | None = None) -> int:
         backward_scale=args.backward_scale,
         lateral_scale=args.lateral_scale,
         stick_shape_exp=args.stick_shape_exp,
+        pose_feedback_host=args.pose_feedback_host,
+        pose_feedback_port=args.pose_feedback_port,
+        pose_feedback_topic=args.pose_feedback_topic,
+        pose_feedback_max_age_s=args.pose_feedback_max_age_s,
+        pose_feedback_deque_maxlen=args.pose_feedback_deque_maxlen,
+        pose_reseed_scope=args.pose_reseed_scope,
     )
 
 
