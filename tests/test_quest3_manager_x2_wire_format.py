@@ -134,10 +134,19 @@ def test_arm_targets_wire_format(manager):
         assert len(parts) == 2
         assert parts[0] == b"arm_targets"
         msg = msgpack.unpackb(parts[1], raw=False)
-        assert set(msg.keys()) == {"left_q_rad", "right_q_rad", "is_engaged", "tick", "ts"}
+        # ``passthrough_arm_targets`` added 2026-05-30 as the
+        # LOCO_DECOUPLED_ARMS sentinel; default False preserves
+        # legacy override behaviour. See test_quest3_manager_arm_decouple.py
+        # for per-mode behaviour pinning.
+        assert set(msg.keys()) == {
+            "left_q_rad", "right_q_rad",
+            "is_engaged", "passthrough_arm_targets",
+            "tick", "ts",
+        }
         assert len(msg["left_q_rad"]) == 7
         assert len(msg["right_q_rad"]) == 7
         assert msg["is_engaged"] is True
+        assert msg["passthrough_arm_targets"] is False
         assert msg["tick"] == 42
         # float32 cast -> at most ~1e-7 error
         assert max(abs(a - b) for a, b in zip(msg["left_q_rad"], L)) < 1e-6

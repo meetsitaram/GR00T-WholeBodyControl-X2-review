@@ -549,12 +549,40 @@ class _SubscribeModeState:
                     self._wire_motion_token = None
 
     def update_arm_targets(
-        self, left: np.ndarray, right: np.ndarray, engaged: bool,
+        self,
+        left: np.ndarray,
+        right: np.ndarray,
+        engaged: bool,
+        passthrough_arm_targets: bool = False,
     ) -> None:
+        """Update cached arm IK targets from the manager.
+
+        ``passthrough_arm_targets=True`` is the
+        ``LOCO_DECOUPLED_ARMS=0`` sentinel: the manager is signalling
+        that for this message it has no arm override and the recorder
+        should let the planner-predicted arms (from ``body_pose``)
+        flow through the merge step unmodified. We implement that by
+        nulling the cached arm pose so the existing validity gate in
+        the merge loop (``if left_arm_valid: body_q_mj[slice] = ...``)
+        skips the override. The next non-passthrough message
+        repopulates the cache normally, so this gate is per-message
+        and not sticky -- if the operator toggles modes mid-walk the
+        recorder immediately recovers.
+
+        ``passthrough_arm_targets`` is a kwarg with a False default so
+        legacy callers (and tests that mock this method) keep working
+        without rewrites; older managers that don't include the wire
+        field also fall through to the legacy real-arms-override path.
+        """
         with self._lock:
-            self._arm_left_q = left.copy()
-            self._arm_right_q = right.copy()
-            self._arm_engaged = bool(engaged)
+            if passthrough_arm_targets:
+                self._arm_left_q = None
+                self._arm_right_q = None
+                self._arm_engaged = False
+            else:
+                self._arm_left_q = left.copy()
+                self._arm_right_q = right.copy()
+                self._arm_engaged = bool(engaged)
             self._last_arm_targets_t = time.time()
 
     def update_hand_finger_cmd(
@@ -851,7 +879,20 @@ def _handle_arm_and_hands_msg(
         msg = msgpack.unpackb(payload_bytes, raw=False)
         l = np.asarray(msg["left_q_rad"], dtype=np.float64)
         r = np.asarray(msg["right_q_rad"], dtype=np.float64)
-        state.update_arm_targets(l, r, bool(msg.get("is_engaged", False)))
+        # ``passthrough_arm_targets`` (added 2026-05-30) is the
+        # LOCO_DECOUPLED_ARMS=0 sentinel from the manager: when True
+        # the recorder treats this message as "no arm override" and
+        # nulls its cache so the merge falls through to planner arms.
+        # Missing key defaults to False for wire-format back-compat
+        # with older manager builds.
+        state.update_arm_targets(
+            l,
+            r,
+            bool(msg.get("is_engaged", False)),
+            passthrough_arm_targets=bool(
+                msg.get("passthrough_arm_targets", False)
+            ),
+        )
     elif topic == hand_finger_cmd_topic:
         msg = msgpack.unpackb(payload_bytes, raw=False)
         l = np.asarray(msg["left_hand_q"], dtype=np.float64)

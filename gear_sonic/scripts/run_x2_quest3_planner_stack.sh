@@ -600,6 +600,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
         --quest3-continuous-yaw-max) QUEST3_CONTINUOUS_YAW_MAX="$2"; shift 2 ;;
+        --loco-decoupled-arms) LOCO_DECOUPLED_ARMS="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
         --vla-bridge) VLA_BRIDGE_MODEL="$2"; shift 2 ;;
         --vla-bridge-sonic-checkpoint)
@@ -1982,6 +1983,32 @@ fi
 # separately).
 QUEST3_CONTINUOUS_YAW_MAX="${QUEST3_CONTINUOUS_YAW_MAX:-0.5}"
 MANAGER_ARGS+=(--continuous-yaw-max "${QUEST3_CONTINUOUS_YAW_MAX}")
+# LOCO_DECOUPLED_ARMS=1 (default) -> manager publishes its frozen arm
+# pose to the recorder during LOCOMOTION and the recorder overrides
+# the planner's predicted arms. Required for the ARM_MANIPULATION ->
+# LOCOMOTION arm-hold workflow (operator positions arms in ARM_MAN,
+# toggles to LOCOMOTION to walk to a new spot, arms STAY LOCKED at
+# the manipulation pose). DO NOT flip this default without
+# coordinating with manipulation operators.
+#
+# LOCO_DECOUPLED_ARMS=0 -> opt-in for whole-body locomotion: in
+# LOCOMOTION the manager sets passthrough_arm_targets=True in the
+# arm_targets payload, the recorder nulls its cached arm pose, and
+# the merge step falls through to planner-predicted arms (natural
+# gait-coupled swing from the x2_ultra_locowalk training corpus).
+# ARM_MAN and OFF are unaffected.
+#
+# Run two Quest 3 sessions with this env var = 1 then = 0 to A/B test
+# whether the static-arms override hurts forward-walking quality.
+LOCO_DECOUPLED_ARMS="${LOCO_DECOUPLED_ARMS:-1}"
+if [[ "${LOCO_DECOUPLED_ARMS}" == "1" ]]; then
+    MANAGER_ARGS+=(--loco-decoupled-arms)
+elif [[ "${LOCO_DECOUPLED_ARMS}" == "0" ]]; then
+    MANAGER_ARGS+=(--no-loco-decoupled-arms)
+else
+    log "WARN: LOCO_DECOUPLED_ARMS must be 0 or 1; got '${LOCO_DECOUPLED_ARMS}'. Falling back to default (1)."
+    MANAGER_ARGS+=(--loco-decoupled-arms)
+fi
 
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &

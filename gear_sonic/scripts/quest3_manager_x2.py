@@ -225,6 +225,42 @@ class ManagerConfig:
     # to restore the legacy "full stick = full planner ceiling"
     # mapping for A/B comparison.
     intent_continuous_yaw_max: float = 0.5
+    # ``intent_loco_decoupled_arms`` (default True) controls whether
+    # the manager signals the recorder to *override* the kplanner's
+    # predicted arm joints with the manager's frozen / IK arm pose
+    # during LOCOMOTION mode.
+    #
+    # TRUE (default) -- current behaviour. Manager publishes
+    # ``arm_targets`` with ``passthrough_arm_targets=False`` every
+    # tick; the recorder applies the operator's last arm pose as a
+    # hard override on the merged ``pose`` stream the deploy
+    # consumes. This is intentional for the ARM_MANIPULATION ->
+    # LOCOMOTION arm-hold workflow: the operator positions the arms
+    # (e.g. holding a tool) in ARM_MAN, toggles to LOCOMOTION to walk
+    # to a new spot, and the arms STAY LOCKED at the manipulation
+    # pose for the duration of the walk instead of swinging back to a
+    # neutral gait pose. Flipping this default to False would silently
+    # break that workflow -- the moment the operator switches from
+    # ARM_MAN to LOCOMOTION, the held pose would dissolve into the
+    # planner's gait swing. Future contributors: do not flip the
+    # default without coordinating with manipulation operators.
+    #
+    # FALSE -- opt-in for *whole-body locomotion* sessions (just
+    # walking around, no payload to hold) and for diagnosing whether
+    # the static-arms override hurts forward-walking quality. When
+    # ``self._intent.mode is StreamMode.LOCOMOTION`` the manager
+    # flips ``passthrough_arm_targets=True`` in the payload, the
+    # recorder nulls its cached arm pose, and the existing
+    # validity gate in the merge step falls through to the planner-
+    # predicted arms (which carry natural gait-coupled swing from the
+    # ``x2_ultra_locowalk`` training corpus). ARM_MAN and OFF still
+    # publish ``passthrough_arm_targets=False`` -- the sentinel is
+    # LOCOMOTION-only so other modes keep today's safety behaviour.
+    #
+    # Wired from CLI ``--loco-decoupled-arms`` /
+    # ``--no-loco-decoupled-arms`` and wrapper env var
+    # ``LOCO_DECOUPLED_ARMS`` (1/0).
+    intent_loco_decoupled_arms: bool = True
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
     #
     # Operator UX contract: pushing the left stick AWAY from your body
@@ -1172,10 +1208,28 @@ class Quest3ManagerX2:
         is_engaged: bool,
         tick: int,
     ) -> None:
+        # ``passthrough_arm_targets`` is the recorder-side sentinel
+        # introduced for the LOCO_DECOUPLED_ARMS=0 path: True means
+        # "treat this message as 'no operator arm override', let the
+        # planner's predicted arms flow through the merge". Computed
+        # here (and not at the call sites) so the same merge-mode is
+        # applied consistently to every publish, including the
+        # frozen-arms repeat publishes that the LOCOMOTION-mode
+        # safety path emits at idle.
+        #
+        # Guarded on ``StreamMode.LOCOMOTION`` so ARM_MAN and OFF
+        # always keep the legacy real-arms-override path (ARM_MAN
+        # operator IK MUST win for manipulation; OFF preserves the
+        # last-known safety pose held in the recorder cache).
+        passthrough_arm_targets = (
+            (not self._cfg.intent_loco_decoupled_arms)
+            and (self._intent.mode is StreamMode.LOCOMOTION)
+        )
         payload = {
             "left_q_rad": np.asarray(left, dtype=np.float32).tolist(),
             "right_q_rad": np.asarray(right, dtype=np.float32).tolist(),
             "is_engaged": bool(is_engaged),
+            "passthrough_arm_targets": bool(passthrough_arm_targets),
             "tick": int(tick),
             "ts": time.time(),
         }
@@ -1563,6 +1617,30 @@ def _build_parser() -> argparse.ArgumentParser:
              "1.0 to restore the legacy 'full stick = full ceiling' "
              "mapping. Bucketed turn_left / turn_right are unaffected.",
     )
+    p.add_argument(
+        "--loco-decoupled-arms",
+        dest="loco_decoupled_arms", action="store_true",
+        default=True,
+        help="LOCOMOTION-mode arms behaviour. TRUE (default): manager "
+             "publishes the operator's last arm pose every tick and "
+             "the recorder overrides the planner's predicted arms with "
+             "it; required for the ARM_MAN -> LOCOMOTION arm-hold "
+             "workflow (e.g. walking while holding a tool). FALSE: "
+             "in LOCOMOTION the manager flags ``passthrough_arm_targets="
+             "True`` so the recorder falls through to planner-"
+             "predicted arms (natural gait-coupled swing from the "
+             "training corpus). ARM_MAN and OFF are unaffected. "
+             "Wrapper env var: LOCO_DECOUPLED_ARMS=1/0.",
+    )
+    p.add_argument(
+        "--no-loco-decoupled-arms",
+        dest="loco_decoupled_arms", action="store_false",
+        help="Opt-in: let planner-predicted arms flow through to the "
+             "deploy during LOCOMOTION (whole-body walking). Breaks "
+             "the manipulation arm-hold workflow; use only when you "
+             "are NOT carrying a payload between manipulation spots. "
+             "Same as wrapper env var LOCO_DECOUPLED_ARMS=0.",
+    )
 
     # Stick polarity (axis sign flips applied before the decoder).
     # All default to False: the operator-facing UX of "push the stick
@@ -1737,6 +1815,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         intent_enable_torso=args.enable_torso,
         intent_enable_continuous_locomotion=args.enable_continuous_locomotion,
         intent_continuous_yaw_max=args.continuous_yaw_max,
+        intent_loco_decoupled_arms=args.loco_decoupled_arms,
         invert_lx=args.invert_lx,
         invert_ly=args.invert_ly,
         invert_rx=args.invert_rx,

@@ -754,3 +754,106 @@ Pinned by 6 new tests in ``tests/test_intent_decoder.py``:
 * Invalid values (0, negative, >1, 50) rejected at construction time.
 * Clamp is stateless per tick -- not an EWMA, so a "release then
   re-push" pattern doesn't accidentally let the cap drift up.
+
+#### Locomotion arm coupling (2026-05-30, follow-up)
+
+**Hypothesis**: the manager's per-tick ``arm_targets`` publishes
+during LOCOMOTION cause the recorder to override the kplanner's
+predicted arm joints (MJ 15-28) with a frozen stand pose. The
+``x2_ultra_locowalk`` training corpus contains natural arm swing
+counter-rotating with the legs, so a static-arms reference in the
+SONIC tokenizer obs is OOD for the policy: lost angular-momentum
+coupling plausibly contributes to (a) the residual cold-start torso
+lean and (b) capped forward-walking speed even with the hip-height
+and cold-start fixes applied.
+
+**Architecture** (read this for context before flipping the flag):
+
+```
+Quest3 manager  --arm_targets:5564-->   recorder
+kplanner        --body_pose:5565 -->    recorder  --pose:5556--> SONIC deploy
+```
+
+The recorder merges legs / waist / head from ``body_pose`` and
+**overrides arms from ``arm_targets``** if the manager has ever
+published one. From [gear_sonic/utils/teleop/x2_dataset_recorder.py:1928-1945](../../gear_sonic/utils/teleop/x2_dataset_recorder.py):
+
+```python
+if left_arm_valid:
+    body_q_mj[_LEFT_ARM_MJ_SLICE] = left_arm
+if right_arm_valid:
+    body_q_mj[_RIGHT_ARM_MJ_SLICE] = right_arm
+```
+
+The cache (``_arm_left_q / _arm_right_q``) is set on every
+``arm_targets`` message and **never cleared on staleness**. Just
+"stop publishing in LOCOMOTION" would NOT work -- the recorder
+would hold the last frozen pose forever and keep overriding.
+
+**Fix**: positive sentinel. New ``passthrough_arm_targets: bool``
+field in the ``arm_targets`` msgpack payload. When True, the
+recorder treats this message as "no arm override" and nulls its
+cache so the existing validity gate falls through to planner arms.
+Per-message and not sticky -- a subsequent normal ``arm_targets``
+repopulates the cache, so the operator toggling LOCO ↔ ARM_MAN
+recovers instantly.
+
+**Flag**: ``LOCO_DECOUPLED_ARMS`` env var (or
+``--loco-decoupled-arms VALUE`` on the wrapper / manager CLI).
+Default ``1`` preserves today's behaviour: the manager publishes
+real arm IK every tick with ``passthrough_arm_targets=False``,
+recorder applies the override, arms stay locked through ARM_MAN ->
+LOCOMOTION transitions (required for the arm-hold workflow used
+when walking while holding a tool). ``LOCO_DECOUPLED_ARMS=0`` is
+opt-in for **whole-body locomotion** sessions: in LOCOMOTION the
+manager flips ``passthrough_arm_targets=True``, recorder skips the
+override, and planner-predicted arm swing flows through to the
+deploy. ARM_MAN and OFF always keep the real-arms override path
+regardless of the flag -- the sentinel is LOCOMOTION-only by design.
+
+**A/B test methodology** (run both, compare subjectively or via
+``robot_pose`` capture):
+
+```bash
+# Trial A: current behaviour (decoupled arms, frozen during walk)
+LOCO_DECOUPLED_ARMS=1 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh
+
+# Trial B: planner-coupled arms (gait-coupled swing)
+LOCO_DECOUPLED_ARMS=0 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh
+```
+
+Compare on:
+
+| Axis | What to watch |
+|------|---------------|
+| Forward speed | Does B walk faster at full L-stick? |
+| Cold-start lean | Is the t=0..2s torso pitch peak smaller? |
+| Gait smoothness | Does the body wobble less side-to-side? |
+| Yaw drift | Less drift when commanded straight-forward? |
+
+**Results placeholder** (fill in after trials):
+
+| Metric                | Trial A (decoupled=1) | Trial B (decoupled=0) | Delta |
+|-----------------------|----------------------:|----------------------:|------:|
+| Forward speed (m/s)   |                       |                       |       |
+| Cold-start peak pitch |                       |                       |       |
+| Steady-state pitch    |                       |                       |       |
+| Yaw drift over 10 s   |                       |                       |       |
+| Subjective rating 1-5 |                       |                       |       |
+
+**Trade-offs to remember if promoting ``LOCO_DECOUPLED_ARMS=0`` to
+default**: the ARM_MAN -> LOCOMOTION arm-hold workflow breaks --
+operators who position arms (e.g. holding a tool) in ARM_MAN and
+toggle to LOCOMOTION to walk to a new spot will see the held pose
+dissolve into the planner's gait swing. The default stays at ``1``
+until manipulation operators sign off on the trade.
+
+Pinned by 7 new tests in ``tests/test_quest3_manager_arm_decouple.py``:
+
+* Manager: default (decoupled=True) emits ``passthrough_arm_targets=False`` in every mode.
+* Manager: ``decoupled=False`` + LOCOMOTION emits True.
+* Manager: ``decoupled=False`` + ARM_MAN emits False (sentinel is LOCO-only).
+* Manager: ``decoupled=False`` + OFF emits False (preserves safety).
+* Recorder: ``passthrough_arm_targets=True`` nulls cached arms.
+* Recorder: per-message gate; subsequent real-arms message repopulates the cache.
+* Recorder: missing wire-format key defaults to False (back-compat with older managers).
