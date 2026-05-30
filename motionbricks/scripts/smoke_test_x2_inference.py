@@ -8,6 +8,9 @@ What this validates:
 3. The VQVAE round-trip (encode -> decode) preserves shapes.
 4. The X2 ``mujoco_qpos_converter`` produces ``[T, 38]`` tensors that decompose
    into ``root_xyz`` (3) + ``root_quat`` (4, wxyz) + ``joint_pos`` (31).
+5. ``load_x2_planner()`` constructs a ``NeuralPlannerCore``, and one
+   ``replan_with_velocity()`` call returns a future window of ``[T, 38]`` qpos
+   on the requested device. This is the gate the kplanner daemon depends on.
 
 Usage::
 
@@ -84,6 +87,34 @@ def main() -> int:
         default=REPO_ROOT / "gear_sonic/data/motions/x2_ultra_bones_seed.pkl",
     )
     parser.add_argument("--max-clips", type=int, default=3)
+    parser.add_argument("--min-frames", type=int, default=0)
+    parser.add_argument("--max-frames", type=int, default=10000)
+    parser.add_argument(
+        "--skip-planner",
+        action="store_true",
+        help="Skip step 7 (load_x2_planner + replan_with_velocity); "
+             "useful if Hydra-instantiation of the pose model is broken "
+             "and you just want to verify the on-disk artifacts.",
+    )
+    parser.add_argument(
+        "--vqvae-ckpt", type=Path, default=None,
+        help="Override VQVAE ckpt path (default: pinned step ckpt in version_1; "
+             "see X2PlannerPaths.default()).",
+    )
+    parser.add_argument(
+        "--pose-ckpt", type=Path, default=None,
+        help="Override pose ckpt path (default: pinned step ckpt in version_1; "
+             "see X2PlannerPaths.default()).",
+    )
+    parser.add_argument(
+        "--root-ckpt", type=Path, default=None,
+        help="Override root ckpt path (default: pinned step ckpt in version_1; "
+             "see X2PlannerPaths.default()).",
+    )
+    parser.add_argument(
+        "--planner-device", default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to load the planner stack on (default: cuda if available).",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -137,8 +168,8 @@ def main() -> int:
         ds = X2MotionDataset(
             args.pkl,
             motion_rep,
-            min_frames=80,
-            max_frames=200,
+            min_frames=args.min_frames,
+            max_frames=args.max_frames,
             max_clips=args.max_clips,
         )
         if len(ds) == 0:
@@ -152,18 +183,21 @@ def main() -> int:
             )
 
         # 5. VQVAE / pose / root ckpts present and loadable.
+        # Default checkpoints must mirror ``X2PlannerPaths.default()`` so
+        # the step-7 ``load_x2_planner()`` invocation below verifies the
+        # same on-disk artifacts as the live daemon.
         print("\n[5/6] Loading trained checkpoints...")
         ckpt_paths = {
-            "vqvae": args.result_dir / "motionbricks_vqvae_x2/version_1/checkpoints/last.ckpt",
-            "pose": args.result_dir / "motionbricks_pose_x2/version_1/checkpoints/last.ckpt",
-            "root": args.result_dir / "motionbricks_root_x2/version_1/checkpoints/last.ckpt",
+            "vqvae": args.result_dir / "motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt",
+            "pose": args.result_dir / "motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt",
+            "root": args.result_dir / "motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt",
         }
         for label, p in ckpt_paths.items():
             _check_ckpt(label, p)
             _load_ckpt_state(p)
 
         # 6. qpos round-trip (38 cols, 3 + 4 + 31).
-        print("\n[6/6] Converting features -> X2 mujoco qpos...")
+        print("\n[6/7] Converting features -> X2 mujoco qpos...")
         feats_b = feats.unsqueeze(0)  # [1, T, 414]
         qpos = motion_feature_to_x2_mujoco_qpos(
             feats_b, motion_rep, is_normalized=True, root_quat_w_first=True
@@ -180,6 +214,61 @@ def main() -> int:
         quat_norm = msg["root_quat"].norm(dim=-1)
         if (quat_norm < 0.95).any() or (quat_norm > 1.05).any():
             raise RuntimeError(f"root_quat norms outside [0.95, 1.05]: {quat_norm}")
+
+        # 7. NeuralPlannerCore: load checkpoints + replan once on a velocity intent.
+        print("\n[7/7] Loading NeuralPlannerCore + 1 replan_with_velocity...")
+        if args.skip_planner:
+            print("  --skip-planner set; skipping planner stack load.")
+        else:
+            from motionbricks.motion_backbone.inference.load_x2_planner import (
+                X2PlannerPaths,
+                load_x2_planner,
+            )
+
+            default_paths = X2PlannerPaths.default()
+            paths = X2PlannerPaths(
+                vqvae_ckpt=args.vqvae_ckpt or default_paths.vqvae_ckpt,
+                pose_ckpt=args.pose_ckpt or default_paths.pose_ckpt,
+                root_ckpt=args.root_ckpt or default_paths.root_ckpt,
+                vqvae_version_dir=default_paths.vqvae_version_dir,
+                pose_version_dir=default_paths.pose_version_dir,
+                root_version_dir=default_paths.root_version_dir,
+            )
+            print(f"  vqvae_ckpt={paths.vqvae_ckpt}")
+            print(f"  pose_ckpt={paths.pose_ckpt}")
+            print(f"  root_ckpt={paths.root_ckpt}")
+            print(f"  device={args.planner_device}")
+
+            planner = load_x2_planner(paths, device=args.planner_device)
+            # Seed buffer with a stand pose: use the first frame of a real clip
+            # (canonicalized to origin) so we don't depend on a separate t-pose.
+            init_qpos = qpos[0, 0].to(args.planner_device)
+            # Ensure wxyz layout (we asked for root_quat_w_first=True above).
+            planner.reset(init_qpos)
+
+            # Walk forward 0.5 m/s, zero yaw, ~0.95 m hip height.
+            velocity_intent = torch.tensor(
+                [0.0, 0.5, 0.0, 0.95], device=args.planner_device
+            )
+            _, future_qpos, num_pred_frames = planner.replan_with_velocity(
+                velocity_intent
+            )
+            print(f"  predicted future_qpos.shape={tuple(future_qpos.shape)}")
+            print(f"  num_pred_frames={num_pred_frames}")
+            if future_qpos.shape[-1] != 38:
+                raise RuntimeError(
+                    f"future qpos last-dim should be 38, got {future_qpos.shape[-1]}"
+                )
+            if num_pred_frames < 16:
+                raise RuntimeError(
+                    f"Expected at least 16 predicted frames, got {num_pred_frames}"
+                )
+
+            # Tick a few frames out of the ring buffer.
+            popped = [planner.get_next_frame() for _ in range(4)]
+            if any(p.shape[-1] != 38 for p in popped):
+                raise RuntimeError("Popped frame has unexpected last-dim != 38")
+            print(f"  popped 4 frames, last frame shape={tuple(popped[-1].shape)}")
 
     except Exception:
         print("\n  SMOKE TEST FAILED:\n")

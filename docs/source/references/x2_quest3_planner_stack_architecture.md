@@ -29,8 +29,14 @@ Lower-level references this doc cites:
   laptop).
 * [`x2_zmq_protocol.md`](x2_zmq_protocol.md) — packed-message wire
   format spec (`pack_pose_message` / `unpack_message`).
+* [`x2_kplanner.md`](x2_kplanner.md) — the **default** planner since
+  2026-05: trained MotionBricks VQVAE + pose + root checkpoints
+  driving `motion_inference.predict()` on a 4-D velocity intent. Same
+  `body_pose` / `pose` wire as the heuristic.
 * [`x2_heuristic_planner.md`](x2_heuristic_planner.md) — planner FSM,
-  recipe library, future-window semantics.
+  recipe library, future-window semantics. Still the canonical
+  reference for the wire-format spec and curator pipeline; available
+  behind `run_x2_quest3_planner_stack.sh --planner heuristic`.
 * [`x2_groot_robocasa.md`](x2_groot_robocasa.md) — Robocasa scene
   integration plan (G1 architecture).
 * [`x2_isaac_groot_data_contract.md`](x2_isaac_groot_data_contract.md) —
@@ -133,7 +139,7 @@ flowchart LR
 |---|---------|------|---------------|----------------|
 | 1 | **Quest 3 WebXR client** | Reads gamepad + XRHand, sends per-frame JSON over WebSocket; receives `play_audio` cues. | Hosted by manager on HTTPS 8443. | `gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html` |
 | 2 | **Manager** | Hosts Quest3Reader, runs IK retargeter, decodes button intents, publishes 4 ZMQ topics, plays audio cues, cycles MuJoCo viewer cameras. | `python -m gear_sonic.scripts.quest3_manager_x2` | `gear_sonic/scripts/quest3_manager_x2.py` |
-| 3 | **Heuristic planner** | Subscribes to `planner_cmd`, runs the recipe FSM at 50 Hz, publishes `body_pose` with a 9-frame future window. Optionally pre-loaded with a scripted YAML demo (`--demo PATH.yaml`, exposed at the wrapper as `--planner-demo PATH.yaml`) whose commands appear in the queue at boot and drain back to `idle_stand`; the first VR-driven `planner_cmd` then preempts via `replace_pending`. | `python -m gear_sonic.scripts.x2_heuristic_planner` | `gear_sonic/scripts/x2_heuristic_planner.py` + `gear_sonic/utils/planner/state_machine.py` |
+| 3 | **Planner** | Subscribes to `planner_cmd`, publishes `body_pose` with a 9-frame future window at 50 Hz. **Default since 2026-05** is the neural **kplanner** (`--planner kplanner`): trained MotionBricks VQVAE + pose + root checkpoints, with a worker thread running `motion_inference.predict()` on a 4-D velocity-intent vector derived from the latest `planner_cmd` via `intent_to_velocity()` (direction-explicit base × magnitude-scalar dispatcher) — see [`x2_kplanner.md`](x2_kplanner.md). The **heuristic** planner (`--planner heuristic`) remains available: recipe FSM that stitches a curated primitives PKL, optionally pre-loaded with a scripted YAML demo (`--planner-demo PATH.yaml`). | `python -m gear_sonic.scripts.x2_kplanner` (default) or `python -m gear_sonic.scripts.x2_heuristic_planner` | `gear_sonic/scripts/x2_kplanner.py` + `motionbricks/motion_backbone/inference/{neural_planner,load_x2_planner}.py` ‖ `gear_sonic/scripts/x2_heuristic_planner.py` + `gear_sonic/utils/planner/state_machine.py` |
 | 4 | **Recorder** | Two SUB sockets (5564 manager + 5565 planner); merges body + arm + hand into the `pose` payload on 5556; writes LeRobot v2.1 episodes to disk. | `python -m gear_sonic.scripts.record_x2_dataset` | `gear_sonic/scripts/record_x2_dataset.py` + `gear_sonic/utils/teleop/x2_dataset_recorder.py` |
 | 5a | **MuJoCo bridge** | Loads MJCF (bare X2 or robocasa scene), steps physics, publishes joint / IMU state to ROS2, subscribes to deploy actuator commands; in robocasa mode also PUBs `scene_state` and SUBs `scene_reset`. | Spawned by `deploy_x2.sh sim`. | `gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py` |
 | 5b | **C++ deploy** | Loads ONNX policy (SONIC 25k), receives `pose` reference from recorder, runs the tracking inference loop, sends actuator commands over ROS2 to the bridge, publishes `x2_debug` telemetry. | Spawned by `deploy_x2.sh sim`. | `gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp` |

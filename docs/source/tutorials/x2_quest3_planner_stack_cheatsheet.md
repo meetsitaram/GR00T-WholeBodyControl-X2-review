@@ -10,8 +10,15 @@ recording. For the deeper architecture, see:
   — end-to-end engineering reference: mermaid topology, full ZMQ port +
   topic catalogue, CONFLATE/HWM matrix, boot/shutdown sequencing, and
   the invocation matrix covering wrappers / individual-component launchers / test groups.
+- [`X2 Neural Kinematic Planner (kplanner)`](../references/x2_kplanner.md)
+  — the **default** planner since 2026-05: trained MotionBricks
+  checkpoints driving `motion_inference.predict()` on a 4-D velocity
+  intent. Same wire format as the heuristic. Selected via
+  `--planner kplanner` (default).
 - [`X2 Heuristic Locomotion Planner`](../references/x2_heuristic_planner.md)
-  — what the planner actually plays under the hood.
+  — fallback planner. Still the canonical reference for the v4 future
+  window contract + curated primitives library. Available behind
+  `--planner heuristic`.
 - [`X2 Dataset Record and Replay`](x2_dataset_record_and_replay.md)
   — the v0 stationary-arms-only recorder (predecessor to this stack).
 - [`X2 VLA motion_token Decoder`](../references/x2_vla_motion_token_decoder.md)
@@ -26,7 +33,7 @@ recording. For the deeper architecture, see:
 ```bash
 cd ~/Projects/GR00T-WholeBodyControl
 
-# Teleop only (no dataset writes)
+# Teleop only (no dataset writes) — kplanner is the default
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --duration 600
 
 # Record episodes
@@ -35,6 +42,10 @@ cd ~/Projects/GR00T-WholeBodyControl
     --with-record \
     --output-dir data/quest3_x2_planner_phase0/v1 \
     --task "phase 0 stand-and-manipulate"
+
+# Force the heuristic planner (fallback / A-B comparison)
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --planner heuristic --duration 600
 ```
 
 The wrapper boots **deploy → planner → manager → recorder** in order,

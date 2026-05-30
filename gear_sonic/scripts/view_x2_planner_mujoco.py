@@ -337,17 +337,17 @@ def run_in_process(
 # ---------------------------------------------------------------------------
 
 
-def run_from_zmq(host: str, port: int, duration_s: float) -> int:
+def run_from_zmq(host: str, port: int, duration_s: float, topic: str = "pose") -> int:
     import mujoco
     import mujoco.viewer
     import zmq
 
     from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import unpack_message
 
-    print(f"[viewer] subscribing to tcp://{host}:{port} (topic='pose')")
+    print(f"[viewer] subscribing to tcp://{host}:{port} (topic={topic!r})")
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
-    sock.setsockopt_string(zmq.SUBSCRIBE, "pose")
+    sock.setsockopt_string(zmq.SUBSCRIBE, topic)
     sock.setsockopt(zmq.RCVTIMEO, 200)
     sock.connect(f"tcp://{host}:{port}")
     time.sleep(0.2)
@@ -390,7 +390,7 @@ def run_from_zmq(host: str, port: int, duration_s: float) -> int:
                     viewer.sync()
                     continue
                 try:
-                    decoded = unpack_message(raw, expected_topic="pose")
+                    decoded = unpack_message(raw, expected_topic=topic)
                 except ValueError as exc:
                     print(f"[viewer] decode error: {exc}")
                     continue
@@ -468,6 +468,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="HOST:PORT",
         help="Subscribe to a running planner instead of running in-process.",
     )
+    p.add_argument(
+        "--topic", default="pose",
+        choices=("pose", "body_pose"),
+        help=(
+            "ZMQ topic to subscribe to in --from-zmq mode. Use 'pose' (default) "
+            "for the heuristic planner's direct-to-deploy mode and the legacy "
+            "kplanner direct mode; use 'body_pose' for the new Phase 0 "
+            "recorder-merge mode and for the x2_kplanner.py daemon's "
+            "default publish topic."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -493,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             host = args.from_zmq
             port = 5556
-        return run_from_zmq(host, port, args.duration_s)
+        return run_from_zmq(host, port, args.duration_s, topic=args.topic)
 
     if not args.primitives.exists():
         print(

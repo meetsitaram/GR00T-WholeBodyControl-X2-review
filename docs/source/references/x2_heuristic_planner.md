@@ -1,5 +1,15 @@
 # X2 Heuristic Locomotion Planner
 
+> **Note (2026-05):** the heuristic planner described here is **no longer
+> the default** in `run_x2_quest3_planner_stack.sh`. The trained neural
+> kplanner now drives the stack by default — see
+> [`x2_kplanner.md`](x2_kplanner.md). The heuristic stays available
+> behind `--planner heuristic` and is still the canonical reference for
+> the FSM, primitives curation pipeline, and v4 future-window contract
+> that the kplanner reuses verbatim. Read this page when you need the
+> bin matrix, the curator, or the wire-format spec; read the kplanner
+> doc for the trained-model replacement.
+
 NVIDIA hasn't released the trained kinematic planner that bridges high-level
 locomotion commands to the SONIC policy on AgiBot X2 Ultra (the way it has for
 Unitree G1's `LocalMotionPlannerTensorRT`). This page documents the
