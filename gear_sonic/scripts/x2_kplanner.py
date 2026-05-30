@@ -130,8 +130,32 @@ _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
 _TURN_45_RAD_S: float = 1.5
 _TURN_90_RAD_S: float = 3.0
-# Default hip height for the X2 (~0.95 m matches idle_stand).
-_HIP_HEIGHT_M: float = 0.95
+# Default hip-height TARGET (channel 3 of the velocity intent the model
+# consumes). This is NOT a metadata field -- ``NeuralPlannerCore``
+# wires it into ``implied_target_y`` (see
+# ``motion_backbone/inference/neural_planner.py:414``), so the model
+# treats it as the world-frame pelvis Y the predicted gait must drive
+# toward.
+#
+# Must therefore match the **training distribution** of pelvis height.
+# The X2 PKL corpus (``x2_ultra_locowalk.pkl``) has pelvis_z spanning
+# roughly 0.595 - 0.726 m with a mean around 0.661 m; the working
+# PKL-replay sweep (``x2_pkl_command_source --use-mean-intent``)
+# computed 0.687 m and produced the only configuration where the
+# deploy actually walked (see "Deploy-integration diagnostics" in
+# motionbricks/docs/x2_kplanner_evaluation.md).
+#
+# The historical value (0.95 m, "matches idle_stand") was a stale
+# carry-over from an earlier checkpoint whose stand pose sat ~25 cm
+# higher than the current ``_TRAINING_DEFAULT_HIP_Z = 0.636 m``.
+# Feeding 0.95 to the current model puts the target pelvis ~25 cm
+# above any pose in its training distribution; the model produces
+# OOD predictions and the policy can't track them, presenting to the
+# operator as "robot won't walk forward even on full stick". This
+# was the dominant failure mode on the Quest 3 stack before
+# 2026-05-30. PKL replay was insulated because ``direct_velocity``
+# carries hip_h verbatim from the clip (0.687 m).
+_HIP_HEIGHT_M: float = 0.687
 
 # Returned for any (intent, magnitude) the kplanner has no velocity
 # meaning for (``hold_torso``, ``lean_*``, ``torso_*``, ``crouch``,

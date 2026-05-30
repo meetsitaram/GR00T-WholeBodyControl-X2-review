@@ -98,6 +98,14 @@ class LocomotionCmd:
     valid. Defaults of 0.0 mean "neutral hold" -- a stick-released
     operator naturally produces a hold at the rest pose, which the
     planner blends back to ``idle_stand`` once a non-hold command lands.
+
+    The ``stick_*`` fields carry continuous locomotion stick deflections
+    in ``[-1, 1]`` when ``intent == "locomotion"`` paired with
+    ``magnitude == "continuous"``. Replaces the legacy bucketed L/R-stick
+    intents (``fwd_step / back_step / side_* / turn_*``) for the kplanner
+    so the operator's thumb gets analog control with fine resolution
+    near zero. Discrete bin intents ignore these fields, so the heuristic
+    planner's primitives-based path remains valid.
     """
 
     intent: str
@@ -105,6 +113,9 @@ class LocomotionCmd:
     waist_pitch_deg: float = 0.0
     waist_roll_deg: float = 0.0
     waist_yaw_deg: float = 0.0
+    stick_fwd: float = 0.0
+    stick_side: float = 0.0
+    stick_yaw: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -140,6 +151,8 @@ class IntentDecoder:
         enable_lean_fwd: bool = False,
         enable_torso: bool = False,
         enable_continuous_torso: bool = False,
+        enable_continuous_locomotion: bool = False,
+        continuous_stick_threshold: float = 0.02,
         turn_threshold: float = 0.75,
         lean_medium_threshold: float = 0.55,
         lean_large_threshold: float = 0.80,
@@ -215,6 +228,29 @@ class IntentDecoder:
         self._enable_lean_fwd = bool(enable_lean_fwd)
         self._enable_torso = bool(enable_torso)
         self._enable_continuous_torso = bool(enable_continuous_torso)
+        # ``enable_continuous_locomotion`` (default OFF) replaces the
+        # bucketed L-stick / R-stick locomotion intents (fwd_step,
+        # back_step, side_*, turn_*) with a single ``locomotion /
+        # continuous`` command that carries the raw stick deflections in
+        # ``stick_fwd / stick_side / stick_yaw``. The kplanner shapes
+        # those into a velocity vector so the operator's thumb gets
+        # analog control; the heuristic planner cannot consume this
+        # intent and treats it as idle. Set True only when the downstream
+        # planner is the kplanner (``run_x2_quest3_planner_stack.sh``
+        # passes the flag automatically in ``--planner kplanner`` mode).
+        self._enable_continuous_locomotion = bool(enable_continuous_locomotion)
+        if continuous_stick_threshold < 0 or continuous_stick_threshold >= 1:
+            raise ValueError(
+                "continuous_stick_threshold must be in [0, 1); "
+                f"got {continuous_stick_threshold}"
+            )
+        # Per-stick-axis change threshold (post-deadzone) below which two
+        # ``locomotion / continuous`` commands are considered identical
+        # by ``_is_significant_change``. Mirrors the
+        # ``hold_target_threshold_deg`` knob for ``hold_torso``: prevents
+        # ZMQ spam from thumbstick noise without losing perceived
+        # smoothness (kplanner's intent dispatcher slews internally).
+        self._continuous_stick_threshold = float(continuous_stick_threshold)
         if max_waist_pitch_deg < 0 or max_waist_roll_deg < 0 or max_waist_yaw_deg < 0:
             raise ValueError(
                 "max_waist_*_deg must be non-negative; got "
@@ -380,6 +416,35 @@ class IntentDecoder:
         if y_held and self._enable_crouch:
             return LocomotionCmd("crouch", "medium")
 
+        # ---- continuous-locomotion path -------------------------------------
+        # When enabled (kplanner mode), L/R-stick deflections are forwarded
+        # raw (post-deadzone rescale) as ``locomotion / continuous`` so the
+        # downstream planner gets analog control. The discrete fwd_step /
+        # back_step / side_* / turn_* path below is skipped entirely.
+        # ``hold_torso`` (right-stick lean) and ARM_MAN gating still apply
+        # on the calling site; this branch only owns L-stick + R-stick X
+        # axis (rx), leaving the ry-driven hold_torso to the legacy path.
+        if self._enable_continuous_locomotion:
+            stick_fwd, stick_side, stick_yaw = self._continuous_stick_targets(
+                lx=lx, ly=ly, rx=rx,
+            )
+            if (
+                abs(stick_fwd) > 0.0
+                or abs(stick_side) > 0.0
+                or abs(stick_yaw) > 0.0
+            ):
+                return LocomotionCmd(
+                    intent="locomotion",
+                    magnitude="continuous",
+                    stick_fwd=float(stick_fwd),
+                    stick_side=float(stick_side),
+                    stick_yaw=float(stick_yaw),
+                )
+            # All three locomotion sticks released. Fall through to the
+            # ry-driven hold_torso path below so the right thumb can
+            # still lean / twist while neither L-stick nor R-stick X
+            # is deflected.
+
         # Left stick: cardinal direction wins (whichever axis dominates).
         # We bias toward forward/backward when the deflections are
         # roughly equal so a slight diagonal still produces forward
@@ -456,6 +521,53 @@ class IntentDecoder:
             return LocomotionCmd("idle", "default")
 
         return LocomotionCmd("idle", "default")
+
+    def _continuous_stick_targets(
+        self,
+        *,
+        lx: float,
+        ly: float,
+        rx: float,
+    ) -> tuple[float, float, float]:
+        """Return (stick_fwd, stick_side, stick_yaw) in ``[-1, 1]``.
+
+        Each axis is deadzone-clamped to 0 below ``stick_deadzone`` and
+        rescaled to ``[-1, 1]`` outside it (sign preserved). The kplanner
+        squares the value to give the operator's thumb fine resolution
+        near zero with full speed at full deflection.
+
+        Notes on signs vs the legacy bucketed path:
+
+        - ``ly > 0`` -> forward intent -> ``stick_fwd > 0``.
+        - ``lx > 0`` -> right step -> ``stick_side > 0``.
+        - ``rx > 0`` -> turn-right -> ``stick_yaw > 0``.
+
+        These match the bucketed convention so the kplanner's
+        ``_BASE_VELOCITY`` table and the new ``_resolve_locomotion``
+        branch agree on direction sign.
+        """
+        dz = self._stick_deadzone
+        return (
+            self._rescaled_axis(ly, dz),
+            self._rescaled_axis(lx, dz),
+            self._rescaled_axis(rx, dz),
+        )
+
+    @staticmethod
+    def _rescaled_axis(value: float, deadzone: float) -> float:
+        """Map raw stick deflection in ``[-1, 1]`` to deadzoned ``[-1, 1]``.
+
+        Below ``deadzone`` -> 0. Above ``deadzone`` -> ``(|v| - dz) / (1 - dz)``
+        clamped to 1, sign preserved. Pure helper for the continuous-
+        locomotion path; kept separate from ``_scaled_axis`` (which is
+        the waist-hold variant that also folds in a ``max_deg`` scale).
+        """
+        sign = 1.0 if value >= 0 else -1.0
+        mag = abs(float(value))
+        if mag <= deadzone:
+            return 0.0
+        denom = max(1.0 - deadzone, 1e-6)
+        return sign * min(1.0, (mag - deadzone) / denom)
 
     @staticmethod
     def _scaled_axis(value: float, deadzone: float, max_deg: float) -> float:
@@ -608,6 +720,18 @@ class IntentDecoder:
                 abs(new.waist_pitch_deg - old.waist_pitch_deg) >= thresh
                 or abs(new.waist_roll_deg - old.waist_roll_deg) >= thresh
                 or abs(new.waist_yaw_deg - old.waist_yaw_deg) >= thresh
+            )
+        if new.intent == "locomotion":
+            # Mirror the hold_torso hysteresis: only re-emit when the
+            # operator has moved a stick by at least the configured
+            # threshold (in normalised post-deadzone units). Without
+            # this every tick of inevitable thumbstick noise would
+            # republish at 50-90 Hz.
+            thresh = self._continuous_stick_threshold
+            return (
+                abs(new.stick_fwd  - old.stick_fwd)  >= thresh
+                or abs(new.stick_side - old.stick_side) >= thresh
+                or abs(new.stick_yaw  - old.stick_yaw)  >= thresh
             )
         # Discrete commands: any field change counts (intent/magnitude
         # already compared above; equality on the dataclass covers any

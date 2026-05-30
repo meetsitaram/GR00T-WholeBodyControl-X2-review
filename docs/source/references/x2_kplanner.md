@@ -196,28 +196,30 @@ _FAST_WALK_SPEED_MPS = 0.9    # walk-fast
 _BACK_SPEED_MPS      = 0.35   # back_step / walk-backward 1× speed
 _SIDE_SPEED_MPS      = 0.4    # side_left / side_right 1× speed
 _TURN_45_RAD_S       = 1.5    # turn_left / turn_right 1× yaw rate (= deg_45)
-_HIP_HEIGHT_M        = 0.95   # hip channel (constant for now)
+_HIP_HEIGHT_M        = 0.687  # target pelvis Y (channel 3) -- must match
+                              # training distribution (PKL pelvis_z mean
+                              # ~0.66 m); 0.95 was OOD for current model
 ```
 
 | `(intent, magnitude)` | Resolved value | Source |
 | --- | --- | --- |
-| `idle / default` or `idle / stand` | `(0, 0, 0, 0.95)` | idle |
-| `walk / forward` | `(0,  0.5, 0, 0.95)` | walk table |
-| `walk / backward` | `(0, -0.35, 0, 0.95)` | walk table |
-| `walk / fast` | `(0,  0.9, 0, 0.95)` | walk table |
-| `fwd_step / default` | `(0,  0.5, 0, 0.95)` | base × 1.0 |
-| `fwd_step / quarter_ft` | `(0,  0.25, 0, 0.95)` | base × 0.5 |
-| `fwd_step / half_ft` | `(0,  0.5, 0, 0.95)` | base × 1.0 |
-| `fwd_step / one_ft` | `(0,  0.75, 0, 0.95)` | base × 1.5 |
-| `back_step / default` | `(0, -0.35, 0, 0.95)` | base × 1.0 |
-| `back_step / quarter_ft` | `(0, -0.175, 0, 0.95)` | base × 0.5 |
-| `back_step / half_ft` | `(0, -0.35, 0, 0.95)` | base × 1.0 |
-| `side_left / default` | `(0, 0,  0.40, 0.95)` | base × 1.0 |
-| `side_right / default` | `(0, 0, -0.40, 0.95)` | base × 1.0 |
-| `turn_left / deg_45` |  `( 1.5, 0, 0, 0.95)` | base × 1.0 (= baseline) |
-| `turn_left / deg_15` |  `( 0.5, 0, 0, 0.95)` | base × ⅓ |
-| `turn_left / deg_30` |  `( 1.0, 0, 0, 0.95)` | base × ⅔ |
-| `turn_left / deg_90` |  `( 3.0, 0, 0, 0.95)` | base × 2 |
+| `idle / default` or `idle / stand` | `(0, 0, 0, 0.687)` | idle |
+| `walk / forward` | `(0,  0.5, 0, 0.687)` | walk table |
+| `walk / backward` | `(0, -0.35, 0, 0.687)` | walk table |
+| `walk / fast` | `(0,  0.9, 0, 0.687)` | walk table |
+| `fwd_step / default` | `(0,  0.5, 0, 0.687)` | base × 1.0 |
+| `fwd_step / quarter_ft` | `(0,  0.25, 0, 0.687)` | base × 0.5 |
+| `fwd_step / half_ft` | `(0,  0.5, 0, 0.687)` | base × 1.0 |
+| `fwd_step / one_ft` | `(0,  0.75, 0, 0.687)` | base × 1.5 |
+| `back_step / default` | `(0, -0.35, 0, 0.687)` | base × 1.0 |
+| `back_step / quarter_ft` | `(0, -0.175, 0, 0.687)` | base × 0.5 |
+| `back_step / half_ft` | `(0, -0.35, 0, 0.687)` | base × 1.0 |
+| `side_left / default` | `(0, 0,  0.40, 0.687)` | base × 1.0 |
+| `side_right / default` | `(0, 0, -0.40, 0.687)` | base × 1.0 |
+| `turn_left / deg_45` |  `( 1.5, 0, 0, 0.687)` | base × 1.0 (= baseline) |
+| `turn_left / deg_15` |  `( 0.5, 0, 0, 0.687)` | base × ⅓ |
+| `turn_left / deg_30` |  `( 1.0, 0, 0, 0.687)` | base × ⅔ |
+| `turn_left / deg_90` |  `( 3.0, 0, 0, 0.687)` | base × 2 |
 | `turn_right / *` | mirror with negated yaw | base × scale |
 
 Channels match the MotionBricks `LocalRootLocalBody` representation

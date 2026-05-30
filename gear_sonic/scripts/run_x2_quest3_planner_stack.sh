@@ -53,6 +53,29 @@
 #       [--sonic-checkpoint PATH] [--no-sonic-checkpoint]
 #       [--sonic-tokenizer-device DEV] [--encoder-config PATH]
 #       [--planner-demo PATH.yaml]
+#       [--planner {kplanner,heuristic}]
+#       [--kplanner-vqvae-ckpt PATH] [--kplanner-pose-ckpt PATH]
+#       [--kplanner-root-ckpt PATH] [--kplanner-warmup-qpos PATH]
+#       [--kplanner-device DEV] [--kplanner-replan-threshold-frames N]
+#       [--kplanner-python PATH]    # e.g. ~/miniconda3/envs/env_isaaclab/bin/python
+#                                   # for Blackwell (RTX 5090) sm_120 support
+#       [--kplanner-stick-shape-exp FLOAT]
+#                                   # locomotion/continuous stick power-curve
+#                                   # exponent (>0). 1.0=linear (default),
+#                                   # 0.5=push-stick-a-little-and-walk-normal,
+#                                   # 2.0=more deadzone-feel. Tunes the
+#                                   # Quest3 L-stick analog response without
+#                                   # changing the peak velocity.
+#       [--pose-ref-watchdog {auto,on,off}]
+#                                   # auto (default): off in local sim,
+#                                   # on for --remote-deploy / --no-deploy.
+#                                   # The deploy's 0.5 s SAFE_IDLE watchdog
+#                                   # is a wifi-safety guard; in local sim
+#                                   # there is no wire to drop, the cold-
+#                                   # start gap reliably trips it, and the
+#                                   # 4x kd snap to default_angles collapses
+#                                   # the robot. Pass ``on`` to exercise the
+#                                   # split-topology safety path in sim.
 #       [--rate FLOAT] [--log-dir PATH] [--cleanup-only] [--validate-only]
 #       [--vla-bridge MODEL_DIR --vla-prompt STR
 #        [--vla-device DEV] [--vla-rate FLOAT] [--vla-inference-period-s S]
@@ -206,9 +229,20 @@ PYTHON="${REPO_ROOT}/.venv/bin/python"
 if [[ ! -x "${PYTHON}" ]]; then
     PYTHON="$(command -v python3 || command -v python)"
 fi
+# The kplanner can need a different python from the rest of the stack
+# because its torch must support the local GPU's compute capability.
+# Specifically, the base ``.venv`` torch (2.6+cu124) crashes on
+# Blackwell (RTX 5090, sm_120); ``env_isaaclab`` ships torch 2.7+cu128
+# which works. Override with --kplanner-python or env var KPLANNER_PYTHON
+# to route just the kplanner subprocess to a different interpreter.
+KPLANNER_PYTHON="${KPLANNER_PYTHON:-${PYTHON}}"
 
 # PID files we need to clean up (planner writes its own; we own the rest).
-PLANNER_PID_FILE="/tmp/x2_heuristic_planner.pid"
+# Resolved post-CLI based on --planner (heuristic vs kplanner). Both
+# planner kinds use ``/tmp/x2_*_planner.pid`` so cleanup_stale can find
+# whichever one was left behind by a previous run.
+PLANNER_PID_FILE="/tmp/x2_kplanner.pid"
+ALT_PLANNER_PID_FILE="/tmp/x2_heuristic_planner.pid"
 
 # --------------------------------------------------------------------------
 # Port + topic contract (mirrored in --help so operators don't have to
@@ -306,6 +340,59 @@ SIDECAR_LOG=""          # default: <log-dir>/manager_sidecar.jsonl
 # (no heuristic planner is spawned in that path).
 PLANNER_DEMO=""
 
+# Planner kind. Default to ``kplanner`` (neural kinematic planner --
+# MotionBricks VQVAE/pose/root checkpoints producing 31-DOF refs from a
+# velocity intent). Set to ``heuristic`` to fall back to the
+# primitives + bins state machine
+# (``gear_sonic/scripts/x2_heuristic_planner.py``). Both planners use
+# ``--sim-profile parity`` by default but bake from different sources:
+# heuristic from ``planner.current_anchor_frame()`` (idle_stand[0] in
+# primitives) and kplanner from its warmup quiet-stand qpos (the
+# 38-D vector in ``x2_kplanner._build_default_warmup_qpos`` or the
+# user-supplied ``--kplanner-warmup-qpos`` PKL). Operators can pass
+# ``--sim-profile manual`` to opt out of parity, but be aware manual
+# spawns the pelvis at z=0.85m on an elastic band -- the robot drops
+# if no pose ref arrives during the cold-start window.
+PLANNER_KIND="kplanner"
+# Optional ckpt overrides for the kplanner. Empty -> defaults baked
+# into x2_kplanner.py (pinned step checkpoints in each
+# motionbricks_*_x2/version_1; see ``X2PlannerPaths.default()`` in
+# motionbricks/.../load_x2_planner.py for the source of truth).
+KPLANNER_VQVAE_CKPT=""
+KPLANNER_POSE_CKPT=""
+KPLANNER_ROOT_CKPT=""
+KPLANNER_WARMUP_QPOS=""
+KPLANNER_DEVICE="cuda"
+# Worker thread refills the kplanner's ring buffer when frames_remaining
+# < this value. Lower => fewer chained replans => fewer prediction-
+# feedback links => less compounding yaw drift. The PKL replay diagnostic
+# matrix (see "Deploy-integration diagnostics" in
+# motionbricks/docs/x2_kplanner_evaluation.md) showed thresh=2 + a
+# non-oscillating (continuous, not bucketed) intent stream raises
+# forward tracking ~19% -> ~72%; the same lever applies here because
+# Quest 3 with --enable-continuous-locomotion is the analog of the PKL
+# replay's mean-intent mode (no per-tick velocity flapping). 16 was
+# the original default; 2 is the empirically-validated shippable value.
+KPLANNER_REPLAN_THRESHOLD_FRAMES="2"
+
+# Runtime velocity tuning passed straight through to ``x2_kplanner.py``.
+# Default empty -> let the daemon use its own defaults (yaw-lock on at
+# 0.05 rad/s, all direction scales 1.0). Override via wrapper flags or
+# environment variables when the operator wants to compensate for the
+# model's L/R asymmetry or quell yaw drift more / less aggressively.
+KPLANNER_YAW_LOCK_EPSILON="${KPLANNER_YAW_LOCK_EPSILON:-}"
+KPLANNER_TURN_LEFT_SCALE="${KPLANNER_TURN_LEFT_SCALE:-}"
+KPLANNER_TURN_RIGHT_SCALE="${KPLANNER_TURN_RIGHT_SCALE:-}"
+KPLANNER_FORWARD_SCALE="${KPLANNER_FORWARD_SCALE:-}"
+KPLANNER_BACKWARD_SCALE="${KPLANNER_BACKWARD_SCALE:-}"
+KPLANNER_LATERAL_SCALE="${KPLANNER_LATERAL_SCALE:-}"
+# Continuous-locomotion stick shaping exponent (power curve). Empty ->
+# x2_kplanner.py default (1.0 = linear). <1.0 = closer to bucketed feel
+# (push stick a little -> robot already at moderate speed); >1.0 = more
+# deadzone-feel (need to push the stick hard to move). Set via env
+# ``KPLANNER_STICK_SHAPE_EXP=0.5`` for a faster walking feel.
+KPLANNER_STICK_SHAPE_EXP="${KPLANNER_STICK_SHAPE_EXP:-}"
+
 # --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
 # we treat the laptop as the operator-side stack ONLY (manager + planner
@@ -392,6 +479,38 @@ VLA_NO_POLICY=0                 # 1 -> bridge runs publisher + x2_debug SUB only
                                 #      without paying the model-load cost or
                                 #      letting policy actions move the robot.
 
+# --------------------------------------------------------------------------
+# Pose-ref starvation watchdog (deploy-side, since 2026-05-16). The C++
+# deploy ships a watchdog that flips CONTROL -> SAFE_IDLE when no pose-ref
+# frame has been received for ``--pose-ref-stale-s`` seconds (default 0.5
+# s) and holds ``default_angles`` with 4x kd until BOTH (a) fresh frames
+# resume for 1 s AND (b) the operator sends the resume chord on
+# ``pose_resume``. The watchdog is essential for the real-robot
+# split-topology path (laptop -> wifi -> PC2): if the operator wire
+# stalls mid-task, the watchdog catches the freeze-while-leaning failure
+# mode and the proxy daemon (x2_pc2_daemons.sh -> x2_pose_proxy.py) keeps
+# the wire flowing with idle frames so the watchdog only ever fires on a
+# real fault.
+#
+# In LOCAL SIM the entire stack is localhost: there's no wire to lose,
+# the wrapper's cleanup trap kills the whole tree if any process dies,
+# and the cold-start ordering (Step 1 deploy -> Step 4 recorder) opens a
+# multi-second gap where ``pose:5556`` has zero subscribers AND zero
+# publishers. The watchdog trips ~0.5 s after CONTROL with no upstream,
+# pulls every DOF to ``default_angles`` with 4x kd, and (depending on
+# the spawn pose <-> default_angles delta) tips the robot. Net: in
+# local sim the watchdog protects against nothing and reliably collapses
+# the robot during cold-start.
+#
+# Default is ``auto`` -> on for split-topology (--remote-deploy / VLA),
+# off for local sim. Override with --pose-ref-watchdog {on,off,auto}.
+# When effectively off, ``--disable-pose-ref-watchdog`` is forwarded to
+# the deploy binary via --deploy-extra-arg (deploy_x2.sh doesn't expose
+# the flag as a first-class wrapper arg; x2_pc2_daemons.sh uses the
+# same passthrough trick).
+# --------------------------------------------------------------------------
+POSE_REF_WATCHDOG="auto"
+
 usage() {
     # Print every comment line from "# Usage:" until the first
     # non-comment line (i.e. the whole hand-written help block above).
@@ -446,6 +565,22 @@ while [[ $# -gt 0 ]]; do
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
         --validate-only) VALIDATE_ONLY=1; shift ;;
         --planner-demo) PLANNER_DEMO="$2"; shift 2 ;;
+        --planner) PLANNER_KIND="$2"; shift 2 ;;
+        --kplanner-vqvae-ckpt) KPLANNER_VQVAE_CKPT="$2"; shift 2 ;;
+        --kplanner-pose-ckpt)  KPLANNER_POSE_CKPT="$2";  shift 2 ;;
+        --kplanner-root-ckpt)  KPLANNER_ROOT_CKPT="$2";  shift 2 ;;
+        --kplanner-warmup-qpos) KPLANNER_WARMUP_QPOS="$2"; shift 2 ;;
+        --kplanner-device) KPLANNER_DEVICE="$2"; shift 2 ;;
+        --kplanner-replan-threshold-frames) KPLANNER_REPLAN_THRESHOLD_FRAMES="$2"; shift 2 ;;
+        --kplanner-python) KPLANNER_PYTHON="$2"; shift 2 ;;
+        --kplanner-yaw-lock-epsilon) KPLANNER_YAW_LOCK_EPSILON="$2"; shift 2 ;;
+        --kplanner-turn-left-scale) KPLANNER_TURN_LEFT_SCALE="$2"; shift 2 ;;
+        --kplanner-turn-right-scale) KPLANNER_TURN_RIGHT_SCALE="$2"; shift 2 ;;
+        --kplanner-forward-scale) KPLANNER_FORWARD_SCALE="$2"; shift 2 ;;
+        --kplanner-backward-scale) KPLANNER_BACKWARD_SCALE="$2"; shift 2 ;;
+        --kplanner-lateral-scale) KPLANNER_LATERAL_SCALE="$2"; shift 2 ;;
+        --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
+        --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
         --vla-bridge) VLA_BRIDGE_MODEL="$2"; shift 2 ;;
         --vla-bridge-sonic-checkpoint)
             VLA_BRIDGE_SONIC_CKPT_MODE="explicit"
@@ -490,6 +625,33 @@ else
     VLA_MODE=0
 fi
 
+# Resolve planner kind. The kplanner is the default for new runs.
+case "${PLANNER_KIND}" in
+    kplanner)
+        PLANNER_PID_FILE="/tmp/x2_kplanner.pid"
+        ALT_PLANNER_PID_FILE="/tmp/x2_heuristic_planner.pid"
+        ;;
+    heuristic)
+        PLANNER_PID_FILE="/tmp/x2_heuristic_planner.pid"
+        ALT_PLANNER_PID_FILE="/tmp/x2_kplanner.pid"
+        ;;
+    *)
+        echo "ERROR: --planner must be one of 'kplanner' (default) or 'heuristic'; got '${PLANNER_KIND}'" >&2
+        exit 1
+        ;;
+esac
+
+# Parity RSI: each planner kind has its own anchor PKL since the
+# heuristic derives the anchor from ``planner.current_anchor_frame()``
+# (idle_stand[0] from primitives) and the kplanner derives it from
+# its warmup quiet-stand qpos. Repoint SIM_RSI_PKL accordingly so the
+# deploy's ``--motion <PKL>`` spawns at a pose byte-identical to what
+# the upstream planner's tick 0 emits. Both planners default to
+# ``--sim-profile parity`` to avoid the manual-profile mid-air spawn.
+if [[ "${PLANNER_KIND}" == "kplanner" ]]; then
+    SIM_RSI_PKL="${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_kplanner_rsi_anchor.pkl"
+fi
+
 # Remote-deploy gating. Keep this BEFORE the --validate-only short-
 # circuit so the operator can sanity-check the resolved banner with
 # both --remote-deploy and --validate-only set together.
@@ -510,6 +672,30 @@ if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
         WITH_DEPLOY=0
     fi
 fi
+
+# Resolve --pose-ref-watchdog ``auto`` to a concrete on/off setting.
+# ``auto`` -> off when the deploy runs locally (WITH_DEPLOY=1); on
+# otherwise (split-topology --remote-deploy / --no-deploy paths where
+# the deploy lives behind a wifi hop and the watchdog is the only thing
+# protecting against a freeze-while-leaning stall). See the long
+# rationale next to ``POSE_REF_WATCHDOG=`` above. Anything not in
+# {on,off,auto} is a CLI typo -- fail loudly so the operator notices.
+case "${POSE_REF_WATCHDOG}" in
+    auto)
+        if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
+            POSE_REF_WATCHDOG_RESOLVED="off"
+        else
+            POSE_REF_WATCHDOG_RESOLVED="on"
+        fi
+        ;;
+    on|off)
+        POSE_REF_WATCHDOG_RESOLVED="${POSE_REF_WATCHDOG}"
+        ;;
+    *)
+        echo "ERROR: --pose-ref-watchdog must be one of 'auto' (default), 'on', or 'off'; got '${POSE_REF_WATCHDOG}'" >&2
+        exit 1
+        ;;
+esac
 
 if [[ -z "${LOG_DIR}" ]]; then
     LOG_DIR="/tmp/x2_quest3_planner_stack-$(date +%Y%m%d_%H%M%S)"
@@ -621,13 +807,16 @@ free_port() {
 }
 
 cleanup_stale() {
-    log "cleanup_stale: PID file=${PLANNER_PID_FILE} ports=${POSE_PORT},${DEBUG_PORT},${PLANNER_CMD_PORT},${ARM_HANDS_PORT},${BODY_POSE_PORT}"
-    if [[ -f "${PLANNER_PID_FILE}" ]]; then
-        local stale_pid
-        stale_pid="$(cat "${PLANNER_PID_FILE}" 2>/dev/null || true)"
-        kill_pid_quiet "${stale_pid}" "stale planner"
-        rm -f "${PLANNER_PID_FILE}"
-    fi
+    log "cleanup_stale: PID files=${PLANNER_PID_FILE},${ALT_PLANNER_PID_FILE} ports=${POSE_PORT},${DEBUG_PORT},${PLANNER_CMD_PORT},${ARM_HANDS_PORT},${BODY_POSE_PORT}"
+    local pid_path
+    for pid_path in "${PLANNER_PID_FILE}" "${ALT_PLANNER_PID_FILE}"; do
+        if [[ -f "${pid_path}" ]]; then
+            local stale_pid
+            stale_pid="$(cat "${pid_path}" 2>/dev/null || true)"
+            kill_pid_quiet "${stale_pid}" "stale planner (${pid_path})"
+            rm -f "${pid_path}"
+        fi
+    done
     free_port "${POSE_PORT}"
     free_port "${PLANNER_CMD_PORT}"
     free_port "${ARM_HANDS_PORT}"
@@ -821,8 +1010,10 @@ fi
 # (Step 2/4) and the parity-mode RSI bake (Step 1/4 sub-step). In VLA
 # mode the planner is replaced and the deploy is forced to non-parity
 # (no RSI PKL needed) -- skip the existence checks so a fresh checkout
-# missing curated primitives can still drive a closed-loop demo.
-if [[ "${VLA_MODE}" -eq 0 ]]; then
+# missing curated primitives can still drive a closed-loop demo. The
+# neural kplanner also doesn't consume them (it streams from trained
+# checkpoints instead).
+if [[ "${VLA_MODE}" -eq 0 && "${PLANNER_KIND}" == "heuristic" ]]; then
     if [[ ! -f "${PRIMITIVES_PKL}" ]]; then
         err "primitives PKL not found: ${PRIMITIVES_PKL}"
         err "run: ${PYTHON} -m gear_sonic.scripts.curate_x2_primitives"
@@ -830,6 +1021,70 @@ if [[ "${VLA_MODE}" -eq 0 ]]; then
     fi
     if [[ ! -f "${BINS_YAML}" ]]; then
         err "bins YAML not found: ${BINS_YAML}"
+        exit 1
+    fi
+fi
+# kplanner preflight: verify the three MotionBricks checkpoints are
+# present unless the operator overrode them explicitly via
+# ``--kplanner-*-ckpt`` (in which case we trust the path and let the
+# Python daemon raise a clean FileNotFoundError on boot).
+if [[ "${VLA_MODE}" -eq 0 && "${PLANNER_KIND}" == "kplanner" ]]; then
+    # Must mirror x2_kplanner.py's argparse defaults + load_x2_planner.py's
+    # X2PlannerPaths.default(). Pinned step checkpoints (not last.ckpt) so
+    # a fresh training run doesn't silently re-point inference at an
+    # unverified checkpoint.
+    KPL_VQVAE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt"
+    KPL_POSE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt"
+    KPL_ROOT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt"
+    for ck in "${KPLANNER_VQVAE_CKPT:-${KPL_VQVAE_DEFAULT}}" \
+              "${KPLANNER_POSE_CKPT:-${KPL_POSE_DEFAULT}}" \
+              "${KPLANNER_ROOT_CKPT:-${KPL_ROOT_DEFAULT}}"; do
+        if [[ ! -f "${ck}" ]]; then
+            err "kplanner checkpoint not found: ${ck}"
+            err "Pass --planner heuristic to use the curated primitives"
+            err "fallback, or override via --kplanner-{vqvae,pose,root}-ckpt."
+            exit 1
+        fi
+    done
+    # Import-time preflight: verify the chosen --kplanner-python can
+    # actually load the kplanner stack. Previously a missing motionbricks
+    # install (e.g. when KPLANNER_PYTHON is routed to env_isaaclab without
+    # having pip-install -e'd motionbricks/) only surfaced AFTER the
+    # deploy was already running, dropping the robot mid-air when the
+    # planner crashed. We now fail fast BEFORE Step 1 (deploy spawn) so
+    # MuJoCo physics never starts without a publisher.
+    log "kplanner preflight: probing imports under ${KPLANNER_PYTHON}..."
+    KPLANNER_PREFLIGHT_PYTHONPATH="${REPO_ROOT}/motionbricks:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    if ! PYTHONPATH="${KPLANNER_PREFLIGHT_PYTHONPATH}" \
+            "${KPLANNER_PYTHON}" -c "
+import sys
+missing = []
+for mod in [
+    'torch', 'numpy', 'omegaconf', 'pytorch_lightning',
+    'vector_quantize_pytorch', 'adam_atan2_pytorch', 'zmq',
+    'motionbricks.motion_backbone.inference.load_x2_planner',
+    'motionbricks.motion_backbone.inference.neural_planner',
+    'gear_sonic.utils.planner.state_machine',
+    'gear_sonic.utils.teleop.zmq.zmq_planner_sender',
+]:
+    try:
+        __import__(mod)
+    except Exception as exc:
+        missing.append((mod, repr(exc)))
+if missing:
+    for mod, exc in missing:
+        print(f'MISSING {mod}: {exc}', file=sys.stderr)
+    sys.exit(1)
+print('all kplanner imports OK')
+" >/dev/null; then
+        err "kplanner python cannot import its dependencies: ${KPLANNER_PYTHON}"
+        err "(this would crash the daemon AFTER deploy spawns -> robot drops)"
+        err ""
+        err "Fix: either"
+        err "  - install missing deps: ${KPLANNER_PYTHON} -m pip install \\"
+        err "        pytorch-lightning vector-quantize-pytorch adam-atan2-pytorch"
+        err "  - switch interpreter: --kplanner-python ${REPO_ROOT}/.venv/bin/python"
+        err "  - fall back to heuristic: --planner heuristic"
         exit 1
     fi
 fi
@@ -1244,10 +1499,13 @@ ${C_GREEN}┌──────────────────────�
   mode             : $([[ "${WITH_RECORD}" -eq 1 ]] && echo "RECORD -> ${OUTPUT_DIR}" || echo "TELEOP-ONLY")
   task             : ${TASK:-(none -- robocasa auto-fills from scene metadata)}
   scene            : $([[ "${ROBOCASA_ENV}" == "none" ]] && echo "(flat floor, no robocasa scene)" || echo "${ROBOCASA_ENV} -> ${ROBOCASA_SCENE_XML}")
+  planner kind     : ${PLANNER_KIND}$([[ "${PLANNER_KIND}" == "kplanner" ]] && echo "  (neural; INTENT_VELOCITY_MAP -> motion_inference.predict)" || echo "  (curated primitives + bins state machine)")$([[ "${PLANNER_KIND}" == "kplanner" ]] && echo "
+  kplanner device  : ${KPLANNER_DEVICE}  python: ${KPLANNER_PYTHON}" || true)
   planner demo     : ${PLANNER_DEMO:-(none -- planner sits in IDLE_LOOP at startup, awaits VR planner_cmd)}
   finger comp      : curl=$([[ "${APPLY_CURL_COMP}" -eq 1 ]] && echo on || echo off)  oppose=$([[ "${APPLY_OPPOSE_COMP}" -eq 1 ]] && echo on || echo off)$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)" || echo "  (pass --apply-{curl,oppose}-compensation to enable)")
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
   remote-deploy    : $([[ -n "${REMOTE_DEPLOY_HOST}" ]] && echo "ON  -> ${REMOTE_DEPLOY_HOST} (recorder x2_debug SUB redirected; manager resume PUB :${RESUME_PUB_PORT}; manager motor_monitor SUB tcp://${REMOTE_DEPLOY_HOST}:${MOTOR_MONITOR_PORT})" || echo "off")
+  pose-ref watchdog: ${POSE_REF_WATCHDOG_RESOLVED} (cli=${POSE_REF_WATCHDOG}; off=--disable-pose-ref-watchdog forwarded to deploy; on=C++ default 0.5 s SAFE_IDLE trip)
   ONNX model       : ${SIM_MODEL}
   motion_token     : $([[ -n "${SONIC_CHECKPOINT}" ]] && echo "ON  (${SONIC_CHECKPOINT}, ${SONIC_TOKENIZER_DEVICE})" || echo "DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)")
   encoder_config   : $([[ -n "${SONIC_CHECKPOINT}" && -n "${ENCODER_CONFIG}" ]] && echo "${ENCODER_CONFIG}, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D" || ([[ -n "${SONIC_CHECKPOINT}" ]] && echo "DEPRECATED freeze-pose (--encoder-config '' was passed)" || echo "(unused; tokenizer DISABLED above)"))
@@ -1312,21 +1570,51 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
         DEPLOY_DURATION_S=0
     fi
 
-    # Parity profile needs the bridge RSI PKL. Auto-bake on first use
-    # so a fresh checkout / primitive rebuild doesn't fail at boot.
+    # Parity profile needs the bridge RSI PKL so MuJoCo spawns the
+    # robot ON THE FLOOR in the exact pose the policy is about to
+    # track (no elastic-band drop from 0.85m, no mid-air launch). Each
+    # planner has its own anchor source:
+    #
+    #   - heuristic: planner.current_anchor_frame() (idle_stand[0]
+    #     from the curated primitives PKL).
+    #   - kplanner: the daemon's warmup quiet-stand qpos
+    #     (``_build_default_warmup_qpos()`` by default, or the user-
+    #     supplied --kplanner-warmup-qpos PKL).
+    #
+    # Auto-bake on first use so a fresh checkout / training rerun
+    # doesn't surface as a robot collapse.
     if [[ "${SIM_PROFILE}" == "parity" ]]; then
-        if [[ ! -f "${SIM_RSI_PKL}" ]]; then
-            log "RSI anchor PKL not found at ${SIM_RSI_PKL}; baking now ..."
-            if ! "${PYTHON}" -m gear_sonic.scripts.bake_planner_rsi_anchor \
-                    --primitives-pkl "${PRIMITIVES_PKL}" \
-                    --bins-yaml "${BINS_YAML}" \
-                    --out "${SIM_RSI_PKL}" \
+        if [[ "${PLANNER_KIND}" == "heuristic" ]]; then
+            if [[ ! -f "${SIM_RSI_PKL}" ]]; then
+                log "RSI anchor PKL not found at ${SIM_RSI_PKL}; baking now ..."
+                if ! "${PYTHON}" -m gear_sonic.scripts.bake_planner_rsi_anchor \
+                        --primitives-pkl "${PRIMITIVES_PKL}" \
+                        --bins-yaml "${BINS_YAML}" \
+                        --out "${SIM_RSI_PKL}" \
+                        >>"${LOG_DIR}/rsi_anchor_bake.log" 2>&1; then
+                    err "failed to bake heuristic RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
+                    exit 1
+                fi
+            fi
+        else
+            # kplanner: bake against the same warmup qpos the daemon
+            # will publish on tick 0 so the bridge RSI = wire content.
+            # Always re-bake (it's <300 ms and depends only on the
+            # operator's --kplanner-warmup-qpos override) so changes
+            # to the override take effect without an explicit rebuild.
+            log "baking kplanner RSI anchor PKL -> ${SIM_RSI_PKL}"
+            KPL_BAKE_ARGS=(-m gear_sonic.scripts.bake_kplanner_rsi_anchor
+                           --out "${SIM_RSI_PKL}")
+            if [[ -n "${KPLANNER_WARMUP_QPOS}" ]]; then
+                KPL_BAKE_ARGS+=(--warmup-qpos-path "${KPLANNER_WARMUP_QPOS}")
+            fi
+            if ! "${PYTHON}" "${KPL_BAKE_ARGS[@]}" \
                     >>"${LOG_DIR}/rsi_anchor_bake.log" 2>&1; then
-                err "failed to bake RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
+                err "failed to bake kplanner RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
                 exit 1
             fi
         fi
-        log "parity RSI source: ${SIM_RSI_PKL}"
+        log "parity RSI source: ${SIM_RSI_PKL}  (planner=${PLANNER_KIND})"
     fi
 
     DEPLOY_ARGS=(
@@ -1411,6 +1699,16 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
         fi
     fi
 
+    # Pose-ref starvation watchdog. ``off`` -> forward
+    # ``--disable-pose-ref-watchdog`` to the C++ binary via deploy_x2.sh's
+    # generic ``--deploy-extra-arg`` passthrough (see the long rationale
+    # at ``POSE_REF_WATCHDOG=`` near the top of this file). In ``auto``
+    # mode this resolves to off for local sim (everything is localhost,
+    # there's nothing to starve over) and on for split-topology.
+    if [[ "${POSE_REF_WATCHDOG_RESOLVED}" == "off" ]]; then
+        DEPLOY_ARGS+=(--deploy-extra-arg --disable-pose-ref-watchdog)
+    fi
+
     if [[ "${VLA_MODE}" -eq 0 ]]; then
         log "Step 1/4 — spawning deploy_x2.sh sim --vla -> ${DEPLOY_LOG}"
         "${DEPLOY_SH}" "${DEPLOY_ARGS[@]}" >"${DEPLOY_LOG}" 2>&1 &
@@ -1453,42 +1751,118 @@ else
     PLANNER_PUB_HOST=127.0.0.1
 fi
 
-PLANNER_ARGS=(
-    -m gear_sonic.scripts.x2_heuristic_planner
-    --primitives "${PRIMITIVES_PKL}"
-    --bins "${BINS_YAML}"
-    --pub-host "${PLANNER_PUB_HOST}"
-    --body-pose-port "${BODY_POSE_PORT}"
-    --zmq-cmd-host localhost
-    --zmq-cmd-port "${PLANNER_CMD_PORT}"
-    --zmq-cmd-topic "${PLANNER_CMD_TOPIC}"
-    --warmup-quiet-stand-s "${WARMUP_QUIET_STAND_S}"
-    --pid-file "${PLANNER_PID_FILE}"
-    --duration-s "${DURATION_S}"
-)
-# Optional --demo: pre-loads the YAML's command sequence into the
-# planner's queue at boot. Commands play in order through the FSM
-# (idle -> blend -> primitive -> blend -> idle ...) and the queue
-# drains naturally back to IDLE_LOOP. The first manager-emitted
-# planner_cmd that lands while the queue is non-empty calls
-# replace_pending() and drops anything still pending so the operator
-# always wins (see x2_heuristic_planner.py "Source semantics").
-if [[ -n "${PLANNER_DEMO}" ]]; then
-    PLANNER_ARGS+=(--demo "${PLANNER_DEMO}")
-fi
+if [[ "${PLANNER_KIND}" == "heuristic" ]]; then
+    PLANNER_ARGS=(
+        -m gear_sonic.scripts.x2_heuristic_planner
+        --primitives "${PRIMITIVES_PKL}"
+        --bins "${BINS_YAML}"
+        --pub-host "${PLANNER_PUB_HOST}"
+        --body-pose-port "${BODY_POSE_PORT}"
+        --zmq-cmd-host localhost
+        --zmq-cmd-port "${PLANNER_CMD_PORT}"
+        --zmq-cmd-topic "${PLANNER_CMD_TOPIC}"
+        --warmup-quiet-stand-s "${WARMUP_QUIET_STAND_S}"
+        --pid-file "${PLANNER_PID_FILE}"
+        --duration-s "${DURATION_S}"
+    )
+    # Optional --demo: pre-loads the YAML's command sequence into the
+    # planner's queue at boot. Commands play in order through the FSM
+    # (idle -> blend -> primitive -> blend -> idle ...) and the queue
+    # drains naturally back to IDLE_LOOP. The first manager-emitted
+    # planner_cmd that lands while the queue is non-empty calls
+    # replace_pending() and drops anything still pending so the operator
+    # always wins (see x2_heuristic_planner.py "Source semantics").
+    if [[ -n "${PLANNER_DEMO}" ]]; then
+        PLANNER_ARGS+=(--demo "${PLANNER_DEMO}")
+    fi
 
-log "Step 2/4 — spawning x2_heuristic_planner -> ${PLANNER_LOG}"
-if [[ -n "${PLANNER_DEMO}" ]]; then
-    log "  (--planner-demo ${PLANNER_DEMO}: queue will drain to idle_stand"
-    log "   on its own; first VR planner_cmd preempts via replace_pending)"
-fi
-"${PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
-PLANNER_PID=$!
+    log "Step 2/4 — spawning x2_heuristic_planner -> ${PLANNER_LOG}"
+    if [[ -n "${PLANNER_DEMO}" ]]; then
+        log "  (--planner-demo ${PLANNER_DEMO}: queue will drain to idle_stand"
+        log "   on its own; first VR planner_cmd preempts via replace_pending)"
+    fi
+    "${PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
+    PLANNER_PID=$!
 
-log "  waiting for planner 'Phase 0 mode' marker (up to 30s)..."
-if ! wait_for_log_marker "${PLANNER_LOG}" "${PLANNER_PID}" \
-        "Phase 0 mode: publishing 'body_pose'" 30 "planner"; then
-    exit 1
+    log "  waiting for planner 'Phase 0 mode' marker (up to 30s)..."
+    if ! wait_for_log_marker "${PLANNER_LOG}" "${PLANNER_PID}" \
+            "Phase 0 mode: publishing 'body_pose'" 30 "planner"; then
+        exit 1
+    fi
+else
+    # kplanner mode (default). The neural daemon's command surface is
+    # a strict subset of the heuristic's, so we forward the same VR
+    # / scripted-demo / pub-host knobs and just swap the entry-point.
+    PLANNER_ARGS=(
+        -m gear_sonic.scripts.x2_kplanner
+        --pub-host "${PLANNER_PUB_HOST}"
+        --body-pose-port "${BODY_POSE_PORT}"
+        --zmq-cmd-host localhost
+        --zmq-cmd-port "${PLANNER_CMD_PORT}"
+        --zmq-cmd-topic "${PLANNER_CMD_TOPIC}"
+        --warmup-quiet-stand-s "${WARMUP_QUIET_STAND_S}"
+        --pid-file "${PLANNER_PID_FILE}"
+        --duration-s "${DURATION_S}"
+        --device "${KPLANNER_DEVICE}"
+        --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
+    )
+    if [[ -n "${PLANNER_DEMO}" ]]; then
+        PLANNER_ARGS+=(--demo "${PLANNER_DEMO}")
+    fi
+    if [[ -n "${KPLANNER_VQVAE_CKPT}" ]]; then
+        PLANNER_ARGS+=(--vqvae-ckpt "${KPLANNER_VQVAE_CKPT}")
+    fi
+    if [[ -n "${KPLANNER_POSE_CKPT}" ]]; then
+        PLANNER_ARGS+=(--pose-ckpt "${KPLANNER_POSE_CKPT}")
+    fi
+    if [[ -n "${KPLANNER_ROOT_CKPT}" ]]; then
+        PLANNER_ARGS+=(--root-ckpt "${KPLANNER_ROOT_CKPT}")
+    fi
+    if [[ -n "${KPLANNER_WARMUP_QPOS}" ]]; then
+        PLANNER_ARGS+=(--warmup-qpos-path "${KPLANNER_WARMUP_QPOS}")
+    fi
+    if [[ -n "${KPLANNER_YAW_LOCK_EPSILON}" ]]; then
+        PLANNER_ARGS+=(--yaw-lock-epsilon "${KPLANNER_YAW_LOCK_EPSILON}")
+    fi
+    if [[ -n "${KPLANNER_TURN_LEFT_SCALE}" ]]; then
+        PLANNER_ARGS+=(--turn-left-scale "${KPLANNER_TURN_LEFT_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_TURN_RIGHT_SCALE}" ]]; then
+        PLANNER_ARGS+=(--turn-right-scale "${KPLANNER_TURN_RIGHT_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_FORWARD_SCALE}" ]]; then
+        PLANNER_ARGS+=(--forward-scale "${KPLANNER_FORWARD_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_BACKWARD_SCALE}" ]]; then
+        PLANNER_ARGS+=(--backward-scale "${KPLANNER_BACKWARD_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_LATERAL_SCALE}" ]]; then
+        PLANNER_ARGS+=(--lateral-scale "${KPLANNER_LATERAL_SCALE}")
+    fi
+    if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
+        PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")
+    fi
+
+    log "Step 2/4 — spawning x2_kplanner -> ${PLANNER_LOG}"
+    log "  using python: ${KPLANNER_PYTHON}"
+    # The kplanner imports ``motionbricks.motion_backbone.*`` and
+    # ``gear_sonic.*``. The default ``.venv`` has motionbricks installed
+    # editable (pip install -e motionbricks/), but alternate pythons
+    # routed via ``--kplanner-python`` (e.g. env_isaaclab for sm_120
+    # support) typically don't. Inject PYTHONPATH explicitly so import
+    # resolves regardless of which interpreter is selected; this is
+    # idempotent on .venv runs because the editable install masks it.
+    KPLANNER_PYTHONPATH="${REPO_ROOT}/motionbricks:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    log "  PYTHONPATH=${KPLANNER_PYTHONPATH}"
+    PYTHONPATH="${KPLANNER_PYTHONPATH}" \
+        "${KPLANNER_PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
+    PLANNER_PID=$!
+
+    log "  waiting for kplanner ready marker (up to 90s; first replan is ~10s)..."
+    if ! wait_for_log_marker "${PLANNER_LOG}" "${PLANNER_PID}" \
+            "first replan complete" 90 "kplanner"; then
+        exit 1
+    fi
 fi
 log "  planner READY (pid=${PLANNER_PID}); settle 0.5s before manager ..."
 sleep 0.5
@@ -1556,6 +1930,15 @@ if [[ "${WITH_RECORD}" -eq 1 ]]; then
     MANAGER_ARGS+=(--recorder-enabled)
 else
     MANAGER_ARGS+=(--no-recorder-enabled)
+fi
+# Continuous-locomotion: forwards raw Quest3 stick deflections as
+# ``locomotion / continuous`` so the kplanner gets analog control
+# instead of binary on/off intent buckets. The heuristic planner has
+# no consumer for this intent, so we only enable it in ``kplanner``
+# mode. Override via env var KPLANNER_CONTINUOUS_LOCOMOTION={1,0}.
+KPLANNER_CONTINUOUS_LOCOMOTION="${KPLANNER_CONTINUOUS_LOCOMOTION:-1}"
+if [[ "${PLANNER_KIND}" == "kplanner" && "${KPLANNER_CONTINUOUS_LOCOMOTION}" -eq 1 ]]; then
+    MANAGER_ARGS+=(--enable-continuous-locomotion)
 fi
 
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"

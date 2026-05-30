@@ -205,6 +205,16 @@ class ManagerConfig:
     # fall back to the legacy
     # discrete soft-band torso bins.
     intent_enable_continuous_torso: bool = True
+    # ``intent_enable_continuous_locomotion`` (default OFF) flips the
+    # L/R-stick locomotion path from the bucketed
+    # (``fwd_step / back_step / side_* / turn_*``) emit to a single
+    # ``locomotion / continuous`` command carrying raw deadzone-rescaled
+    # stick deflections in ``stick_fwd / stick_side / stick_yaw``. The
+    # kplanner shapes those into a velocity vector for analog control;
+    # the heuristic planner cannot consume the intent and treats it as
+    # idle. ``run_x2_quest3_planner_stack.sh`` flips it ON automatically
+    # when ``--planner kplanner`` is selected.
+    intent_enable_continuous_locomotion: bool = False
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
     #
     # Operator UX contract: pushing the left stick AWAY from your body
@@ -326,9 +336,12 @@ def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
     For ``hold_torso`` commands we also serialize the continuous waist
     targets; the planner's ``_zmq_command_thread`` reads them as
     optional fields and feeds them into ``LocomotionCommand.waist_*_deg``.
-    For every other intent we omit them (defaulting to 0.0 on the
-    receiving end), which keeps wire payloads minimal and matches the
-    pre-v7 wire format.
+    For ``locomotion`` commands (continuous L/R-stick teleop) we
+    serialize the three stick deflections; the kplanner reads them as
+    ``stick_fwd / stick_side / stick_yaw`` and shapes them into a 4-D
+    velocity vector. For every other intent we omit both blocks
+    (defaulting to 0.0 on the receiving end), which keeps wire payloads
+    minimal and matches the pre-v7 wire format.
     """
     payload: dict[str, object] = {
         "intent": cmd.intent,
@@ -338,6 +351,10 @@ def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
         payload["waist_pitch_deg"] = float(cmd.waist_pitch_deg)
         payload["waist_roll_deg"] = float(cmd.waist_roll_deg)
         payload["waist_yaw_deg"] = float(cmd.waist_yaw_deg)
+    elif cmd.intent == "locomotion":
+        payload["stick_fwd"]  = float(cmd.stick_fwd)
+        payload["stick_side"] = float(cmd.stick_side)
+        payload["stick_yaw"]  = float(cmd.stick_yaw)
     return json.dumps(payload).encode("utf-8")
 
 
@@ -391,6 +408,7 @@ class Quest3ManagerX2:
             enable_lean_fwd=cfg.intent_enable_lean_fwd,
             enable_torso=cfg.intent_enable_torso,
             enable_continuous_torso=cfg.intent_enable_continuous_torso,
+            enable_continuous_locomotion=cfg.intent_enable_continuous_locomotion,
         )
         # Latched continuous waist target. Set in two situations:
         #   1) The operator presses B to flip LOCOMOTION ->
@@ -1504,6 +1522,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-enable torso_left_30deg / torso_right_30deg on soft "
              "R-stick L/R (off by default; bin currently snaps back)",
     )
+    # Continuous-locomotion: forwards raw stick deflections as
+    # ``locomotion / continuous`` instead of bucketing to fwd_step /
+    # back_step / side_* / turn_*. Off by default for back-compat
+    # with the heuristic planner; the kplanner wrapper flips it on.
+    p.add_argument(
+        "--enable-continuous-locomotion",
+        dest="enable_continuous_locomotion", action="store_true",
+        default=False,
+        help="Emit locomotion/continuous (analog stick deflection) "
+             "instead of fwd_step / back_step / side_* / turn_*. "
+             "Required for analog kplanner control; the heuristic "
+             "planner ignores the intent.",
+    )
+    p.add_argument(
+        "--no-enable-continuous-locomotion",
+        dest="enable_continuous_locomotion", action="store_false",
+        help="Force-disable continuous-locomotion (keeps bucketed "
+             "fwd_step / turn_* even when paired with the kplanner). "
+             "Useful for ablation / regression runs.",
+    )
 
     # Stick polarity (axis sign flips applied before the decoder).
     # All default to False: the operator-facing UX of "push the stick
@@ -1676,6 +1714,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         intent_repeat_interval_s=args.repeat_interval,
         intent_enable_lean_fwd=args.enable_lean_fwd,
         intent_enable_torso=args.enable_torso,
+        intent_enable_continuous_locomotion=args.enable_continuous_locomotion,
         invert_lx=args.invert_lx,
         invert_ly=args.invert_ly,
         invert_rx=args.invert_rx,

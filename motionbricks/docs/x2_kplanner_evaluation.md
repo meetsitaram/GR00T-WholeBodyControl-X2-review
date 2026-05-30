@@ -472,3 +472,88 @@ The closed-loop machinery (``--pose-feedback-host/port``,
 codebase as an opt-in capability for future use cases (e.g. coarse
 re-localization after a deploy reset) and as a regression target so
 the negative result stays measurable.
+
+#### Hip-height (channel 3) OOD bug (2026-05-30)
+
+While porting the "config A" recipe to the Quest 3 stack the
+operator reported "robot won't move forward even on full stick".
+PKL-replay's ``capture/compare.json`` from the same session showed
+the symptom is *deploy-side, not Quest 3-side*: even the PKL replay
+that we previously reported at "71.7%" forward tracking actually
+walked the simulated robot only **1.7 m in 58 s** (``sim.fwd_disp_m
+= 1.72`` vs ``pkl_velocity_integrated.fwd_disp_m = 22.43``, i.e.
+**7.7 %** body-frame tracking). The 71.7 % number came from
+``test_root_isolated.py`` measuring the *root model* in isolation,
+not the deploy + policy + MuJoCo chain.
+
+The deploy log carried the smoking gun:
+
+```
+[WARN] Reference motion 'zmq_pose' yaw-anchored to robot heading
+       (robot yaw = 0.00 deg, applied Δyaw = 0.00 deg)
+... CONTROL tick=N policy_t=Ts alpha=1.00 grav_z=-0.99 ...
+       pose_ref_age=-1.000s mc_mode=-1
+```
+
+``pose_ref_age=-1`` is just the ``--disable-pose-ref-watchdog``
+sentinel (the watchdog is off; this is *not* "no pose received");
+``mc_mode=-1`` is unrelated to pose consumption. The yaw-anchored
+WARN fires only after the first body-bearing frame is consumed, so
+the deploy *was* reading kplanner pose. The robot still wouldn't
+walk.
+
+Comparing the working PKL path against the Quest 3 path revealed a
+4-D intent layout mismatch:
+
+| field | PKL replay (works) | Quest 3 continuous (fails) |
+|---|---|---|
+| ``vel_z`` (forward) | +0.384 m/s (constant) | 0–0.49 m/s (variable) |
+| **``hip_h``** (channel 3) | **0.687 m** (PKL mean) | **0.95 m** (``_HIP_HEIGHT_M``) |
+| state machine | PLAYING for 70 s | IDLE_LOOP ↔ PLAYING flapping |
+
+In ``motion_backbone/inference/neural_planner.py``,
+``replan_with_velocity`` wires channel 3 of ``velocity_intent``
+*directly* into ``implied_target_y`` (line 414) — the world-frame
+pelvis Y the model is told to drive towards. The X2 PKL corpus has
+pelvis_z spanning ~0.595–0.726 m with mean 0.661 m. The kplanner's
+``_HIP_HEIGHT_M = 0.95 m`` constant was a stale carry-over from an
+older checkpoint whose stand pose sat ~25 cm higher than the
+current ``_TRAINING_DEFAULT_HIP_Z = 0.636 m``. Feeding 0.95 m to
+the current model puts the target pelvis ~25 cm above every pose
+in the training distribution; the model outputs OOD predictions
+and the policy can't track them.
+
+PKL replay was insulated because ``x2_pkl_command_source``'s
+``direct_velocity`` path carries ``hip_h`` verbatim from the clip
+(= 0.687 m for ``Loop_Forward_Walk_001__A018``); the bug only bit
+the bucketed and continuous-locomotion paths that read
+``_HIP_HEIGHT_M``.
+
+**Fix**: ``_HIP_HEIGHT_M`` lowered from ``0.95`` to ``0.687`` to
+match the PKL training distribution (specifically the value the
+working ``--use-mean-intent`` configuration computed). Pure
+constant change, no API churn; all 71 unit tests in
+``tests/test_x2_kplanner_intent_velocity.py`` reference
+``_HIP_HEIGHT_M`` symbolically so they stay green automatically.
+
+**Post-fix observation (Quest 3, 2026-05-30)**: bare-minimum
+forward motion now reproducible on the Quest 3 stack under
+``--enable-continuous-locomotion`` + ``replan-threshold-frames 2``.
+The robot takes recognisable steps in response to L-stick forward
+deflection where the same stack previously froze in place. Forward
+tracking is still far from production-quality (qualitative report:
+"working, although nowhere near decent move"), which is consistent
+with the open-loop ~8 % body-frame tracking ceiling documented
+above for the deploy + policy chain. The next levers (in cost
+order) are:
+
+* Operator-side: kill the IDLE_LOOP ↔ PLAYING flapping caused by
+  ``hold_torso`` (0, 0, 0, hip_h) resolving to ``_IDLE_INTENT``
+  whenever the L-stick crosses the deadzone. Each PLAYING→IDLE_LOOP
+  transition triggers ``planner_core.reset(warm)`` which wipes the
+  ring buffer and forces the next PLAYING window to start from a
+  static stance. Sustained walking requires sustained PLAYING.
+* Model-side: retrain with the implied-target-pos curriculum
+  documented above; the per-replan yaw bias and the model's
+  preference for stand-pose-shaped predictions both live in the
+  trained weights.

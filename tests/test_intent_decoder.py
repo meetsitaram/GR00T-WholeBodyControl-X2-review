@@ -686,3 +686,153 @@ def test_last_emitted_tracks_recent_command():
     assert dec.last_emitted() == LocomotionCmd("fwd_step", "default")
     dec.decode_locomotion(-0.9, 0.0, 0.0, 0.0, False, now=0.1)
     assert dec.last_emitted() == LocomotionCmd("side_left", "default")
+
+
+# ---------------------------------------------------------------------------
+# Continuous-locomotion path (enable_continuous_locomotion=True)
+# ---------------------------------------------------------------------------
+
+
+def _make_loco_continuous(
+    *,
+    stick_deadzone: float = 0.30,
+    continuous_stick_threshold: float = 0.02,
+) -> IntentDecoder:
+    dec = IntentDecoder(
+        stick_deadzone=stick_deadzone,
+        enable_continuous_locomotion=True,
+        continuous_stick_threshold=continuous_stick_threshold,
+    )
+    dec.update_mode(_abxy_chord())
+    assert dec.mode is StreamMode.LOCOMOTION
+    return dec
+
+
+def test_continuous_neutral_stick_emits_idle():
+    """All three sticks inside the deadzone -> idle (not locomotion)."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.0, 0.0, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("idle", "default")
+
+
+def test_continuous_fwd_stick_carries_normalised_deflection():
+    """Forward L-stick beyond deadzone emits locomotion / continuous with
+    a positive stick_fwd in (0, 1]. Lateral / yaw stay 0 because lx/rx
+    are inside the deadzone."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.magnitude == "continuous"
+    assert cmd.stick_fwd > 0.0
+    assert cmd.stick_fwd <= 1.0
+    assert cmd.stick_side == 0.0
+    assert cmd.stick_yaw == 0.0
+
+
+def test_continuous_back_stick_carries_negative_fwd():
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, -0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_fwd < 0.0
+    assert cmd.stick_fwd >= -1.0
+
+
+def test_continuous_side_stick_carries_side_only():
+    """Right L-stick deflection -> positive stick_side, others 0."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.9, 0.0, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_side > 0.0
+    assert cmd.stick_fwd == 0.0
+    assert cmd.stick_yaw == 0.0
+
+
+def test_continuous_yaw_stick_carries_yaw_only():
+    """R-stick deflection -> stick_yaw, sign matches rx direction."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.0, 0.9, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_yaw > 0.0
+    cmd = dec.decode_locomotion(0.0, 0.0, -0.9, 0.0, False, now=0.1)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_yaw < 0.0
+
+
+def test_continuous_deadzone_clamps_below_threshold():
+    """|stick| <= deadzone produces 0 deflection on that axis."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    # 0.2 is inside the 0.3 deadzone on every axis; should remain idle.
+    cmd = dec.decode_locomotion(0.2, 0.2, 0.2, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("idle", "default")
+
+
+def test_continuous_just_past_deadzone_emits_small_deflection():
+    """Outside the deadzone the rescaled deflection should be small but
+    non-zero, NOT snap to 1.0 -- the operator's thumb owns analog
+    control here."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    cmd = dec.decode_locomotion(0.0, 0.35, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    # (0.35 - 0.30) / (1 - 0.30) ~= 0.071
+    assert 0.0 < cmd.stick_fwd < 0.2
+
+
+def test_continuous_full_deflection_saturates_to_unity():
+    """|stick| = 1.0 -> normalised deflection = 1.0 (full speed)."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    cmd = dec.decode_locomotion(0.0, 1.0, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.stick_fwd == pytest.approx(1.0, abs=1e-6)
+
+
+def test_continuous_combined_stick_carries_all_three_axes():
+    """L-stick fwd + L-stick side + R-stick yaw should populate all
+    three stick_* fields in a single locomotion command."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.7, 0.7, 0.7, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_fwd > 0.0
+    assert cmd.stick_side > 0.0
+    assert cmd.stick_yaw > 0.0
+
+
+def test_continuous_repeat_suppressed_when_stick_unchanged():
+    """Steady-state stick -> first tick emits, subsequent ticks suppress."""
+    dec = _make_loco_continuous()
+    first = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert first is not None
+    repeat = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.01)
+    assert repeat is None
+
+
+def test_continuous_micro_jitter_below_threshold_does_not_emit():
+    """Sub-threshold stick changes are filtered by _is_significant_change."""
+    dec = _make_loco_continuous(continuous_stick_threshold=0.05)
+    dec.decode_locomotion(0.0, 0.90, 0.0, 0.0, False, now=0.0)
+    # 0.91 is well within the 0.05 stick-delta threshold of 0.90
+    repeat = dec.decode_locomotion(0.0, 0.91, 0.0, 0.0, False, now=0.02)
+    assert repeat is None
+
+
+def test_continuous_significant_change_re_emits():
+    dec = _make_loco_continuous(continuous_stick_threshold=0.05)
+    dec.decode_locomotion(0.0, 0.50, 0.0, 0.0, False, now=0.0)
+    out = dec.decode_locomotion(0.0, 0.80, 0.0, 0.0, False, now=0.02)
+    assert out is not None
+    assert out.intent == "locomotion"
+
+
+def test_continuous_off_mode_disables_continuous_path():
+    """``enable_continuous_locomotion=False`` (default) keeps the
+    bucketed fwd_step / side_* / turn_* path that the heuristic
+    planner consumes. Regression for the heuristic-mode wrapper."""
+    dec = _make_loco()  # default: continuous disabled
+    cmd = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("fwd_step", "default")
