@@ -209,3 +209,205 @@ with ``vel_z=0.45`` on ``Loop_Forward_Walk_001__A018`` produces
 ``pred dy_m = -2.325`` vs ``actual dy_m = -2.597`` (10% error, correct
 direction). Side-by-side MuJoCo viewer confirms the predicted robot
 walks forward in lock-step with the source clip.
+
+## Deploy-integration diagnostics
+
+The evaluation tooling above measures the planner *in isolation*: the
+model is driven by a unit-test harness, its predicted qpos is consumed
+directly by the same harness, and there is no policy / no closed-loop
+dynamics. That setup catches *model-quality* regressions.
+
+A separate failure mode lives at the *integration boundary*: when the
+kplanner's pose stream is consumed by the real X2 deploy (MuJoCo
+physics + SONIC policy in ``gear_sonic_deploy/docker_x2/``) the planner
+is no longer the only voice. The policy adds tracking error, contacts
+add slippage, and the robot's *actual* pose diverges from the planner's
+predicted pose every tick. This section is the diagnostic recipe for
+debugging *that* class of failure — what the planner published, what
+the robot did, and where the gap came from.
+
+The upstream G1 demo (``motionbricks/scripts/interactive_demo_g1.py``)
+is **not** a useful reference here. Its inner loop teleports the
+"simulator" to the planner's output every tick
+(``demo_agent.mj_data.qpos[:] = qpos`` followed by ``mj_forward`` —
+not ``mj_step``), so there is no dynamics gap to drift against. The X2
+deploy is the first real-physics consumer of ``NeuralPlannerCore``;
+the tools below were invented for it.
+
+### Three-layer isolation methodology
+
+Capture every layer's output independently so each can be tested
+against ground truth without trusting the next layer:
+
+```mermaid
+flowchart LR
+    src["x2_pkl_command_source<br>(PKL -> intent)"] -->|"planner_cmd:5563"| plan["kplanner"]
+    plan -->|"pose:5556"| dep["deploy<br>(MuJoCo + SONIC)"]
+    dep -->|"robot_pose:5570"| cap["capture"]
+    dep -->|"x2_debug:5557"| cap
+    plan -->|"pose:5556 (multicast)"| cap
+    src -.->|"intent log"| cap
+```
+
+The capture node subscribes to *all four* topics and writes them to
+disk with a unified timeline, so the four questions —
+
+1. What intent did the source publish?
+2. What pose did the planner emit?
+3. What command did the deploy send to the joints?
+4. What did the robot actually do (pelvis xyz + quat)?
+
+— are answered independently. A divergence between any two adjacent
+layers points to a specific subsystem rather than handwaving "the
+robot isn't walking."
+
+Tools:
+
+- ``gear_sonic/scripts/x2_pkl_command_source.py`` — PKL clip -> 4-D
+  velocity intent stream on ``planner_cmd:5563`` (50 Hz). Includes
+  ``--constant-intent yaw,vx,vz,hip`` and ``--use-mean-intent``
+  diagnostic overrides that bypass the per-frame intent stream
+  entirely, so the planner can be tested against a clean DC input.
+- ``gear_sonic/scripts/capture_pkl_replay_motion.py`` — multi-topic
+  ZMQ SUB; produces ``capture.npz`` (raw streams), ``compare.json``
+  (body-frame trajectory metrics), and ``trajectory.png`` (overlay
+  plot). The ``[planner output]`` row in its verdict table
+  specifically isolates planner-output yaw drift from sim-side yaw
+  drift.
+- ``gear_sonic/scripts/run_x2_pkl_planner_stack.sh`` — wrapper that
+  spawns deploy + kplanner + pkl source + capture in the right order
+  with shared ports. ``--with-capture`` enables the capture side-car.
+
+### Findings: compounding context drift
+
+The architectural cap on a single forward pass is hard-coded into the
+checkpoints via ``max_tokens=16``, ``NUM_FRAMES_PER_TOKEN=4``,
+``fps=30``:
+
+```
+prediction window = max_tokens * NUM_FRAMES_PER_TOKEN / fps
+                  = 16 * 4 / 30 = 2.133 s
+```
+
+This is enforced in three independent places: the positional embedding
+length (``PositionEmbedding(seq_length=self._args['max_tokens'])``),
+the token-count output head, and the training-data sampler (see
+``motionbricks/scripts/train_vqvae.py`` and
+``motionbricks/helper/data_training_util.py:sample_motion_segments_from_motion_clips``).
+Extending the window past 2.13 s requires retraining all three
+checkpoints from scratch.
+
+Any deployment that needs more than 2.13 s of motion therefore has to
+chain replans. The default chains every
+``REPLAN_THRESHOLD_FRAMES=16`` ticks at 50 Hz, i.e. every 0.96 s. Each
+replan reads the buffer's last 4 frames as context (see
+``NeuralPlannerCore.get_context_mujoco_qpos`` at
+``motionbricks/motion_backbone/inference/neural_planner.py:220``), but
+those 4 frames are the *model's own prior predictions* from the previous
+replan — never the robot's observed state. Small per-replan biases
+compound across the chain.
+
+Concrete measurement (32 replans over 26 s, clean constant intent
+``yaw_rate=0, vel_z=+0.5``): the kplanner's *own published* pose stream
+drifts +412° of yaw despite being told to hold heading. The SONIC
+policy faithfully tracks this drift (sim yaw = +425°). The drift is
+not in the policy; it is in the planner's chain of self-conditioned
+predictions.
+
+### Validated open-loop mitigations
+
+Two changes to the deploy stack reduced the drift without touching the
+model:
+
+1. **Use mean intent instead of per-frame.** The PKL command source's
+   default ``_instant_intent_from_clip(window=8)`` extracts wildly
+   oscillating per-frame velocities from a walking clip (max yaw_rate
+   observed: +-3.6 rad/s = +-207 deg/s) because the pelvis sways
+   during natural walking. Each replan samples one of these
+   instantaneous intents and broadcasts it across the 2.13 s
+   prediction horizon. Pinning intent to the clip's mean velocity
+   ``--use-mean-intent`` removes this aliasing.
+
+2. **Reduce replan frequency.** Going from
+   ``--kplanner-replan-threshold-frames 16`` (replan every 0.96 s) to
+   ``2`` (every 1.26 s) reduces the number of chain links by ~30%
+   and reduces yaw drift super-linearly (~5x).
+
+Combined results from
+``./gear_sonic/scripts/run_x2_pkl_planner_stack.sh --pkl
+gear_sonic/data/motions/x2_ultra_locowalk.pkl --clip-id
+Loop_Forward_Walk_001__A018 --duration 30 --loop --no-sim-viewer
+--with-capture <FLAGS>``:
+
+| config | fwd tracking | planner yaw drift | sim yaw drift |
+|---|---|---|---|
+| default (per-frame intent, thresh=16) | 19% | not captured | wild +-150 deg |
+| constant 0.5 m/s fwd, thresh=16 | 29% | +412 deg | +425 deg |
+| constant 0.5 m/s fwd, thresh=2 | 36% | +85 deg | +76 deg |
+| **mean intent, thresh=2** | **67%** | **+59 deg** | **+66 deg** |
+
+The mean-intent + thresh=2 row is the current shippable open-loop
+demo recipe.
+
+### Reproducing the diagnostics
+
+Default open-loop (regression test — should still produce ~19%):
+
+```bash
+./gear_sonic/scripts/run_x2_pkl_planner_stack.sh \
+    --pkl gear_sonic/data/motions/x2_ultra_locowalk.pkl \
+    --clip-id Loop_Forward_Walk_001__A018 \
+    --duration 30 --loop --no-sim-viewer --with-capture
+```
+
+Open-loop best (current shippable recipe):
+
+```bash
+./gear_sonic/scripts/run_x2_pkl_planner_stack.sh \
+    --pkl gear_sonic/data/motions/x2_ultra_locowalk.pkl \
+    --clip-id Loop_Forward_Walk_001__A018 \
+    --duration 30 --loop --no-sim-viewer --with-capture \
+    --use-mean-intent --kplanner-replan-threshold-frames 2
+```
+
+Smoking-gun isolation (clean DC intent — exposes planner-only drift):
+
+```bash
+./gear_sonic/scripts/run_x2_pkl_planner_stack.sh \
+    --pkl gear_sonic/data/motions/x2_ultra_locowalk.pkl \
+    --clip-id Loop_Forward_Walk_001__A018 \
+    --duration 30 --loop --no-sim-viewer --with-capture \
+    --constant-intent "0.0,0.0,0.5,0.7"
+```
+
+Each run writes ``capture/compare.json``, ``capture/capture.npz``,
+``capture/compare_trace.npz``, and ``capture/trajectory.png``. The
+verdict table's ``[planner output]`` row is the key isolation row.
+
+### Next-experiment hypothesis: closed-loop pose reseed
+
+The mitigations above attack the *symptoms* of compounding drift
+(fewer links in the chain, cleaner DC input). The *cause* is that
+every replan's context is the model's own prior predictions, never the
+robot's actual state.
+
+Hypothesis: subscribing the kplanner to ``robot_pose:5570`` and
+overwriting the last 4 root rows of ``planner_core.frames["mujoco_qpos"]``
+with observed pelvis xyz + quat *immediately before each replan*
+should break the prediction-feedback loop. The model's 2.13 s window
+becomes "predict from the robot's *real* current pose" instead of
+"predict from your own prior prediction" — much closer to the training
+distribution (every training sample starts from a ground-truth pose).
+
+Joint slots ``[7:]`` stay model-predicted on purpose: the policy's
+joint-level tracking error would inject high-frequency noise into the
+context if those were reseeded.
+
+The closed-loop change is additive and opt-out via ``--no-pose-feedback``
+so the open-loop baseline above remains the regression target.
+
+#### Closed-loop reseed: results
+
+*(populated once the validation matrix from the closed-loop commit
+lands; placeholder so future readers see both hypothesis and outcome
+in one place)*

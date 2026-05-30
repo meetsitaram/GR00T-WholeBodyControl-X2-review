@@ -106,10 +106,11 @@ class LocomotionCommand:
                   # / lean_fwd / lean_left / lean_right
                   # / torso_left / torso_right / crouch
                   # / hold_torso (continuous waist target; uses waist_*_deg)
+                  # / locomotion (continuous stick deflection; uses stick_*)
     magnitude: str  # default / forward / backward / one_ft / half_ft / quarter_ft
                     # / deg_15 / deg_30 / deg_40 / deg_45 / deg_90
                     # / small / medium / large
-                    # / continuous (paired with intent=hold_torso)
+                    # / continuous (paired with intent=hold_torso or intent=locomotion)
     source: str = "scripted"  # for logging only
     # Continuous waist targets (degrees). Only consulted when
     # ``intent == HOLD_TORSO_INTENT``. Defaults to 0.0 = neutral, so an
@@ -117,6 +118,32 @@ class LocomotionCommand:
     waist_pitch_deg: float = 0.0
     waist_roll_deg: float = 0.0
     waist_yaw_deg: float = 0.0
+    # Continuous locomotion stick deflections in [-1, 1] (after deadzone
+    # rescale). Only consulted when ``intent == "locomotion"`` paired with
+    # ``magnitude == "continuous"``. Sign convention:
+    #   ``stick_fwd  > 0`` -> forward, < 0 -> backward
+    #   ``stick_side > 0`` -> right,   < 0 -> left
+    #   ``stick_yaw  > 0`` -> turn-right, < 0 -> turn-left
+    # The kplanner shapes these (squared with sign preserved) into a 4-D
+    # velocity vector so the operator's thumb gets analog control with
+    # fine resolution near zero. Discrete bin intents
+    # (``fwd_step / walk / side_left / turn_left / ...``) ignore these
+    # fields and use the static ``_BASE_VELOCITY`` table instead, which
+    # preserves the heuristic planner's primitives-based behaviour.
+    stick_fwd: float = 0.0
+    stick_side: float = 0.0
+    stick_yaw: float = 0.0
+    # Direct 4-D velocity intent ``(yaw_rate, vel_x, vel_z, hip_h)``
+    # passthrough. When non-None the kplanner's ``intent_to_velocity``
+    # short-circuits and returns this tuple verbatim, bypassing the
+    # bucketed table, continuous-stick shaping, and runtime scales. This
+    # is the wire used by ``x2_pkl_command_source.py`` (the PKL replay
+    # peer of ``quest3_manager_x2.py``) so a recorded motion clip's
+    # per-frame velocity reaches the model unchanged.
+    #
+    # Heuristic planner: ignored (the heuristic uses ``as_bin_name`` and
+    # has no raw-velocity surface; PKL replay is kplanner-only).
+    direct_velocity: tuple[float, float, float, float] | None = None
 
     def is_hold_torso(self) -> bool:
         return self.intent == HOLD_TORSO_INTENT

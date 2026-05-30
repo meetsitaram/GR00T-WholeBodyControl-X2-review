@@ -95,18 +95,23 @@ def _reset_runtime_scales():
 # carefully.
 # ---------------------------------------------------------------------------
 
+# Velocity tuple layout: ``(yaw_rate, vel_x=lateral, vel_z=forward, hip_h)``.
+# This matches ``_BASE_VELOCITY`` after the 2026-05-29 channel-swap
+# bugfix (commit ``46bd017``) which moved forward speed into ``vel_z``
+# and lateral speed into ``vel_x``. The pre-bugfix layout had them
+# swapped; values below are the post-fix expected truth.
 _LEGACY_GOLDEN: dict[tuple[str, str], tuple[float, float, float, float]] = {
     ("idle", "default"):       (0.0, 0.0, 0.0, _HIP_HEIGHT_M),
     ("idle", "stand"):         (0.0, 0.0, 0.0, _HIP_HEIGHT_M),
-    ("walk", "forward"):       (0.0,  _WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("walk", "fast"):          (0.0,  _FAST_WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("fwd_step", "quarter_ft"): (0.0,  _WALK_SPEED_MPS * 0.5, 0.0, _HIP_HEIGHT_M),
-    ("fwd_step", "half_ft"):   (0.0,  _WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("fwd_step", "one_ft"):    (0.0,  _WALK_SPEED_MPS * 1.5, 0.0, _HIP_HEIGHT_M),
-    ("back_step", "quarter_ft"): (0.0, -_BACK_SPEED_MPS * 0.5, 0.0, _HIP_HEIGHT_M),
-    ("back_step", "half_ft"):  (0.0, -_BACK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("side_left", "default"):  (0.0, 0.0,  _SIDE_SPEED_MPS, _HIP_HEIGHT_M),
-    ("side_right", "default"): (0.0, 0.0, -_SIDE_SPEED_MPS, _HIP_HEIGHT_M),
+    ("walk", "forward"):       (0.0, 0.0,  _WALK_SPEED_MPS,        _HIP_HEIGHT_M),
+    ("walk", "fast"):          (0.0, 0.0,  _FAST_WALK_SPEED_MPS,   _HIP_HEIGHT_M),
+    ("fwd_step", "quarter_ft"): (0.0, 0.0,  _WALK_SPEED_MPS * 0.5, _HIP_HEIGHT_M),
+    ("fwd_step", "half_ft"):   (0.0, 0.0,  _WALK_SPEED_MPS,        _HIP_HEIGHT_M),
+    ("fwd_step", "one_ft"):    (0.0, 0.0,  _WALK_SPEED_MPS * 1.5,  _HIP_HEIGHT_M),
+    ("back_step", "quarter_ft"): (0.0, 0.0, -_BACK_SPEED_MPS * 0.5, _HIP_HEIGHT_M),
+    ("back_step", "half_ft"):  (0.0, 0.0, -_BACK_SPEED_MPS,        _HIP_HEIGHT_M),
+    ("side_left", "default"):  (0.0,  _SIDE_SPEED_MPS, 0.0,        _HIP_HEIGHT_M),
+    ("side_right", "default"): (0.0, -_SIDE_SPEED_MPS, 0.0,        _HIP_HEIGHT_M),
     ("turn_left", "deg_15"):   ( _TURN_15_RAD_S, 0.0, 0.0, _HIP_HEIGHT_M),
     ("turn_left", "deg_30"):   ( _TURN_30_RAD_S, 0.0, 0.0, _HIP_HEIGHT_M),
     ("turn_left", "deg_45"):   ( _TURN_45_RAD_S, 0.0, 0.0, _HIP_HEIGHT_M),
@@ -125,9 +130,9 @@ _LEGACY_GOLDEN: dict[tuple[str, str], tuple[float, float, float, float]] = {
 # ---------------------------------------------------------------------------
 
 _SURGICAL_FIX_GOLDEN: dict[tuple[str, str], tuple[float, float, float, float]] = {
-    ("fwd_step", "default"):   (0.0,  _WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("back_step", "default"):  (0.0, -_BACK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
-    ("walk", "backward"):      (0.0, -_BACK_SPEED_MPS, 0.0, _HIP_HEIGHT_M),
+    ("fwd_step", "default"):   (0.0, 0.0,  _WALK_SPEED_MPS, _HIP_HEIGHT_M),
+    ("back_step", "default"):  (0.0, 0.0, -_BACK_SPEED_MPS, _HIP_HEIGHT_M),
+    ("walk", "backward"):      (0.0, 0.0, -_BACK_SPEED_MPS, _HIP_HEIGHT_M),
 }
 
 
@@ -343,8 +348,9 @@ def test_turn_left_scale_multiplies_only_left_yaw():
     # turn_right untouched.
     assert right[0] == pytest.approx(-_TURN_45_RAD_S, abs=1e-9)
     # Forward translation untouched (scale lives on the yaw axis only).
+    # Tuple layout: (yaw_rate, vel_x=lateral, vel_z=forward, hip_h).
     assert fwd == pytest.approx(
-        (0.0, _WALK_SPEED_MPS, 0.0, _HIP_HEIGHT_M), abs=1e-9
+        (0.0, 0.0, _WALK_SPEED_MPS, _HIP_HEIGHT_M), abs=1e-9
     )
 
 
@@ -372,12 +378,13 @@ def test_forward_scale_affects_fwd_step_and_walk_forward():
     back_walk = intent_to_velocity(LocomotionCommand("walk", "backward"))
     side = intent_to_velocity(LocomotionCommand("side_left", "default"))
 
-    assert fwd_step[1] == pytest.approx(_WALK_SPEED_MPS * 0.6, abs=1e-9)
-    assert fwd_walk[1] == pytest.approx(_WALK_SPEED_MPS * 0.6, abs=1e-9)
+    # Tuple layout: (yaw_rate, vel_x=lateral, vel_z=forward, hip_h).
+    assert fwd_step[2] == pytest.approx(_WALK_SPEED_MPS * 0.6, abs=1e-9)
+    assert fwd_walk[2] == pytest.approx(_WALK_SPEED_MPS * 0.6, abs=1e-9)
     # Backward + lateral untouched.
-    assert back_step[1] == pytest.approx(-_BACK_SPEED_MPS, abs=1e-9)
-    assert back_walk[1] == pytest.approx(-_BACK_SPEED_MPS, abs=1e-9)
-    assert side[2] == pytest.approx(_SIDE_SPEED_MPS, abs=1e-9)
+    assert back_step[2] == pytest.approx(-_BACK_SPEED_MPS, abs=1e-9)
+    assert back_walk[2] == pytest.approx(-_BACK_SPEED_MPS, abs=1e-9)
+    assert side[1] == pytest.approx(_SIDE_SPEED_MPS, abs=1e-9)
 
 
 def test_backward_scale_affects_back_step_and_walk_backward():
@@ -387,9 +394,9 @@ def test_backward_scale_affects_back_step_and_walk_backward():
     back_walk = intent_to_velocity(LocomotionCommand("walk", "backward"))
     fwd_step = intent_to_velocity(LocomotionCommand("fwd_step", "default"))
 
-    assert back_step[1] == pytest.approx(-_BACK_SPEED_MPS * 0.5, abs=1e-9)
-    assert back_walk[1] == pytest.approx(-_BACK_SPEED_MPS * 0.5, abs=1e-9)
-    assert fwd_step[1] == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
+    assert back_step[2] == pytest.approx(-_BACK_SPEED_MPS * 0.5, abs=1e-9)
+    assert back_walk[2] == pytest.approx(-_BACK_SPEED_MPS * 0.5, abs=1e-9)
+    assert fwd_step[2] == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
 
 
 def test_lateral_scale_affects_only_side_intents():
@@ -400,10 +407,162 @@ def test_lateral_scale_affects_only_side_intents():
     fwd = intent_to_velocity(LocomotionCommand("fwd_step", "default"))
     turn = intent_to_velocity(LocomotionCommand("turn_left", "deg_45"))
 
-    assert side_l[2] == pytest.approx(_SIDE_SPEED_MPS * 0.7, abs=1e-9)
-    assert side_r[2] == pytest.approx(-_SIDE_SPEED_MPS * 0.7, abs=1e-9)
-    assert fwd[1] == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
+    assert side_l[1] == pytest.approx(_SIDE_SPEED_MPS * 0.7, abs=1e-9)
+    assert side_r[1] == pytest.approx(-_SIDE_SPEED_MPS * 0.7, abs=1e-9)
+    assert fwd[2] == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
     assert turn[0] == pytest.approx(_TURN_45_RAD_S, abs=1e-9)
+
+
+def test_continuous_locomotion_idle_when_all_sticks_zero():
+    """``locomotion / continuous`` with all-zero sticks produces idle."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=0.0, stick_side=0.0, stick_yaw=0.0,
+    )
+    assert intent_to_velocity(cmd) == _IDLE_INTENT
+
+
+def test_continuous_locomotion_full_fwd_stick_hits_walk_speed():
+    """``stick_fwd=1`` -> shaped to 1 -> vel_z = _WALK_SPEED_MPS."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=1.0,
+    )
+    yaw, vx, vz, hip_h = intent_to_velocity(cmd)
+    assert yaw == pytest.approx(0.0, abs=1e-9)
+    assert vx  == pytest.approx(0.0, abs=1e-9)
+    assert vz  == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
+    assert hip_h == pytest.approx(_HIP_HEIGHT_M, abs=1e-9)
+
+
+def test_continuous_locomotion_half_stick_linear_default():
+    """At the default linear shaping (exp=1.0), ``stick_fwd=0.5`` -> shaped
+    to 0.5 -> vel_z = 0.5 * _WALK_SPEED.
+
+    Defaults to linear because the previous squared default produced
+    only 25%% of walk speed at 50%% deflection, which the operator
+    perceived as "robot won't move forward". Linear (50%% deflection ->
+    50%% speed) is a much closer match to the bucketed-path muscle
+    memory while still allowing fine creeping near zero.
+    """
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=0.5,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(0.5 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_continuous_locomotion_shape_exponent_tunable():
+    """``--stick-shape-exp`` changes the curve. exp=2.0 reproduces the
+    historical squared curve (0.5 stick -> 0.25 vel); exp=0.5 produces
+    a bucketed-like fast feel (0.5 stick -> ~0.707 vel)."""
+    import gear_sonic.scripts.x2_kplanner as kp
+    original = kp._RUNTIME_STICK_SHAPING_EXPONENT
+    try:
+        kp._RUNTIME_STICK_SHAPING_EXPONENT = 2.0
+        cmd = LocomotionCommand(
+            intent="locomotion", magnitude="continuous", stick_fwd=0.5,
+        )
+        _, _, vz_sq, _ = intent_to_velocity(cmd)
+        assert vz_sq == pytest.approx(0.25 * _WALK_SPEED_MPS, abs=1e-9)
+
+        kp._RUNTIME_STICK_SHAPING_EXPONENT = 0.5
+        _, _, vz_half, _ = intent_to_velocity(cmd)
+        # 0.5 ** 0.5 = sqrt(0.5) = 0.7071...
+        assert vz_half == pytest.approx(
+            (0.5 ** 0.5) * _WALK_SPEED_MPS, abs=1e-9,
+        )
+    finally:
+        kp._RUNTIME_STICK_SHAPING_EXPONENT = original
+
+
+def test_continuous_locomotion_back_stick_uses_back_speed():
+    """Negative stick_fwd is scaled by _BACK_SPEED_MPS (not _WALK_SPEED)."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=-1.0,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(-_BACK_SPEED_MPS, abs=1e-9)
+
+
+def test_continuous_locomotion_side_stick_maps_to_vel_x():
+    """``stick_side=+1`` (L-stick right) -> side_right -> -vel_x,
+    matching the bucketed ``_BASE_VELOCITY['side_right']`` convention."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_side=1.0,
+    )
+    _, vx, _, _ = intent_to_velocity(cmd)
+    assert vx == pytest.approx(-_SIDE_SPEED_MPS, abs=1e-9)
+    cmd_left = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_side=-1.0,
+    )
+    _, vx_left, _, _ = intent_to_velocity(cmd_left)
+    assert vx_left == pytest.approx(_SIDE_SPEED_MPS, abs=1e-9)
+
+
+def test_continuous_locomotion_yaw_stick_sign_matches_bucketed_turn():
+    """``stick_yaw=+1`` (R-stick right) -> turn-right -> negative yaw_rate,
+    matching the bucketed ``turn_right`` path."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_yaw=1.0,
+    )
+    yaw, _, _, _ = intent_to_velocity(cmd)
+    assert yaw == pytest.approx(-_TURN_45_RAD_S, abs=1e-9)
+    cmd_left = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_yaw=-1.0,
+    )
+    yaw_left, _, _, _ = intent_to_velocity(cmd_left)
+    assert yaw_left == pytest.approx(_TURN_45_RAD_S, abs=1e-9)
+
+
+def test_continuous_locomotion_combined_axes():
+    """All three sticks at full deflection -> full speed on all three
+    axes simultaneously, with the bucketed-path sign conventions."""
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=1.0, stick_side=-1.0, stick_yaw=-1.0,
+    )
+    yaw, vx, vz, hip_h = intent_to_velocity(cmd)
+    assert vz  == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
+    # stick_side = -1 -> side_left -> +vel_x
+    assert vx  == pytest.approx(_SIDE_SPEED_MPS, abs=1e-9)
+    # stick_yaw = -1 -> turn_left -> +yaw_rate
+    assert yaw == pytest.approx(_TURN_45_RAD_S,  abs=1e-9)
+    assert hip_h == pytest.approx(_HIP_HEIGHT_M, abs=1e-9)
+
+
+def test_continuous_locomotion_runtime_scale_applies():
+    """``--kplanner-forward-scale 0.5`` (env-mutated _RUNTIME_FORWARD_SCALE)
+    caps continuous mode the same way it caps the bucketed ``fwd_step``."""
+    kp._RUNTIME_FORWARD_SCALE = 0.5
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=1.0,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(0.5 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_continuous_locomotion_turn_scales_split_by_sign():
+    """``stick_yaw > 0`` -> turn_right path -> _RUNTIME_TURN_RIGHT_SCALE.
+    ``stick_yaw < 0`` -> turn_left path -> _RUNTIME_TURN_LEFT_SCALE."""
+    kp._RUNTIME_TURN_LEFT_SCALE = 0.3
+    kp._RUNTIME_TURN_RIGHT_SCALE = 0.7
+    right = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_yaw=1.0,
+    )
+    left = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_yaw=-1.0,
+    )
+    yaw_right, _, _, _ = intent_to_velocity(right)
+    yaw_left,  _, _, _ = intent_to_velocity(left)
+    assert yaw_right == pytest.approx(-_TURN_45_RAD_S * 0.7, abs=1e-9)
+    assert yaw_left  == pytest.approx( _TURN_45_RAD_S * 0.3, abs=1e-9)
 
 
 def test_runtime_scales_do_not_reanimate_idle_intent():
@@ -431,3 +590,79 @@ def test_runtime_scales_do_not_reanimate_idle_intent():
             "scales were boosted; the scale path should only multiply "
             "an already-resolved non-idle velocity."
         )
+
+
+# ---------------------------------------------------------------------------
+# Direct-velocity passthrough (used by x2_pkl_command_source for replaying
+# recorded motion clips through the kplanner -> deploy chain). The
+# dispatcher must short-circuit and return the exact 4-tuple unchanged
+# even when continuous-stick or runtime-scale fields are also set on
+# the same command. Missing the field reverts to the normal path.
+# ---------------------------------------------------------------------------
+
+
+def test_direct_velocity_short_circuits_dispatcher():
+    """direct_velocity != None -> returned verbatim; intent/magnitude ignored."""
+    target = (0.42, -0.13, 0.97, 0.91)
+    cmd = LocomotionCommand(
+        intent="idle", magnitude="default",
+        direct_velocity=target,
+    )
+    assert intent_to_velocity(cmd) == pytest.approx(target, abs=1e-9)
+
+
+def test_direct_velocity_bypasses_runtime_scales():
+    """A direct-velocity command must NOT pick up the forward / yaw scales.
+
+    Replaying a recorded clip's velocity through the runtime scales
+    would double-apply the operator's compensation knobs -- they were
+    designed to cap live Quest3 stick output, not to re-shape PKL data.
+    """
+    kp._RUNTIME_FORWARD_SCALE = 0.5
+    kp._RUNTIME_TURN_LEFT_SCALE = 2.0
+    target = (0.3, 0.0, 0.6, 0.95)
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        direct_velocity=target,
+    )
+    assert intent_to_velocity(cmd) == pytest.approx(target, abs=1e-9)
+
+
+def test_direct_velocity_bypasses_continuous_shaping():
+    """A direct-velocity command must NOT go through stick shaping.
+
+    Even when the same command also carries non-zero stick_fwd /
+    stick_side / stick_yaw, the direct path wins so a poorly-formed
+    payload from the transmitter doesn't accidentally mix in shaped
+    velocity from the analog-stick branch.
+    """
+    target = (-0.5, 0.2, 0.4, 0.95)
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_fwd=1.0, stick_side=1.0, stick_yaw=1.0,
+        direct_velocity=target,
+    )
+    assert intent_to_velocity(cmd) == pytest.approx(target, abs=1e-9)
+
+
+def test_direct_velocity_none_falls_back_to_bucketed():
+    """Missing direct_velocity preserves the bucketed-dispatch behaviour."""
+    cmd = LocomotionCommand(
+        intent="fwd_step", magnitude="default", direct_velocity=None,
+    )
+    assert intent_to_velocity(cmd) == pytest.approx(
+        (0.0, 0.0, _WALK_SPEED_MPS, _HIP_HEIGHT_M), abs=1e-9,
+    )
+
+
+def test_direct_velocity_idle_tuple_returned_verbatim():
+    """direct_velocity equal to _IDLE_INTENT is honoured (e.g. replaying a
+    standing PKL frame). The publisher's idle gate then freezes the wire
+    on the warmup anchor; that's the correct behaviour for a stationary
+    clip frame.
+    """
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        direct_velocity=_IDLE_INTENT,
+    )
+    assert intent_to_velocity(cmd) == _IDLE_INTENT

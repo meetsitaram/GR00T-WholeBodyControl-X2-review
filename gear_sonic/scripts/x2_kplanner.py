@@ -176,6 +176,93 @@ _TURN_SCALE: dict[str, float] = {
 
 _ROTATIONAL_INTENTS: frozenset[str] = frozenset({"turn_left", "turn_right"})
 
+# ---------------------------------------------------------------------------
+# Continuous locomotion (analog Quest3 sticks)
+# ---------------------------------------------------------------------------
+#
+# When the IntentDecoder is run with ``enable_continuous_locomotion=True``
+# (the kplanner-mode wrapper flips this on), the manager publishes
+# ``locomotion / continuous`` commands carrying three deadzone-rescaled
+# stick deflections in ``[-1, 1]``:
+#
+#   stick_fwd  > 0 -> forward, < 0 -> backward
+#   stick_side > 0 -> right,   < 0 -> left
+#   stick_yaw  > 0 -> turn-right (negative yaw_rate), < 0 -> turn-left
+#
+# We shape each axis with a power curve (sign preserved) so the
+# operator gets fine resolution near zero with full speed at full
+# deflection -- this kills the "binary slam" failure mode that was
+# making the SONIC controller fall when the bucketed path stepped the
+# velocity 0 -> 0.5 m/s in a single tick. The peak velocities are
+# pinned to the same constants the bucketed path uses
+# (``_WALK_SPEED_MPS`` etc.) so scripted demos and the kplanner sweep
+# harness stay calibrated.
+#
+# Default exponent = 1.0 (linear). Bigger -> harder to reach full
+# speed (more fine control near zero, but operators report "robot
+# struggles to move forward" because 50% stick deflection produces
+# only 25% velocity at exp=2.0). Smaller -> easier to reach full
+# speed (more bucketed-like). Override at runtime via ``--stick-shape-
+# exp`` (CLI) or ``KPLANNER_STICK_SHAPE_EXP`` (env var on the
+# wrapper). At exp=0.5 a 50% stick gives 71% of max velocity; at
+# exp=1.0 a 50% stick gives 50%; at exp=2.0 a 50% stick gives 25%.
+
+_DEFAULT_STICK_SHAPING_EXPONENT: float = 1.0
+
+# Mutable runtime-tuned exponent, set from ``run()`` per CLI flag.
+_RUNTIME_STICK_SHAPING_EXPONENT: float = _DEFAULT_STICK_SHAPING_EXPONENT
+
+
+def _shape_stick(value: float) -> float:
+    """Map ``[-1, 1]`` post-deadzone stick deflection to ``[-1, 1]`` velocity.
+
+    Power curve with sign preserved: ``sign(v) * |v|**exp`` where ``exp``
+    is the runtime-tuned ``_RUNTIME_STICK_SHAPING_EXPONENT``. Pure helper
+    -- the IntentDecoder owns deadzone clamping, so values arrive here
+    already in ``[-1, 1]`` (or 0 if inside the deadzone).
+    """
+    sign = 1.0 if value >= 0 else -1.0
+    mag = abs(float(value))
+    if mag == 0.0:
+        return 0.0
+    return sign * mag ** _RUNTIME_STICK_SHAPING_EXPONENT
+
+
+def _resolve_locomotion_continuous(
+    stick_fwd: float,
+    stick_side: float,
+    stick_yaw: float,
+) -> tuple[float, float, float, float]:
+    """Map continuous stick deflections to a 4-D velocity vector.
+
+    Forward / backward use different peak speeds (``_WALK_SPEED_MPS``
+    vs ``_BACK_SPEED_MPS``) because the model's training data has
+    asymmetric forward / backward stride coverage. Lateral and turn
+    axes are symmetric. Returns the ``(yaw_rate, vel_x, vel_z, hip_h)``
+    tuple in the same convention as ``_BASE_VELOCITY``.
+
+    The runtime-tuning scalars (``_RUNTIME_FORWARD_SCALE`` etc.) are
+    intentionally NOT applied here -- ``_apply_runtime_scales`` handles
+    them downstream, mirroring the bucketed path so a single
+    ``--kplanner-forward-scale 0.6`` override caps both modes.
+    """
+    shaped_fwd  = _shape_stick(stick_fwd)
+    shaped_side = _shape_stick(stick_side)
+    shaped_yaw  = _shape_stick(stick_yaw)
+    vel_z = (
+        shaped_fwd * _WALK_SPEED_MPS
+        if shaped_fwd >= 0
+        else shaped_fwd * _BACK_SPEED_MPS
+    )
+    # ``stick_side > 0`` (L-stick right, lx > 0) -> side_right ->
+    # negative vel_x, matching ``_BASE_VELOCITY['side_right']``.
+    vel_x = -shaped_side * _SIDE_SPEED_MPS
+    # ``stick_yaw > 0`` (R-stick right) -> turn-right -> negative
+    # yaw_rate, matching ``_BASE_VELOCITY['turn_right']``.
+    yaw_rate = -shaped_yaw * _TURN_45_RAD_S
+    return (yaw_rate, vel_x, vel_z, _HIP_HEIGHT_M)
+
+
 # ``walk`` is a manager-side legacy where direction is in the magnitude
 # (``forward`` / ``backward``) rather than the intent name. Resolve it
 # explicitly so the rest of the dispatcher can assume direction-in-name
@@ -234,19 +321,27 @@ def _apply_runtime_scales(
     or shave magnitudes globally without rebuilding the static tables.
     All scales default to 1.0 (no-op) so the existing unit-test
     invariants hold when nothing is overridden.
+
+    Velocity tuple layout: ``(yaw_rate, vel_x=lateral, vel_z=forward,
+    hip_h)`` -- matches ``_BASE_VELOCITY`` after the 2026-05-29
+    channel-swap bugfix. Prior to that fix this helper scaled the
+    wrong axis for ``--kplanner-{forward,backward,lateral}-scale``
+    (the pre-fix layout had forward in ``vel_x`` and lateral in
+    ``vel_z``); the swap is now applied here too so the CLI knobs
+    target the right channel.
     """
-    yaw, vx, vy, hip_h = velocity
+    yaw, vel_x, vel_z, hip_h = velocity
     if intent == "turn_left":
         yaw *= _RUNTIME_TURN_LEFT_SCALE
     elif intent == "turn_right":
         yaw *= _RUNTIME_TURN_RIGHT_SCALE
-    elif intent in ("fwd_step",) or (intent == "walk" and vx > 0):
-        vx *= _RUNTIME_FORWARD_SCALE
-    elif intent in ("back_step",) or (intent == "walk" and vx < 0):
-        vx *= _RUNTIME_BACKWARD_SCALE
+    elif intent in ("fwd_step",) or (intent == "walk" and vel_z > 0):
+        vel_z *= _RUNTIME_FORWARD_SCALE
+    elif intent in ("back_step",) or (intent == "walk" and vel_z < 0):
+        vel_z *= _RUNTIME_BACKWARD_SCALE
     elif intent in ("side_left", "side_right"):
-        vy *= _RUNTIME_LATERAL_SCALE
-    return (yaw, vx, vy, hip_h)
+        vel_x *= _RUNTIME_LATERAL_SCALE
+    return (yaw, vel_x, vel_z, hip_h)
 
 
 def intent_to_velocity(cmd: LocomotionCommand) -> tuple[float, float, float, float]:
@@ -256,13 +351,69 @@ def intent_to_velocity(cmd: LocomotionCommand) -> tuple[float, float, float, flo
     meaning for (``hold_torso``, ``lean_*``, ``torso_*``, ``crouch``,
     unrecognised intents). Logs a single DEBUG line per miss so missing
     vocabulary additions are visible in the planner log.
+
+    Dispatch order (first match wins):
+
+    1. ``cmd.direct_velocity is not None`` -> the recorded-velocity
+       passthrough used by ``x2_pkl_command_source``. Returns the
+       4-tuple verbatim with NO shaping and NO runtime scales applied,
+       so the PKL replay path lands the exact (yaw, vel_x, vel_z,
+       hip_h) extracted from the motion clip into the model. This
+       isolates the kplanner -> deploy link from the analog-stick
+       shaping curve and the operator's per-direction runtime scales.
+
+    2. ``intent == "locomotion"`` paired with ``magnitude ==
+       "continuous"`` -> analog Quest3 sticks. Reads ``cmd.stick_fwd /
+       cmd.stick_side / cmd.stick_yaw`` and shapes them via
+       ``_resolve_locomotion_continuous``. Runtime tuning scalars still
+       apply post-shaping so ``--kplanner-forward-scale`` caps both
+       bucketed and continuous modes consistently.
+
+    3. Bucketed ``(intent, magnitude)`` lookup via ``_resolve_velocity``,
+       with runtime tuning scalars applied via ``_apply_runtime_scales``.
     """
+    if cmd.direct_velocity is not None:
+        # PKL replay path: the source publishes a raw 4-D velocity
+        # extracted from the recorded motion clip. We honour it
+        # verbatim so the wire content matches what
+        # _instant_intent_from_clip computed.
+        yaw, vx, vz, hip_h = cmd.direct_velocity
+        return (float(yaw), float(vx), float(vz), float(hip_h))
+    if cmd.intent == "locomotion" and cmd.magnitude == "continuous":
+        result = _resolve_locomotion_continuous(
+            cmd.stick_fwd, cmd.stick_side, cmd.stick_yaw,
+        )
+        return _apply_continuous_runtime_scales(result)
     result = _resolve_velocity(cmd.intent, cmd.magnitude)
     if result == _IDLE_INTENT and cmd.intent != "idle":
         log.debug("intent %s,%s has no velocity mapping; idling",
                   cmd.intent, cmd.magnitude)
         return result
     return _apply_runtime_scales(cmd.intent, result)
+
+
+def _apply_continuous_runtime_scales(
+    velocity: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Per-axis runtime scaling for the continuous-locomotion path.
+
+    Mirrors ``_apply_runtime_scales`` but routes on the sign of each
+    velocity axis (forward vs backward, left turn vs right turn, etc.)
+    instead of the (now-absent) intent name. Same scalars, same defaults
+    -- a single ``--kplanner-forward-scale 0.6`` flag caps continuous
+    and bucketed modes identically.
+    """
+    yaw, vx, vz, hip_h = velocity
+    if yaw > 0:
+        yaw *= _RUNTIME_TURN_LEFT_SCALE
+    elif yaw < 0:
+        yaw *= _RUNTIME_TURN_RIGHT_SCALE
+    if vz > 0:
+        vz *= _RUNTIME_FORWARD_SCALE
+    elif vz < 0:
+        vz *= _RUNTIME_BACKWARD_SCALE
+    vx *= _RUNTIME_LATERAL_SCALE
+    return (yaw, vx, vz, hip_h)
 
 
 def _build_intent_velocity_map() -> dict[
@@ -498,6 +649,50 @@ def _zmq_command_thread(
                     stop_event.set()
                     continue
                 magnitude = str(payload.get("magnitude", "default"))
+                # Continuous locomotion (analog Quest3 sticks) carries
+                # three deadzone-rescaled deflections in [-1, 1]. Missing
+                # fields default to 0.0 so legacy bucketed payloads still
+                # work for the same wire format.
+                stick_fwd  = float(payload.get("stick_fwd",  0.0))
+                stick_side = float(payload.get("stick_side", 0.0))
+                stick_yaw  = float(payload.get("stick_yaw",  0.0))
+                # ``hold_torso`` (continuous waist target) passes through
+                # but the kplanner's dispatcher idles on it (no upper-body
+                # bins). We still parse the waist fields so future kplanner
+                # extensions can consume them without changing the wire
+                # format.
+                waist_pitch_deg = float(payload.get("waist_pitch_deg", 0.0))
+                waist_roll_deg  = float(payload.get("waist_roll_deg",  0.0))
+                waist_yaw_deg   = float(payload.get("waist_yaw_deg",   0.0))
+                # Optional raw 4-D velocity passthrough used by
+                # ``x2_pkl_command_source`` for replaying recorded motion
+                # clips through the planner -> deploy chain without the
+                # bucketed table / continuous shaping / runtime scales
+                # distorting the recorded velocity. When present this is
+                # ``[yaw_rate, vel_x, vel_z, hip_h]``; the dispatcher
+                # short-circuits to it (see ``intent_to_velocity``).
+                # Missing field -> ``None`` -> dispatcher follows its
+                # normal bucketed / continuous path.
+                target_velocity = payload.get("target_velocity")
+                direct_velocity: Optional[tuple[float, float, float, float]] = None
+                if target_velocity is not None:
+                    if (
+                        not isinstance(target_velocity, (list, tuple))
+                        or len(target_velocity) != 4
+                    ):
+                        log.warning(
+                            "zmq command source: target_velocity must be a "
+                            "4-element list [yaw_rate, vel_x, vel_z, hip_h]; "
+                            "got %r (ignoring)",
+                            target_velocity,
+                        )
+                    else:
+                        direct_velocity = (
+                            float(target_velocity[0]),
+                            float(target_velocity[1]),
+                            float(target_velocity[2]),
+                            float(target_velocity[3]),
+                        )
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 log.warning("zmq command source: bad payload %r: %s", parts[1], exc)
                 continue
@@ -506,6 +701,13 @@ def _zmq_command_thread(
                     intent=intent,
                     magnitude=magnitude,
                     source="zmq",
+                    waist_pitch_deg=waist_pitch_deg,
+                    waist_roll_deg=waist_roll_deg,
+                    waist_yaw_deg=waist_yaw_deg,
+                    stick_fwd=stick_fwd,
+                    stick_side=stick_side,
+                    stick_yaw=stick_yaw,
+                    direct_velocity=direct_velocity,
                 )
             )
     finally:
@@ -905,6 +1107,7 @@ def run(
     forward_scale: float = 1.0,
     backward_scale: float = 1.0,
     lateral_scale: float = 1.0,
+    stick_shape_exp: float = _DEFAULT_STICK_SHAPING_EXPONENT,
 ) -> int:
     _setup_logging(verbose)
 
@@ -913,11 +1116,17 @@ def run(
     # unit-test invariants still hold when the user passes no override.
     global _RUNTIME_TURN_LEFT_SCALE, _RUNTIME_TURN_RIGHT_SCALE
     global _RUNTIME_FORWARD_SCALE, _RUNTIME_BACKWARD_SCALE, _RUNTIME_LATERAL_SCALE
+    global _RUNTIME_STICK_SHAPING_EXPONENT
     _RUNTIME_TURN_LEFT_SCALE = float(turn_left_scale)
     _RUNTIME_TURN_RIGHT_SCALE = float(turn_right_scale)
     _RUNTIME_FORWARD_SCALE = float(forward_scale)
     _RUNTIME_BACKWARD_SCALE = float(backward_scale)
     _RUNTIME_LATERAL_SCALE = float(lateral_scale)
+    if stick_shape_exp <= 0:
+        log.error("--stick-shape-exp must be > 0 (got %s); using default %.2f",
+                  stick_shape_exp, _DEFAULT_STICK_SHAPING_EXPONENT)
+        stick_shape_exp = _DEFAULT_STICK_SHAPING_EXPONENT
+    _RUNTIME_STICK_SHAPING_EXPONENT = float(stick_shape_exp)
     if any(s != 1.0 for s in (
         turn_left_scale, turn_right_scale,
         forward_scale, backward_scale, lateral_scale,
@@ -928,6 +1137,9 @@ def run(
             turn_left_scale, turn_right_scale,
             forward_scale, backward_scale, lateral_scale,
         )
+    log.info("continuous-locomotion stick shape exponent: %.3f "
+             "(1.0=linear, <1 closer-to-bucketed, >1 more deadzone-feel)",
+             _RUNTIME_STICK_SHAPING_EXPONENT)
     log.info("yaw-lock epsilon: %.3f rad/s (0=disabled)",
              yaw_lock_epsilon_rad_s)
 
@@ -1532,6 +1744,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--lateral-scale", type=float, default=1.0,
         help="Multiplier on side_left / side_right vel_y. Default 1.0.",
     )
+    tune_grp.add_argument(
+        "--stick-shape-exp", type=float,
+        default=_DEFAULT_STICK_SHAPING_EXPONENT,
+        help=(
+            "Power-curve exponent applied to ``locomotion / continuous`` "
+            "stick deflections before scaling by the base velocity. "
+            "1.0 (default) = linear; >1.0 (e.g. 2.0) = more dead near zero, "
+            "harder to reach full speed; <1.0 (e.g. 0.5) = closer to the "
+            "bucketed feel (50%% stick already at 71%% velocity)."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -1564,6 +1787,7 @@ def main(argv: list[str] | None = None) -> int:
         forward_scale=args.forward_scale,
         backward_scale=args.backward_scale,
         lateral_scale=args.lateral_scale,
+        stick_shape_exp=args.stick_shape_exp,
     )
 
 
