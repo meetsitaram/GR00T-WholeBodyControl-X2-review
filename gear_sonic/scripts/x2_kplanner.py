@@ -45,6 +45,7 @@ import argparse
 import collections
 import json
 import logging
+import math
 import os
 import pickle
 import queue
@@ -130,6 +131,33 @@ _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
 _TURN_45_RAD_S: float = 1.5
 _TURN_90_RAD_S: float = 3.0
+# Yaw-rate ceiling for the **continuous-locomotion** path (Quest 3
+# R-stick X axis after deadzone rescale + stick shaping). Decoupled
+# from the bucketed ``_TURN_45_RAD_S`` because:
+#
+#   * The current X2 root model trained on
+#     ``Loop_Forward_Walk_001__A018``, which contains essentially zero
+#     yaw motion. Any non-zero yaw_rate is extrapolation; the larger
+#     the yaw the more OOD the prediction. Empirically full-stick at
+#     1.5 rad/s (~86 deg/s = a 90 deg turn in ~1 s) overdrives the
+#     model and the operator reports "turns are too aggressive". A
+#     90 deg turn in ~2 s (0.75 rad/s, ~43 deg/s) sits comfortably
+#     inside what the policy can track.
+#   * Bucketed callers (``turn_left / deg_45`` etc.) intentionally
+#     want sharp pivots from a single button press -- those continue
+#     to use the legacy ``_TURN_*_RAD_S`` table.
+#
+# Tunable at runtime via ``--continuous-turn-max-rad-s`` on the
+# kplanner CLI, or ``KPLANNER_CONTINUOUS_TURN_MAX_RAD_S`` env var on
+# the Quest 3 / PKL wrappers. The per-side ``_RUNTIME_TURN_LEFT_SCALE
+# / _RIGHT_SCALE`` runtime scales still apply on top (default 1.0)
+# so the operator can compensate for any L/R asymmetry independently.
+_DEFAULT_CONTINUOUS_TURN_MAX_RAD_S: float = 0.75
+
+# Mutable runtime knob, mutated by ``run()`` per CLI flag. Reads in
+# ``_resolve_locomotion_continuous`` pick up the override at every
+# dispatch call.
+_CONTINUOUS_TURN_MAX_RAD_S: float = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
 # Default hip-height TARGET (channel 3 of the velocity intent the model
 # consumes). This is NOT a metadata field -- ``NeuralPlannerCore``
 # wires it into ``implied_target_y`` (see
@@ -285,7 +313,17 @@ def _resolve_locomotion_continuous(
     vel_x = -shaped_side * _SIDE_SPEED_MPS
     # ``stick_yaw > 0`` (R-stick right) -> turn-right -> negative
     # yaw_rate, matching ``_BASE_VELOCITY['turn_right']``.
-    yaw_rate = -shaped_yaw * _TURN_45_RAD_S
+    #
+    # Continuous mode uses its own yaw ceiling
+    # (``_CONTINUOUS_TURN_MAX_RAD_S``) rather than the bucketed
+    # ``_TURN_45_RAD_S`` constant -- the bucketed callers want a
+    # sharp pivot from a single button press, but the analog R-stick
+    # wants gentler resolution. See the constant's comment block for
+    # the full rationale (model is trained on a no-yaw clip; high
+    # yaw_rate is OOD). The mutable global is set from ``run()`` per
+    # CLI flag / env var; this read picks up any override applied
+    # before the dispatcher fires.
+    yaw_rate = -shaped_yaw * _CONTINUOUS_TURN_MAX_RAD_S
     return (yaw_rate, vel_x, vel_z, _HIP_HEIGHT_M)
 
 
@@ -1555,6 +1593,7 @@ def run(
     pose_feedback_deque_maxlen: int = 32,
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
     cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
+    continuous_turn_max_rad_s: float = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
 ) -> int:
     _setup_logging(verbose)
 
@@ -1564,6 +1603,7 @@ def run(
     global _RUNTIME_TURN_LEFT_SCALE, _RUNTIME_TURN_RIGHT_SCALE
     global _RUNTIME_FORWARD_SCALE, _RUNTIME_BACKWARD_SCALE, _RUNTIME_LATERAL_SCALE
     global _RUNTIME_STICK_SHAPING_EXPONENT
+    global _CONTINUOUS_TURN_MAX_RAD_S
     _RUNTIME_TURN_LEFT_SCALE = float(turn_left_scale)
     _RUNTIME_TURN_RIGHT_SCALE = float(turn_right_scale)
     _RUNTIME_FORWARD_SCALE = float(forward_scale)
@@ -1574,6 +1614,14 @@ def run(
                   stick_shape_exp, _DEFAULT_STICK_SHAPING_EXPONENT)
         stick_shape_exp = _DEFAULT_STICK_SHAPING_EXPONENT
     _RUNTIME_STICK_SHAPING_EXPONENT = float(stick_shape_exp)
+    if continuous_turn_max_rad_s <= 0:
+        log.error(
+            "--continuous-turn-max-rad-s must be > 0 (got %s); using "
+            "default %.3f rad/s",
+            continuous_turn_max_rad_s, _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
+        )
+        continuous_turn_max_rad_s = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
+    _CONTINUOUS_TURN_MAX_RAD_S = float(continuous_turn_max_rad_s)
     if any(s != 1.0 for s in (
         turn_left_scale, turn_right_scale,
         forward_scale, backward_scale, lateral_scale,
@@ -1587,6 +1635,15 @@ def run(
     log.info("continuous-locomotion stick shape exponent: %.3f "
              "(1.0=linear, <1 closer-to-bucketed, >1 more deadzone-feel)",
              _RUNTIME_STICK_SHAPING_EXPONENT)
+    log.info(
+        "continuous-locomotion yaw ceiling: %.3f rad/s (~%.1f deg/s, "
+        "90-deg turn in %.2f s); bucketed turn_*/deg_45 unchanged at "
+        "%.3f rad/s",
+        _CONTINUOUS_TURN_MAX_RAD_S,
+        math.degrees(_CONTINUOUS_TURN_MAX_RAD_S),
+        (math.pi / 2.0) / max(_CONTINUOUS_TURN_MAX_RAD_S, 1e-9),
+        _TURN_45_RAD_S,
+    )
     log.info("yaw-lock epsilon: %.3f rad/s (0=disabled)",
              yaw_lock_epsilon_rad_s)
 
@@ -2292,6 +2349,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--continuous-turn-max-rad-s",
+        type=float,
+        default=_DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
+        help=(
+            "Yaw-rate ceiling (rad/s) at full R-stick deflection in the "
+            "continuous-locomotion path. Default %.3f rad/s (~43 deg/s, a "
+            "90-deg turn in ~2.1 s). The bucketed path keeps its own "
+            "_TURN_45_RAD_S = 1.5 rad/s ceiling -- this knob only affects "
+            "Quest 3 R-stick X analog turns. The per-side runtime turn "
+            "scales (--turn-left-scale / --turn-right-scale) still apply "
+            "on top of this ceiling for L/R asymmetry compensation."
+        ) % _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
+    )
+    p.add_argument(
         "--cold-start-ramp-tau-s",
         type=float,
         default=_DEFAULT_COLD_START_RAMP_TAU_S,
@@ -2346,6 +2417,7 @@ def main(argv: list[str] | None = None) -> int:
         pose_feedback_deque_maxlen=args.pose_feedback_deque_maxlen,
         pose_reseed_scope=args.pose_reseed_scope,
         cold_start_ramp_tau_s=args.cold_start_ramp_tau_s,
+        continuous_turn_max_rad_s=args.continuous_turn_max_rad_s,
     )
 
 

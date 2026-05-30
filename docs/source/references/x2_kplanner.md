@@ -191,14 +191,22 @@ the two surfaces are guaranteed to agree.
 Constants (`gear_sonic/scripts/x2_kplanner.py`):
 
 ```
-_WALK_SPEED_MPS      = 0.5    # fwd_step / walk-forward 1× speed
-_FAST_WALK_SPEED_MPS = 0.9    # walk-fast
-_BACK_SPEED_MPS      = 0.35   # back_step / walk-backward 1× speed
-_SIDE_SPEED_MPS      = 0.4    # side_left / side_right 1× speed
-_TURN_45_RAD_S       = 1.5    # turn_left / turn_right 1× yaw rate (= deg_45)
-_HIP_HEIGHT_M        = 0.687  # target pelvis Y (channel 3) -- must match
-                              # training distribution (PKL pelvis_z mean
-                              # ~0.66 m); 0.95 was OOD for current model
+_WALK_SPEED_MPS              = 0.5    # fwd_step / walk-forward 1× speed
+_FAST_WALK_SPEED_MPS         = 0.9    # walk-fast
+_BACK_SPEED_MPS              = 0.35   # back_step / walk-backward 1× speed
+_SIDE_SPEED_MPS              = 0.4    # side_left / side_right 1× speed
+_TURN_45_RAD_S               = 1.5    # bucketed turn_left/turn_right deg_45
+                                      # yaw rate (button-driven pivots only)
+_CONTINUOUS_TURN_MAX_RAD_S   = 0.75   # Quest 3 R-stick full-deflection yaw
+                                      # ceiling (analog turns). Decoupled
+                                      # from _TURN_45_RAD_S because the
+                                      # current X2 root model is OOD for
+                                      # yaw_rate > ~1.0 rad/s. Tune with
+                                      # --continuous-turn-max-rad-s.
+_HIP_HEIGHT_M                = 0.687  # target pelvis Y (channel 3) -- must
+                                      # match training distribution (PKL
+                                      # pelvis_z mean ~0.66 m); 0.95 was
+                                      # OOD for current model
 ```
 
 | `(intent, magnitude)` | Resolved value | Source |

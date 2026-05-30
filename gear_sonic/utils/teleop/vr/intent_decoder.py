@@ -153,6 +153,7 @@ class IntentDecoder:
         enable_continuous_torso: bool = False,
         enable_continuous_locomotion: bool = False,
         continuous_stick_threshold: float = 0.02,
+        continuous_yaw_max: float = 0.5,
         turn_threshold: float = 0.75,
         lean_medium_threshold: float = 0.55,
         lean_large_threshold: float = 0.80,
@@ -251,6 +252,27 @@ class IntentDecoder:
         # ZMQ spam from thumbstick noise without losing perceived
         # smoothness (kplanner's intent dispatcher slews internally).
         self._continuous_stick_threshold = float(continuous_stick_threshold)
+        # Maximum R-stick X amplitude forwarded as ``stick_yaw`` to the
+        # planner. Lives on the *teleop* side (this class) rather than
+        # in the planner because turn aggressiveness is fundamentally an
+        # operator-feel concern: the kplanner's yaw-rate ceiling
+        # (``_CONTINUOUS_TURN_MAX_RAD_S``) sets the *physical* maximum
+        # the robot can be asked to track; this knob caps how much of
+        # that ceiling a full R-stick deflection actually reaches. With
+        # the default 0.5, slamming the stick to the rail commands half
+        # the planner's yaw-rate ceiling, which empirically gives a
+        # turn rate the policy can track without overshoot. Operators
+        # wanting sharper button-style pivots can leave the bucketed
+        # path (which is unaffected by this clamp) or raise this to
+        # 1.0. The clamp is symmetric -- the SAME ratio applies to
+        # left and right turns; per-side asymmetry compensation lives
+        # in the planner's runtime turn scales.
+        if not (0.0 < continuous_yaw_max <= 1.0):
+            raise ValueError(
+                "continuous_yaw_max must be in (0, 1]; "
+                f"got {continuous_yaw_max}"
+            )
+        self._continuous_yaw_max = float(continuous_yaw_max)
         if max_waist_pitch_deg < 0 or max_waist_roll_deg < 0 or max_waist_yaw_deg < 0:
             raise ValueError(
                 "max_waist_*_deg must be non-negative; got "
@@ -545,12 +567,21 @@ class IntentDecoder:
         These match the bucketed convention so the kplanner's
         ``_BASE_VELOCITY`` table and the new ``_resolve_locomotion``
         branch agree on direction sign.
+
+        The yaw axis is additionally clamped to ``±continuous_yaw_max``
+        before publishing. This caps the operator-commanded fraction of
+        the planner's yaw-rate ceiling and lives here (teleop layer)
+        rather than in the planner because turn aggressiveness is an
+        operator-feel concern, not a planner capability. Forward and
+        side axes are unaffected -- those don't suffer from the same
+        "brief stick burst commits to a long turn" failure mode (the
+        operator naturally holds the L-stick to drive).
         """
         dz = self._stick_deadzone
         return (
             self._rescaled_axis(ly, dz),
             self._rescaled_axis(lx, dz),
-            self._rescaled_axis(rx, dz),
+            self._rescaled_axis(rx, dz) * self._continuous_yaw_max,
         )
 
     @staticmethod

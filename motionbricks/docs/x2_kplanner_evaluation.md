@@ -642,3 +642,115 @@ won't regress steady-state behaviour. The ramper class is unit
 tested in ``tests/test_x2_kplanner_cold_start_ramp.py`` (EWMA
 arithmetic, hip_h passthrough, reset_idle semantics, release-then-
 repush patterns).
+
+#### Continuous-mode turn ceiling (2026-05-30, follow-up)
+
+**Symptom**: with the hip-height + cold-start fixes in place, the
+operator drives forward fine but reports *"left and right turns are
+too aggressive"* on Quest 3 R-stick.
+
+**Mechanism**. The continuous-locomotion path in
+``_resolve_locomotion_continuous`` was hard-wired to
+``yaw_rate = -shaped_yaw * _TURN_45_RAD_S = ±1.5 rad/s`` at full
+R-stick (~86 deg/s, a 90-deg turn in ~1.05 s). Two problems compound:
+
+1. **OOD for the X2 root model**. The shipped checkpoint trained on
+   ``Loop_Forward_Walk_001__A018``, which contains essentially zero
+   yaw motion. Any non-zero yaw_rate is an extrapolation request; the
+   larger the yaw the further the model has to extrapolate. Full
+   stick at 1.5 rad/s drives the predicted root angular velocity
+   well outside the training distribution; the policy then can't
+   track and the visible behaviour is "snap turn that overshoots".
+2. **No analog resolution**. ``_TURN_45_RAD_S`` was named for a 45-deg
+   pivot, and was a sensible *button-driven* default for the bucketed
+   path. Re-using the same scalar for the analog stick gave operators
+   no headroom: half-stick still produced 0.75 rad/s = a 43 deg/s
+   turn (in a tight indoor lab, basically the only useful range).
+
+**Fix** (commit TBD): introduce a dedicated runtime-mutable global
+``_CONTINUOUS_TURN_MAX_RAD_S`` (default ``0.75 rad/s``, ~43 deg/s, a
+90-deg turn in ~2.1 s) used only by ``_resolve_locomotion_continuous``;
+the bucketed ``turn_left / turn_right`` dispatch entries keep the
+legacy ``_TURN_45_RAD_S = 1.5 rad/s`` ceiling so button-driven pivots
+stay sharp.
+
+**Tunables**:
+
+* ``--continuous-turn-max-rad-s RAD_S`` on ``x2_kplanner.py``.
+* ``KPLANNER_CONTINUOUS_TURN_MAX_RAD_S`` env var or
+  ``--kplanner-continuous-turn-max-rad-s RAD_S`` flag on
+  ``run_x2_quest3_planner_stack.sh``.
+* Per-side ``KPLANNER_TURN_LEFT_SCALE`` / ``KPLANNER_TURN_RIGHT_SCALE``
+  still apply on top, so L/R asymmetry compensation continues to work.
+
+**Rule-of-thumb** for the current X2 checkpoint:
+
+| ceiling | turn speed | 90-deg time | when to use |
+|--------:|-----------:|------------:|-------------|
+| 0.25 rad/s | 14 deg/s | 6.3 s | demo / fine-positioning |
+| 0.50 rad/s | 29 deg/s | 3.1 s | conservative default |
+| **0.75 rad/s** | **43 deg/s** | **2.1 s** | **shipped default** |
+| 1.00 rad/s | 57 deg/s | 1.6 s | upper edge of in-distribution |
+| 1.50 rad/s | 86 deg/s | 1.05 s | legacy (pre-2026-05-30); OOD |
+
+The ``_RUNTIME_STICK_SHAPING_EXPONENT`` knob (``--stick-shape-exp``)
+remains the orthogonal way to tune *resolution* (>1 = more deadzone
+feel, <1 = more bang-bang); the new ceiling tunes the *maximum*.
+Pinned by ``tests/test_x2_kplanner_intent_velocity.py`` (decoupling
+from bucketed path, runtime mutability, linear partial-stick scaling).
+
+#### Teleop-side yaw amplitude clamp (2026-05-30, follow-up)
+
+**Symptom (continued)**: even with the planner-side ceiling lowered to
+0.75 rad/s, the operator reports *"even a small fraction-of-a-second
+full R-stick deflection commits the robot to a large turn"*.
+
+**Mechanism**. The planner's ceiling caps the *physical* yaw-rate the
+robot can be asked to track, but the planner doesn't know how briefly
+the operator was holding the stick: it sees ``stick_yaw=1.0`` for one
+frame and asks the model to predict a 2.13 s rotation at full
+ceiling. By the time the next replan fires (66 ms at
+``replan-threshold-frames=2``, 30 FPS) the deploy has already
+consumed enough of the rotated-trajectory prediction to noticeably
+turn the robot, and the rotated pose in the next context window
+biases the model toward *continuing* to rotate (the same compounding
+drift documented further up this file).
+
+**Fix** (commit TBD): introduce a teleop-side amplitude clamp on the
+R-stick X axis inside ``IntentDecoder._continuous_stick_targets``.
+The clamp multiplies the deadzone-rescaled ``stick_yaw`` by
+``continuous_yaw_max`` (default ``0.5``) before publishing the
+``locomotion / continuous`` command, so the planner sees at most
+half the operator's full-stick deflection. With the default planner
+ceiling of 0.75 rad/s, that means a full slam to the R-stick rail
+requests 0.375 rad/s (~21 deg/s) -- a brief 100 ms burst now
+integrates to roughly 2 deg of commanded rotation, well inside what
+the policy can recover from on release.
+
+The clamp lives on the **teleop side** rather than in the planner
+because turn aggressiveness is an operator-feel concern; the planner
+just consumes whatever intent it's told. This also keeps the door
+open for a future stick-velocity integration (where the *time
+integral* of stick deflection sets turn amount) inside the same
+IntentDecoder layer without disturbing the planner contract.
+
+**Tunables**:
+
+* ``--continuous-yaw-max RATIO`` on ``quest3_manager_x2.py``
+  (range (0, 1]).
+* ``QUEST3_CONTINUOUS_YAW_MAX`` env var or
+  ``--quest3-continuous-yaw-max RATIO`` flag on
+  ``run_x2_quest3_planner_stack.sh``.
+* Set to ``1.0`` to reproduce the pre-fix mapping (full stick = full
+  planner ceiling) for A/B comparison; defaults to ``0.5``.
+
+Pinned by 6 new tests in ``tests/test_intent_decoder.py``:
+
+* Default 0.5 caps full deflection to ±0.5 (both directions).
+* Linear partial-stick scaling within the cap (analog control
+  preserved).
+* Fwd / side axes unaffected (yaw-only clamp).
+* ``continuous_yaw_max=1.0`` reproduces legacy behaviour.
+* Invalid values (0, negative, >1, 50) rejected at construction time.
+* Clamp is stateless per tick -- not an EWMA, so a "release then
+  re-push" pattern doesn't accidentally let the cap drift up.

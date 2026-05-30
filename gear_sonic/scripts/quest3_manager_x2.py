@@ -215,6 +215,16 @@ class ManagerConfig:
     # idle. ``run_x2_quest3_planner_stack.sh`` flips it ON automatically
     # when ``--planner kplanner`` is selected.
     intent_enable_continuous_locomotion: bool = False
+    # Maximum R-stick X amplitude forwarded as ``stick_yaw`` to the
+    # planner. Defaults to 0.5 so full-stick deflection commands HALF
+    # the planner's continuous-mode yaw-rate ceiling; this empirically
+    # matches what the current X2 root-model checkpoint can track
+    # without overshoot. Lives on the teleop side (operator-feel
+    # concern) rather than the planner (which only sees the post-
+    # clamp value and treats it like any other intent). Set to 1.0
+    # to restore the legacy "full stick = full planner ceiling"
+    # mapping for A/B comparison.
+    intent_continuous_yaw_max: float = 0.5
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
     #
     # Operator UX contract: pushing the left stick AWAY from your body
@@ -409,6 +419,7 @@ class Quest3ManagerX2:
             enable_torso=cfg.intent_enable_torso,
             enable_continuous_torso=cfg.intent_enable_continuous_torso,
             enable_continuous_locomotion=cfg.intent_enable_continuous_locomotion,
+            continuous_yaw_max=cfg.intent_continuous_yaw_max,
         )
         # Latched continuous waist target. Set in two situations:
         #   1) The operator presses B to flip LOCOMOTION ->
@@ -1542,6 +1553,16 @@ def _build_parser() -> argparse.ArgumentParser:
              "fwd_step / turn_* even when paired with the kplanner). "
              "Useful for ablation / regression runs.",
     )
+    p.add_argument(
+        "--continuous-yaw-max",
+        dest="continuous_yaw_max", type=float, default=0.5,
+        help="Maximum R-stick X amplitude forwarded as stick_yaw to "
+             "the planner in continuous-locomotion mode. Range (0, "
+             "1]; default 0.5 commands HALF the planner's continuous "
+             "yaw ceiling at full stick. Lower for gentler turns, "
+             "1.0 to restore the legacy 'full stick = full ceiling' "
+             "mapping. Bucketed turn_left / turn_right are unaffected.",
+    )
 
     # Stick polarity (axis sign flips applied before the decoder).
     # All default to False: the operator-facing UX of "push the stick
@@ -1715,6 +1736,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         intent_enable_lean_fwd=args.enable_lean_fwd,
         intent_enable_torso=args.enable_torso,
         intent_enable_continuous_locomotion=args.enable_continuous_locomotion,
+        intent_continuous_yaw_max=args.continuous_yaw_max,
         invert_lx=args.invert_lx,
         invert_ly=args.invert_ly,
         invert_rx=args.invert_rx,

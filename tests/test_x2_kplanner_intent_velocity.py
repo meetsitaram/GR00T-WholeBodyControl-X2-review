@@ -40,6 +40,7 @@ import gear_sonic.scripts.x2_kplanner as kp  # noqa: E402
 from gear_sonic.scripts.x2_kplanner import (  # noqa: E402
     INTENT_VELOCITY_MAP,
     _BACK_SPEED_MPS,
+    _CONTINUOUS_TURN_MAX_RAD_S,
     _FAST_WALK_SPEED_MPS,
     _HIP_HEIGHT_M,
     _IDLE_INTENT,
@@ -72,12 +73,14 @@ def _reset_runtime_scales():
         kp._RUNTIME_FORWARD_SCALE,
         kp._RUNTIME_BACKWARD_SCALE,
         kp._RUNTIME_LATERAL_SCALE,
+        kp._CONTINUOUS_TURN_MAX_RAD_S,
     )
     kp._RUNTIME_TURN_LEFT_SCALE = 1.0
     kp._RUNTIME_TURN_RIGHT_SCALE = 1.0
     kp._RUNTIME_FORWARD_SCALE = 1.0
     kp._RUNTIME_BACKWARD_SCALE = 1.0
     kp._RUNTIME_LATERAL_SCALE = 1.0
+    kp._CONTINUOUS_TURN_MAX_RAD_S = kp._DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
     yield
     (
         kp._RUNTIME_TURN_LEFT_SCALE,
@@ -85,6 +88,7 @@ def _reset_runtime_scales():
         kp._RUNTIME_FORWARD_SCALE,
         kp._RUNTIME_BACKWARD_SCALE,
         kp._RUNTIME_LATERAL_SCALE,
+        kp._CONTINUOUS_TURN_MAX_RAD_S,
     ) = saved
 
 
@@ -506,19 +510,26 @@ def test_continuous_locomotion_side_stick_maps_to_vel_x():
 
 def test_continuous_locomotion_yaw_stick_sign_matches_bucketed_turn():
     """``stick_yaw=+1`` (R-stick right) -> turn-right -> negative yaw_rate,
-    matching the bucketed ``turn_right`` path."""
+    same sign convention as the bucketed ``turn_right`` path.
+
+    The *magnitude* is intentionally decoupled: continuous mode caps at
+    ``_CONTINUOUS_TURN_MAX_RAD_S`` (a gentler ceiling so analog R-stick
+    turns don't overdrive a model trained mostly on forward walking),
+    while the bucketed ``turn_right deg_45`` path keeps the legacy
+    ``_TURN_45_RAD_S = 1.5 rad/s``. See the constant's comment block.
+    """
     cmd = LocomotionCommand(
         intent="locomotion", magnitude="continuous",
         stick_yaw=1.0,
     )
     yaw, _, _, _ = intent_to_velocity(cmd)
-    assert yaw == pytest.approx(-_TURN_45_RAD_S, abs=1e-9)
+    assert yaw == pytest.approx(-_CONTINUOUS_TURN_MAX_RAD_S, abs=1e-9)
     cmd_left = LocomotionCommand(
         intent="locomotion", magnitude="continuous",
         stick_yaw=-1.0,
     )
     yaw_left, _, _, _ = intent_to_velocity(cmd_left)
-    assert yaw_left == pytest.approx(_TURN_45_RAD_S, abs=1e-9)
+    assert yaw_left == pytest.approx(_CONTINUOUS_TURN_MAX_RAD_S, abs=1e-9)
 
 
 def test_continuous_locomotion_combined_axes():
@@ -532,8 +543,9 @@ def test_continuous_locomotion_combined_axes():
     assert vz  == pytest.approx(_WALK_SPEED_MPS, abs=1e-9)
     # stick_side = -1 -> side_left -> +vel_x
     assert vx  == pytest.approx(_SIDE_SPEED_MPS, abs=1e-9)
-    # stick_yaw = -1 -> turn_left -> +yaw_rate
-    assert yaw == pytest.approx(_TURN_45_RAD_S,  abs=1e-9)
+    # stick_yaw = -1 -> turn_left -> +yaw_rate, capped at the continuous
+    # ceiling (decoupled from bucketed _TURN_45_RAD_S).
+    assert yaw == pytest.approx(_CONTINUOUS_TURN_MAX_RAD_S, abs=1e-9)
     assert hip_h == pytest.approx(_HIP_HEIGHT_M, abs=1e-9)
 
 
@@ -546,6 +558,66 @@ def test_continuous_locomotion_runtime_scale_applies():
     )
     _, _, vz, _ = intent_to_velocity(cmd)
     assert vz == pytest.approx(0.5 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_continuous_turn_ceiling_decoupled_from_bucketed():
+    """Bucketed ``turn_left deg_45`` keeps the legacy 1.5 rad/s ceiling
+    even after the continuous knob is dialled way down.
+
+    Regression guard for the 2026-05-30 fix: the analog R-stick turn
+    rate was previously hard-wired to ``_TURN_45_RAD_S``, so any operator
+    that dialled down the continuous-mode ceiling would also have nerfed
+    button-driven pivots. The two paths must be independent.
+    """
+    kp._CONTINUOUS_TURN_MAX_RAD_S = 0.1  # essentially "no turn"
+    bucketed = LocomotionCommand(
+        intent="turn_left", magnitude="deg_45",
+    )
+    yaw_bucketed, _, _, _ = intent_to_velocity(bucketed)
+    assert yaw_bucketed == pytest.approx(_TURN_45_RAD_S, abs=1e-9)
+    continuous = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_yaw=-1.0,
+    )
+    yaw_continuous, _, _, _ = intent_to_velocity(continuous)
+    assert yaw_continuous == pytest.approx(0.1, abs=1e-9)
+
+
+def test_continuous_turn_ceiling_is_runtime_mutable():
+    """Mutating ``_CONTINUOUS_TURN_MAX_RAD_S`` at runtime (as ``run()``
+    does when ``--continuous-turn-max-rad-s`` is passed) immediately
+    changes the yaw_rate the dispatcher emits for full R-stick.
+
+    This is what plumbs the wrapper-script env var through to live
+    behaviour without a kplanner restart-rebuild cycle.
+    """
+    kp._CONTINUOUS_TURN_MAX_RAD_S = 1.25
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_yaw=1.0,
+    )
+    yaw, _, _, _ = intent_to_velocity(cmd)
+    assert yaw == pytest.approx(-1.25, abs=1e-9)
+    kp._CONTINUOUS_TURN_MAX_RAD_S = 0.25
+    yaw2, _, _, _ = intent_to_velocity(cmd)
+    assert yaw2 == pytest.approx(-0.25, abs=1e-9)
+
+
+def test_continuous_turn_ceiling_scales_partial_stick_linearly():
+    """``shaped_yaw`` after shape_exp=1 is linear in the stick deflection;
+    the ceiling scales the result, so 50%-stick yields 50% of the ceiling.
+
+    Catches accidental introduction of a non-linear remap inside the
+    yaw-stick path that could make small deflections feel jumpy.
+    """
+    kp._CONTINUOUS_TURN_MAX_RAD_S = 0.8
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_yaw=0.5,
+    )
+    yaw, _, _, _ = intent_to_velocity(cmd)
+    # IntentDecoder owns deadzone rescaling, so stick_yaw arrives here
+    # already in [-1, 1]. The kplanner only applies stick_shape_exp
+    # (default 1.0 = identity). So shaped = 0.5, yaw = -0.5 * 0.8.
+    assert yaw == pytest.approx(-0.5 * 0.8, abs=1e-9)
 
 
 def test_continuous_locomotion_turn_scales_split_by_sign():
@@ -561,8 +633,10 @@ def test_continuous_locomotion_turn_scales_split_by_sign():
     )
     yaw_right, _, _, _ = intent_to_velocity(right)
     yaw_left,  _, _, _ = intent_to_velocity(left)
-    assert yaw_right == pytest.approx(-_TURN_45_RAD_S * 0.7, abs=1e-9)
-    assert yaw_left  == pytest.approx( _TURN_45_RAD_S * 0.3, abs=1e-9)
+    # Continuous-mode yaw ceiling is _CONTINUOUS_TURN_MAX_RAD_S (not
+    # _TURN_45_RAD_S); per-side runtime scales multiply the ceiling.
+    assert yaw_right == pytest.approx(-_CONTINUOUS_TURN_MAX_RAD_S * 0.7, abs=1e-9)
+    assert yaw_left  == pytest.approx( _CONTINUOUS_TURN_MAX_RAD_S * 0.3, abs=1e-9)
 
 
 def test_runtime_scales_do_not_reanimate_idle_intent():

@@ -401,6 +401,14 @@ KPLANNER_STICK_SHAPE_EXP="${KPLANNER_STICK_SHAPE_EXP:-}"
 # Set ``KPLANNER_COLD_START_RAMP_TAU_S=0`` to disable the ramp and
 # reproduce the pre-fix behaviour.
 KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
+# Yaw-rate ceiling for continuous-locomotion R-stick turns (rad/s at
+# full deflection). Default empty -> daemon default 0.75 rad/s (~43
+# deg/s, a 90-deg turn in ~2.1 s). The legacy bucketed path stays at
+# 1.5 rad/s for sharp pivots; this knob only affects analog R-stick
+# turns. Halve it for even gentler turns; double to roughly match the
+# bucketed feel. Tied to model training distribution -- raising past
+# ~1.0 rad/s starts to overdrive the current X2 root model.
+KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S:-}"
 
 # --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
@@ -590,6 +598,8 @@ while [[ $# -gt 0 ]]; do
         --kplanner-lateral-scale) KPLANNER_LATERAL_SCALE="$2"; shift 2 ;;
         --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
+        --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
+        --quest3-continuous-yaw-max) QUEST3_CONTINUOUS_YAW_MAX="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
         --vla-bridge) VLA_BRIDGE_MODEL="$2"; shift 2 ;;
         --vla-bridge-sonic-checkpoint)
@@ -1852,6 +1862,9 @@ else
     if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
         PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
     fi
+    if [[ -n "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}" ]]; then
+        PLANNER_ARGS+=(--continuous-turn-max-rad-s "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}")
+    fi
     if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
         PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")
     fi
@@ -1953,6 +1966,22 @@ KPLANNER_CONTINUOUS_LOCOMOTION="${KPLANNER_CONTINUOUS_LOCOMOTION:-1}"
 if [[ "${PLANNER_KIND}" == "kplanner" && "${KPLANNER_CONTINUOUS_LOCOMOTION}" -eq 1 ]]; then
     MANAGER_ARGS+=(--enable-continuous-locomotion)
 fi
+# Maximum R-stick X amplitude forwarded as stick_yaw in continuous-
+# locomotion mode. Defaults to 0.5 (= half deflection) which the
+# operator validated on 2026-05-30 as "turns look smooth now" against
+# the current X2 root-model checkpoint. Combined with the kplanner's
+# 0.75 rad/s yaw ceiling that gives a 0.375 rad/s (~21 deg/s) full-
+# stick turn -- inside what the policy can track without commit-and-
+# overshoot from brief R-stick bursts.
+#
+# Lower for gentler demo turns, 1.0 to restore the legacy "full stick
+# = full planner ceiling" mapping for A/B comparison. Lives on the
+# teleop side so it shapes operator feel without changing the
+# planner's physical yaw-rate ceiling
+# (KPLANNER_CONTINUOUS_TURN_MAX_RAD_S handles that downstream concern
+# separately).
+QUEST3_CONTINUOUS_YAW_MAX="${QUEST3_CONTINUOUS_YAW_MAX:-0.5}"
+MANAGER_ARGS+=(--continuous-yaw-max "${QUEST3_CONTINUOUS_YAW_MAX}")
 
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
