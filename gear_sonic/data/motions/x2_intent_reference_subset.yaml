@@ -1,0 +1,104 @@
+# Curated PKL clip subset for VR stick-smoothing tuning.
+#
+# Self-contained: each entry resolves directly to a (pkl, motion_key,
+# start_frame, n_frames) slice in the locowalk training corpus that
+# ``motionbricks/scripts/extract_training_intent_stats.py`` and
+# ``scripts/analyze_planner_cmd_jsonl.py`` use to build the (A) raw-
+# training-intent and (B) live-PKL-replay reference distributions.
+#
+# We intentionally do NOT use all ~18,000 PKL clips. The goal is to
+# characterise the kplanner's IN-DISTRIBUTION operating envelope for
+# the maneuvers a VR operator actually drives (forward / back /
+# lateral / turn / idle), not the full training corpus. The 7-clip
+# subset below covers the 75 s maneuver script in
+# ``docs/source/references/x2_quest3_stick_smoothing.md`` 1:1.
+#
+# NOTE: ``gear_sonic/data/motions/x2_planner_primitives.yaml`` has
+# stale motion_key references from a prior PKL revision; do not chain
+# this file through that one. Both the extractor and the analyzer
+# read THIS YAML directly.
+#
+# Each ``start_frame`` / ``n_frames`` window was chosen by inspecting
+# the per-frame ``_instant_intent_from_clip`` trace and picking a
+# section with steady, in-direction intent (no boot transient, no
+# end-of-clip decel back to idle).
+#
+# Edit with care: regenerate ``training_intent_stats.json`` and re-run
+# the analyzer if you change a clip.
+
+clip_subset:
+  # Forward / backward
+  - name: fwd_walk_confident
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: walk_forward_confident_impro_001__A002_M
+    start_frame: 200
+    n_frames: 120
+    rationale: >-
+      Strong forward gait (vz ~= +0.97 m/s at mid-clip). Primary anchor
+      for VR forward-stick smoothing (maps to t=25-35 s "fast forward"
+      in the maneuver script).
+
+  - name: fwd_walk_loop
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: Loop_Forward_Walk_001__A018
+    start_frame: 20
+    n_frames: 120
+    rationale: >-
+      Looped forward walk (vz ~= +0.83 m/s). Covers the t=10-20 s
+      "slow forward" segment of the maneuver script and provides a
+      second forward-gait sample so per-channel stats aren't dominated
+      by a single clip's idiosyncrasies.
+
+  - name: back_walk_start
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: walk_backward_start_001__A021
+    start_frame: 0
+    n_frames: 90
+    rationale: >-
+      Backward gait initiation (vz ~= -0.74 m/s, short T=122 clip).
+      Confirms the release / reverse path stays in distribution; maps
+      to t=20-25 s "stop / recover" in the maneuver script.
+
+  # Lateral
+  - name: side_step_pos_vx
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: walk_sideway_045_loop_001__A021
+    start_frame: 20
+    n_frames: 150
+    rationale: >-
+      Lateral step with positive vx (~+0.72 m/s). Maps to one direction
+      of the t=40-50 s lateral L/R segments; the analyzer aggregates
+      |vx| so a single sign is sufficient.
+
+  - name: side_step_neg_vx
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: walk_sideway_090_stop_001__A039_M
+    start_frame: 20
+    n_frames: 150
+    rationale: >-
+      Lateral step with negative vx (~-0.45 m/s) at a wider 90 deg
+      angle. Complements ``side_step_pos_vx`` for two-sided coverage.
+
+  # Turn
+  - name: turn_in_place
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: idle_turn_270_R_003__A235_M
+    start_frame: 10
+    n_frames: 90
+    rationale: >-
+      Pure in-place turn (yaw_rate ~= +1.25 rad/s at mid-clip, almost
+      zero vx/vz). Anchors the t=50-60 s "turn L / turn R" maneuver-
+      script segments. Analyzer aggregates |yaw_rate| so one sign is
+      enough.
+
+  # Idle baseline
+  - name: idle_stand
+    pkl: gear_sonic/data/motions/x2_ultra_locowalk.pkl
+    motion_key: Idle_Right_001__A019
+    start_frame: 100
+    n_frames: 120
+    rationale: >-
+      Static-stand baseline (vz ~= 0, vx ~= 0, yaw_rate ~= 0). Used to
+      establish the "operator-released" target the StickFilter must
+      settle to without overshoot. Maps to the t=0-10 s settle and
+      t=70-75 s safe-disengage segments of the maneuver script.

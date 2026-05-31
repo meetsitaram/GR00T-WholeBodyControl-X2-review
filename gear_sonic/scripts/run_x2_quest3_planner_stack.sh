@@ -409,6 +409,18 @@ KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
 # bucketed feel. Tied to model training distribution -- raising past
 # ~1.0 rad/s starts to overdrive the current X2 root model.
 KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S:-}"
+# Forward-velocity floor (m/s) for continuous-locomotion. Default empty
+# -> daemon default 0.30 m/s = lift any non-zero forward stick into
+# the SONIC X2 root model's in-distribution forward-walk band on
+# engagement. Below ~0.30 m/s the corpus has essentially no training
+# samples; the model wiggles its hips without stepping and snaps into
+# an unstable stride near full stick (operator-reported 2026-05-31).
+# Only the analog forward channel is touched -- backward / lateral /
+# yaw, bucketed forward intents, and PKL replay are unaffected.
+# Override with ``KPLANNER_CONTINUOUS_FORWARD_MIN_MPS=0.40`` for a
+# more aggressive lift-off, or ``=0`` to revert to the legacy raw
+# proportional behaviour and accept the sub-0.3 m/s hip-wiggle.
+KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS:-}"
 
 # --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
@@ -599,6 +611,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
+        --kplanner-continuous-forward-min-mps) KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="$2"; shift 2 ;;
         --quest3-continuous-yaw-max) QUEST3_CONTINUOUS_YAW_MAX="$2"; shift 2 ;;
         --loco-decoupled-arms) LOCO_DECOUPLED_ARMS="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
@@ -1901,6 +1914,9 @@ else
     if [[ -n "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}" ]]; then
         PLANNER_ARGS+=(--continuous-turn-max-rad-s "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}")
     fi
+    if [[ -n "${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS}" ]]; then
+        PLANNER_ARGS+=(--continuous-forward-min-mps "${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS}")
+    fi
     if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
         PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")
     fi
@@ -2043,6 +2059,53 @@ elif [[ "${LOCO_DECOUPLED_ARMS}" == "0" ]]; then
 else
     log "WARN: LOCO_DECOUPLED_ARMS must be 0 or 1; got '${LOCO_DECOUPLED_ARMS}'. Falling back to default (1)."
     MANAGER_ARGS+=(--loco-decoupled-arms)
+fi
+
+# Quest3 raw capture sidecar -- replayable input-smoothing fixture.
+# Set QUEST3_RECORD_TO=/path/to/quest3_raw.jsonl to dump every manager
+# tick that consumed a Quest sample (post-invert axes + buttons +
+# 3pt-pose + hand curls). Default empty -> no capture. Consumed by
+# the Quest3Replayer (Part 2) so one live operator session becomes a
+# reusable fixture for input-smoothing knob sweeps without re-donning
+# the rig. See docs/source/references/x2_quest3_stick_smoothing.md.
+QUEST3_RECORD_TO="${QUEST3_RECORD_TO:-}"
+if [[ -n "${QUEST3_RECORD_TO}" ]]; then
+    # mkdir -p the parent so the manager doesn't fail on first write
+    # if the operator pointed at a fresh out/ subtree.
+    mkdir -p "$(dirname "${QUEST3_RECORD_TO}")"
+    MANAGER_ARGS+=(--quest3-record-to "${QUEST3_RECORD_TO}")
+    log "  Quest3 raw capture ENABLED -> ${QUEST3_RECORD_TO}"
+fi
+
+# --- VR stick smoothing (StickFilter) ----------------------------------
+# Bring the live VR p99 |d(vel_z)/dt| into the kplanner's training band
+# (~3 m/s^2) so the operator's forward-walk inputs don't lurch the
+# robot. Tuned via offline analyzer
+# (scripts/analyze_planner_cmd_jsonl.py) against the captured live
+# fixture; see docs/source/references/x2_quest3_stick_smoothing.md for
+# the methodology and per-channel rationale.
+#
+# Env vars (all optional; unset preserves legacy unfiltered path):
+#   QUEST3_STICK_LPF_TAU    -- first-order LPF time constant (s).
+#                              0.10 is the tuned default; 0.0 disables.
+#   QUEST3_STICK_SLEW_MAX   -- per-channel slew cap (stick-units/s).
+#                              ``inf`` (default) disables slew clamp.
+#   QUEST3_STICK_RETURN_TAU -- optional asymmetric release LPF tau (s).
+#                              0.0 disables -> symmetric engage/release.
+QUEST3_STICK_LPF_TAU="${QUEST3_STICK_LPF_TAU:-}"
+QUEST3_STICK_SLEW_MAX="${QUEST3_STICK_SLEW_MAX:-}"
+QUEST3_STICK_RETURN_TAU="${QUEST3_STICK_RETURN_TAU:-}"
+if [[ -n "${QUEST3_STICK_LPF_TAU}" ]]; then
+    MANAGER_ARGS+=(--stick-lpf-tau "${QUEST3_STICK_LPF_TAU}")
+    log "  StickFilter LPF tau: ${QUEST3_STICK_LPF_TAU} s"
+fi
+if [[ -n "${QUEST3_STICK_SLEW_MAX}" ]]; then
+    MANAGER_ARGS+=(--stick-slew-max "${QUEST3_STICK_SLEW_MAX}")
+    log "  StickFilter slew max: ${QUEST3_STICK_SLEW_MAX} stick-units/s"
+fi
+if [[ -n "${QUEST3_STICK_RETURN_TAU}" ]]; then
+    MANAGER_ARGS+=(--stick-return-tau "${QUEST3_STICK_RETURN_TAU}")
+    log "  StickFilter release tau: ${QUEST3_STICK_RETURN_TAU} s"
 fi
 
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
@@ -2258,6 +2321,33 @@ if [[ "${VLA_MODE}" -eq 1 ]]; then
         MANAGER_ARGS+=(--recorder-enabled)
     else
         MANAGER_ARGS+=(--no-recorder-enabled)
+    fi
+    # See the matching block in the non-VLA branch (~line 2049) for the
+    # rationale. Re-checked here so VLA-mode runs can also produce the
+    # raw-input fixture if the operator opts in via env.
+    QUEST3_RECORD_TO="${QUEST3_RECORD_TO:-}"
+    if [[ -n "${QUEST3_RECORD_TO}" ]]; then
+        mkdir -p "$(dirname "${QUEST3_RECORD_TO}")"
+        MANAGER_ARGS+=(--quest3-record-to "${QUEST3_RECORD_TO}")
+        log "  Quest3 raw capture ENABLED -> ${QUEST3_RECORD_TO}"
+    fi
+    # Same StickFilter env vars as the non-VLA branch (see ~line 2065
+    # for the description). VLA bridge runs benefit from the smoother
+    # stick inputs equally; operator-feel is identical.
+    QUEST3_STICK_LPF_TAU="${QUEST3_STICK_LPF_TAU:-}"
+    QUEST3_STICK_SLEW_MAX="${QUEST3_STICK_SLEW_MAX:-}"
+    QUEST3_STICK_RETURN_TAU="${QUEST3_STICK_RETURN_TAU:-}"
+    if [[ -n "${QUEST3_STICK_LPF_TAU}" ]]; then
+        MANAGER_ARGS+=(--stick-lpf-tau "${QUEST3_STICK_LPF_TAU}")
+        log "  StickFilter LPF tau: ${QUEST3_STICK_LPF_TAU} s"
+    fi
+    if [[ -n "${QUEST3_STICK_SLEW_MAX}" ]]; then
+        MANAGER_ARGS+=(--stick-slew-max "${QUEST3_STICK_SLEW_MAX}")
+        log "  StickFilter slew max: ${QUEST3_STICK_SLEW_MAX} stick-units/s"
+    fi
+    if [[ -n "${QUEST3_STICK_RETURN_TAU}" ]]; then
+        MANAGER_ARGS+=(--stick-return-tau "${QUEST3_STICK_RETURN_TAU}")
+        log "  StickFilter release tau: ${QUEST3_STICK_RETURN_TAU} s"
     fi
 
     log "Step 1/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"

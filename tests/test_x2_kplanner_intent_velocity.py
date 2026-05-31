@@ -74,6 +74,7 @@ def _reset_runtime_scales():
         kp._RUNTIME_BACKWARD_SCALE,
         kp._RUNTIME_LATERAL_SCALE,
         kp._CONTINUOUS_TURN_MAX_RAD_S,
+        kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS,
     )
     kp._RUNTIME_TURN_LEFT_SCALE = 1.0
     kp._RUNTIME_TURN_RIGHT_SCALE = 1.0
@@ -81,6 +82,7 @@ def _reset_runtime_scales():
     kp._RUNTIME_BACKWARD_SCALE = 1.0
     kp._RUNTIME_LATERAL_SCALE = 1.0
     kp._CONTINUOUS_TURN_MAX_RAD_S = kp._DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = kp._DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
     yield
     (
         kp._RUNTIME_TURN_LEFT_SCALE,
@@ -89,6 +91,7 @@ def _reset_runtime_scales():
         kp._RUNTIME_BACKWARD_SCALE,
         kp._RUNTIME_LATERAL_SCALE,
         kp._CONTINUOUS_TURN_MAX_RAD_S,
+        kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS,
     ) = saved
 
 
@@ -448,7 +451,13 @@ def test_continuous_locomotion_half_stick_linear_default():
     perceived as "robot won't move forward". Linear (50%% deflection ->
     50%% speed) is a much closer match to the bucketed-path muscle
     memory while still allowing fine creeping near zero.
+
+    Floor disabled here so the test exercises **pure shape math**;
+    the production default (0.30 m/s) would lift the 0.25 m/s shaped
+    output and obscure the linearity check. The floor's own behaviour
+    is covered separately by the ``test_forward_floor_*`` group.
     """
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.0
     cmd = LocomotionCommand(
         intent="locomotion", magnitude="continuous",
         stick_fwd=0.5,
@@ -460,8 +469,12 @@ def test_continuous_locomotion_half_stick_linear_default():
 def test_continuous_locomotion_shape_exponent_tunable():
     """``--stick-shape-exp`` changes the curve. exp=2.0 reproduces the
     historical squared curve (0.5 stick -> 0.25 vel); exp=0.5 produces
-    a bucketed-like fast feel (0.5 stick -> ~0.707 vel)."""
-    import gear_sonic.scripts.x2_kplanner as kp
+    a bucketed-like fast feel (0.5 stick -> ~0.707 vel).
+
+    Floor disabled here so the test exercises **pure shape math**;
+    the production default (0.30 m/s) would clip both sample points.
+    """
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.0
     original = kp._RUNTIME_STICK_SHAPING_EXPONENT
     try:
         kp._RUNTIME_STICK_SHAPING_EXPONENT = 2.0
@@ -551,7 +564,15 @@ def test_continuous_locomotion_combined_axes():
 
 def test_continuous_locomotion_runtime_scale_applies():
     """``--kplanner-forward-scale 0.5`` (env-mutated _RUNTIME_FORWARD_SCALE)
-    caps continuous mode the same way it caps the bucketed ``fwd_step``."""
+    caps continuous mode the same way it caps the bucketed ``fwd_step``.
+
+    Floor disabled here so the test exercises **pure scale math**;
+    the production default (0.30 m/s) would lift the post-scale
+    0.25 m/s value to 0.30 and obscure the scale check. Scale-floor
+    interaction is covered separately by
+    ``test_forward_floor_applied_post_forward_scale``.
+    """
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.0
     kp._RUNTIME_FORWARD_SCALE = 0.5
     cmd = LocomotionCommand(
         intent="locomotion", magnitude="continuous", stick_fwd=1.0,
@@ -740,3 +761,151 @@ def test_direct_velocity_idle_tuple_returned_verbatim():
         direct_velocity=_IDLE_INTENT,
     )
     assert intent_to_velocity(cmd) == _IDLE_INTENT
+
+
+# ---------------------------------------------------------------------------
+# Continuous-locomotion forward-velocity floor
+# (``--continuous-forward-min-mps`` / ``KPLANNER_CONTINUOUS_FORWARD_MIN_MPS``).
+#
+# The floor lifts the forward-channel command to an in-distribution
+# value whenever the operator commits any non-zero forward stick
+# deflection. It must NOT affect backward, lateral, yaw, or any tiny
+# forward stick value that fell inside the deadzone (which arrives
+# here as stick_fwd=0.0 from the IntentDecoder).
+# ---------------------------------------------------------------------------
+
+
+def test_forward_floor_lifts_small_forward_stick_to_minimum():
+    """Tiny forward stick past the deadzone -> floor, not the raw shaped value."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.05,
+    )
+    _, vx, vz, _ = intent_to_velocity(cmd)
+    assert vx == pytest.approx(0.0, abs=1e-9)
+    # Raw shaped vel_z would be 0.05 * _WALK_SPEED_MPS = 0.025 m/s; the
+    # floor must lift it to exactly 0.40 m/s.
+    assert vz == pytest.approx(0.40, abs=1e-9)
+
+
+def test_forward_floor_does_not_cap_above_minimum():
+    """Stick above the floor's stick-equivalent must pass through unchanged."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.20  # = 0.4 * _WALK_SPEED_MPS
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.8,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    # 0.8 * 0.5 = 0.40 m/s, well above the 0.20 floor.
+    assert vz == pytest.approx(0.8 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_forward_floor_does_not_engage_in_deadzone():
+    """stick_fwd == 0 (inside the manager's deadzone) -> vel_z stays 0."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.0,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(0.0, abs=1e-9)
+
+
+def test_forward_floor_leaves_backward_untouched():
+    """Backward stick must be unaffected by the forward floor."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=-0.05,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    # Raw shaped backward: -0.05 * _BACK_SPEED_MPS, NOT lifted by the floor.
+    assert vz == pytest.approx(-0.05 * _BACK_SPEED_MPS, abs=1e-9)
+
+
+def test_forward_floor_leaves_lateral_and_yaw_untouched():
+    """The floor only touches vel_z; vel_x / yaw pass through unchanged."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        stick_side=0.5, stick_yaw=0.5,
+    )
+    yaw, vx, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(0.0, abs=1e-9)
+    assert vx == pytest.approx(-0.5 * _SIDE_SPEED_MPS, abs=1e-9)
+    assert yaw == pytest.approx(-0.5 * _CONTINUOUS_TURN_MAX_RAD_S, abs=1e-9)
+
+
+def test_forward_floor_default_constant_matches_policy():
+    """Pin the production-default floor at 0.30 m/s.
+
+    Bump in lockstep with ``_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS`` -- a
+    regression here means the policy default drifted without anyone
+    noticing. 0.30 m/s sits just above the SONIC X2 forward-walk
+    training-band lower edge; values further down put the policy OOD
+    (hip-wiggle / no stepping).
+    """
+    assert kp._DEFAULT_CONTINUOUS_FORWARD_MIN_MPS == pytest.approx(0.30, abs=1e-9)
+
+
+def test_forward_floor_default_lifts_small_forward_stick():
+    """Under the production default (0.30 m/s), any non-zero forward
+    stick must lift vel_z into the in-distribution forward-walk band
+    immediately. The autouse fixture initialises
+    ``_RUNTIME_CONTINUOUS_FORWARD_MIN_MPS`` from
+    ``_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS`` so this test exercises the
+    operator's out-of-the-box experience.
+    """
+    assert kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS == pytest.approx(0.30, abs=1e-9)
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.05,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    # Raw shaped vel_z would be 0.05 * _WALK_SPEED_MPS = 0.025 m/s; the
+    # production-default floor lifts it to exactly 0.30 m/s.
+    assert vz == pytest.approx(0.30, abs=1e-9)
+
+
+def test_forward_floor_explicit_zero_disables_floor():
+    """Setting the floor to 0.0 reverts to legacy raw proportional behaviour.
+
+    This is the documented opt-out for operators who want pre-floor
+    behaviour back (e.g. for offline replay reproducibility).
+    """
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.0
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.05,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    assert vz == pytest.approx(0.05 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_forward_floor_applied_post_forward_scale():
+    """``--forward-scale 0.5`` shrinks the cap but does not shrink the floor."""
+    kp._RUNTIME_FORWARD_SCALE = 0.5
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous", stick_fwd=0.10,
+    )
+    _, _, vz, _ = intent_to_velocity(cmd)
+    # Post-scale shaped: 0.10 * 0.5 * 0.5 = 0.025; floor lifts to 0.40.
+    assert vz == pytest.approx(0.40, abs=1e-9)
+
+
+def test_forward_floor_does_not_affect_bucketed_fwd_step():
+    """Bucketed fwd_step is intentionally untouched -- only the
+    continuous-locomotion analog stick path applies the floor."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.99
+    cmd = LocomotionCommand(intent="fwd_step", magnitude="quarter_ft")
+    _, _, vz, _ = intent_to_velocity(cmd)
+    # quarter_ft = 0.5 * _WALK_SPEED_MPS = 0.25 m/s; well below the 0.99
+    # floor, but the bucketed path skips the floor entirely.
+    assert vz == pytest.approx(0.5 * _WALK_SPEED_MPS, abs=1e-9)
+
+
+def test_forward_floor_does_not_affect_direct_velocity():
+    """PKL-replay (direct_velocity) must bypass the floor verbatim."""
+    kp._RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = 0.40
+    target = (0.0, 0.0, 0.05, _HIP_HEIGHT_M)
+    cmd = LocomotionCommand(
+        intent="locomotion", magnitude="continuous",
+        direct_velocity=target,
+    )
+    assert intent_to_velocity(cmd) == pytest.approx(target, abs=1e-9)

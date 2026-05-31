@@ -104,6 +104,10 @@ from gear_sonic.utils.teleop.vr.intent_decoder import (  # noqa: E402
     StreamMode,
 )
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader  # noqa: E402
+from gear_sonic.utils.teleop.vr.stick_smoother import (  # noqa: E402
+    StickFilter,
+    StickFilterConfig,
+)
 from gear_sonic.utils.teleop.x2_retarget_pipeline import (  # noqa: E402
     Retargeter,
     RetargetTickInput,
@@ -225,6 +229,36 @@ class ManagerConfig:
     # to restore the legacy "full stick = full planner ceiling"
     # mapping for A/B comparison.
     intent_continuous_yaw_max: float = 0.5
+    # StickFilter config for taming raw VR stick step-inputs into a
+    # band that matches the kplanner's training distribution.
+    #
+    # The kplanner + SONIC pair was trained on smooth human mocap; raw
+    # Quest 3 thumbstick deflections are step inputs (operator's thumb
+    # snaps to full deflection in 1-2 ticks of the 50 Hz loop). With
+    # no filtering, the VR p99 |d(vel_z)/dt| is ~8 m/s^2 -- 2-3x the
+    # ~3 m/s^2 carried by the curated PKL primitive subset. The robot
+    # is stable when idle but lurches forward on every step input
+    # because the model is asked to track an acceleration profile
+    # outside its training distribution.
+    #
+    # Apply order in ``run()``:
+    #   1. Read raw axes from the WebXR reader (post invert_lx/ly/rx/ry).
+    #   2. If mode == LOCOMOTION and filter is set, pass (ly, lx, rx)
+    #      as (stick_fwd, stick_side, stick_yaw) through the filter
+    #      using the per-tick dt. The filter applies a slew clamp
+    #      then a first-order LPF per channel.
+    #   3. Pass the filtered axes to ``IntentDecoder.decode_locomotion``
+    #      which deadzones + scales them and emits LocomotionCmd.
+    #
+    # Filter state is reset on mode transitions (LOCOMOTION <->
+    # ARM_MAN, OFF, cold start) so the first tick after a fresh
+    # LOCOMOTION engage is a pass-through. The decoder itself is
+    # stateless and does not see the filter.
+    #
+    # ``None`` -> no filter, raw axes pass through unchanged (legacy
+    # behaviour, kept as the safe default until the tuned defaults
+    # are validated on the robot).
+    stick_filter_config: Optional[StickFilterConfig] = None
     # ``intent_loco_decoupled_arms`` (default True) controls whether
     # the manager signals the recorder to *override* the kplanner's
     # predicted arm joints with the manager's frozen / IK arm pose
@@ -306,6 +340,19 @@ class ManagerConfig:
     sidecar_log_path: Optional[Path] = None
     """If set, append one JSONL line per emitted ``planner_cmd`` to this
     file. Useful for post-hoc analysis (which intent fired when)."""
+
+    # Quest3 raw capture (input-smoothing tuning fixture)
+    quest3_raw_log_path: Optional[Path] = None
+    """If set, append one JSONL line per 50 Hz manager tick to this file,
+    recording the raw Quest 3 inputs the manager loop actually consumed
+    (post-invert sticks + buttons + 3pt-pose + reader timestamps). Used as
+    a replayable fixture by ``Quest3Replayer`` so we can sweep
+    ``StickFilter`` knobs headset-free against an identical input stream.
+
+    Captures ONLY ticks where the reader has a sample (i.e. after the
+    first WS packet has landed); waiting-for-Quest ticks are skipped so
+    the file's row count equals the number of operator-driven ticks.
+    Default off; the live recording session sets it via ``--quest3-record-to``."""
 
     # Episode lifecycle audio cues
     recorder_enabled: bool = False
@@ -457,6 +504,37 @@ class Quest3ManagerX2:
             enable_continuous_locomotion=cfg.intent_enable_continuous_locomotion,
             continuous_yaw_max=cfg.intent_continuous_yaw_max,
         )
+
+        # --- StickFilter (raw-axis smoother for continuous locomotion) ----
+        # Filters the (ly, lx, rx) axes BEFORE the decoder sees them, but
+        # only while in LOCOMOTION mode. The filter is reset on any
+        # transition INTO LOCOMOTION so the first post-mode-flip tick is
+        # a pass-through (no spurious slew-clamp ramp from a zero anchor).
+        # ``None`` config preserves legacy behaviour exactly.
+        if cfg.stick_filter_config is not None and not cfg.stick_filter_config.is_noop():
+            self._stick_filter: Optional[StickFilter] = StickFilter(
+                cfg.stick_filter_config
+            )
+            self._stick_filter_last_t: Optional[float] = None
+            self._stick_filter_prev_in_loco: bool = False
+            log.info(
+                "[stick-filter] enabled: tau_fwd=%.3fs tau_side=%.3fs "
+                "tau_yaw=%.3fs slew_fwd=%s slew_side=%s slew_yaw=%s "
+                "(release_tau fwd/side/yaw = %s / %s / %s)",
+                cfg.stick_filter_config.tau_lpf_fwd_s,
+                cfg.stick_filter_config.tau_lpf_side_s,
+                cfg.stick_filter_config.tau_lpf_yaw_s,
+                cfg.stick_filter_config.slew_max_fwd_per_s,
+                cfg.stick_filter_config.slew_max_side_per_s,
+                cfg.stick_filter_config.slew_max_yaw_per_s,
+                cfg.stick_filter_config.return_to_zero_tau_fwd_s,
+                cfg.stick_filter_config.return_to_zero_tau_side_s,
+                cfg.stick_filter_config.return_to_zero_tau_yaw_s,
+            )
+        else:
+            self._stick_filter = None
+            self._stick_filter_last_t = None
+            self._stick_filter_prev_in_loco = False
         # Latched continuous waist target. Set in two situations:
         #   1) The operator presses B to flip LOCOMOTION ->
         #      ARM_MANIPULATION (existing behavior; ARM_MAN is implicitly
@@ -551,6 +629,29 @@ class Quest3ManagerX2:
         else:
             self._sidecar = None
             self._sidecar_lock = threading.Lock()
+
+        # --- Quest3 raw capture (input-smoothing tuning fixture) ----------
+        # Independent file handle from the planner_cmd sidecar so the two
+        # streams stay grep-able by file (raw quest dump = pre-decoder
+        # inputs; planner sidecar = post-decoder emissions). Each row is
+        # one manager tick that consumed a real Quest3 reader sample.
+        self._quest3_raw_path = cfg.quest3_raw_log_path
+        if self._quest3_raw_path is not None:
+            self._quest3_raw_path.parent.mkdir(parents=True, exist_ok=True)
+            self._quest3_raw_file = self._quest3_raw_path.open("a", buffering=1)
+            self._quest3_raw_lock = threading.Lock()
+            self._quest3_raw_count = 0
+            self._quest3_raw_last_log = time.monotonic()
+            log.info(
+                "[quest3-raw] capture -> %s "
+                "(one row per tick; replay with --quest3-replay-from)",
+                self._quest3_raw_path,
+            )
+        else:
+            self._quest3_raw_file = None
+            self._quest3_raw_lock = threading.Lock()
+            self._quest3_raw_count = 0
+            self._quest3_raw_last_log = 0.0
 
         # --- Resume chord PUB (split-topology safety) ---------------------
         self._resume_sock = None
@@ -672,6 +773,26 @@ class Quest3ManagerX2:
                 self._sidecar.close()
             except Exception:
                 pass
+        if self._quest3_raw_file is not None:
+            try:
+                # Flush + fsync so the file is structurally complete even
+                # if the operator Ctrl-C's mid-tick. The capture fixture
+                # is the only artefact carrying the live session, so we
+                # are deliberately paranoid here.
+                with self._quest3_raw_lock:
+                    self._quest3_raw_file.flush()
+                    try:
+                        import os as _os
+                        _os.fsync(self._quest3_raw_file.fileno())
+                    except OSError:
+                        pass
+                    self._quest3_raw_file.close()
+                log.info(
+                    "[quest3-raw] closed %s after %d rows",
+                    self._quest3_raw_path, self._quest3_raw_count,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[quest3-raw] close failed: %s", exc)
 
     # -- main loop ------------------------------------------------------------
 
@@ -720,6 +841,23 @@ class Quest3ManagerX2:
                     rx = -rx
                 if self._cfg.invert_ry:
                     ry = -ry
+
+                # Quest3 raw capture sidecar -- one row per tick the
+                # manager actually saw a Quest sample. We snapshot
+                # the post-invert axes (what the IntentDecoder sees)
+                # AND the raw payload (so Quest3Replayer can drive
+                # every getter the manager calls). Skipping the
+                # ``vr_pose is None`` ticks below means the file row
+                # count equals operator-driven ticks.
+                if self._quest3_raw_file is not None and vr_pose is not None:
+                    self._quest3_raw_emit(
+                        tick=tick,
+                        tick_now=tick_now,
+                        axes_post_invert=(lx, ly, rx, ry),
+                        buttons=buttons,
+                        triggers=triggers,
+                        vr_pose=vr_pose,
+                    )
 
                 if vr_pose is None:
                     if not wait_logged:
@@ -890,8 +1028,58 @@ class Quest3ManagerX2:
                 # gated off in IntentDecoder. Buttons already destructured
                 # above so the live_waist_target sample agrees with the
                 # decoder's view of the held modifiers.
+                #
+                # StickFilter gating: when a smoother is configured and
+                # the manager is in LOCOMOTION, route (ly, lx, rx) through
+                # the filter so the decoder + downstream planner see the
+                # band-limited stream rather than the raw step inputs the
+                # VR controllers ship. Other modes (OFF / ARM_MAN) bypass
+                # the filter so the right-stick lean / chord-detection
+                # paths stay 1:1 with the raw axes. The filter is reset
+                # on each LOCOMOTION re-entry so the first post-mode-flip
+                # tick is a pass-through (no spurious slew clamp from
+                # zero anchor).
+                lx_for_decoder, ly_for_decoder, rx_for_decoder = lx, ly, rx
+                if self._stick_filter is not None:
+                    in_loco = self._intent.mode == StreamMode.LOCOMOTION
+                    if in_loco:
+                        if not self._stick_filter_prev_in_loco:
+                            self._stick_filter.reset()
+                            self._stick_filter_last_t = tick_now
+                        dt = (
+                            tick_now - self._stick_filter_last_t
+                            if self._stick_filter_last_t is not None
+                            else 0.02
+                        )
+                        self._stick_filter_last_t = tick_now
+                        # Channel map: ly -> stick_fwd, lx -> stick_side,
+                        # rx -> stick_yaw. The decoder applies the same
+                        # mapping in ``_continuous_stick_targets``; we
+                        # filter the raw axes (pre-deadzone) so the LPF
+                        # tail can drain naturally through the deadzone
+                        # boundary rather than getting truncated at the
+                        # decoder edge.
+                        ly_for_decoder, lx_for_decoder, rx_for_decoder = (
+                            self._stick_filter.step(
+                                stick_fwd=ly,
+                                stick_side=lx,
+                                stick_yaw=rx,
+                                dt=dt,
+                            )
+                        )
+                    else:
+                        # Reset on exit from LOCOMOTION; on next re-entry
+                        # the first tick is a pass-through. ``ry`` (lean)
+                        # is never filtered because the decoder routes it
+                        # through a different code path (hold_torso) that
+                        # has its own internal hysteresis.
+                        self._stick_filter.reset()
+                        self._stick_filter_last_t = None
+                    self._stick_filter_prev_in_loco = in_loco
+
                 cmd = self._intent.decode_locomotion(
-                    lx=lx, ly=ly, rx=rx, ry=ry,
+                    lx=lx_for_decoder, ly=ly_for_decoder,
+                    rx=rx_for_decoder, ry=ry,
                     y_held=(y_held and self._intent.mode == StreamMode.LOCOMOTION),
                     a_held=(a_held and self._intent.mode == StreamMode.LOCOMOTION),
                     x_held=(x_held and self._intent.mode == StreamMode.LOCOMOTION),
@@ -1393,6 +1581,119 @@ class Quest3ManagerX2:
         except Exception as exc:  # noqa: BLE001
             log.debug("[sidecar] write failed: %s", exc)
 
+    # -- quest3 raw capture --------------------------------------------------
+
+    def _quest3_raw_emit(
+        self,
+        *,
+        tick: int,
+        tick_now: float,
+        axes_post_invert: tuple[float, float, float, float],
+        buttons: tuple[bool, bool, bool, bool],
+        triggers: tuple[float, float, float, float],
+        vr_pose,
+    ) -> None:
+        """Append one row to the Quest3 raw capture JSONL.
+
+        Row contract (one JSON object per line; advance the cursor by
+        the recorded ``t_mono`` deltas during replay):
+
+          * ``t_mono``  : monotonic clock at consumption time (seconds)
+          * ``wall_clock``: ``time.time()`` (for human-readable correlation)
+          * ``tick``    : manager loop tick index
+          * ``mode``    : ``OFF`` / ``LOCOMOTION`` / ``ARM_MANIPULATION``
+          * ``axes_post_invert``: ``{lx, ly, rx, ry}`` after the four
+            ``invert_*`` polarity flips (i.e. what the IntentDecoder sees)
+          * ``buttons``: ``{a, b, x, y}`` face buttons + ``leftTrigger /
+            rightTrigger / leftGrip / rightGrip`` analog values +
+            ``leftStickClick / rightStickClick``
+          * ``vr_3pt_pose``: ``[[lwrist 3+4], [rwrist 3+4], [neck 3+4]]``
+            or ``null`` -- the same payload ``Quest3Reader.get_3pt_pose``
+            exposes, materialised so the replayer can serve it verbatim
+          * ``hand_curls``: ``{left, right, left_source, right_source}``
+          * ``thumb_oppose``: ``{left, right}``
+          * ``finger_tip_oppose``: ``{left, right}``
+          * ``quest_fps``: WS arrival rate EMA from the reader (sanity)
+
+        We pull from the reader's getters (rather than ``get_latest``)
+        so the replayer can swap the reader 1:1 without any private
+        struct coupling. NaN / None entries are preserved -- the
+        replayer must accept the same nulls the live path tolerates.
+        """
+        if self._quest3_raw_file is None:
+            return
+        try:
+            lx, ly, rx, ry = axes_post_invert
+            a, b_btn, x_btn, y_btn = buttons
+            lt, rt, lg, rg = triggers
+            l_click, r_click = self._quest.get_stick_clicks()
+            l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
+            l_oppose, r_oppose = self._quest.get_thumb_opposition()
+            l_tip, r_tip = self._quest.get_finger_tip_oppose()
+            try:
+                quest_fps = float(getattr(self._quest, "_fps_ema", 0.0))
+            except Exception:
+                quest_fps = 0.0
+
+            def _arr_to_list(arr):
+                if arr is None:
+                    return None
+                try:
+                    return np.asarray(arr).tolist()
+                except Exception:
+                    return None
+
+            rec = {
+                "t_mono": float(tick_now),
+                "wall_clock": time.time(),
+                "tick": int(tick),
+                "mode": self._intent.mode.name,
+                "axes_post_invert": {
+                    "lx": float(lx), "ly": float(ly),
+                    "rx": float(rx), "ry": float(ry),
+                },
+                "buttons": {
+                    "a": bool(a), "b": bool(b_btn),
+                    "x": bool(x_btn), "y": bool(y_btn),
+                    "leftTrigger": float(lt), "rightTrigger": float(rt),
+                    "leftGrip": float(lg), "rightGrip": float(rg),
+                    "leftStickClick": bool(l_click),
+                    "rightStickClick": bool(r_click),
+                },
+                "vr_3pt_pose": _arr_to_list(vr_pose),
+                "hand_curls": {
+                    "left": _arr_to_list(l_curls),
+                    "right": _arr_to_list(r_curls),
+                    "left_source": l_src,
+                    "right_source": r_src,
+                },
+                "thumb_oppose": {"left": l_oppose, "right": r_oppose},
+                "finger_tip_oppose": {
+                    "left": _arr_to_list(l_tip),
+                    "right": _arr_to_list(r_tip),
+                },
+                "quest_fps": quest_fps,
+            }
+            line = json.dumps(rec) + "\n"
+            with self._quest3_raw_lock:
+                self._quest3_raw_file.write(line)
+                self._quest3_raw_count += 1
+
+            # Periodic row-count beacon every ~5 s so the operator can
+            # tail the manager log and see capture liveness without
+            # opening the JSONL. First emission is always logged so a
+            # silent first 5 s does not look like a hang.
+            if (self._quest3_raw_count == 1
+                or (tick_now - self._quest3_raw_last_log) >= 5.0):
+                log.info(
+                    "[quest3-raw] %d rows captured (mode=%s, fps=%.1f)",
+                    self._quest3_raw_count, self._intent.mode.name,
+                    quest_fps,
+                )
+                self._quest3_raw_last_log = tick_now
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[quest3-raw] emit failed: %s", exc)
+
     # -- resume chord (split-topology safety) --------------------------------
 
     def _tick_resume_chord(self, buttons: tuple[bool, bool, bool, bool],
@@ -1688,6 +1989,56 @@ def _build_parser() -> argparse.ArgumentParser:
             "line per motor_monitor message (key=motor_monitor)."
         ),
     )
+    p.add_argument(
+        "--quest3-record-to", dest="quest3_record_to",
+        type=Path, default=None,
+        help=(
+            "If set, append one JSONL row per manager tick capturing the "
+            "raw Quest 3 inputs the manager consumed (post-invert axes, "
+            "buttons, 3pt-pose, hand curls). Used as a replayable "
+            "fixture by Quest3Replayer so we can sweep input-smoothing "
+            "knobs headset-free against an identical operator stream. "
+            "Default off."
+        ),
+    )
+
+    # --- StickFilter (continuous-locomotion stick smoothing) -----------
+    # The kplanner + SONIC pair was trained on smooth human mocap; raw
+    # Quest 3 thumbstick step inputs put the model out of distribution
+    # and cause forward-walk lurches. These flags expose the (tau, slew)
+    # knobs that bring the live VR p99 |d(vel_z)/dt| into the PKL
+    # training band. See ``docs/source/references/x2_quest3_stick_smoothing.md``.
+    p.add_argument(
+        "--stick-lpf-tau", type=float, default=0.0,
+        help=(
+            "First-order LPF time constant (s) applied uniformly to "
+            "(stick_fwd, stick_side, stick_yaw) BEFORE the IntentDecoder "
+            "deadzone, only while in LOCOMOTION mode. 0.0 = no LPF "
+            "(default; legacy behaviour). Tuned default from the "
+            "offline sweep: 0.10 s. Values above ~0.30 s introduce "
+            "operator-noticeable lag."
+        ),
+    )
+    p.add_argument(
+        "--stick-slew-max", type=float, default=float("inf"),
+        help=(
+            "Slew-rate cap (stick-units/s) applied per-channel before "
+            "the LPF. ``inf`` (default) disables. Useful as a backstop "
+            "when an LPF tau alone is not enough to cap the d/dt; the "
+            "offline sweep recommends ``inf`` (LPF-only) for the "
+            "currently-tuned defaults."
+        ),
+    )
+    p.add_argument(
+        "--stick-return-tau", type=float, default=0.0,
+        help=(
+            "Optional asymmetric release LPF tau (s). When > 0, the "
+            "filter uses this tau when the operator is releasing the "
+            "stick toward zero (vs the engaged ``--stick-lpf-tau`` "
+            "when the stick is being pushed away from zero). Useful "
+            "for ``snappy push, gentle release`` operator-feel."
+        ),
+    )
 
     # Split-topology safety (Phase 3 + 5c)
     sft_grp = p.add_argument_group("split-topology safety (Phase 3 + 5c)")
@@ -1798,6 +2149,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="[%(asctime)s %(levelname)s %(name)s] %(message)s",
     )
 
+    # Build the optional StickFilter config from CLI flags. Uniform
+    # tau/slew across the three channels for now; per-channel tuning
+    # can land later if the offline sweep ever shows asymmetric needs.
+    # ``--stick-lpf-tau 0`` with ``--stick-slew-max inf`` collapses to
+    # the no-op identity filter so we don't pay the per-tick overhead
+    # in the legacy code path.
+    stick_filter_cfg: Optional[StickFilterConfig] = None
+    if args.stick_lpf_tau > 0.0 or args.stick_slew_max != float("inf"):
+        return_tau = args.stick_return_tau if args.stick_return_tau > 0 else None
+        stick_filter_cfg = StickFilterConfig(
+            tau_lpf_fwd_s=args.stick_lpf_tau,
+            tau_lpf_side_s=args.stick_lpf_tau,
+            tau_lpf_yaw_s=args.stick_lpf_tau,
+            slew_max_fwd_per_s=args.stick_slew_max,
+            slew_max_side_per_s=args.stick_slew_max,
+            slew_max_yaw_per_s=args.stick_slew_max,
+            return_to_zero_tau_fwd_s=return_tau,
+            return_to_zero_tau_side_s=return_tau,
+            return_to_zero_tau_yaw_s=return_tau,
+        )
+
     cfg = ManagerConfig(
         quest3_ws_port=args.ws_port,
         quest3_http_port=args.http_port,
@@ -1831,6 +2203,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         apply_oppose_compensation=args.apply_oppose_compensation,
         enable_finger_filter=not args.no_finger_filter,
         sidecar_log_path=args.sidecar_log,
+        quest3_raw_log_path=args.quest3_record_to,
         recorder_enabled=args.recorder_enabled,
         resume_pub_enabled=args.resume_pub_enabled,
         resume_pub_host=args.resume_pub_host,
@@ -1842,6 +2215,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         motor_monitor_sub_host=args.motor_monitor_sub_host,
         motor_monitor_sub_port=args.motor_monitor_sub_port,
         motor_monitor_sub_topic=args.motor_monitor_sub_topic,
+        stick_filter_config=stick_filter_cfg,
         verbose=args.verbose,
     )
 

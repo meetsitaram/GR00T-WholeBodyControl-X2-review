@@ -126,6 +126,49 @@ _WALK_SPEED_MPS: float = 0.5
 _FAST_WALK_SPEED_MPS: float = 0.9
 _SIDE_SPEED_MPS: float = 0.4
 _BACK_SPEED_MPS: float = 0.35
+
+# Minimum forward velocity command (m/s) emitted whenever the operator
+# commits any non-zero forward stick deflection in the
+# continuous-locomotion path. Default 0.30 m/s lands the SONIC X2
+# root model inside its in-distribution forward-walk band as soon as
+# the operator pushes past the deadzone. Set to 0.0 to disable the
+# floor entirely (pre-2026-05-31 legacy behaviour).
+#
+# Rationale: ``x2_ultra_locowalk.pkl`` forward-walk training samples
+# are concentrated between roughly 0.3 - 1.0 m/s, with essentially no
+# coverage below 0.3 m/s. Commanding 0 < vel_z < 0.3 puts the policy
+# OOD -- empirically the robot wiggles its hips but never initiates
+# a step, then snaps into an unstable stride once vel_z finally
+# exceeds the training-band minimum (operator-reported 2026-05-31).
+# The backward channel does not need this floor because the same
+# corpus has dense backward samples all the way down to ~-0.08 m/s.
+#
+# 0.30 m/s was picked as the default because it sits just above the
+# training-band p1 (~0.28 m/s) -- the smallest forward speed the
+# policy has more than a handful of frames of. Operators who want
+# more aggressive lift-off (faster, less smooth deadzone transition)
+# can bump to ~0.40 m/s; operators who want to revert to raw
+# proportional control (and accept the hip-wiggle below ~0.3 m/s)
+# can set 0.0.
+#
+# The floor is applied **post** ``_RUNTIME_FORWARD_SCALE`` in
+# ``_apply_continuous_runtime_scales`` so it acts as a true
+# operator-felt minimum regardless of any scale override. Operators
+# who want progressive forward control above the floor should keep
+# ``floor < forward_scale * _WALK_SPEED_MPS`` (i.e.
+# ``floor < 0.5 m/s`` at scale=1.0); otherwise every forward stick
+# value collapses onto the floor. Tunable via
+# ``--continuous-forward-min-mps`` (CLI) or
+# ``KPLANNER_CONTINUOUS_FORWARD_MIN_MPS`` (env var on the
+# Quest 3 wrapper). The bucketed forward intents and the PKL replay
+# path are intentionally untouched -- the floor only fires when the
+# operator is on the analog stick.
+_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS: float = 0.30
+
+# Mutable runtime knob, set from ``run()`` per CLI flag. Reads in
+# ``_apply_continuous_runtime_scales`` pick up the override on every
+# dispatch call.
+_RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
 # Per-step yaw rate baseline; magnitude scalars in ``_TURN_SCALE`` rescale.
 _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
@@ -496,6 +539,16 @@ def _apply_continuous_runtime_scales(
         yaw *= _RUNTIME_TURN_RIGHT_SCALE
     if vz > 0:
         vz *= _RUNTIME_FORWARD_SCALE
+        # Forward-velocity floor: if the operator has committed any
+        # non-zero forward stick deflection (vz > 0 pre-scale), lift
+        # the post-scale forward command up to the in-distribution
+        # band so the SONIC root model commits to a stride instead of
+        # hip-wiggling below the training minimum. See
+        # ``_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS``'s docstring for the
+        # full rationale; default 0.0 = no-op so legacy invariants and
+        # unit tests still hold when the operator does not opt in.
+        if _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS > 0.0:
+            vz = max(vz, _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS)
     elif vz < 0:
         vz *= _RUNTIME_BACKWARD_SCALE
     vx *= _RUNTIME_LATERAL_SCALE
@@ -1616,6 +1669,7 @@ def run(
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
     cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
     continuous_turn_max_rad_s: float = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
+    continuous_forward_min_mps: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
 ) -> int:
     _setup_logging(verbose)
 
@@ -1626,6 +1680,7 @@ def run(
     global _RUNTIME_FORWARD_SCALE, _RUNTIME_BACKWARD_SCALE, _RUNTIME_LATERAL_SCALE
     global _RUNTIME_STICK_SHAPING_EXPONENT
     global _CONTINUOUS_TURN_MAX_RAD_S
+    global _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS
     _RUNTIME_TURN_LEFT_SCALE = float(turn_left_scale)
     _RUNTIME_TURN_RIGHT_SCALE = float(turn_right_scale)
     _RUNTIME_FORWARD_SCALE = float(forward_scale)
@@ -1644,6 +1699,22 @@ def run(
         )
         continuous_turn_max_rad_s = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
     _CONTINUOUS_TURN_MAX_RAD_S = float(continuous_turn_max_rad_s)
+    if continuous_forward_min_mps < 0.0:
+        log.error(
+            "--continuous-forward-min-mps must be >= 0 (got %s); "
+            "disabling forward floor",
+            continuous_forward_min_mps,
+        )
+        continuous_forward_min_mps = 0.0
+    if continuous_forward_min_mps > _WALK_SPEED_MPS:
+        log.warning(
+            "--continuous-forward-min-mps (%.3f m/s) exceeds the forward "
+            "stick cap _WALK_SPEED_MPS=%.3f m/s; every forward stick value "
+            "will collapse onto the floor with no progressive control. "
+            "Consider tuning down to <= %.3f m/s.",
+            continuous_forward_min_mps, _WALK_SPEED_MPS, _WALK_SPEED_MPS,
+        )
+    _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = float(continuous_forward_min_mps)
     if any(s != 1.0 for s in (
         turn_left_scale, turn_right_scale,
         forward_scale, backward_scale, lateral_scale,
@@ -1666,6 +1737,15 @@ def run(
         (math.pi / 2.0) / max(_CONTINUOUS_TURN_MAX_RAD_S, 1e-9),
         _TURN_45_RAD_S,
     )
+    if _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS > 0.0:
+        log.info(
+            "continuous-locomotion forward floor: %.3f m/s "
+            "(any post-deadzone forward stick lifts vel_z to this "
+            "minimum; backward / lateral / yaw unaffected)",
+            _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS,
+        )
+    else:
+        log.info("continuous-locomotion forward floor: disabled (0.0 m/s)")
     log.info("yaw-lock epsilon: %.3f rad/s (0=disabled)",
              yaw_lock_epsilon_rad_s)
 
@@ -2385,6 +2465,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ) % _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
     )
     p.add_argument(
+        "--continuous-forward-min-mps",
+        type=float,
+        default=_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
+        help=(
+            "Minimum forward velocity (m/s) commanded whenever the operator "
+            "commits any non-zero forward stick deflection in the "
+            "continuous-locomotion path. Default %.3f m/s lands the SONIC "
+            "X2 root model inside its in-distribution forward-walk band as "
+            "soon as the operator pushes past the deadzone -- empirically "
+            "the corpus has essentially no training samples below 0.3 m/s "
+            "forward, so commanding 0 < vel_z < 0.3 produces hip-wiggle "
+            "without stepping. Set 0.0 to disable the floor entirely "
+            "(pre-2026-05-31 legacy behaviour). Backward / lateral / yaw "
+            "are unaffected; bucketed forward intents and PKL replay are "
+            "also untouched. Applied post --forward-scale, so keep "
+            "``floor < forward_scale * 0.5 m/s`` to preserve progressive "
+            "control above the floor."
+        ) % _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
+    )
+    p.add_argument(
         "--cold-start-ramp-tau-s",
         type=float,
         default=_DEFAULT_COLD_START_RAMP_TAU_S,
@@ -2440,6 +2540,7 @@ def main(argv: list[str] | None = None) -> int:
         pose_reseed_scope=args.pose_reseed_scope,
         cold_start_ramp_tau_s=args.cold_start_ramp_tau_s,
         continuous_turn_max_rad_s=args.continuous_turn_max_rad_s,
+        continuous_forward_min_mps=args.continuous_forward_min_mps,
     )
 
 
