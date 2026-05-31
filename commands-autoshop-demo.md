@@ -1,23 +1,28 @@
-==== do not auto edit this section ====
-
+=============== do not auto edit this section ===============
+### start local stack
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --no-deploy 
+or 
+./gear_sonic/scripts/run_x2_quest3_wholebody_walk.sh --no-deploy 
 
+### start sonic on PC2 : Robogym Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
-    --pc2-host 192.168.86.21 --laptop-host 192.168.86.22 \
+    --pc2-host 192.168.86.30 --laptop-host 192.168.86.22 \
     --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml
 
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.21
+### stop sonic
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.30
 
-# Express Auto Wifi
+### start sonic on PC2 : Express Auto Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
     --pc2-host 192.168.4.79 --laptop-host 192.168.4.91 \
     --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml
 
+### stop sonic
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.4.79
 
-=== end of pure manual notes section
+=============== end of pure manual notes section ===============
 
 ## Topology A — split (laptop = planner stack; PC2 = deploy + idle proxy)
 

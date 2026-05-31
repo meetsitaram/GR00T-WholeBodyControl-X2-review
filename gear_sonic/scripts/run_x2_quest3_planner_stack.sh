@@ -1486,6 +1486,41 @@ fi
 # Banner
 # --------------------------------------------------------------------------
 
+# Resolve the laptop's primary IPv4 addresses so the WebXR banner can
+# print concrete `wss://<ip>:port` URLs instead of a literal `<host>`
+# placeholder. Filter out loopback, Docker bridges (172.16/12), and
+# Tailscale CGNAT (100.64/10) -- the Quest 3 needs a LAN-routable IP
+# (most often the laptop WiFi address on the same /24 as the headset).
+# If nothing routable is found we fall back to the legacy placeholder.
+# NOTE: pattern uses `\.[0-9]+\.[0-9]+\.[0-9]+` (no `{3}`) because the
+# default awk on Ubuntu (mawk) doesn't enable POSIX interval expressions.
+_LOCAL_IP_CANDIDATES="$(
+    hostname -I 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk '
+            /^127\./ { next }
+            /^172\.(1[6-9]|2[0-9]|3[01])\./ { next }
+            /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ { next }
+            /^169\.254\./ { next }
+            /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print }
+        ' \
+        | paste -sd ',' -
+)"
+if [[ -z "${_LOCAL_IP_CANDIDATES}" ]]; then
+    _LOCAL_IP_CANDIDATES="<host>"
+fi
+
+# Right-pad the "Browser URL" line of the ACTION-REQUIRED ASCII box so the
+# closing │ still aligns when we splice in concrete IPs. Original literal
+# content width was 70 chars; the static prefix "    Browser URL:  https://"
+# (26) + ":" (1) + port + ip_len + suffix-spaces = 70. Clamp at 0 so a
+# very long candidate string just wraps rather than failing arithmetic.
+_BROWSER_URL_PAD_LEN=$(( 70 - 26 - 1 - ${#QUEST3_HTTP_PORT} - ${#_LOCAL_IP_CANDIDATES} ))
+if (( _BROWSER_URL_PAD_LEN < 0 )); then
+    _BROWSER_URL_PAD_LEN=0
+fi
+_BROWSER_URL_PAD="$(printf '%*s' "${_BROWSER_URL_PAD_LEN}" '')"
+
 if [[ "${VLA_MODE}" -eq 1 ]]; then
 cat <<EOF
 ${C_GREEN}┌──────────────────────────────────────────────────────────────────────┐
@@ -1508,7 +1543,7 @@ ${C_GREEN}┌──────────────────────�
   VLA inf period   : ${VLA_INFERENCE_PERIOD_S} s  (50 Hz x 40-step horizon = 0.8 s)
   ports            : pose=${POSE_PORT}  body_pose=${BODY_POSE_PORT}  arm/hands=${ARM_HANDS_PORT}  x2_debug=${DEBUG_PORT}$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "
                      scene_state=${SCENE_STATE_PORT}  scene_reset=${SCENE_RESET_PORT}" || true)
-  WebXR (optional) : wss://<host>:${QUEST3_WS_PORT}, https://<host>:${QUEST3_HTTP_PORT}
+  WebXR (optional) : wss://${_LOCAL_IP_CANDIDATES}:${QUEST3_WS_PORT}, https://${_LOCAL_IP_CANDIDATES}:${QUEST3_HTTP_PORT}
 EOF
 else
 cat <<EOF
@@ -1531,7 +1566,7 @@ ${C_GREEN}┌──────────────────────�
   motion_token     : $([[ -n "${SONIC_CHECKPOINT}" ]] && echo "ON  (${SONIC_CHECKPOINT}, ${SONIC_TOKENIZER_DEVICE})" || echo "DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)")
   encoder_config   : $([[ -n "${SONIC_CHECKPOINT}" && -n "${ENCODER_CONFIG}" ]] && echo "${ENCODER_CONFIG}, modes=[retargeted_body_q], multi-frame 10x68 -> 680-D" || ([[ -n "${SONIC_CHECKPOINT}" ]] && echo "DEPRECATED freeze-pose (--encoder-config '' was passed)" || echo "(unused; tokenizer DISABLED above)"))
   operator         : ${OPERATOR_ID} (${CALIBRATION_PATH})
-  WebXR endpoint   : wss://<host>:${QUEST3_WS_PORT}, https://<host>:${QUEST3_HTTP_PORT}
+  WebXR endpoint   : wss://${_LOCAL_IP_CANDIDATES}:${QUEST3_WS_PORT}, https://${_LOCAL_IP_CANDIDATES}:${QUEST3_HTTP_PORT}
   ports            : pose=${POSE_PORT}  x2_debug=${DEBUG_PORT}  planner_cmd=${PLANNER_CMD_PORT}
                      arm/hands=${ARM_HANDS_PORT}  body_pose=${BODY_POSE_PORT}$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "
                      scene_state=${SCENE_STATE_PORT}  scene_reset=${SCENE_RESET_PORT}" || true)
@@ -2033,7 +2068,7 @@ cat <<EOF
 
 ${C_YELLOW}┌──────────────────────────────────────────────────────────────────────┐
 │  ACTION REQUIRED: open WebXR client on the Quest 3                   │
-│    Browser URL:  https://<workstation-IP>:${QUEST3_HTTP_PORT}                       │
+│    Browser URL:  https://${_LOCAL_IP_CANDIDATES}:${QUEST3_HTTP_PORT}${_BROWSER_URL_PAD}│
 │    Accept the self-signed certificate, tap "Enter VR".               │
 │                                                                       │
 │  Mode chord:                                                         │
