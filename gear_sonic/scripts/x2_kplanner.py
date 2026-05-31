@@ -183,6 +183,28 @@ _CONTINUOUS_TURN_MAX_RAD_S: float = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
 # was the dominant failure mode on the Quest 3 stack before
 # 2026-05-30. PKL replay was insulated because ``direct_velocity``
 # carries hip_h verbatim from the clip (0.687 m).
+#
+# 2026-05-30 PM iteration log:
+#   0.687 -> 0.636: dropped to _TRAINING_DEFAULT_HIP_Z after MC scan
+#     showed the policy actively extending the legs at idle (knee
+#     tgt-def ~-0.45 rad, ankle plantarflexed ~+0.28 rad) producing
+#     a visible "stands taller than MC" posture + 1-2 Hz rocking sway.
+#     Operator feedback: "height changes, but barely noticeable, and
+#     still taller than MC height."
+#   0.636 -> 0.55: cheap sensitivity probe. 0.55 m is 45 mm BELOW the
+#     PKL training-distribution minimum (0.595), so it's intentionally
+#     OOD on the low side. RESULT: stand height did not visibly change
+#     -- a 14 cm reduction in implied_target_y produced ~no visible
+#     pelvis drop. Conclusion: ``hip_h`` is largely ignored by the
+#     policy at idle; the leg-extension / "tall stand" behavior is
+#     driven by something else (most likely default_angles drift
+#     between the policy's training-time defaults and the C++ deploy
+#     binary, an IMU pitch bias, or the policy's learned neutral
+#     pose). Investigation pivot: leave ``_HIP_HEIGHT_M`` at the
+#     PKL-replay-validated 0.687 (only config where deploy actually
+#     walks) and probe ``default_angles`` next.
+#   0.55 -> 0.687: revert per operator decision -- back to last
+#     known-good before pivoting to default_angles investigation.
 _HIP_HEIGHT_M: float = 0.687
 
 # Returned for any (intent, magnitude) the kplanner has no velocity
