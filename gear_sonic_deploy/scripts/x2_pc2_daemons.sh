@@ -216,6 +216,22 @@ POSE_PROXY_SESSION="${POSE_PROXY_SESSION:-x2_pose_proxy}"
 
 POSTMORTEM_OUT="${POSTMORTEM_OUT:-./postmortem_out}"
 
+# Laptop-side repo root, derived from this script's location. Used by the
+# just-in-time rsync that ships the --tuning YAML to PC2 at deploy start
+# (see cmd_start). Without this, every YAML edit would silently require a
+# separate ``pc2_bringup.sh`` run before the new value is observed by the
+# deploy binary -- pc2_bringup.sh step 7 is the only other code path that
+# stages tuning configs onto PC2.
+SCRIPT_DIR_DAEMONS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAPTOP_REPO_ROOT="$(cd "${SCRIPT_DIR_DAEMONS}/../.." && pwd)"
+
+# Set to 1 with --no-sync-tuning to skip the JIT rsync. Useful if the
+# operator is intentionally testing a PC2-only override of a tuning preset
+# (rare; the default of "always sync" matches the principle of least
+# surprise -- the YAML that the deploy reads should be the one the
+# operator just edited on the laptop).
+NO_SYNC_TUNING=0
+
 C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'; C_DIM=$'\e[2m'; C_BLUE=$'\e[34m'; C_RESET=$'\e[0m'
 log()  { printf '%s[pc2 %s]%s %s\n' "${C_GREEN}" "$(date +%H:%M:%S)" "${C_RESET}" "$*"; }
 warn() { printf '%s[pc2 %s WARN]%s %s\n' "${C_YELLOW}" "$(date +%H:%M:%S)" "${C_RESET}" "$*"; }
@@ -232,7 +248,7 @@ Per-command flags (after the subcommand):
              [--pc1-host H] [--pc1-em-port N]
              [--prefix DIR] [--pc2-ws W] [--pc2-venv V]
              [--pc2-onnxruntime O] [--pc2-deploy-sh PATH] [--aimdk-prefix A]
-             [--model PATH] [--tuning PATH]
+             [--model PATH] [--tuning PATH] [--no-sync-tuning]
              [--wrist-bypass {ik,off}]
              [--no-confirm] [--no-monitor] [--no-hand] [--no-pose-proxy]
              [--pose-proxy-port N] [--pose-proxy-stale-ms MS]
@@ -241,7 +257,10 @@ Per-command flags (after the subcommand):
              [--extra-deploy-arg ARG]...
     stop     [--pc2-host H] [--pc2-user U]
              [--pc1-host H] [--pc1-em-port N]
-             [--no-mc-restart] [--keep-logs]
+             [--no-mc-restart] [--keep-logs] [--yes|-y]
+             # stop is interactive by default: prints a banner, runs a
+             # short Ctrl-C-able countdown, and then requires typing
+             # 'y' + Enter. Use --yes to skip the prompt in scripts.
     status   [--pc2-host H] [--pc2-user U]
     logs     [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|proxy|all}
     attach   [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|proxy}
@@ -282,6 +301,10 @@ NO_HAND=0
 NO_MC_RESTART=0
 KEEP_LOGS=0
 ATTACH_AFTER_START=0
+# Bypass the cmd_stop confirmation prompt. Default 0 ("always ask"); set
+# to 1 via --yes for scripted invocations (CI / postmortem automation /
+# x2_freeze_postmortem.py-style tooling).
+STOP_YES=0
 ATTACH_SETTLE_SECONDS="${ATTACH_SETTLE_SECONDS:-2}"
 CENTER_TS=""
 WINDOW_S=30
@@ -316,6 +339,7 @@ while [[ $# -gt 0 ]]; do
         --aimdk-prefix) PC2_AIMDK_PREFIX="$2"; shift 2 ;;
         --model) X2_MODEL="$2"; shift 2 ;;
         --tuning) X2_TUNING="$2"; shift 2 ;;
+        --no-sync-tuning) NO_SYNC_TUNING=1; shift ;;
         --wrist-bypass) X2_WRIST_BYPASS="$2"; shift 2 ;;
         --no-confirm) DEPLOY_NO_CONFIRM=1; shift ;;
         --no-monitor) NO_MONITOR=1; shift ;;
@@ -326,6 +350,7 @@ while [[ $# -gt 0 ]]; do
         --pose-proxy-port) PC2_POSE_PROXY_PORT="$2"; shift 2 ;;
         --no-mc-restart) NO_MC_RESTART=1; shift ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
+        --yes|-y) STOP_YES=1; shift ;;
         --attach) ATTACH_AFTER_START=1; shift ;;
         --attach-settle-seconds) ATTACH_SETTLE_SECONDS="$2"; shift 2 ;;
         --extra-deploy-arg) EXTRA_DEPLOY_ARGS+=("$2"); shift 2 ;;
@@ -582,17 +607,60 @@ cmd_start() {
         # paths or paths relative to that root both work; users typically
         # pass `gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml`
         # on the laptop and we map it onto the staged PC2 copy.
+        #
+        # In addition to the path remap below, we JIT-rsync the laptop
+        # YAML to its PC2 destination so an edit on the laptop is
+        # automatically reflected in the next deploy start. Without this,
+        # the only code path that ships tuning YAMLs to PC2 is
+        # ``pc2_bringup.sh`` step 7 -- and people forget to re-run it,
+        # leading to the very confusing situation where the deploy reads
+        # a STALE preset that doesn't match what's open in the editor.
+        # The rsync is a few KB and runs in <100 ms, so we always do it
+        # unless ``--no-sync-tuning`` is set (intentional PC2-only test).
         local resolved_tuning="${X2_TUNING}"
+        local laptop_tuning_src=""
         case "${X2_TUNING}" in
-            /*) ;;  # already absolute, pass through
+            /*)
+                # Absolute path. If it sits under the laptop repo root,
+                # rsync it; otherwise pass through and trust the operator.
+                if [[ -f "${X2_TUNING}" && "${X2_TUNING}" == "${LAPTOP_REPO_ROOT}/"* ]]; then
+                    laptop_tuning_src="${X2_TUNING}"
+                fi
+                ;;
             gear_sonic_deploy/*)
                 resolved_tuning="${PC2_PREFIX}/${X2_TUNING}"
+                laptop_tuning_src="${LAPTOP_REPO_ROOT}/${X2_TUNING}"
                 ;;
             *)
-                # Treat as basename under configs/real_deploy_tuning/
+                # Treat as basename under configs/real_deploy_tuning/.
                 resolved_tuning="${PC2_PREFIX}/gear_sonic_deploy/configs/real_deploy_tuning/${X2_TUNING}"
+                laptop_tuning_src="${LAPTOP_REPO_ROOT}/gear_sonic_deploy/configs/real_deploy_tuning/${X2_TUNING}"
                 ;;
         esac
+        if [[ "${NO_SYNC_TUNING}" -eq 0 && -n "${laptop_tuning_src}" ]]; then
+            if [[ -f "${laptop_tuning_src}" ]]; then
+                log "  rsync tuning YAML (laptop -> PC2):"
+                log "    src = ${laptop_tuning_src}"
+                log "    dst = ${PC2_USER}@${PC2_HOST}:${resolved_tuning}"
+                # --inplace keeps the destination's inode stable so any
+                # daemon that's already running (and reading the file)
+                # sees a consistent view. --checksum forces a content
+                # compare instead of mtime, since the just-edited file
+                # often has a brand-new mtime even when it didn't change.
+                if ! rsync -av --inplace --checksum --info=stats0,progress0 \
+                        -e "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5" \
+                        "${laptop_tuning_src}" \
+                        "${PC2_USER}@${PC2_HOST}:${resolved_tuning}"; then
+                    err "tuning YAML rsync to PC2 failed."
+                    err "  Fix the connection (or pass --no-sync-tuning) and retry."
+                    exit 1
+                fi
+            else
+                warn "tuning YAML not found on laptop at ${laptop_tuning_src};"
+                warn "  trusting whatever's staged on PC2. (Pass --no-sync-tuning"
+                warn "  to silence this warning if the absence is intentional.)"
+            fi
+        fi
         deploy_args+=(--tuning-config "${resolved_tuning}")
     fi
     if [[ "${DEPLOY_NO_CONFIRM}" -eq 1 ]]; then
@@ -747,6 +815,94 @@ cmd_start() {
 # -------------------------------------------------------------------------
 
 cmd_stop() {
+    # Stop is destructive and operator-only -- a stray ``stop`` after
+    # several hours of teleop kills the policy mid-session and forces a
+    # full pc2_bringup or daemons start --attach restart that also has
+    # to wait through the WAIT_FOR_CONTROL handshake. We've eaten that
+    # cost at least once. Default policy is therefore "explicit
+    # acknowledgement required", with --yes as the documented bypass
+    # for scripted invocations (CI / postmortem automation).
+
+    # Surface which sessions are actually about to die. Capturing this
+    # also serves as a "did you mean to do this?" sanity check -- if
+    # nothing is running, we can short-circuit the prompt entirely
+    # rather than annoying the operator with a confirm-to-kill-nothing.
+    local sessions_running=()
+    for s in "${DEPLOY_SESSION}" "${POSE_PROXY_SESSION}" "${HAND_SESSION}" "${MONITOR_SESSION}"; do
+        if tmux_session_exists "${s}"; then
+            sessions_running+=("${s}")
+        fi
+    done
+
+    if [[ "${STOP_YES}" -ne 1 ]]; then
+        if [[ ${#sessions_running[@]} -eq 0 ]]; then
+            log "nothing to stop on ${PC2_USER}@${PC2_HOST} (no daemon sessions running)."
+            if [[ "${NO_MC_RESTART}" -eq 1 ]]; then
+                return 0
+            fi
+            # Fall through to the MC restart so operators who just want
+            # to re-arm MC after a crash can still use this path. But
+            # still gate it on confirmation.
+        fi
+
+        # Banner. Yellow because this is "you sure?" -- the actual kill
+        # below is the red action.
+        printf '\n'
+        printf '%s========================================================%s\n' "${C_YELLOW}" "${C_RESET}"
+        printf '%s ABOUT TO STOP X2 DAEMONS on %s%s%s%s\n' \
+            "${C_YELLOW}" "${C_RESET}" "${C_BLUE}" "${PC2_USER}@${PC2_HOST}" "${C_RESET}"
+        printf '%s========================================================%s\n' "${C_YELLOW}" "${C_RESET}"
+        if [[ ${#sessions_running[@]} -gt 0 ]]; then
+            printf '   tmux sessions queued for kill:\n'
+            for s in "${sessions_running[@]}"; do
+                printf '     - %s\n' "${s}"
+            done
+        fi
+        if [[ "${NO_MC_RESTART}" -eq 0 ]]; then
+            printf '   then will re-arm MC via EM HTTP on %s:%s\n' "${PC1_HOST}" "${PC1_EM_PORT}"
+        else
+            printf '   --no-mc-restart: MC will NOT be re-armed\n'
+        fi
+        printf '%s========================================================%s\n' "${C_YELLOW}" "${C_RESET}"
+        printf '   Pass --yes to skip this confirmation in scripted use.\n'
+        printf '\n'
+
+        # Countdown. Purely visual -- the kill does NOT auto-fire when
+        # the timer hits zero; it's a "give the operator 3 seconds to
+        # Ctrl-C if they're already regretting it" gate. The Enter
+        # prompt below is the actual gate.
+        local countdown_s=3
+        local i
+        for ((i=countdown_s; i>=1; i--)); do
+            printf '\r   %sCtrl-C to abort... %d %s' "${C_YELLOW}" "${i}" "${C_RESET}"
+            sleep 1
+        done
+        printf '\r                                  \r'
+
+        # Explicit-Enter gate. read with a -p prompt + -r (no backslash
+        # munging) catches "I pressed return on muscle memory" as well
+        # as accidental copy-paste. We DON'T accept just bare Enter --
+        # the operator has to type 'y' (or 'yes') first. That keeps a
+        # stray Enter on the terminal from triggering the kill.
+        local reply=""
+        printf '   Type %sy%s + Enter to confirm stop, anything else to abort: ' \
+            "${C_GREEN}" "${C_RESET}"
+        # In case stdin is non-interactive (e.g., piped from a script
+        # that didn't pass --yes), read will return immediately with
+        # an empty reply, which falls into the abort branch below --
+        # that's the safe default.
+        read -r reply || true
+        printf '\n'
+        case "${reply}" in
+            y|Y|yes|YES)
+                : ;;  # proceed
+            *)
+                warn "stop aborted (reply=${reply:-<empty>}); daemons untouched."
+                return 0
+                ;;
+        esac
+    fi
+
     log "stopping X2 daemons on ${PC2_USER}@${PC2_HOST}"
     # Order: deploy first (its restart_mc_on_exit trap brings MC back up
     # via the wire-still-flowing proxy), then proxy, then hand bridge +
@@ -933,7 +1089,10 @@ cmd_print_env() {
 case "${SUBCMD}" in
     start)      cmd_start ;;
     stop)       cmd_stop ;;
-    restart)    cmd_stop && cmd_start ;;
+    # restart already signals "yes, kill and bring back up" -- adding a
+    # second confirmation prompt would just train operators to mash
+    # Enter, which defeats the gate we just added on plain ``stop``.
+    restart)    STOP_YES=1; cmd_stop && cmd_start ;;
     status)     cmd_status ;;
     logs)       cmd_logs ;;
     attach)     cmd_attach ;;
