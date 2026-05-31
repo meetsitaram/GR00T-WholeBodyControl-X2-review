@@ -147,6 +147,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         "https://raw.githubusercontent.com/zeromq/cppzmq/v${CPPZMQ_VERSION}/zmq_addon.hpp" \
         -O /usr/local/include/zmq_addon.hpp
 
+# Late-binding Python pip deps (kept separate from the heavy
+# mujoco/scipy/torch layer so adding tools later doesn't invalidate the
+# >5 minute torch CPU wheel + onnxruntime layers cached above).
+#   matplotlib  -- offline analysis of rosbag data (joint trajectories,
+#                  IMU traces, drift plots) for x2-nav-slam milestone 3+
+RUN pip3 install --no-cache-dir matplotlib
+
 # Default workdir is the bind-mounted monorepo (set in docker-compose.yml).
 WORKDIR /workspace/sonic
 
