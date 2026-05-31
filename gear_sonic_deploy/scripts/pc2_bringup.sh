@@ -585,7 +585,14 @@ else
         export_motion_for_deploy.py \
         x2_hand_zmq_to_aimdk_bridge.py \
         x2_pose_proxy.py \
+        x2_scan_mc_motors.py \
         ; do
+        # NOTE: x2_scan_mc_motors.py isn't a runtime daemon -- it's a
+        # diagnostic we run inside the docker_x2 container OR directly
+        # in the colcon overlay during operator nudge tests. Without
+        # it on PC2, the only way to run the scan is to scp it ad-hoc
+        # every session, which we kept forgetting. Adding it here so
+        # it tracks the laptop copy automatically.
         if [[ ! -f "${REPO_ROOT}/gear_sonic_deploy/scripts/${helper}" ]]; then
             warn "helper missing on laptop: gear_sonic_deploy/scripts/${helper} -- skipping"
             continue

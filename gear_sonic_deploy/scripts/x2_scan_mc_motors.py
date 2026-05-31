@@ -708,6 +708,15 @@ def main() -> int:
                          "existing JSONL written by a previous run. Useful for "
                          "trying different LPF / dead-zone settings on the same "
                          "captured nudge without re-running the scan.")
+    ap.add_argument("--stop-sentinel", default=None,
+                    help="Optional sentinel file path. When the file is "
+                         "touch'd while the scan is running, the capture loop "
+                         "exits cleanly at the next tick (within ~250 ms) and "
+                         "the JSONL + summary are written normally. Lets you "
+                         "run open-ended captures: pass a generous --duration "
+                         "(e.g. 600 s) and signal stop by 'touch <sentinel>' "
+                         "when the operator session is done. Defaults to None "
+                         "(no sentinel; --duration is the only timer).")
     args = ap.parse_args()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -782,15 +791,40 @@ def main() -> int:
         print(" " * 40, end="\r", flush=True)
     print(f"[x2_scan_mc_motors] >>> NUDGE NOW <<<  (recording for {args.duration:.0f} s)")
 
+    # Optional early-stop sentinel: when the file at ``args.stop_sentinel``
+    # appears, the capture loop exits cleanly at the next tick, snapshot
+    # is written, and the summary prints normally. Useful for open-ended
+    # operator-driven captures where you don't know up front how long the
+    # robot's session will take -- launch the scan with --duration 600 (10
+    # min), let the operator do their thing, then touch the sentinel to
+    # stop. SIGTERM/SIGINT are NOT used for this because killing the
+    # process would skip the JSONL write at the bottom of main(); the
+    # sentinel keeps the normal exit path intact.
+    stop_sentinel = pathlib.Path(args.stop_sentinel) if args.stop_sentinel else None
+    if stop_sentinel is not None and stop_sentinel.exists():
+        try:
+            stop_sentinel.unlink()
+        except OSError:
+            pass
     t_start = time.monotonic()
+    early_stop = False
     while time.monotonic() - t_start < args.duration:
         elapsed = time.monotonic() - t_start
         remaining = args.duration - elapsed
+        if stop_sentinel is not None and stop_sentinel.exists():
+            print(" " * 70, end="\r", flush=True)
+            print(f"[x2_scan_mc_motors] stop sentinel detected at {stop_sentinel} "
+                  f"after {elapsed:.1f}s; exiting capture early")
+            early_stop = True
+            break
         print(f"[x2_scan_mc_motors] elapsed {elapsed:5.1f} s / remaining {remaining:5.1f} s",
               end="\r", flush=True)
         time.sleep(0.25)
     print(" " * 70, end="\r", flush=True)
-    print(f"[x2_scan_mc_motors] Scan complete. Stopping subscribers ...")
+    actual_duration = time.monotonic() - t_start
+    print(f"[x2_scan_mc_motors] Scan complete "
+          f"({'early-stopped' if early_stop else 'duration-elapsed'}, "
+          f"actual {actual_duration:.1f}s). Stopping subscribers ...")
 
     snap = node.snapshot()
     exec_.shutdown()
@@ -803,9 +837,9 @@ def main() -> int:
     print(f"[x2_scan_mc_motors] Raw JSONL written: {out_path} "
           f"({len(snap['raw'])} records)")
 
-    print(_summarize(snap, duration=args.duration))
+    print(_summarize(snap, duration=actual_duration))
     if not args.no_oscillation:
-        print(_oscillation_summary(snap, duration=args.duration,
+        print(_oscillation_summary(snap, duration=actual_duration,
                                    window_s=args.osc_window,
                                    step_s=args.osc_step,
                                    top_k=args.osc_top_k,
