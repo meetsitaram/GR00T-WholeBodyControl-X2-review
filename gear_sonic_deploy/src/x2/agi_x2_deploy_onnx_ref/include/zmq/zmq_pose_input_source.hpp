@@ -171,6 +171,18 @@ class ZmqPoseInputSource : public ReferenceMotion {
     return total_frames_received_.load(std::memory_order_acquire);
   }
 
+  /// Monotonic seconds (std::chrono::steady_clock relative to Connect()'s
+  /// "no frames yet" epoch) when the most recent ZMQ frame was decoded.
+  /// Returns -1.0 if no frame has ever arrived. Thread-safe: takes
+  /// ``cache_mutex_`` for the duration of a single 64-bit read.
+  ///
+  /// Designed for the deploy-side pose-ref starvation watchdog
+  /// (PoseRefStarvationWatchdog::Update). The returned value is in the same
+  /// monotonic frame as ``std::chrono::steady_clock``'s
+  /// ``time_since_epoch()`` -- pair with ``SteadyNow()`` in the deploy to
+  /// compute age = now - LastReceivedMonotonicS().
+  double LastReceivedMonotonicS() const;
+
   /// Whether at least one ``joint_pos_mj``-bearing frame has arrived. Until
   /// this returns true ``Sample()`` falls back to ``default_angles``.
   bool has_body_reference() const noexcept {

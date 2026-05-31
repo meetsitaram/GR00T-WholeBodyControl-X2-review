@@ -45,6 +45,15 @@ from robocasa.utils.dexmg_utils import DexMGConfigHelper
 from robocasa.utils.object_utils import check_obj_upright
 from robocasa.utils.visuals_utls import Gradient, randomize_materials_rgba
 
+# ``X2PickPlaceApple`` reuses the upstream ``apple_0`` real-mesh asset
+# from the locomanip object library. Unlike ``PrimitiveCube`` /
+# ``PrimitiveBowl`` (which we synthesize inline from raw boxes), the
+# apple ships with a textured visual mesh + 5-fragment convex
+# decomposition and is loaded via ``MJCFObject``. Centralising the
+# mesh-relative path here keeps the asset reference next to the env
+# class that consumes it instead of hidden in a per-method literal.
+_APPLE_MJCF_PATH: str = "objects/omniverse/locomanip/apple_0/model.xml"
+
 
 # ---------------------------------------------------------------------------
 # Primitive props (kept self-contained so X2 tasks load on a clean install)
@@ -272,8 +281,28 @@ class LMTabletopFixedBase(LocoManipulationEnv):
         super().__init__(*args, **kwargs)
 
     def _load_model(self):
-        self.mujoco_objects = [self._create_table("table_body", self.TABLE_POS, self.TABLE_EULER)]
+        self.mujoco_objects = self._build_mujoco_objects()
         super()._load_model()
+
+    def _build_mujoco_objects(self) -> list:
+        """Hook returning the MJCFObjects merged BEFORE ``super()._load_model()``.
+
+        Default: just the lab table. Subclasses that need additional
+        real-mesh free-joint props (e.g. an upstream ``apple_0`` /
+        ``jug_a01`` / ``plate_1`` from the locomanip asset library)
+        should extend this list -- those props carry their own
+        ``<asset>`` sections (textures + meshes) which only get merged
+        into ``self.model`` if the object is in ``self.mujoco_objects``
+        when robosuite's ``ManipulationTask`` is constructed in
+        ``LocoManipulationEnv._load_model``.
+
+        Primitive props (``PrimitiveCube``, ``PrimitiveBowl``,
+        ``PrimitiveFixture``) don't need this hook -- they're inlined
+        directly into ``self.model.worldbody`` by the subclass AFTER
+        ``super()`` runs because their asset elements are tiny and
+        don't depend on robosuite's per-object naming machinery.
+        """
+        return [self._create_table("table_body", self.TABLE_POS, self.TABLE_EULER)]
 
     @staticmethod
     def _create_table(name: str, position: list[float], euler: list[float]) -> MJCFObject:
@@ -601,6 +630,288 @@ class X2PickPlaceBowl(LMTabletopFixedBase, DexMGConfigHelper):
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
         )
+        task.task_spec_1.subtask_1 = dict(
+            object_ref=None,
+            subtask_term_signal=None,
+            subtask_term_offset_range=None,
+            selection_strategy="random",
+            selection_strategy_kwargs=None,
+            action_noise=0.05,
+            num_interpolation_steps=5,
+            num_fixed_steps=0,
+            apply_noise_during_interpolation=False,
+        )
+        return task.to_dict()
+
+
+class X2PickPlaceApple(LMTabletopFixedBase, DexMGConfigHelper):
+    """Pick the red apple on the table and drop it inside the blue bowl.
+
+    Real-mesh sibling of :class:`X2PickPlaceCube`. Where the cube is a
+    flat-shaded primitive box, the apple is the upstream ``apple_0``
+    locomanip asset -- a textured visual mesh wrapped around a
+    5-fragment convex-decomposition collision shell. That makes this
+    scene useful for:
+
+    * **Real-mesh visual variety in the recorded ego frames.** The cube
+      task records a flat red blob; the apple records a textured object
+      with proper shading + albedo. VLA training can mix the two cleanly
+      because the table layout, bowl, and success criterion are
+      identical -- only the manipulable object's geometry / texture
+      differs.
+    * **Non-convex grasp object.** The apple's curved sides + stem
+      indent are harder to "trap" between OmniHand fingertips than the
+      sharp-cornered cube, so a policy trained on cube + apple sees a
+      richer grasp-pose distribution and is less likely to overfit to
+      "just close fingers around any small object on the table".
+
+    The apple body is loaded via :class:`MJCFObject` (added to
+    ``self.mujoco_objects`` before ``super()._load_model()`` so robosuite
+    merges its asset section into ``self.model``); the bowl is the same
+    welded :class:`PrimitiveBowl` used by :class:`X2PickPlaceCube`.
+
+    Conventions (mirrored from :class:`X2PickPlaceCube` so per-episode
+    placements + success criteria stay comparable across the two
+    scenes):
+
+    * Apple spawn is randomised every reset within a tight box on the
+      *source* (right) side of the table.
+    * Bowl is welded at a fixed pose on the *target* (left) side of
+      the table.
+    * Success fires when the apple comes to rest above the bowl floor
+      and inside the bowl walls. Uprightness is *not* enforced -- the
+      apple is roughly spherical, so any settled orientation that
+      keeps it inside the bowl footprint is acceptable.
+    """
+
+    # Apple geometry. The asset's intrinsic mesh scale is 0.075 so a
+    # MJCFObject(scale=1.0) gives an apple ~7.4 cm tall and ~7.4 cm
+    # across (top_site - bottom_site = 0.0738 m, horizontal_radius
+    # ~0.052 m projected). We store the half-extents below for the
+    # success-check footprint math; both default to 0.037 because we
+    # treat the apple as roughly spherical.
+    APPLE_HALF_HEIGHT: float = 0.037
+    APPLE_HALF_WIDTH: float = 0.037
+
+    # Bowl geometry. Wall height bumped from the cube's 0.04 to 0.045
+    # because the apple is ~3x taller than the cube and would otherwise
+    # roll out of the bowl on a soft drop. Half-size matches
+    # X2PickPlaceCube so the operator's calibrated hand-to-bowl reach
+    # transfers across scenes without re-tuning.
+    BOWL_HALF_SIZE_XY: float = 0.075
+    BOWL_WALL_HEIGHT: float = 0.045
+
+    # Spawn ranges relative to the table top.  X is forward (away from
+    # robot), Y is left/right.  Mirror X2PickPlaceCube so the per-
+    # operator calibration that works for cube spawns also works here.
+    _APPLE_X_RANGE: tuple[float, float] = (-0.12, -0.04)
+    _APPLE_Y_RANGE: tuple[float, float] = (-0.20, -0.10)
+    _BOWL_X: float = -0.08
+    _BOWL_Y: float = +0.15
+
+    # Approximate world-z of the lab-table top with TABLE_POS[2]=0 and
+    # the omniverse lab_table mesh's top_offset. Used ONLY for the
+    # apple's static-XML default pose (so the apple is visible at
+    # viewer startup before any per-episode scene_reset has fired).
+    # Per-episode placement uses the runtime ``self._table_top_z()``,
+    # which queries the actual MuJoCo body position; that path stays
+    # robust to future table-pose changes.
+    _STATIC_TABLE_TOP_Z: float = 0.684446
+
+    def _build_mujoco_objects(self) -> list:
+        # Append the apple to the table list returned by the base class.
+        # The apple has to land in ``self.mujoco_objects`` (and stay
+        # there) before ``super()._load_model()`` runs so robosuite
+        # merges its <asset> section (textures + 6 meshes for the
+        # convex decomposition) into ``self.model`` AND wraps its body
+        # with the auto-generated free joint ``apple_joint0``. If we
+        # tried to append the apple AFTER super (the way the cube /
+        # bowl primitives are appended), the asset references would be
+        # dangling.
+        self._apple = self._create_apple()
+
+        # Set a sensible static-XML default pose so the apple is
+        # visible on the table top from the moment MuJoCo finishes
+        # compiling the model -- not just after the first per-episode
+        # scene_reset has fired.  Without this, ``MJCFObject`` leaves
+        # the body's ``pos`` attribute unset, MuJoCo defaults the
+        # free-joint qpos to ``[0, 0, 0, 1, 0, 0, 0]``, and the apple
+        # ends up buried at world origin (under the floor) until the
+        # operator presses B to start an episode.  The cube / bowl
+        # primitives don't show this failure mode because their
+        # ``__init__`` hardcodes ``pos="0.45 0 0.85"`` /
+        # ``pos="0.54 0.15 …"`` directly into the body element.
+        #
+        # The default position is the midpoint of the spawn range so
+        # the very first viewer frame shows the apple sitting at the
+        # centre of the per-episode randomisation window, on top of
+        # the lab table.  Per-episode resets in
+        # :meth:`_reset_internal` then jitter the apple within
+        # ``_APPLE_X_RANGE`` / ``_APPLE_Y_RANGE``.
+        ax_mid = 0.5 * (self._APPLE_X_RANGE[0] + self._APPLE_X_RANGE[1])
+        ay_mid = 0.5 * (self._APPLE_Y_RANGE[0] + self._APPLE_Y_RANGE[1])
+        default_pos = [
+            float(self.TABLE_POS[0] + ax_mid),
+            float(self.TABLE_POS[1] + ay_mid),
+            float(self._STATIC_TABLE_TOP_Z + self.APPLE_HALF_HEIGHT + 0.005),
+        ]
+        self._apple.set_pos(default_pos)
+
+        return [*super()._build_mujoco_objects(), self._apple]
+
+    def _load_model(self):
+        super()._load_model()
+
+        # Bowl is a Primitive (welded -- no joint), inlined directly into
+        # the world body the same way ``X2PickPlaceCube`` inlines its
+        # primitive cube + bowl. Asset elements live in the bowl object
+        # itself, so no robosuite-side merge is needed.
+        self._bowl = PrimitiveBowl(
+            name="bowl",
+            half_size_xy=self.BOWL_HALF_SIZE_XY,
+            wall_height=self.BOWL_WALL_HEIGHT,
+        )
+        self.model.asset.extend(self._bowl.assets)
+        self.model.worldbody.append(self._bowl.body)
+        self.objects["bowl"] = {"name": f"{self._bowl.name}_body"}
+
+        # Robosuite gives the MJCFObject the body name ``<name>_main`` and
+        # a single auto-named free joint ``<name>_joint0`` (because we
+        # passed ``static=False``). Cache both so the success checks +
+        # SceneEnvSpec metadata don't have to recompute them.
+        self.objects["apple"] = {
+            "name": self._apple.root_body,
+            "joint": self._apple.joints[0],
+        }
+
+    @staticmethod
+    def _create_apple() -> MJCFObject:
+        return MJCFObject(
+            name="apple",
+            mjcf_path=xml_path_completion(
+                _APPLE_MJCF_PATH, root=robocasa.models.assets_root
+            ),
+            scale=1.0,
+            # Real apple density is ~800 kg/m^3; we use 80 here to match
+            # the ``LMPnPAppleToPlate`` upstream env's apple-mass tuning,
+            # which keeps the OmniHand from spiking the position-actuator
+            # force budget on a power grasp.
+            density=80,
+            friction=(1.0, 0.3, 0.05),
+            static=False,
+        )
+
+    def _reset_internal(self):
+        super()._reset_internal()
+        if self.deterministic_reset:
+            return
+
+        # Place the bowl on the table top (welded body -- write into model).
+        bowl_id = self.sim.model.body_name2id("bowl_body")
+        table_id = self.sim.model.body_name2id("table_body_main")
+        table_x = float(self.sim.data.body_xpos[table_id][0])
+        table_y = float(self.sim.data.body_xpos[table_id][1])
+        z_top = self._table_top_z()
+        self.sim.model.body_pos[bowl_id] = np.array(
+            [table_x + self._BOWL_X, table_y + self._BOWL_Y, z_top]
+        )
+
+        # Place the apple within its sampling range, centred above the table.
+        ax = self.rng.uniform(*self._APPLE_X_RANGE)
+        ay = self.rng.uniform(*self._APPLE_Y_RANGE)
+        # Add a small clearance so MuJoCo doesn't penetrate on first step.
+        # The apple's body origin sits at the asset's mesh centre, so a
+        # z offset of (half_height + clearance) leaves the bottom-most
+        # collision fragment ~5 mm above the table top.
+        apple_z = z_top + self.APPLE_HALF_HEIGHT + 0.005
+
+        joint_name = self.objects["apple"]["joint"]
+        qpos = self.sim.data.get_joint_qpos(joint_name).copy()
+        qpos[:3] = np.array([table_x + ax, table_y + ay, apple_z])
+        # Random yaw only -- keep the apple's stem aligned with world +z so
+        # its first-contact pose is repeatable across episodes.
+        yaw = self.rng.uniform(-np.pi, np.pi)
+        qpos[3:7] = np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+        self.sim.data.set_joint_qpos(joint_name, qpos)
+
+        self._randomize_table_texture()
+
+    # --- success ---
+
+    def _check_success(self) -> bool:
+        apple_pos = self.sim.data.body_xpos[self.obj_body_id["apple"]]
+        bowl_pos = self.sim.data.body_xpos[self.obj_body_id["bowl"]]
+        # Apple xy must sit inside the bowl footprint (with the apple's
+        # own horizontal half-width subtracted so the test still passes
+        # for an apple resting against a wall).
+        in_xy = (
+            abs(apple_pos[0] - bowl_pos[0])
+            <= self.BOWL_HALF_SIZE_XY - self.APPLE_HALF_WIDTH
+        ) and (
+            abs(apple_pos[1] - bowl_pos[1])
+            <= self.BOWL_HALF_SIZE_XY - self.APPLE_HALF_WIDTH
+        )
+        # Apple z must be inside [bowl_floor + apple_half, bowl_top + slack].
+        # The +0.04 slack on the upper bound is generous because a real
+        # apple settles on its side with the stem poking above the rim.
+        bowl_floor_z = float(bowl_pos[2])
+        apple_z = float(apple_pos[2])
+        in_z = (
+            bowl_floor_z + self.APPLE_HALF_HEIGHT * 0.5
+            <= apple_z
+            <= bowl_floor_z + self.BOWL_WALL_HEIGHT + 0.04
+        )
+        # Apple is roughly spherical -- skip uprightness check (any
+        # settled orientation inside the bowl is acceptable).
+        return bool(in_xy and in_z)
+
+    # --- DexMG integration ---
+
+    def get_object(self) -> dict:
+        return dict(
+            apple=dict(obj_name=self.objects["apple"]["name"], obj_type="body"),
+            bowl=dict(obj_name=self.objects["bowl"]["name"], obj_type="body"),
+        )
+
+    def get_subtask_term_signals(self) -> dict[str, int]:
+        # Right OmniHand grasps the apple. ``MJCFObject.contact_geoms``
+        # returns the auto-named collision-class geoms (``apple_g1`` ..
+        # ``apple_g5`` for the 5 convex-decomposition fragments).
+        check_grasp_right = self._check_grasp(
+            self.robots[0].gripper["right"], self._apple.contact_geoms
+        )
+        return {"grasp_apple": int(check_grasp_right)}
+
+    @staticmethod
+    def task_config() -> dict:
+        task = DexMGConfigHelper.AttrDict()
+        # Subtask 1 -- right hand grasps the apple.
+        task.task_spec_0.subtask_1 = dict(
+            object_ref="apple",
+            subtask_term_signal="grasp_apple",
+            subtask_term_offset_range=(5, 10),
+            selection_strategy="random",
+            selection_strategy_kwargs=None,
+            action_noise=0.05,
+            num_interpolation_steps=5,
+            num_fixed_steps=0,
+            apply_noise_during_interpolation=False,
+        )
+        # Subtask 2 -- right hand drops the apple into the bowl.
+        task.task_spec_0.subtask_2 = dict(
+            object_ref="bowl",
+            subtask_term_signal=None,
+            subtask_term_offset_range=None,
+            selection_strategy="random",
+            selection_strategy_kwargs=None,
+            action_noise=0.05,
+            num_interpolation_steps=5,
+            num_fixed_steps=0,
+            apply_noise_during_interpolation=False,
+        )
+        # Idle filler for the (unused) left arm spec -- mirrors the
+        # X2PickPlaceCube layout so DexMG demo collation treats the two
+        # scenes interchangeably.
         task.task_spec_1.subtask_1 = dict(
             object_ref=None,
             subtask_term_signal=None,

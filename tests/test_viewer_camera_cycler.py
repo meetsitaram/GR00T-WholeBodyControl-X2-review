@@ -182,7 +182,13 @@ def test_cycler_dispatches_xdotool_key_tab_to_found_window(cycler):
     # that avoids GNOME mutter's frame wrapper).
     assert search_call.args[0] == ["xdotool", "search", "--classname", "MuJoCo"]
     assert getclass_call.args[0] == ["xdotool", "getwindowclassname", "42"]
-    assert key_call.args[0] == ["xdotool", "key", "--window", "42", "Tab"]
+    # Camera-cycle key must be ``bracketright`` (the X11 keysym for
+    # ``]``, mujoco viewer's "next fixed camera"). This regression
+    # pin exists because v7.1 originally synthesised ``Tab``, which
+    # actually toggles the viewer's left UI panel and does NOT
+    # change cameras -- the bug surfaced live in the deploy and
+    # cost us a test session. See ViewerCameraCycler class docstring.
+    assert key_call.args[0] == ["xdotool", "key", "--window", "42", "bracketright"]
 
 
 def test_cycler_prefers_classname_over_name_fallback(cycler):
@@ -236,12 +242,12 @@ def test_cycler_excludes_mutter_x11_frames_wrapper(cycler):
     ) as m_run:
         assert cycler.cycle() is True
 
-    # Tab must land on the REAL GLFW window, not the mutter wrapper.
+    # Camera-cycle key must land on the REAL GLFW window, not the mutter wrapper.
     key_call = m_run.call_args_list[-1]
     assert key_call.args[0] == [
-        "xdotool", "key", "--window", "77594631", "Tab",
+        "xdotool", "key", "--window", "77594631", "bracketright",
     ], (
-        f"Tab landed on the wrong window. Full call list:\n"
+        f"Camera-cycle key landed on the wrong window. Full call list:\n"
         f"{[c.args[0] for c in m_run.call_args_list]}"
     )
 
@@ -272,7 +278,7 @@ def test_cycler_falls_back_to_name_search_when_classname_empty(cycler):
     args_seen = [c.args[0] for c in m_run.call_args_list]
     assert args_seen[0] == ["xdotool", "search", "--classname", "MuJoCo"]
     assert args_seen[1] == ["xdotool", "search", "--name", "MuJoCo"]
-    assert args_seen[-1] == ["xdotool", "key", "--window", "42", "Tab"]
+    assert args_seen[-1] == ["xdotool", "key", "--window", "42", "bracketright"]
 
 
 def test_cycler_caches_window_id_across_calls(cycler):
@@ -458,3 +464,188 @@ def test_cycler_subprocess_timeout_logged_not_raised(cycler):
         side_effect=subprocess.TimeoutExpired(["xdotool"], 2.0),
     ):
         assert cycler.cycle() is False
+
+
+# ---------------------------------------------------------------------------
+# Layer 2b: ViewerCameraCycler -- periodic WARN re-emission
+# ---------------------------------------------------------------------------
+
+
+def _drain_cycle_inside_cooldown(cycler) -> None:
+    """Sleep past the cycler's cooldown so the next cycle() runs.
+
+    Lets us call cycle() repeatedly in tests without each call
+    short-circuiting on the rate-limit gate.
+    """
+    import time
+    time.sleep(cycler._cooldown_s + 0.01)
+
+
+def test_cycler_warns_once_then_silences_within_reemit_period(cycler, caplog):
+    """Two failures in quick succession must produce only ONE WARN
+    (the existing one-shot behaviour). Without this, a noisy stick
+    spamming clicks at 50 Hz would also spam the manager log with
+    50 identical warnings per second."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="gear_sonic.utils.teleop.vr.viewer_camera_cycler")
+    with patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.shutil.which",
+        return_value=None,  # xdotool missing -> WARN path
+    ):
+        assert cycler.cycle() is False
+        _drain_cycle_inside_cooldown(cycler)
+        assert cycler.cycle() is False
+        _drain_cycle_inside_cooldown(cycler)
+        assert cycler.cycle() is False
+
+    warns = [r for r in caplog.records if "xdotool not installed" in r.getMessage()]
+    assert len(warns) == 1, (
+        f"Expected exactly 1 'xdotool not installed' WARN inside "
+        f"WARN_REEMIT_PERIOD_S; got {len(warns)}."
+    )
+
+
+def test_cycler_reemits_warn_after_period_elapses(cycler, caplog):
+    """Long-session diagnostic: if the failure persists past
+    ``WARN_REEMIT_PERIOD_S``, the next cycle() WARN re-emits so the
+    operator gets a fresh log line instead of the cycler going
+    permanently silent. Critical for the "I started the stack
+    before the deploy was up, then nothing ever logged again"
+    failure mode."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="gear_sonic.utils.teleop.vr.viewer_camera_cycler")
+    # Force the period low so the test is fast.
+    cycler.WARN_REEMIT_PERIOD_S = 0.01
+    with patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.shutil.which",
+        return_value=None,
+    ):
+        assert cycler.cycle() is False
+        # Wait past BOTH the cooldown AND the re-emit period.
+        import time
+        time.sleep(max(cycler._cooldown_s, cycler.WARN_REEMIT_PERIOD_S) + 0.02)
+        assert cycler.cycle() is False
+
+    warns = [r for r in caplog.records if "xdotool not installed" in r.getMessage()]
+    assert len(warns) == 2, (
+        f"Expected 2 WARNs after period elapsed; got {len(warns)}. "
+        "Re-emission gate is broken; long sessions will go silent "
+        "after the first failure."
+    )
+
+
+def test_cycler_reset_re_arms_no_window_warn(cycler, caplog):
+    """``reset()`` clears both the WID cache AND the no-window WARN
+    gate so the post-reset cycle() can warn freshly if the new
+    deploy still doesn't have a viewer up. Without this the
+    operator would never see a follow-up warn after a deploy
+    restart."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="gear_sonic.utils.teleop.vr.viewer_camera_cycler")
+    with patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.shutil.which",
+        return_value="/usr/bin/xdotool",
+    ), patch.dict(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.os.environ",
+        {"DISPLAY": ":1"}, clear=False,
+    ), patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.subprocess.run",
+        side_effect=[
+            _xdotool_search_empty(), _xdotool_search_empty(),
+            _xdotool_search_empty(), _xdotool_search_empty(),
+        ],
+    ):
+        assert cycler.cycle() is False
+        _drain_cycle_inside_cooldown(cycler)
+        cycler.reset()
+        _drain_cycle_inside_cooldown(cycler)
+        assert cycler.cycle() is False
+
+    no_window_warns = [
+        r for r in caplog.records if "no window matching" in r.getMessage()
+    ]
+    assert len(no_window_warns) == 2, (
+        f"Expected 2 no-window WARNs (one before reset, one after); "
+        f"got {len(no_window_warns)}."
+    )
+
+
+def test_cycler_default_keysym_is_bracketright_not_tab():
+    """REGRESSION: in v7.1 we initially used ``Tab`` because a stale
+    cheatsheet said "Tab cycles cameras". It does NOT -- in
+    mujoco.viewer.launch_passive Tab toggles the left UI panel and
+    leaves the active camera unchanged. The actual next-fixed-camera
+    key is ``]`` (X11 keysym ``bracketright``), per the upstream
+    docs (https://mujoco.readthedocs.io/en/2.3.6/programming/visualization.html).
+
+    This test pins the default so any future "let's go back to Tab"
+    refactor surfaces immediately rather than at a live deploy.
+    """
+    from gear_sonic.utils.teleop.vr.viewer_camera_cycler import (
+        ViewerCameraCycler,
+    )
+
+    assert ViewerCameraCycler.CYCLE_KEYSYM == "bracketright", (
+        "ViewerCameraCycler.CYCLE_KEYSYM regressed to %r. The MuJoCo "
+        "passive viewer cycles fixed cameras on `]` (X11 keysym "
+        "`bracketright`); `Tab` only toggles the left UI panel and "
+        "must NOT be used here." % ViewerCameraCycler.CYCLE_KEYSYM
+    )
+
+
+def test_cycler_honors_overridden_keysym(cycler):
+    """Operator override path: setting CYCLE_KEYSYM on the instance
+    redirects the synthesized keystroke. This lets us swap to
+    ``bracketleft`` (cycle backwards) or ``Escape`` (snap to free
+    camera) without subclassing."""
+    cycler.CYCLE_KEYSYM = "bracketleft"
+    with patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.shutil.which",
+        return_value="/usr/bin/xdotool",
+    ), patch.dict(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.os.environ",
+        {"DISPLAY": ":1"}, clear=False,
+    ), patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.subprocess.run",
+        side_effect=_classname_match_flow(wid="42"),
+    ) as m_run:
+        assert cycler.cycle() is True
+
+    key_call = m_run.call_args_list[-1]
+    assert key_call.args[0] == [
+        "xdotool", "key", "--window", "42", "bracketleft",
+    ], f"Override didn't take effect; saw: {key_call.args[0]}"
+
+
+def test_cycler_no_window_warn_includes_display_for_diagnosis(cycler, caplog):
+    """The no-window WARN must include the DISPLAY value -- this is
+    the single most common operator-error cause (running on Wayland
+    where xdotool returns empty for every search; or having
+    DISPLAY=:0 when the deploy launched on :1). Without it the
+    operator can't distinguish "viewer not up" from "wrong DISPLAY"."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="gear_sonic.utils.teleop.vr.viewer_camera_cycler")
+    with patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.shutil.which",
+        return_value="/usr/bin/xdotool",
+    ), patch.dict(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.os.environ",
+        {"DISPLAY": ":7"}, clear=False,
+    ), patch(
+        "gear_sonic.utils.teleop.vr.viewer_camera_cycler.subprocess.run",
+        side_effect=[_xdotool_search_empty(), _xdotool_search_empty()],
+    ):
+        assert cycler.cycle() is False
+
+    no_window_warns = [
+        r for r in caplog.records if "no window matching" in r.getMessage()
+    ]
+    assert len(no_window_warns) == 1
+    msg = no_window_warns[0].getMessage()
+    assert "DISPLAY=:7" in msg, (
+        f"WARN must include the actual DISPLAY value for diagnosis; got: {msg}"
+    )

@@ -12,6 +12,15 @@ of [`x2-ultra-onnx-deploy_9dde7da2.plan.md`](.cursor/plans/x2-ultra-onnx-deploy_
 For an end-to-end "first time on the real robot" walkthrough, see
 [`x2_first_real_robot.md`](../user_guide/x2_first_real_robot.md).
 
+For the **split-topology** variant where this binary runs on PC2 (Jetson
+AGX) under tmux while the operator-side stack stays on the laptop, see
+[`x2_split_deploy_pc2.md`](x2_split_deploy_pc2.md). That document also
+covers the new `SAFE_IDLE` state, the `PoseRefStarvationWatchdog`, and
+the operator's A+B (no X+Y) resume chord that the deploy SUBs on
+`pose_resume`. The `x2_debug` ZMQ telemetry has been bumped to v5 to
+include `pose_ref_age_s`, `in_safe_idle`, `mc_action_mode` (1 Hz poll
+of `GetMcAction`), and `resume_*` counters.
+
 ## Architecture overview
 
 ```
@@ -166,9 +175,44 @@ specific kp/kd values per joint. Those exact values are codegen'd into
 then applies them on its own 1 kHz inner loop; the policy never directly
 torques the joints.
 
-> The `ankle KP × 1.5` MuJoCo deployment-side scaling, which helped during
-> sim2sim experiments, is **not** baked into the deploy — that is a
-> MuJoCo-only artifact. See the FAQ at the bottom for why this is correct.
+The deploy binary exposes per-joint-family multiplicative scale factors
+on top of the codegen'd `kps[]` / `kds[]`:
+
+```
+--kp-scale, --kp-scale-{hip,knee,ankle,waist,shoulder,elbow,wrist,head}
+            (plus split aliases --kp-scale-ankle-{pitch,roll}
+                                --kp-scale-waist-{yaw,pr})
+--kd-scale, --kd-scale-{hip,knee,ankle,waist,shoulder,elbow,wrist,head}
+            (plus matching split aliases)
+```
+
+These default to 1.0 (= ship the trained gain unchanged). They exist
+because the X2 firmware applies torque *explicitly* on top of MC's
+arbitration, while training used IsaacLab's implicit integrator —
+which means the deployed loop gain is ~1.3-1.5x lower than what the
+policy was optimised for. The standard fix is to bump deployed PD per
+joint family without retraining. Operators almost never set these
+flags directly; they pin a YAML preset from
+`gear_sonic_deploy/configs/real_deploy_tuning/` instead, which encodes
+known-good combinations validated against real-robot nudge tests.
+
+The procedure for picking the scale factors — including the
+`x2_scan_mc_motors.sh` helper that records MC's published PD per joint
+in `STAND_DEFAULT` and the oscillation analysis used to validate each
+bump — is documented in
+[`x2_pd_tuning_with_mc_scan.md`](../user_guide/x2_pd_tuning_with_mc_scan.md).
+The split per-subgroup knobs (`*_ankle_pitch` vs `*_ankle_roll`,
+`*_waist_yaw` vs `*_waist_pr`) exist because MC publishes asymmetric
+PD across those families and a single-knob compromise leaves at least
+one subgroup off MC-match by 30-50%.
+
+> The `ankle KP × 1.5` MuJoCo deployment-side scaling, which helped
+> during sim2sim experiments, is **not** baked into the deploy ONNX —
+> that is a MuJoCo-only artifact. The deploy *does* now ship the
+> equivalent per-family knobs (`--kp-scale-ankle 1.5` plus the split
+> waist / per-subgroup ankle bumps), so the C++ binary can mirror the
+> Python sim's effective gain when paired with a `--tuning-config`. See
+> the FAQ at the bottom for why this is correct.
 
 ## CLI
 
@@ -195,6 +239,12 @@ ros2 run agi_x2_deploy_onnx_ref x2_deploy_onnx_ref \
 | `--log-dir PATH` | (off) | Per-tick CSVs (one per channel) written here. |
 | `--intra-op-threads N` | 1 | ONNX session threads. |
 | `--imu-topic NAME` | `/aima/hal/imu/torso/state` | Override IMU topic (e.g. `/aima/hal/imu/torse/state` on firmware shipped with the SDK-example typo). |
+| `--action-clip VAL` | 20.0 | Symmetric per-element clamp on `action_il` after policy inference. Default matches training (`base_env.yaml: action_clip_value`). Going higher lets the policy emit OOD actions whose clipped form is then fed back as `last_action`, which destabilises the next step. |
+| `--max-target-dev RAD` | -1 (off) | Global hard clamp on `\|target − default_angles\|` per joint, in radians. The per-group `--max-target-dev-{leg,waist,arm,head}` flags override this on their respective MJ-index ranges (legs 0..11, waist 12..14, arms 15..28, head 29..30). Tight legs / wide arms is the natural setting for teleop. |
+| `--max-target-dev-{leg,waist,arm,head} RAD` | inherit | Per-group override of `--max-target-dev`. Wins over the global clamp for joints in its group. |
+| `--kp-scale*`, `--kd-scale*` | 1.0 | Multiplicative trim on the codegen'd PD per joint family. See "PD gains and the implicit-PD assumption" above for the per-family knob list and `x2_pd_tuning_with_mc_scan.md` for how to pick values. |
+| `--target-lpf-hz HZ` | 0 (off) | First-order LPF on the target stream after clipping. Tames real-sensor obs noise that doesn't exist in sim. RAMP_OUT and SAFE_HOLD bypass it so they retain their deliberately shaped trajectories. |
+| `--tuning-config PATH` | (off) | YAML preset from `gear_sonic_deploy/configs/real_deploy_tuning/` that encodes a known-good combination of the flags above. Rejected in `sim` mode (would erode bit-exact parity with `eval_x2_mujoco.py`). Explicit CLI flags after the preset still win. |
 
 ## State machine
 

@@ -39,7 +39,8 @@
 #                               just sit at MJCF rest pose. Default OFF
 #                               keeps you on the bare x2_ultra.xml the
 #                               25k checkpoint was trained on.
-#   --robocasa-env ENV          {none, X2PickPlaceCube, X2PickPlaceBowl}
+#   --robocasa-env ENV          {none, X2PickPlaceCube, X2PickPlaceBowl,
+#                                X2PickPlaceApple}
 #                               Default: none. When != none, switches
 #                               both the deploy and the recorder into
 #                               "robocasa scene" mode (G1 architecture):
@@ -154,7 +155,7 @@ esac
 ROBOCASA_SCENE_XML=""
 case "${ROBOCASA_ENV}" in
     none) ;;
-    X2PickPlaceCube|X2PickPlaceBowl)
+    X2PickPlaceCube|X2PickPlaceBowl|X2PickPlaceApple)
         ROBOCASA_SCENE_XML="${REPO_ROOT}/gear_sonic/data/assets/robocasa_scenes/${ROBOCASA_ENV}.xml"
         if [[ ! -f "${ROBOCASA_SCENE_XML}" ]]; then
             echo "Error: scene MJCF for --robocasa-env ${ROBOCASA_ENV}" >&2
@@ -170,7 +171,7 @@ case "${ROBOCASA_ENV}" in
         SIM_OMNIHAND=true
         ;;
     *)
-        echo "Error: --robocasa-env must be one of 'none', 'X2PickPlaceCube', 'X2PickPlaceBowl' (got '${ROBOCASA_ENV}')" >&2
+        echo "Error: --robocasa-env must be one of 'none', 'X2PickPlaceCube', 'X2PickPlaceBowl', 'X2PickPlaceApple' (got '${ROBOCASA_ENV}')" >&2
         exit 1
         ;;
 esac

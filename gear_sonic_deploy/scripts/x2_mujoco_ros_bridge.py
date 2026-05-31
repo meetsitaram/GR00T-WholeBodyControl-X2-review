@@ -847,6 +847,32 @@ class X2MujocoRosBridge:
         self._hand_first_msg_logged = False
         self._hand_msg_count = 0
 
+        # OmniHand diagnostic: every 5 s, log (a) the per-finger ctrl
+        # setpoint we just wrote and (b) the resulting qpos after the
+        # most recent ``mj_step``. Used to diagnose "fingers visually
+        # don't close in robocasa scenes but do close in bare scenes"
+        # bugs by separating recorder/bridge issues from MuJoCo
+        # physics issues:
+        #   * if target == qpos at all steady-state values → bridge
+        #     and physics agree, so any visual mismatch is a render
+        #     or perception issue.
+        #   * if target moves (e.g. up to 1.54) but qpos stays low
+        #     (e.g. ~0.1) → the integrator is unable to reach the
+        #     target. Most common cause is contact (hand fingertips
+        #     touching the table/cube at episode start so the PD
+        #     can't push past), but it could also be solver clamping
+        #     or a kp/forcerange mismatch in the merged scene.
+        #   * if target stays at the rest pose (~0.09) regardless of
+        #     ZMQ input → the SUB thread never updated
+        #     ``self._hand_left_active`` / ``_hand_right_active``,
+        #     i.e. the recorder isn't pushing or the message format
+        #     mismatches.
+        self._hand_diag_last_log_t: float = 0.0
+        # Throttle in seconds; keep aligned with the recorder's
+        # status_log_period_s so the two log streams interleave at
+        # the same cadence and operators can read them as pairs.
+        self._hand_diag_period_s: float = 5.0
+
         # --- Scene reset queue (set by _scene_reset_zmq_thread, drained
         #     by the sim thread). The SUB thread previously wrote
         #     ``mj_data.qpos`` / ``mj_model.body_pos`` directly without
@@ -1057,6 +1083,67 @@ class X2MujocoRosBridge:
             left_active=left,
             right_active=right,
         )
+        self._maybe_log_hand_diag(left=left, right=right)
+
+    def _maybe_log_hand_diag(
+        self,
+        *,
+        left: np.ndarray,
+        right: np.ndarray,
+    ) -> None:
+        """Throttled bridge-side diagnostic for OmniHand command tracking.
+
+        Prints, once every ``_hand_diag_period_s``, the pair
+        ``(ctrl_target, qpos_settled)`` for each of the 10 active
+        fingers per side. The raw values come from the same
+        ``HandQposLayout`` the writer just used, so any mismatch is
+        guaranteed to be physics-side (PD couldn't reach setpoint)
+        and not a layout-routing bug.
+
+        See the constructor for the failure-mode taxonomy this diag
+        is designed to discriminate.
+        """
+        now = time.monotonic()
+        if (now - self._hand_diag_last_log_t) < self._hand_diag_period_s:
+            return
+        self._hand_diag_last_log_t = now
+
+        layout = self._omnihand_layout
+        if layout is None:
+            return
+
+        def _fmt_pair(target: float, settled: float) -> str:
+            return f"({target:+.2f}->{settled:+.2f})"
+
+        for side, active in (("left", left), ("right", right)):
+            qadrs = layout.active_qposadr.get(side) or []
+            actadrs = layout.active_actadr.get(side) or []
+            if not qadrs or not actadrs:
+                # Layout was built without the position actuators
+                # (e.g. the offline qpos-stamp renderer path that
+                # doesn't add ``pos_<joint>``). Diag is meaningless
+                # there because no PD loop is running.
+                continue
+            # Read settled qpos (post mj_step) and the actuator's
+            # last-written ctrl. We could read ``active`` too, but
+            # going through ``mj_data.ctrl[actid]`` proves the value
+            # the integrator actually saw -- if the bridge dropped
+            # the write somewhere, the diag will surface it.
+            try:
+                ctrls = [float(self.mj_data.ctrl[a]) for a in actadrs]
+                qpos = [float(self.mj_data.qpos[q]) for q in qadrs]
+            except (IndexError, TypeError):
+                # Defensive: skip the diag if anything is mid-shape-
+                # change (e.g. the model just got replaced by a
+                # scene_reset). The next tick will retry.
+                return
+            pairs = " ".join(_fmt_pair(c, q) for c, q in zip(ctrls, qpos))
+            self.node.get_logger().info(
+                f"[hand-bridge] {side.upper():<5s} "
+                f"thumb=(roll/abad/mcp) fingers=(idx_mcp/idx_pip"
+                f"/mid_mcp/mid_pip/ring_mcp/ring_pip/pinky_mcp) "
+                f"target->settled: {pairs}"
+            )
 
     def _ensure_pyzmq_in_container(self, *, purpose: str) -> bool:
         """Lazy-install ``pyzmq`` if the container's Python is missing it.

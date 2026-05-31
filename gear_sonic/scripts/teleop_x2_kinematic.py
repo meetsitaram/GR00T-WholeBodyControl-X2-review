@@ -635,6 +635,10 @@ def main(argv: list[str] | None = None) -> int:
         if finger_filter_params is not None else None
     )
 
+    _prev_q3_hand_src_unset = object()
+    prev_q3_l_hand_src: Any = _prev_q3_hand_src_unset
+    prev_q3_r_hand_src: Any = _prev_q3_hand_src_unset
+
     period = 1.0 / max(args.rate, 1e-6)
     next_tick = time.monotonic()
 
@@ -811,14 +815,18 @@ def main(argv: list[str] | None = None) -> int:
                     # in Quest 3 settings, or the hand has briefly left
                     # the camera FOV).
                     #
-                    # IMPORTANT: do NOT gate on ``l_src``. In multimodal
-                    # the WebXR client tags ``source = "controller"``
-                    # because gripSpace wins for IK pose, but the same
-                    # frame still carries XRHand curls + the thumb
-                    # opposition signal. Gating on source kind would
-                    # spuriously route us to the uniform-trigger path
-                    # in multimodal and throw away the per-finger detail
-                    # AND the thumb opposition correction.
+                    # IMPORTANT: do NOT gate XRHand vs controller *dispatch*
+                    # on ``l_src`` alone. In multimodal mode the WebXR client
+                    # tags ``source = "controller"`` because gripSpace wins
+                    # for IK pose, but the same frame can still carry XRHand
+                    # curls + thumb opposition.
+                    #
+                    # DO reset :class:`FingerSignalFilter` when ``l_src`` /
+                    # ``r_src`` *change* (``hand`` <-> ``controller`` /
+                    # ``None``). Otherwise the filter's NaN-holding EMA
+                    # freezes the last XRHand curls while raw ``curls`` are
+                    # ``None`` after returning to controllers-only, and
+                    # trigger/grip never drives ``hand_q`` again.
                     l_curls, r_curls, l_src, r_src = quest.get_hand_curls()
                     l_oppose, r_oppose = quest.get_thumb_opposition()
                     l_finger_tip_oppose, r_finger_tip_oppose = quest.get_finger_tip_oppose()
@@ -833,6 +841,19 @@ def main(argv: list[str] | None = None) -> int:
                     r_finger_tip_oppose_raw = r_finger_tip_oppose
 
                     if finger_filter_left is not None and finger_filter_right is not None:
+                        if (
+                            prev_q3_l_hand_src is not _prev_q3_hand_src_unset
+                            and l_src != prev_q3_l_hand_src
+                        ):
+                            finger_filter_left.reset()
+                        if (
+                            prev_q3_r_hand_src is not _prev_q3_hand_src_unset
+                            and r_src != prev_q3_r_hand_src
+                        ):
+                            finger_filter_right.reset()
+                        prev_q3_l_hand_src = l_src
+                        prev_q3_r_hand_src = r_src
+
                         l_curls, l_oppose, l_finger_tip_oppose = (
                             finger_filter_left.update(
                                 l_curls, l_oppose, l_finger_tip_oppose,

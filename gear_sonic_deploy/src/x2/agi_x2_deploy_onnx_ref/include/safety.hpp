@@ -101,6 +101,97 @@ class TiltWatchdog {
   std::string reason_;
 };
 
+/// Pose-ref starvation watchdog: monitors the age of the most recent ZMQ
+/// pose-reference frame received from the operator-side stack (planner /
+/// recorder / Quest 3 manager) and trips into a *recoverable* idle state
+/// when the wire goes silent for longer than ``stale_threshold_s`` seconds.
+///
+/// Unlike ``TiltWatchdog`` (which is terminal -- once tripped the robot
+/// goes to SAFE_HOLD until the deploy is restarted), this watchdog is
+/// designed for the split-topology deploy where the operator stack runs on
+/// a separate machine and crosses wifi: a transient drop should land the
+/// robot in a safe idle pose (legs locked, default angles, 4x kd) without
+/// shutting down the deploy, and an explicit operator chord on the Quest 3
+/// (delivered out-of-band on a separate ZMQ topic) brings it back online.
+///
+/// State machine on the watchdog side:
+///
+///   not-tripped  --(age >= stale_threshold_s)-->  tripped
+///        ^                                            |
+///        |                                            v
+///   ClearTrip()  <--(operator chord OK AND          ReadyToResume()
+///                    fresh frames flowing >=          returns true after
+///                    min_fresh_window_s)              fresh frames have
+///                                                     been arriving for
+///                                                     ``min_fresh_window_s``
+///                                                     continuously
+///
+/// The min-fresh window prevents a flapping wifi link from re-engaging
+/// CONTROL on a single fresh frame and then immediately starving again
+/// (which would produce repeated SAFE_IDLE entries with full PD ramps in
+/// between -- worse than just holding idle).
+class PoseRefStarvationWatchdog {
+ public:
+  /// @param stale_threshold_s   Pose-ref age (seconds) at which Update()
+  ///                            trips. Typical 0.3-1.0 s on wifi.
+  /// @param min_fresh_window_s  After a trip, ReadyToResume() returns true
+  ///                            only after fresh frames have been arriving
+  ///                            continuously for this long. Typical 0.5-2.0 s.
+  PoseRefStarvationWatchdog(double stale_threshold_s = 0.5,
+                            double min_fresh_window_s = 1.0)
+      : stale_threshold_s_(stale_threshold_s),
+        min_fresh_window_s_(min_fresh_window_s) {}
+
+  void   Reset()        { tripped_ = false; fresh_since_s_ = -1.0; reason_.clear(); }
+  void   ClearTrip()    { tripped_ = false; fresh_since_s_ = -1.0; reason_.clear(); }
+  bool   Tripped()      const { return tripped_; }
+  double StaleThresholdS()  const { return stale_threshold_s_; }
+  double MinFreshWindowS()  const { return min_fresh_window_s_; }
+  const std::string& Reason() const { return reason_; }
+
+  /// Returns true if the watchdog fires ON THIS TICK (transitioned from
+  /// not-tripped to tripped). Subsequent calls return false but Tripped()
+  /// stays true until ClearTrip() (or Reset()).
+  ///
+  /// @param now_s               Current monotonic time (steady_clock).
+  /// @param last_rx_monotonic_s steady_clock time of the most recent ZMQ
+  ///                            frame received. If the wire has never
+  ///                            received a frame, callers should pass a
+  ///                            value <= 0; we treat that as ``age = +inf``
+  ///                            and trip immediately (the deploy is in
+  ///                            split-topology CONTROL state without any
+  ///                            operator-side input, which is unsafe).
+  bool Update(double now_s, double last_rx_monotonic_s);
+
+  /// Returns true when fresh pose-ref frames have been arriving for at
+  /// least ``min_fresh_window_s`` seconds continuously, signalling that
+  /// the operator side is healthy and the deploy can safely re-engage
+  /// CONTROL on receipt of the operator's resume chord.
+  ///
+  /// Must be called every tick (even when not tripped) so the watchdog
+  /// can maintain the fresh-since-when bookkeeping. Returns false when
+  /// not tripped (no need to "resume" if we're already running).
+  ///
+  /// @param now_s    Current monotonic time (steady_clock).
+  /// @param ref_age_s  Pose-ref age (seconds) at this tick.
+  bool ReadyToResume(double now_s, double ref_age_s);
+
+  /// Latest computed pose-ref age. Updated by Update() on every call;
+  /// reported via x2_debug for the operator/forensic tooling.
+  double LatestAgeS() const { return latest_age_s_; }
+
+ private:
+  double      stale_threshold_s_;
+  double      min_fresh_window_s_;
+  bool        tripped_      = false;
+  // Monotonic time when fresh frames started arriving again. -1 = no fresh
+  // frame seen since the last trip (or since startup). Used by
+  // ReadyToResume() to gate exit-from-SAFE_IDLE on a stable wire.
+  double      fresh_since_s_ = -1.0;
+  double      latest_age_s_  = 0.0;
+  std::string reason_;
+};
+
 /// Build the post-safety command for one control tick. Encapsulates the
 /// dry-run / ramp / watchdog interaction so the main loop stays small.
 ///
@@ -108,13 +199,22 @@ class TiltWatchdog {
 /// published by the 500 Hz writer (which simply re-publishes the latest
 /// SafeCommand without modification).
 ///
-/// @param max_target_dev_rad  Per-joint hard clamp on |target - default|.
-///   Applied AFTER the soft-start ramp blend, BEFORE the dry-run gain
-///   zeroing. A non-positive value disables the clamp entirely (back to the
-///   pre-clamp behaviour). Use a small value (e.g. 0.05 rad ~= 3 deg) for the
-///   first powered bring-up runs so a divergent policy or obs-construction
-///   bug cannot drive any joint more than `max_target_dev_rad` away from the
-///   trained standing pose, regardless of what the ONNX session emits.
+/// Two ApplySafetyStack overloads exist:
+///
+///   * Scalar (legacy): one ``max_target_dev_rad`` applied to all 31 DOFs.
+///     Negative value disables the clamp. Kept for callers that don't care
+///     about per-group differentiation.
+///
+///   * Per-DOF (preferred for real-robot deploys): a 31-element array
+///     where ``per_dof[i]`` is the clamp on joint ``i`` (MuJoCo order, see
+///     ``policy_parameters.hpp::mujoco_joint_names``). Entry < 0 disables
+///     the clamp on that joint. Used by ``--max-target-dev-{leg,waist,
+///     arm,head}`` so legs (kp ~99) can be tightly clamped while arms
+///     (kp ~14) get the room they need to reach operator IK targets.
+///
+/// In both cases the clamp is applied AFTER the soft-start ramp blend
+/// and BEFORE the dry-run gain zeroing. Skipped on a tilt-trip because
+/// that branch already pinned the target to ``default_angles``.
 SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
                              double current_gravity_body_z,
                              SoftStartRamp& ramp,
@@ -122,6 +222,39 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
                              bool dry_run,
                              double now_s,
                              double max_target_dev_rad = -1.0);
+
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof);
+
+/// Full-control overload. Same semantics as the per-DOF max_target_dev
+/// variant above, but ALSO takes per-DOF kp / kd arrays instead of using
+/// the trained ``kps`` / ``kds`` from policy_parameters.hpp directly.
+///
+/// Use this overload when the operator wants to bump deployment-time PD
+/// per joint group (e.g. ``--kp-scale-ankle 1.5`` to recover the loop gain
+/// IsaacLab's implicit PD lent training). The values passed here ARE the
+/// final effective gains the safety stack will publish on the bus -- any
+/// per-group scaling should already be folded in by the caller (see
+/// ``BuildPdScalesPerDof`` in x2_deploy_onnx_ref.cpp).
+///
+/// On a tilt-trip the kd part of the returned SafeCommand is still boosted
+/// by 4x (over-damped slump-back), so callers don't need to reproduce that
+/// branch. The dry-run zeroing also still applies AFTER the per-DOF kp/kd
+/// landed, so dry-run + custom gains gives kp=0/kd=0 like before.
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof,
+                             const std::array<double, NUM_DOFS>& kp_per_dof,
+                             const std::array<double, NUM_DOFS>& kd_per_dof);
 
 }  // namespace agi_x2
 

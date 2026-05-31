@@ -93,7 +93,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from gear_sonic.utils.teleop.finger_signal_filter import FingerFilterParams  # noqa: E402
 from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration  # noqa: E402
-from gear_sonic.utils.teleop.vr.button_state_machine import ButtonStateMachine  # noqa: E402
+from gear_sonic.utils.teleop.vr.button_state_machine import (  # noqa: E402
+    ButtonEvents,
+    ButtonStateMachine,
+)
 from gear_sonic.utils.teleop.vr.intent_decoder import (  # noqa: E402
     IntentDecoder,
     LocomotionCmd,
@@ -143,6 +146,42 @@ class ManagerConfig:
     stream_mode_topic: str = "stream_mode"
     recorder_cmd_topic: str = "recorder_cmd"
 
+    # --- Split-topology SAFE_IDLE resume chord (Phase 3a-b) ----------------
+    # PUB socket the deploy on PC2 subscribes to. The manager publishes a
+    # single multipart message [topic, ts_ns_le_i64] whenever the operator
+    # holds A+B (right controller) for >= resume_chord_hold_s seconds with
+    # X+Y not pressed. The chord is recognised across ALL modes because it
+    # operates at the safety layer (operator -> deploy "you can come back"),
+    # not the policy layer.
+    #
+    # Defaults reflect "split topology by default": bind on 0.0.0.0:5566
+    # but DON'T enable the PUB unless explicitly requested via CLI flag.
+    # The wrapper (run_x2_quest3_planner_stack.sh --remote-deploy) sets the
+    # flag automatically; manual launches that want it must pass
+    # ``--resume-pub-enabled``.
+    resume_pub_enabled: bool = False
+    resume_pub_host: str = "*"        # bind address (0.0.0.0 in PUB land)
+    resume_pub_port: int = 5566
+    resume_pub_topic: str = "pose_resume"
+    resume_chord_hold_s: float = 1.0  # hold-duration before first publish
+    resume_chord_rep_s:  float = 0.5  # min republish interval during sustained hold
+
+    # --- Motor monitor SUB (Phase 5c) -------------------------------------
+    # SUB socket connecting to the x2_motor_monitor daemon running in a
+    # tmux session on PC2 (port 5567). Each received message is JSON-
+    # decoded and appended to ``sidecar_log_path`` (the same JSONL the
+    # ``_sidecar_emit`` planner_cmd writer uses) under the key
+    # ``motor_monitor`` so a single grep across the file surfaces both
+    # operator intents and motor-side events on the same timeline.
+    #
+    # Disabled by default; the wrapper flips it on for --remote-deploy
+    # runs with --pc2-host set. No WebXR UX, no terminal tail -- log-only
+    # sink (matches the user's "minimal" preference).
+    motor_monitor_sub_enabled: bool = False
+    motor_monitor_sub_host: str = ""
+    motor_monitor_sub_port: int = 5567
+    motor_monitor_sub_topic: str = "motor_monitor"
+
     # IntentDecoder
     intent_stick_deadzone: float = 0.30
     intent_repeat_interval_s: float = 0.0
@@ -156,6 +195,72 @@ class ManagerConfig:
     # hold the static lean / torso pose without snapping back.
     intent_enable_lean_fwd: bool = False
     intent_enable_torso: bool = False
+    # Continuous waist hold via the right stick: pitch (ry > 0), yaw
+    # (rx). The roll axis was retired in v7.2 (the operator's right
+    # thumb owns the R-stick, leaving A on the same controller
+    # unreachable mid-lean -- so the legacy "A held + rx -> roll"
+    # modifier was a footgun rather than a feature). Default True
+    # because this is the primary VR teleop surface for static reach
+    # now that the planner has STATIC_HOLD wired up. Set False to
+    # fall back to the legacy
+    # discrete soft-band torso bins.
+    intent_enable_continuous_torso: bool = True
+    # ``intent_enable_continuous_locomotion`` (default OFF) flips the
+    # L/R-stick locomotion path from the bucketed
+    # (``fwd_step / back_step / side_* / turn_*``) emit to a single
+    # ``locomotion / continuous`` command carrying raw deadzone-rescaled
+    # stick deflections in ``stick_fwd / stick_side / stick_yaw``. The
+    # kplanner shapes those into a velocity vector for analog control;
+    # the heuristic planner cannot consume the intent and treats it as
+    # idle. ``run_x2_quest3_planner_stack.sh`` flips it ON automatically
+    # when ``--planner kplanner`` is selected.
+    intent_enable_continuous_locomotion: bool = False
+    # Maximum R-stick X amplitude forwarded as ``stick_yaw`` to the
+    # planner. Defaults to 0.5 so full-stick deflection commands HALF
+    # the planner's continuous-mode yaw-rate ceiling; this empirically
+    # matches what the current X2 root-model checkpoint can track
+    # without overshoot. Lives on the teleop side (operator-feel
+    # concern) rather than the planner (which only sees the post-
+    # clamp value and treats it like any other intent). Set to 1.0
+    # to restore the legacy "full stick = full planner ceiling"
+    # mapping for A/B comparison.
+    intent_continuous_yaw_max: float = 0.5
+    # ``intent_loco_decoupled_arms`` (default True) controls whether
+    # the manager signals the recorder to *override* the kplanner's
+    # predicted arm joints with the manager's frozen / IK arm pose
+    # during LOCOMOTION mode.
+    #
+    # TRUE (default) -- current behaviour. Manager publishes
+    # ``arm_targets`` with ``passthrough_arm_targets=False`` every
+    # tick; the recorder applies the operator's last arm pose as a
+    # hard override on the merged ``pose`` stream the deploy
+    # consumes. This is intentional for the ARM_MANIPULATION ->
+    # LOCOMOTION arm-hold workflow: the operator positions the arms
+    # (e.g. holding a tool) in ARM_MAN, toggles to LOCOMOTION to walk
+    # to a new spot, and the arms STAY LOCKED at the manipulation
+    # pose for the duration of the walk instead of swinging back to a
+    # neutral gait pose. Flipping this default to False would silently
+    # break that workflow -- the moment the operator switches from
+    # ARM_MAN to LOCOMOTION, the held pose would dissolve into the
+    # planner's gait swing. Future contributors: do not flip the
+    # default without coordinating with manipulation operators.
+    #
+    # FALSE -- opt-in for *whole-body locomotion* sessions (just
+    # walking around, no payload to hold) and for diagnosing whether
+    # the static-arms override hurts forward-walking quality. When
+    # ``self._intent.mode is StreamMode.LOCOMOTION`` the manager
+    # flips ``passthrough_arm_targets=True`` in the payload, the
+    # recorder nulls its cached arm pose, and the existing
+    # validity gate in the merge step falls through to the planner-
+    # predicted arms (which carry natural gait-coupled swing from the
+    # ``x2_ultra_locowalk`` training corpus). ARM_MAN and OFF still
+    # publish ``passthrough_arm_targets=False`` -- the sentinel is
+    # LOCOMOTION-only so other modes keep today's safety behaviour.
+    #
+    # Wired from CLI ``--loco-decoupled-arms`` /
+    # ``--no-loco-decoupled-arms`` and wrapper env var
+    # ``LOCO_DECOUPLED_ARMS`` (1/0).
+    intent_loco_decoupled_arms: bool = True
     # Per-axis sign flips applied BEFORE the decoder sees the sticks.
     #
     # Operator UX contract: pushing the left stick AWAY from your body
@@ -202,11 +307,40 @@ class ManagerConfig:
     """If set, append one JSONL line per emitted ``planner_cmd`` to this
     file. Useful for post-hoc analysis (which intent fired when)."""
 
-    # Camera cycler (right-stick-click -> Tab to deploy MuJoCo viewer)
+    # Episode lifecycle audio cues
+    recorder_enabled: bool = False
+    """When True, the manager plays the ``record_start`` / ``record_save``
+    headset audio cues on X / Y press in ARM_MANIPULATION. When False
+    (the default, matching ``--teleop-only`` recorder mode), those
+    cues are suppressed so the operator doesn't get a false "Recording."
+    / "Saved." ACK while no parquet is being written.
+
+    The ``recorder_cmd`` ZMQ message is **always** published regardless
+    of this flag: the recorder is the source of truth for whether the
+    save actually landed and logs ``[recorder] [Y] ignored: ...`` when
+    it can't honour the request. This flag only gates the *audio* path,
+    not the wire path, so a future ACK-driven cue (recorder PUBs
+    ``recorder_ack`` -> manager waits before playing) can land
+    incrementally without breaking existing teleop-only sessions.
+
+    The wrapper (``run_x2_quest3_planner_stack.sh``) sets this to True
+    iff ``--with-record`` was passed; manual launches must set it
+    explicitly with ``--recorder-enabled``. Note: this flag still
+    leaves a known footgun -- in ``--with-record`` mode an X press
+    while already recording, or a Y press with no active episode,
+    will fire the cue (the recorder logs ``ignored`` but the manager
+    doesn't see that). Tracked as the "ACK topic" follow-up."""
+
+    # Camera cycler (left-stick-click -> ']' to deploy MuJoCo viewer)
     enable_viewer_camera_cycler: bool = True
-    """When True (default), pressing the right thumbstick click cycles
-    the deploy MuJoCo viewer's fixed cameras via xdotool (Tab). Set
-    to False on headless / CI runs where no GLFW window exists.
+    """When True (default), pressing the LEFT thumbstick click cycles
+    the deploy MuJoCo viewer's fixed cameras via a synthesised ``]``
+    keystroke (xdotool keysym ``bracketright``; that's the next-fixed-
+    camera key in mujoco.viewer.launch_passive). Set to False on
+    headless / CI runs where no GLFW window exists. Pre-v7.1 the
+    binding was on the right click; pre-deploy-test we briefly used
+    ``Tab`` here, but Tab only toggles the viewer's left UI panel and
+    doesn't change cameras.
 
     TODO(unified-vr-input-topic): replace this entire xdotool path with
     a proper ZMQ ``vr_input`` topic that the manager publishes and any
@@ -224,8 +358,8 @@ class ManagerConfig:
     precise way to find the deploy viewer window. WM_CLASS is set
     by GLFW on the application window itself and is NOT inherited
     by the GNOME / mutter compositor's frame wrapper, so this filter
-    avoids the "Tab vanishes into mutter-x11-frames" failure mode
-    we hit before 2026-05-13. Only override if you've rebuilt
+    avoids the "synthetic key vanishes into mutter-x11-frames"
+    failure mode we hit before 2026-05-13. Only override if you've rebuilt
     MuJoCo with a custom WM_CLASS string (very rare)."""
 
     # Misc
@@ -243,8 +377,31 @@ def _default_calibration_path() -> Path:
 
 
 def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
-    """Build the JSON payload the planner's _zmq_command_thread expects."""
-    return json.dumps({"intent": cmd.intent, "magnitude": cmd.magnitude}).encode("utf-8")
+    """Build the JSON payload the planner's _zmq_command_thread expects.
+
+    For ``hold_torso`` commands we also serialize the continuous waist
+    targets; the planner's ``_zmq_command_thread`` reads them as
+    optional fields and feeds them into ``LocomotionCommand.waist_*_deg``.
+    For ``locomotion`` commands (continuous L/R-stick teleop) we
+    serialize the three stick deflections; the kplanner reads them as
+    ``stick_fwd / stick_side / stick_yaw`` and shapes them into a 4-D
+    velocity vector. For every other intent we omit both blocks
+    (defaulting to 0.0 on the receiving end), which keeps wire payloads
+    minimal and matches the pre-v7 wire format.
+    """
+    payload: dict[str, object] = {
+        "intent": cmd.intent,
+        "magnitude": cmd.magnitude,
+    }
+    if cmd.intent == "hold_torso":
+        payload["waist_pitch_deg"] = float(cmd.waist_pitch_deg)
+        payload["waist_roll_deg"] = float(cmd.waist_roll_deg)
+        payload["waist_yaw_deg"] = float(cmd.waist_yaw_deg)
+    elif cmd.intent == "locomotion":
+        payload["stick_fwd"]  = float(cmd.stick_fwd)
+        payload["stick_side"] = float(cmd.stick_side)
+        payload["stick_yaw"]  = float(cmd.stick_yaw)
+    return json.dumps(payload).encode("utf-8")
 
 
 def _recorder_cmd_payload(action: str, tick: int) -> bytes:
@@ -296,14 +453,36 @@ class Quest3ManagerX2:
             repeat_interval_s=cfg.intent_repeat_interval_s,
             enable_lean_fwd=cfg.intent_enable_lean_fwd,
             enable_torso=cfg.intent_enable_torso,
+            enable_continuous_torso=cfg.intent_enable_continuous_torso,
+            enable_continuous_locomotion=cfg.intent_enable_continuous_locomotion,
+            continuous_yaw_max=cfg.intent_continuous_yaw_max,
         )
+        # Latched continuous waist target. Set in two situations:
+        #   1) The operator presses B to flip LOCOMOTION ->
+        #      ARM_MANIPULATION (existing behavior; ARM_MAN is implicitly
+        #      a hold because the right stick is a no-op for waist there).
+        #   2) The operator presses the right thumbstick CLICK while in
+        #      LOCOMOTION (or ARM_MANIPULATION) to toggle ``_waist_frozen``
+        #      ON; the live waist target is captured here so the planner
+        #      can be re-pinned later if needed.
+        # ``None`` means "no latch active" (live stick drives the waist).
+        self._latched_waist: tuple[float, float, float] | None = None
+        # R-thumbstick-click freeze toggle. Independent of mode: a press
+        # in LOCOMOTION freezes the body so the operator can keep
+        # leaning/twisting while walking with the L stick; the freeze
+        # persists across B-press mode flips so the body stays leaned
+        # through ARM_MANIPULATION and back. Toggled off by another
+        # R-click. Reset on any transition to OFF.
+        self._waist_frozen: bool = False
         self._button_sm = ButtonStateMachine(log_prefix="Input")
 
-        # Stick-click rising-edge tracker: the WebXR client polls the
+        # Stick-click rising-edge trackers. The WebXR client polls the
         # gamepad ~50 Hz so a click typically holds True for several
-        # ticks. We only want to fire ``cycle()`` on the press transition
-        # (False -> True), so we mirror the prevState-style detector
-        # ``ButtonStateMachine`` already does for the face buttons.
+        # ticks. We only fire on the press transition (False -> True);
+        # this mirrors the ``ButtonStateMachine`` debounce for the four
+        # face buttons. Left click cycles deploy MuJoCo viewer cameras
+        # (was on right click pre-v7); right click toggles waist freeze.
+        self._prev_left_stick_click = False
         self._prev_right_stick_click = False
 
         # Camera cycler. Always constructed (even when xdotool isn't
@@ -367,9 +546,71 @@ class Quest3ManagerX2:
         if cfg.sidecar_log_path is not None:
             cfg.sidecar_log_path.parent.mkdir(parents=True, exist_ok=True)
             self._sidecar = cfg.sidecar_log_path.open("a", buffering=1)
+            self._sidecar_lock = threading.Lock()
             log.info("sidecar log -> %s", cfg.sidecar_log_path)
         else:
             self._sidecar = None
+            self._sidecar_lock = threading.Lock()
+
+        # --- Resume chord PUB (split-topology safety) ---------------------
+        self._resume_sock = None
+        if cfg.resume_pub_enabled:
+            self._resume_sock = self._ctx.socket(zmq.PUB)
+            self._resume_sock.setsockopt(zmq.LINGER, 0)
+            self._resume_sock.bind(
+                f"tcp://{cfg.resume_pub_host}:{cfg.resume_pub_port}"
+            )
+            log.info(
+                "[safety] pose_resume PUB bound at tcp://%s:%d (topic=%s) -- "
+                "operator chord A+B held for >=%.1fs republishes every %.2fs.",
+                cfg.resume_pub_host, cfg.resume_pub_port, cfg.resume_pub_topic,
+                cfg.resume_chord_hold_s, cfg.resume_chord_rep_s,
+            )
+        # Chord-hold state. ``_resume_chord_active_since`` is the
+        # monotonic timestamp when A+B (without X+Y) was first seen;
+        # cleared the moment the chord breaks. ``_resume_last_pub`` is
+        # the last time we published a pose_resume frame (used to limit
+        # republish rate while the operator continues to hold the chord).
+        # ``_resume_press_count`` is for diagnostics on the periodic log line.
+        self._resume_chord_active_since: Optional[float] = None
+        self._resume_last_pub: float = -1.0
+        self._resume_press_count: int = 0
+
+        # --- Motor monitor SUB (Phase 5c forensic sidecar) ---------------
+        self._motor_monitor_sock = None
+        self._motor_monitor_thread = None
+        self._motor_monitor_msg_count = 0
+        if cfg.motor_monitor_sub_enabled and cfg.motor_monitor_sub_host:
+            try:
+                self._motor_monitor_sock = self._ctx.socket(zmq.SUB)
+                self._motor_monitor_sock.setsockopt(zmq.LINGER, 0)
+                self._motor_monitor_sock.setsockopt(zmq.RCVHWM, 10)
+                self._motor_monitor_sock.setsockopt_string(
+                    zmq.SUBSCRIBE, cfg.motor_monitor_sub_topic,
+                )
+                self._motor_monitor_sock.connect(
+                    f"tcp://{cfg.motor_monitor_sub_host}:{cfg.motor_monitor_sub_port}"
+                )
+                self._motor_monitor_thread = threading.Thread(
+                    target=self._motor_monitor_loop,
+                    name="motor_monitor_sub",
+                    daemon=True,
+                )
+                self._motor_monitor_thread.start()
+                log.info(
+                    "[safety] motor_monitor SUB connected to tcp://%s:%d "
+                    "(topic=%s). Each message appended to sidecar JSONL.",
+                    cfg.motor_monitor_sub_host, cfg.motor_monitor_sub_port,
+                    cfg.motor_monitor_sub_topic,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[safety] failed to start motor_monitor SUB on "
+                    "tcp://%s:%d: %s. Sidecar will not record motor-side events.",
+                    cfg.motor_monitor_sub_host, cfg.motor_monitor_sub_port, exc,
+                )
+                self._motor_monitor_sock = None
+                self._motor_monitor_thread = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -411,6 +652,21 @@ class Quest3ManagerX2:
             self._recorder_sock.close(linger=0)
         except Exception:
             pass
+        if self._motor_monitor_sock is not None:
+            try:
+                self._motor_monitor_sock.close(linger=0)
+            except Exception:
+                pass
+        if self._motor_monitor_thread is not None:
+            try:
+                self._motor_monitor_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._resume_sock is not None:
+            try:
+                self._resume_sock.close(linger=0)
+            except Exception:
+                pass
         if self._sidecar is not None:
             try:
                 self._sidecar.close()
@@ -438,6 +694,15 @@ class Quest3ManagerX2:
             "invert_rx=%s invert_ry=%s (push --no-invert-ly etc. to flip)",
             self._cfg.invert_lx, self._cfg.invert_ly,
             self._cfg.invert_rx, self._cfg.invert_ry,
+        )
+        log.info(
+            "[manager-x2] recorder audio cues: %s "
+            "(controlled by --recorder-enabled / --no-recorder-enabled; "
+            "the wrapper sets it to ON iff --with-record was passed). "
+            "When OFF, X/Y in ARM_MAN still publish recorder_cmd but "
+            "skip the 'Recording.' / 'Saved.' headset cue so the "
+            "operator doesn't get a false ACK in --teleop-only runs.",
+            "ON" if self._cfg.recorder_enabled else "OFF",
         )
 
         try:
@@ -472,11 +737,36 @@ class Quest3ManagerX2:
                 wait_logged = False
 
                 ev = self._button_sm.tick(*buttons)
+                a_held, _b_held, x_held, y_held = buttons
+
+                # Split-topology SAFE_IDLE resume: A+B (without X+Y) held
+                # for >= resume_chord_hold_s. No-op unless --resume-pub-enabled.
+                self._tick_resume_chord(buttons, tick_now)
+
+                # Live continuous waist target derived from the right
+                # stick. We compute this BEFORE the mode transition
+                # handler so a B-press into ARM_MANIPULATION can latch
+                # exactly the pose the operator was holding at the
+                # moment of the press, rather than the pose from the
+                # previous tick (which would drift by up to one 50 Hz
+                # interval). The continuous target is well-defined in
+                # any mode (it's a pure function of stick state) but
+                # only consumed on the LOCOMOTION -> ARM_MANIPULATION
+                # transition. v7.2: A-modifier removed from the waist
+                # path (right-thumb ergonomics; see decoder docstring).
+                live_waist_target = self._intent.continuous_waist_target(
+                    rx=rx, ry=ry,
+                )
 
                 # 1) Mode transitions ---------------------------------------
                 transition = self._intent.update_mode(ev, now=tick_now)
                 if transition is not None:
-                    self._on_mode_transition(transition, vr_pose=vr_pose, tick=tick)
+                    self._on_mode_transition(
+                        transition,
+                        vr_pose=vr_pose,
+                        tick=tick,
+                        live_waist_target=live_waist_target,
+                    )
 
                 # 2) Operator-facing UX hint: in OFF mode, A/B/X/Y by
                 #    themselves do nothing useful. Print a one-shot hint
@@ -529,21 +819,23 @@ class Quest3ManagerX2:
                 # delete the latest parquet/mp4 if you need to drop a
                 # bad episode -- the recorder still understands the
                 # 'discard' wire action if we re-bind it later).
-                in_arm_man = self._intent.mode == StreamMode.ARM_MANIPULATION
-                if in_arm_man and ev.x_pressed:
-                    log.info("[X] start episode forwarded to recorder")
-                    self._publish_recorder_cmd("start", tick)
-                    self._play_audio_prompt("record_start", fallback="Recording.")
-                if in_arm_man and ev.y_pressed:
-                    log.info("[Y] save episode forwarded to recorder")
-                    self._publish_recorder_cmd("save", tick)
-                    self._play_audio_prompt("record_save", fallback="Saved.")
+                self._handle_episode_buttons(ev, tick)
 
-                # 4b) Camera cycler (right thumbstick click) --------------
-                #     Cycles the deploy MuJoCo viewer's fixed cameras
-                #     by synthesising a Tab keypress on the GLFW window
-                #     via xdotool. Active in LOCOMOTION + ARM_MAN, idle
-                #     in OFF (consistent with the rest of the manager:
+                # 4b) Stick clicks ------------------------------------------
+                #     LEFT thumbstick click  -> cycle deploy MuJoCo viewer
+                #         cameras (xdotool ']' keypress -- mujoco's
+                #         next-fixed-camera key). Pre-v7 this was
+                #         the right click; moved here so the operator can
+                #         keep their right thumb on the lean / twist stick
+                #         while clicking the LEFT stick to re-frame.
+                #     RIGHT thumbstick click -> toggle ``_waist_frozen``.
+                #         While frozen, the right stick is suppressed for
+                #         waist control: the planner stays in STATIC_HOLD
+                #         at the pose the operator was holding when the
+                #         click landed. Another R-click releases it.
+                #
+                #     Both are active in LOCOMOTION + ARM_MAN, idle in
+                #     OFF (consistent with the rest of the manager:
                 #     OFF means "ignore controller events"). Rising-edge
                 #     tracked manually because ButtonStateMachine only
                 #     handles the four face buttons today.
@@ -552,25 +844,52 @@ class Quest3ManagerX2:
                 # publishes a unified ``vr_input`` ZMQ topic carrying
                 # the full controller state, the deploy viewer should
                 # subscribe directly and update mjvCamera in-process,
-                # making this xdotool hack unnecessary. See
+                # making the xdotool hack unnecessary. See
                 # ViewerCameraCycler.__doc__ for the rationale.
-                _l_click, r_click = self._quest.get_stick_clicks()
+                l_click, r_click = self._quest.get_stick_clicks()
+                l_click_edge = l_click and not self._prev_left_stick_click
                 r_click_edge = r_click and not self._prev_right_stick_click
+                self._prev_left_stick_click = l_click
                 self._prev_right_stick_click = r_click
-                if (
-                    r_click_edge
-                    and self._intent.mode != StreamMode.OFF
-                    and self._viewer_cycler is not None
-                ):
-                    if self._viewer_cycler.cycle():
-                        log.info("[R-click] cycled deploy viewer camera (Tab)")
+                if l_click_edge and self._intent.mode != StreamMode.OFF:
+                    # ALWAYS log the rising edge so we can tell whether
+                    # the L-click event reached the manager at all,
+                    # even when the cycler is disabled or fails. The
+                    # cycler itself does its own one-shot WARN on the
+                    # first failure (missing xdotool / DISPLAY / no
+                    # MuJoCo window) and a periodic re-warn after that
+                    # so a long session doesn't go silent if the viewer
+                    # gets restarted under us. Crucial for diagnosing
+                    # "I pressed the stick but nothing happened":
+                    # without this line you can't tell stick-not-
+                    # detected from cycler-failed-silently.
+                    if self._viewer_cycler is None:
+                        log.info(
+                            "[L-click] camera cycler disabled "
+                            "(--no-viewer-camera-cycler); ignoring."
+                        )
+                    else:
+                        ok = self._viewer_cycler.cycle()
+                        log.info(
+                            "[L-click] camera cycle: %s",
+                            "ok ('%s' dispatched to deploy viewer)" % (
+                                self._viewer_cycler.CYCLE_KEYSYM,
+                            )
+                            if ok
+                            else "no-op (cooldown or xdotool/window "
+                            "unavailable; see preceding [viewer-cycler] "
+                            "warning for the specific reason)",
+                        )
+                if r_click_edge and self._intent.mode != StreamMode.OFF:
+                    self._toggle_waist_freeze(live_waist_target)
 
                 # 3) Locomotion command ---------------------------------------
                 # Held-button modifiers (LOCOMOTION-only via decoder
                 # short-circuit). A held + ly = continuous walk;
                 # X held + rx = 90° turn. Y held was crouch; currently
-                # gated off in IntentDecoder.
-                a_held, _b_held, x_held, y_held = buttons
+                # gated off in IntentDecoder. Buttons already destructured
+                # above so the live_waist_target sample agrees with the
+                # decoder's view of the held modifiers.
                 cmd = self._intent.decode_locomotion(
                     lx=lx, ly=ly, rx=rx, ry=ry,
                     y_held=(y_held and self._intent.mode == StreamMode.LOCOMOTION),
@@ -579,15 +898,27 @@ class Quest3ManagerX2:
                     now=tick_now,
                 )
                 if cmd is not None:
-                    self._publish_planner_cmd(cmd)
-                    self._sidecar_emit(cmd, tick)
+                    # Drop live ``hold_torso`` updates while the operator
+                    # has the waist frozen (R-click toggle). The planner
+                    # stays in STATIC_HOLD at its current target because
+                    # no new hold_torso commands arrive; non-hold commands
+                    # (walk / turn / idle) still flow through so the
+                    # operator can keep walking with the body leaned.
+                    if self._waist_frozen and cmd.intent == "hold_torso":
+                        pass
+                    else:
+                        self._publish_planner_cmd(cmd)
+                        self._sidecar_emit(cmd, tick)
 
-                # In ARM_MANIPULATION we keep the planner held at idle by
-                # emitting an idle command on entry (handled in the mode
-                # transition); we do NOT emit one per tick here because
-                # the planner's queue dedupes anyway and we want to leave
-                # bandwidth for the operator to flip back to LOCOMOTION
-                # without a stale walk command lurking in the queue.
+                # In ARM_MANIPULATION the per-tick decoder output above
+                # is whatever ``hold_torso`` target the right stick is
+                # currently demanding (or None if the operator is
+                # pushing the L-stick / hard R-stick, both of which the
+                # decoder filters out in ARM_MAN). The B-press into
+                # ARM_MAN handler already emitted a one-shot
+                # ``hold_torso(latched)`` so the planner is in
+                # STATIC_HOLD with no jump on entry; subsequent ticks
+                # just slew the target via the same path.
 
                 # 4) Retargeting ---------------------------------------------
                 # We RUN the retargeter every tick (even in LOCOMOTION
@@ -649,7 +980,7 @@ class Quest3ManagerX2:
         vr_pose: np.ndarray,
         triggers: tuple[float, float, float, float],
     ) -> RetargetTickInput:
-        l_curls, r_curls, _l_src, _r_src = self._quest.get_hand_curls()
+        l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
         l_oppose, r_oppose = self._quest.get_thumb_opposition()
         l_tip, r_tip = self._quest.get_finger_tip_oppose()
         return RetargetTickInput(
@@ -661,7 +992,49 @@ class Quest3ManagerX2:
             right_thumb_oppose=None if r_oppose is None else float(r_oppose),
             left_finger_tip_oppose=l_tip,
             right_finger_tip_oppose=r_tip,
+            left_hand_source=l_src,
+            right_hand_source=r_src,
         )
+
+    def _toggle_waist_freeze(
+        self,
+        live_waist_target: tuple[float, float, float],
+    ) -> None:
+        """R-thumbstick-click handler: toggle waist freeze on/off.
+
+        On freeze ON: the live waist target at the moment of click is
+        captured into ``_latched_waist`` so subsequent code paths (e.g.
+        a B-press into ARM_MANIPULATION while frozen) source the
+        latched pose instead of resampling. The decoder keeps emitting
+        ``hold_torso`` updates internally, but the manager suppresses
+        them at publish time (see the ``_waist_frozen`` check in the
+        main loop), so the planner stays at its current STATIC_HOLD
+        target even as the operator's right stick drifts.
+
+        On freeze OFF: ``_latched_waist`` is cleared and the suppression
+        lifts. The next decoder tick re-emits the live target, so the
+        planner blends to whatever the operator is now holding (or to
+        neutral, if the stick is centered).
+        """
+        if self._waist_frozen:
+            self._waist_frozen = False
+            self._latched_waist = None
+            log.info("[R-click] waist freeze -> RELEASED")
+            self._play_audio_prompt(
+                "torso_released", fallback="Torso released.",
+            )
+        else:
+            pitch, roll, yaw = live_waist_target
+            self._waist_frozen = True
+            self._latched_waist = (pitch, roll, yaw)
+            log.info(
+                "[R-click] waist freeze -> FROZEN at "
+                "pitch=%+.1f roll=%+.1f yaw=%+.1f",
+                pitch, roll, yaw,
+            )
+            self._play_audio_prompt(
+                "torso_frozen", fallback="Torso frozen.",
+            )
 
     def _on_mode_transition(
         self,
@@ -669,6 +1042,7 @@ class Quest3ManagerX2:
         *,
         vr_pose: np.ndarray,
         tick: int,
+        live_waist_target: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         log.info("[manager-x2] mode %s -> %s", transition.previous.name, transition.current.name)
         # Re-arm the OFF-mode hint so it fires once again on next entry
@@ -678,15 +1052,120 @@ class Quest3ManagerX2:
         # planner clears any stale queue entries and goes to idle_stand.
         if transition.previous == StreamMode.OFF:
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
-        # When entering ARM_MANIPULATION we tell the planner to idle so
-        # the lower body holds the trained stand pose while we drive arms.
-        if transition.current == StreamMode.ARM_MANIPULATION:
+            # Snap the arm + hand freeze caches back to neutral so the
+            # very next arm_targets / hand_finger_cmd publish carries a
+            # clean default pose. Without this, OFF held the LAST
+            # commanded arm + hand targets from the prior session (eg.
+            # mid-grasp, wrist twisted from a manipulation pose), and
+            # re-entering LOCOMOTION via A+B+X+Y would continue to
+            # publish that stale pose. The deploy's wrist-bypass=ik
+            # would then drive the wrist motors to those stale IK
+            # values -- they'd "stick" wherever the prior run left
+            # them, even though the operator just engaged a fresh
+            # session. Reset gives a predictable starting position
+            # (X2 neutral stand-pose arms, fingers fully open) before
+            # the operator presses B->ARM and A->engage to start
+            # actively teleoperating.
+            #
+            # Safety: the C++ deploy slews PD targets via its soft-
+            # start ramp + per-tick step clamp, so this neutral target
+            # blends in smoothly rather than commanding an instant jump.
+            self._frozen_left_arm_q = self._retargeter._teleop.left_neutral_q
+            self._frozen_right_arm_q = self._retargeter._teleop.right_neutral_q
+            self._frozen_left_hand_q = np.zeros(10, dtype=np.float64)
+            self._frozen_right_hand_q = np.zeros(10, dtype=np.float64)
+            log.info(
+                "[manager-x2] OFF -> %s: snap arm + hand freeze to neutral "
+                "(arms=X2 stand pose, fingers=open)",
+                transition.current.name,
+            )
+
+        # ----- LOCOMOTION <-> ARM_MANIPULATION transitions ---------------
+        # Going INTO ARM_MANIPULATION: latch whatever pitch / roll / yaw
+        # the operator was holding via the right stick at the moment of
+        # B-press, and pin the planner's STATIC_HOLD to that pose. This
+        # mirrors the existing arm-latch on the reverse transition: the
+        # operator picks an upper-body pose in LOCOMOTION, B-clicks into
+        # ARM_MANIPULATION, then drives arms via VR IK while the lower
+        # body stays at the chosen lean / twist for extra reach.
+        #
+        # Going OUT of ARM_MANIPULATION (back to LOCOMOTION): clear the
+        # latch and emit a single idle cmd so the planner cleanly
+        # blends out of STATIC_HOLD; subsequent ticks resume normal
+        # continuous emission from the right stick.
+        if (
+            transition.previous == StreamMode.LOCOMOTION
+            and transition.current == StreamMode.ARM_MANIPULATION
+        ):
+            # Source the latch from whichever target is currently
+            # authoritative: if the operator already R-clicked to freeze
+            # in LOCOMOTION, use the frozen pose (so the B-press doesn't
+            # snap to a slightly different live sample). Otherwise, take
+            # the live continuous target as today.
+            if self._waist_frozen and self._latched_waist is not None:
+                pitch, roll, yaw = self._latched_waist
+            else:
+                pitch, roll, yaw = live_waist_target
+                self._latched_waist = (pitch, roll, yaw)
+            self._publish_planner_cmd(
+                LocomotionCmd(
+                    intent="hold_torso",
+                    magnitude="continuous",
+                    waist_pitch_deg=pitch,
+                    waist_roll_deg=roll,
+                    waist_yaw_deg=yaw,
+                )
+            )
+            self._retargeter.reset_finger_filter()
+            log.info(
+                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f"
+                "%s",
+                pitch, roll, yaw,
+                " (R-click freeze active)" if self._waist_frozen else "",
+            )
+            # Audio cue: separate "torso_locked" prompt only when the
+            # latched pose is meaningfully non-neutral (>= 1 deg on
+            # any axis). For neutral poses the standard
+            # "mode_arm_manipulation" cue below covers it.
+            if max(abs(pitch), abs(roll), abs(yaw)) >= 1.0:
+                self._play_audio_prompt(
+                    "mode_torso_locked", fallback="Torso locked.",
+                )
+        elif (
+            transition.previous == StreamMode.ARM_MANIPULATION
+            and transition.current == StreamMode.LOCOMOTION
+        ):
+            # If the operator R-click-froze the waist before / during
+            # ARM_MANIPULATION, KEEP the freeze across the transition
+            # back to LOCOMOTION: don't clear ``_latched_waist`` and
+            # don't blow the planner's STATIC_HOLD away with an idle
+            # cmd. The operator can now walk / turn with the L stick
+            # while the body stays at the locked pose. R-click again
+            # to release. If the freeze flag is OFF, fall through to
+            # the legacy release-into-idle path so the body smoothly
+            # blends back to standing.
+            if self._waist_frozen and self._latched_waist is not None:
+                log.info(
+                    "[manager-x2] ARM->LOCO with R-click freeze active; "
+                    "keeping STATIC_HOLD at latched pose"
+                )
+            else:
+                self._latched_waist = None
+                self._publish_planner_cmd(LocomotionCmd("idle", "default"))
+        elif transition.current == StreamMode.ARM_MANIPULATION:
+            # Reached ARM_MANIPULATION not via LOCOMOTION (e.g. would
+            # only happen if a future chord adds a direct OFF -> ARM
+            # path). Keep the legacy "planner idles" semantics.
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
             self._retargeter.reset_finger_filter()
+
         # On leaving an active mode -> OFF: tell the recorder to drop
         # any in-progress episode (this is a hard E-stop semantic;
-        # operator can re-arm and start fresh).
+        # operator can re-arm and start fresh). Also drop the R-click
+        # freeze so the next engagement starts with a clean slate.
         if transition.current == StreamMode.OFF and transition.previous != StreamMode.OFF:
+            self._latched_waist = None
+            self._waist_frozen = False
             self._publish_planner_cmd(LocomotionCmd("idle", "default"))
             self._publish_recorder_cmd("estop", tick)
 
@@ -729,10 +1208,28 @@ class Quest3ManagerX2:
         is_engaged: bool,
         tick: int,
     ) -> None:
+        # ``passthrough_arm_targets`` is the recorder-side sentinel
+        # introduced for the LOCO_DECOUPLED_ARMS=0 path: True means
+        # "treat this message as 'no operator arm override', let the
+        # planner's predicted arms flow through the merge". Computed
+        # here (and not at the call sites) so the same merge-mode is
+        # applied consistently to every publish, including the
+        # frozen-arms repeat publishes that the LOCOMOTION-mode
+        # safety path emits at idle.
+        #
+        # Guarded on ``StreamMode.LOCOMOTION`` so ARM_MAN and OFF
+        # always keep the legacy real-arms-override path (ARM_MAN
+        # operator IK MUST win for manipulation; OFF preserves the
+        # last-known safety pose held in the recorder cache).
+        passthrough_arm_targets = (
+            (not self._cfg.intent_loco_decoupled_arms)
+            and (self._intent.mode is StreamMode.LOCOMOTION)
+        )
         payload = {
             "left_q_rad": np.asarray(left, dtype=np.float32).tolist(),
             "right_q_rad": np.asarray(right, dtype=np.float32).tolist(),
             "is_engaged": bool(is_engaged),
+            "passthrough_arm_targets": bool(passthrough_arm_targets),
             "tick": int(tick),
             "ts": time.time(),
         }
@@ -800,6 +1297,48 @@ class Quest3ManagerX2:
         except zmq.Again:
             pass
 
+    def _handle_episode_buttons(self, ev: ButtonEvents, tick: int) -> None:
+        """Translate X / Y rising edges in ARM_MANIPULATION into recorder
+        commands and (optionally) headset audio cues.
+
+        Splits cleanly into wire path + audio path:
+
+        - **Wire** (always fires when the chord is right): publish a
+          ``recorder_cmd`` so the recorder can decide to honour or
+          ignore the action. Same in ``--with-record`` and
+          ``--teleop-only`` -- the recorder is the source of truth.
+        - **Audio** (gated on ``self._cfg.recorder_enabled``): play
+          the ``record_start`` / ``record_save`` headset cue. When
+          disabled, no cue plays so the operator doesn't get a false
+          ACK in teleop-only sessions where no parquet is being
+          written. Known footgun (still): in ``--with-record`` the
+          cue still plays on X-while-recording / Y-with-no-episode
+          because the manager has no ACK channel from the recorder.
+          Tracked as the "recorder ACK topic" follow-up; the gate
+          covers the most common foot-shoot (operator forgets the
+          ``--with-record`` flag and trusts the headset).
+
+        Args:
+            ev: Rising-edge button events for this tick.
+            tick: Current tick index, stamped into the ZMQ payload.
+        """
+        if self._intent.mode != StreamMode.ARM_MANIPULATION:
+            return
+        if ev.x_pressed:
+            log.info("[X] start episode forwarded to recorder")
+            self._publish_recorder_cmd("start", tick)
+            if self._cfg.recorder_enabled:
+                self._play_audio_prompt(
+                    "record_start", fallback="Recording.",
+                )
+        if ev.y_pressed:
+            log.info("[Y] save episode forwarded to recorder")
+            self._publish_recorder_cmd("save", tick)
+            if self._cfg.recorder_enabled:
+                self._play_audio_prompt(
+                    "record_save", fallback="Saved.",
+                )
+
     def _play_audio_prompt(
         self, key: str, *, fallback: Optional[str] = None,
     ) -> None:
@@ -835,7 +1374,156 @@ class Quest3ManagerX2:
             "magnitude": cmd.magnitude,
             "stream_mode": self._intent.mode.name,
         }
-        self._sidecar.write(json.dumps(rec) + "\n")
+        self._sidecar_write(rec)
+
+    def _sidecar_write(self, rec: dict) -> None:
+        """Thread-safe append to the manager sidecar JSONL.
+
+        Used by ``_sidecar_emit`` (called from the 50 Hz main loop) AND by
+        ``_motor_monitor_loop`` (background SUB thread). Without the lock
+        a half-written line from one writer can be interleaved with a
+        line from the other, breaking JSONL parsers downstream.
+        """
+        if self._sidecar is None:
+            return
+        try:
+            line = json.dumps(rec) + "\n"
+            with self._sidecar_lock:
+                self._sidecar.write(line)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[sidecar] write failed: %s", exc)
+
+    # -- resume chord (split-topology safety) --------------------------------
+
+    def _tick_resume_chord(self, buttons: tuple[bool, bool, bool, bool],
+                           now_mono: float) -> None:
+        """Detect A+B held >= ``resume_chord_hold_s`` and PUB pose_resume.
+
+        Triggered every 50 Hz tick. Disambiguation rules (chosen to avoid
+        colliding with the existing A+B+X+Y "engage" chord):
+
+          * Requires A AND B held simultaneously.
+          * Requires X AND Y NOT held (the engage chord includes both).
+          * Requires continuous hold for ``resume_chord_hold_s`` seconds
+            before the FIRST publish lands (default 1.0 s -- longer than
+            any typical button press).
+          * Sustained holds republish every ``resume_chord_rep_s`` seconds
+            so a brief packet drop on wifi doesn't strand the deploy in
+            SAFE_IDLE waiting for a frame that already passed.
+
+        Chord lifecycle log lines fire only on rising edge (transitioning
+        from "no chord" to "chord active") and on the first successful
+        publish, to keep the per-tick log noise out of the steady state.
+        """
+        if self._resume_sock is None:
+            return
+        a_held, b_held, x_held, y_held = buttons
+        chord_now = a_held and b_held and (not x_held) and (not y_held)
+        if not chord_now:
+            self._resume_chord_active_since = None
+            return
+        if self._resume_chord_active_since is None:
+            self._resume_chord_active_since = now_mono
+            log.debug("[safety] A+B chord rising edge; counting hold...")
+            return
+        held = now_mono - self._resume_chord_active_since
+        if held < self._cfg.resume_chord_hold_s:
+            return
+        if (self._resume_last_pub > 0.0
+                and (now_mono - self._resume_last_pub) < self._cfg.resume_chord_rep_s):
+            return
+        # Publish the resume frame. Payload is the publisher-side
+        # monotonic ns timestamp (cosmetic only -- the deploy stamps its
+        # own steady_clock on receipt for freshness calculations, see
+        # ZmqResumeSubscriber).
+        try:
+            ts_ns = int(time.monotonic_ns())
+            payload = ts_ns.to_bytes(8, byteorder="little", signed=False)
+            self._resume_sock.send_multipart(
+                [self._cfg.resume_pub_topic.encode("utf-8"), payload]
+            )
+            self._resume_last_pub = now_mono
+            self._resume_press_count += 1
+            if self._resume_press_count == 1 or self._resume_press_count % 10 == 0:
+                log.info(
+                    "[safety] published pose_resume (press #%d, held %.2fs).",
+                    self._resume_press_count, held,
+                )
+            self._sidecar_write({
+                "ts": time.time(),
+                "_kind": "resume_chord",
+                "press_count": self._resume_press_count,
+                "held_s": held,
+            })
+            # One-shot audio cue for operator feedback. Suppressed when
+            # the headset isn't connected (the helper is best-effort).
+            self._play_audio_prompt(
+                "resume_published",
+                fallback="Resume sent.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[safety] pose_resume send failed: %s", exc)
+
+    # -- motor monitor SUB (background JSONL appender) -----------------------
+
+    def _motor_monitor_loop(self) -> None:
+        """Background loop draining the motor_monitor SUB into the sidecar.
+
+        Each received frame is a multipart message [topic_bytes, json_bytes]
+        where ``json_bytes`` is the UTF-8 JSON the ``x2_motor_monitor.py``
+        daemon emits. We decode and append it under the ``motor_monitor``
+        key so a single grep "motor_monitor" across the sidecar surfaces
+        all motor-side events that landed during the session.
+
+        Errors are logged at WARN once (subsequent failures are debug-
+        suppressed via ``_motor_monitor_err_logged``) -- a flaky connection
+        should NOT spam the operator's terminal.
+        """
+        err_logged = False
+        sock = self._motor_monitor_sock
+        if sock is None:
+            return
+        # Internal poller for short non-blocking waits; lets stop() join
+        # within ~200 ms even if the publisher is silent.
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        while not self._stop.is_set():
+            try:
+                events = dict(poller.poll(200))
+                if sock not in events:
+                    continue
+                parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+                if len(parts) < 2:
+                    continue
+                topic = parts[0].decode("utf-8", errors="replace")
+                payload_bytes = parts[1]
+                try:
+                    payload = json.loads(payload_bytes.decode("utf-8"))
+                except Exception:
+                    payload = {"_decode_error": True,
+                               "raw_len": len(payload_bytes)}
+                self._motor_monitor_msg_count += 1
+                self._sidecar_write({
+                    "ts": time.time(),
+                    "_kind": "motor_monitor",
+                    "topic": topic,
+                    "motor_monitor": payload,
+                })
+                if self._motor_monitor_msg_count == 1:
+                    log.info(
+                        "[safety] motor_monitor: first message received "
+                        "(topic=%s, %d bytes).",
+                        topic, len(payload_bytes),
+                    )
+            except zmq.Again:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not err_logged:
+                    log.warning(
+                        "[safety] motor_monitor receive error: %s. "
+                        "Subsequent errors suppressed.", exc,
+                    )
+                    err_logged = True
 
     @staticmethod
     def _sleep_until(deadline_mono: float) -> None:
@@ -899,6 +1587,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-enable torso_left_30deg / torso_right_30deg on soft "
              "R-stick L/R (off by default; bin currently snaps back)",
     )
+    # Continuous-locomotion: forwards raw stick deflections as
+    # ``locomotion / continuous`` instead of bucketing to fwd_step /
+    # back_step / side_* / turn_*. Off by default for back-compat
+    # with the heuristic planner; the kplanner wrapper flips it on.
+    p.add_argument(
+        "--enable-continuous-locomotion",
+        dest="enable_continuous_locomotion", action="store_true",
+        default=False,
+        help="Emit locomotion/continuous (analog stick deflection) "
+             "instead of fwd_step / back_step / side_* / turn_*. "
+             "Required for analog kplanner control; the heuristic "
+             "planner ignores the intent.",
+    )
+    p.add_argument(
+        "--no-enable-continuous-locomotion",
+        dest="enable_continuous_locomotion", action="store_false",
+        help="Force-disable continuous-locomotion (keeps bucketed "
+             "fwd_step / turn_* even when paired with the kplanner). "
+             "Useful for ablation / regression runs.",
+    )
+    p.add_argument(
+        "--continuous-yaw-max",
+        dest="continuous_yaw_max", type=float, default=0.5,
+        help="Maximum R-stick X amplitude forwarded as stick_yaw to "
+             "the planner in continuous-locomotion mode. Range (0, "
+             "1]; default 0.5 commands HALF the planner's continuous "
+             "yaw ceiling at full stick. Lower for gentler turns, "
+             "1.0 to restore the legacy 'full stick = full ceiling' "
+             "mapping. Bucketed turn_left / turn_right are unaffected.",
+    )
+    p.add_argument(
+        "--loco-decoupled-arms",
+        dest="loco_decoupled_arms", action="store_true",
+        default=True,
+        help="LOCOMOTION-mode arms behaviour. TRUE (default): manager "
+             "publishes the operator's last arm pose every tick and "
+             "the recorder overrides the planner's predicted arms with "
+             "it; required for the ARM_MAN -> LOCOMOTION arm-hold "
+             "workflow (e.g. walking while holding a tool). FALSE: "
+             "in LOCOMOTION the manager flags ``passthrough_arm_targets="
+             "True`` so the recorder falls through to planner-"
+             "predicted arms (natural gait-coupled swing from the "
+             "training corpus). ARM_MAN and OFF are unaffected. "
+             "Wrapper env var: LOCO_DECOUPLED_ARMS=1/0.",
+    )
+    p.add_argument(
+        "--no-loco-decoupled-arms",
+        dest="loco_decoupled_arms", action="store_false",
+        help="Opt-in: let planner-predicted arms flow through to the "
+             "deploy during LOCOMOTION (whole-body walking). Breaks "
+             "the manipulation arm-hold workflow; use only when you "
+             "are NOT carrying a payload between manipulation spots. "
+             "Same as wrapper env var LOCO_DECOUPLED_ARMS=0.",
+    )
 
     # Stick polarity (axis sign flips applied before the decoder).
     # All default to False: the operator-facing UX of "push the stick
@@ -940,7 +1682,80 @@ def _build_parser() -> argparse.ArgumentParser:
     # Sidecar
     p.add_argument(
         "--sidecar-log", type=Path, default=None,
-        help="Path to write a JSONL sidecar of emitted planner_cmds",
+        help=(
+            "Path to write a JSONL sidecar of emitted planner_cmds. When "
+            "--motor-monitor-host is set the sidecar also receives one "
+            "line per motor_monitor message (key=motor_monitor)."
+        ),
+    )
+
+    # Split-topology safety (Phase 3 + 5c)
+    sft_grp = p.add_argument_group("split-topology safety (Phase 3 + 5c)")
+    sft_grp.add_argument(
+        "--resume-pub-enabled", dest="resume_pub_enabled",
+        action="store_true", default=False,
+        help=(
+            "Bind a PUB socket on tcp://<--resume-pub-host>:<--resume-pub-port> "
+            "and publish a pose_resume frame whenever the operator holds A+B "
+            "(without X+Y) for >= --resume-chord-hold-s seconds. The deploy on "
+            "PC2 SUBs to this to exit SAFE_IDLE. Default OFF; the wrapper "
+            "(run_x2_quest3_planner_stack.sh --remote-deploy) flips this on "
+            "automatically."
+        ),
+    )
+    sft_grp.add_argument("--resume-pub-host", default="*")
+    sft_grp.add_argument("--resume-pub-port", type=int, default=5566)
+    sft_grp.add_argument("--resume-pub-topic", default="pose_resume")
+    sft_grp.add_argument(
+        "--resume-chord-hold-s", type=float, default=1.0,
+        help="Continuous A+B hold (s) before the first pose_resume publish.",
+    )
+    sft_grp.add_argument(
+        "--resume-chord-rep-s", type=float, default=0.5,
+        help=(
+            "Min interval (s) between republished pose_resume frames during a "
+            "sustained chord hold. Compensates for ZMQ frame loss on flaky wifi."
+        ),
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-host", dest="motor_monitor_sub_host", default="",
+        help=(
+            "If set, SUB to tcp://<host>:5567 topic 'motor_monitor' for the "
+            "PC2 x2_motor_monitor daemon's compact summaries. Each message is "
+            "decoded as JSON and appended to --sidecar-log under the "
+            "'motor_monitor' key. Empty string disables (default)."
+        ),
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-port", dest="motor_monitor_sub_port",
+        type=int, default=5567,
+    )
+    sft_grp.add_argument(
+        "--motor-monitor-topic", dest="motor_monitor_sub_topic",
+        default="motor_monitor",
+    )
+
+    # Episode lifecycle audio cues
+    rec_grp = p.add_argument_group("recorder audio cues")
+    rec_grp.add_argument(
+        "--recorder-enabled", dest="recorder_enabled",
+        action="store_true", default=False,
+        help=(
+            "Play the 'Recording.' / 'Saved.' headset audio cues on "
+            "X / Y press in ARM_MANIPULATION. Set this iff the "
+            "downstream record_x2_dataset is running with "
+            "--output-dir (i.e. NOT --teleop-only); the wrapper "
+            "(run_x2_quest3_planner_stack.sh) sets it automatically "
+            "when --with-record is passed. The recorder_cmd ZMQ "
+            "message is published either way; this only gates the "
+            "audio path so the operator doesn't get a false 'Saved.' "
+            "ACK while no parquet is being written."
+        ),
+    )
+    rec_grp.add_argument(
+        "--no-recorder-enabled", dest="recorder_enabled",
+        action="store_false",
+        help="Suppress the X/Y audio cues (default; teleop-only safe).",
     )
 
     # Camera cycler (xdotool path; TODO replace with vr_input topic)
@@ -949,7 +1764,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-viewer-camera-cycler", dest="enable_viewer_camera_cycler",
         action="store_false", default=True,
         help=(
-            "Disable the right-stick-click -> Tab camera cycler. "
+            "Disable the left-stick-click -> ']' camera cycler. "
             "Useful for headless / CI runs where no GLFW window exists."
         ),
     )
@@ -966,7 +1781,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "xdotool search --classname pattern -- the PRIMARY way to "
             "find the deploy viewer window (avoids GNOME mutter's "
-            "frame-wrapper that swallows synthetic Tab events). "
+            "frame-wrapper that swallows synthetic key events). "
             "Only override if you've rebuilt MuJoCo with a custom "
             "WM_CLASS via glfwWindowHintString."
         ),
@@ -998,6 +1813,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         intent_repeat_interval_s=args.repeat_interval,
         intent_enable_lean_fwd=args.enable_lean_fwd,
         intent_enable_torso=args.enable_torso,
+        intent_enable_continuous_locomotion=args.enable_continuous_locomotion,
+        intent_continuous_yaw_max=args.continuous_yaw_max,
+        intent_loco_decoupled_arms=args.loco_decoupled_arms,
         invert_lx=args.invert_lx,
         invert_ly=args.invert_ly,
         invert_rx=args.invert_rx,
@@ -1013,6 +1831,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         apply_oppose_compensation=args.apply_oppose_compensation,
         enable_finger_filter=not args.no_finger_filter,
         sidecar_log_path=args.sidecar_log,
+        recorder_enabled=args.recorder_enabled,
+        resume_pub_enabled=args.resume_pub_enabled,
+        resume_pub_host=args.resume_pub_host,
+        resume_pub_port=args.resume_pub_port,
+        resume_pub_topic=args.resume_pub_topic,
+        resume_chord_hold_s=args.resume_chord_hold_s,
+        resume_chord_rep_s=args.resume_chord_rep_s,
+        motor_monitor_sub_enabled=bool(args.motor_monitor_sub_host),
+        motor_monitor_sub_host=args.motor_monitor_sub_host,
+        motor_monitor_sub_port=args.motor_monitor_sub_port,
+        motor_monitor_sub_topic=args.motor_monitor_sub_topic,
         verbose=args.verbose,
     )
 

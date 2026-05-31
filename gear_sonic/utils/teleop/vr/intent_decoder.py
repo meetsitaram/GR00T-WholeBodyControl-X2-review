@@ -43,14 +43,24 @@ Button vocabulary
 Locomotion vocabulary (LOCOMOTION mode only)
 --------------------------------------------
 
-- Left stick forward  -> ``(fwd_step, default)``
-- Left stick back     -> ``(back_step, default)``
-- Left stick right    -> ``(side_right, default)``
-- Left stick left     -> ``(side_left,  default)``
-- Right stick right   -> ``(turn_right, deg_45)``
-- Right stick left    -> ``(turn_left,  deg_45)``
-- ``Y`` held          -> ``(crouch, medium)``
-- All sticks neutral  -> ``(idle, default)``
+- Left stick forward          -> ``(fwd_step, default)``
+- Left stick back             -> ``(back_step, default)``
+- Left stick right            -> ``(side_right, default)``
+- Left stick left             -> ``(side_left,  default)``
+- Right stick hard left/right -> ``(turn_left/right, deg_45 [or deg_90])``
+- Right stick (continuous)    -> ``(hold_torso, continuous, waist_*_deg)``
+    * ``ry > 0`` => positive ``waist_pitch_deg`` (forward lean; backward
+      lean has no primitive and is clamped to 0)
+    * ``rx``     => negative ``waist_yaw_deg`` for stick-right (twist)
+    * ``waist_roll_deg`` is always 0 from the operator path. v7.0 used
+      "A held + rx -> roll" but A and the R-stick share the operator's
+      right thumb and the modifier was unreachable mid-lean; v7.2
+      removed it. The wire format still carries the field for scripted
+      demos / future VLA outputs, but the right thumbstick can no
+      longer steer it.
+- ``Y`` held                  -> ``(crouch, medium)`` (only when enabled)
+- All sticks neutral          -> ``(idle, default)`` (or ``hold_torso`` at 0/0/0
+                                  while continuous mode is engaged)
 """
 
 from __future__ import annotations
@@ -81,10 +91,31 @@ class LocomotionCmd:
     Mirrors :class:`gear_sonic.utils.planner.state_machine.LocomotionCommand`
     but without the ``source`` field — the manager fills that in when
     serializing to JSON for the planner.
+
+    The ``waist_*_deg`` fields carry continuous waist targets when
+    ``intent == "hold_torso"`` (paired with ``magnitude == "continuous"``);
+    they are ignored for every other intent so existing call sites remain
+    valid. Defaults of 0.0 mean "neutral hold" -- a stick-released
+    operator naturally produces a hold at the rest pose, which the
+    planner blends back to ``idle_stand`` once a non-hold command lands.
+
+    The ``stick_*`` fields carry continuous locomotion stick deflections
+    in ``[-1, 1]`` when ``intent == "locomotion"`` paired with
+    ``magnitude == "continuous"``. Replaces the legacy bucketed L/R-stick
+    intents (``fwd_step / back_step / side_* / turn_*``) for the kplanner
+    so the operator's thumb gets analog control with fine resolution
+    near zero. Discrete bin intents ignore these fields, so the heuristic
+    planner's primitives-based path remains valid.
     """
 
     intent: str
     magnitude: str
+    waist_pitch_deg: float = 0.0
+    waist_roll_deg: float = 0.0
+    waist_yaw_deg: float = 0.0
+    stick_fwd: float = 0.0
+    stick_side: float = 0.0
+    stick_yaw: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -119,9 +150,26 @@ class IntentDecoder:
         enable_crouch: bool = False,
         enable_lean_fwd: bool = False,
         enable_torso: bool = False,
-        turn_threshold: float = 0.60,
+        enable_continuous_torso: bool = False,
+        enable_continuous_locomotion: bool = False,
+        continuous_stick_threshold: float = 0.02,
+        continuous_yaw_max: float = 0.5,
+        turn_threshold: float = 0.75,
         lean_medium_threshold: float = 0.55,
         lean_large_threshold: float = 0.80,
+        # Per-axis maximum deflection deg (clamps; defaults match the
+        # planner's _WAIST_RAMP_CAP_DEG safety caps so the operator
+        # cannot drive STATIC_HOLD past a trackable angle).
+        max_waist_pitch_deg: float = 20.0,
+        max_waist_roll_deg: float = 10.0,
+        max_waist_yaw_deg: float = 40.0,
+        # Hysteresis for continuous hold_torso emission. The decoder
+        # only re-emits when ANY axis target moves by at least this
+        # many degrees from the last sent target (or repeat_interval_s
+        # elapses). Keeps the ZMQ topic from being spammed at every tick
+        # by inevitable stick noise without losing perceived smoothness:
+        # the planner-side _HoldTracker slews between coarse waypoints.
+        hold_target_threshold_deg: float = 0.5,
     ) -> None:
         if stick_deadzone <= 0 or stick_deadzone >= 1:
             raise ValueError(f"stick_deadzone must be in (0, 1); got {stick_deadzone}")
@@ -171,8 +219,74 @@ class IntentDecoder:
         # the operator finds intuitive), and graded lean / soft torso
         # fall through to ``idle`` instead. Re-enable per primitive
         # once the planner can hold the static pose.
+        #
+        # ``enable_continuous_torso`` (default ON) supersedes the soft-
+        # band discrete bins with a continuous hold_torso target. The
+        # right-stick X-axis hard turn_* path is unchanged; pitch (ry)
+        # / yaw (rx) / roll (A+rx) all map to a single hold_torso
+        # command that the planner runs in STATIC_HOLD. Set False to
+        # restore the legacy discrete-bin behavior.
         self._enable_lean_fwd = bool(enable_lean_fwd)
         self._enable_torso = bool(enable_torso)
+        self._enable_continuous_torso = bool(enable_continuous_torso)
+        # ``enable_continuous_locomotion`` (default OFF) replaces the
+        # bucketed L-stick / R-stick locomotion intents (fwd_step,
+        # back_step, side_*, turn_*) with a single ``locomotion /
+        # continuous`` command that carries the raw stick deflections in
+        # ``stick_fwd / stick_side / stick_yaw``. The kplanner shapes
+        # those into a velocity vector so the operator's thumb gets
+        # analog control; the heuristic planner cannot consume this
+        # intent and treats it as idle. Set True only when the downstream
+        # planner is the kplanner (``run_x2_quest3_planner_stack.sh``
+        # passes the flag automatically in ``--planner kplanner`` mode).
+        self._enable_continuous_locomotion = bool(enable_continuous_locomotion)
+        if continuous_stick_threshold < 0 or continuous_stick_threshold >= 1:
+            raise ValueError(
+                "continuous_stick_threshold must be in [0, 1); "
+                f"got {continuous_stick_threshold}"
+            )
+        # Per-stick-axis change threshold (post-deadzone) below which two
+        # ``locomotion / continuous`` commands are considered identical
+        # by ``_is_significant_change``. Mirrors the
+        # ``hold_target_threshold_deg`` knob for ``hold_torso``: prevents
+        # ZMQ spam from thumbstick noise without losing perceived
+        # smoothness (kplanner's intent dispatcher slews internally).
+        self._continuous_stick_threshold = float(continuous_stick_threshold)
+        # Maximum R-stick X amplitude forwarded as ``stick_yaw`` to the
+        # planner. Lives on the *teleop* side (this class) rather than
+        # in the planner because turn aggressiveness is fundamentally an
+        # operator-feel concern: the kplanner's yaw-rate ceiling
+        # (``_CONTINUOUS_TURN_MAX_RAD_S``) sets the *physical* maximum
+        # the robot can be asked to track; this knob caps how much of
+        # that ceiling a full R-stick deflection actually reaches. With
+        # the default 0.5, slamming the stick to the rail commands half
+        # the planner's yaw-rate ceiling, which empirically gives a
+        # turn rate the policy can track without overshoot. Operators
+        # wanting sharper button-style pivots can leave the bucketed
+        # path (which is unaffected by this clamp) or raise this to
+        # 1.0. The clamp is symmetric -- the SAME ratio applies to
+        # left and right turns; per-side asymmetry compensation lives
+        # in the planner's runtime turn scales.
+        if not (0.0 < continuous_yaw_max <= 1.0):
+            raise ValueError(
+                "continuous_yaw_max must be in (0, 1]; "
+                f"got {continuous_yaw_max}"
+            )
+        self._continuous_yaw_max = float(continuous_yaw_max)
+        if max_waist_pitch_deg < 0 or max_waist_roll_deg < 0 or max_waist_yaw_deg < 0:
+            raise ValueError(
+                "max_waist_*_deg must be non-negative; got "
+                f"({max_waist_pitch_deg}, {max_waist_roll_deg}, {max_waist_yaw_deg})"
+            )
+        if hold_target_threshold_deg < 0:
+            raise ValueError(
+                f"hold_target_threshold_deg must be >= 0; "
+                f"got {hold_target_threshold_deg}"
+            )
+        self._max_waist_pitch_deg = float(max_waist_pitch_deg)
+        self._max_waist_roll_deg = float(max_waist_roll_deg)
+        self._max_waist_yaw_deg = float(max_waist_yaw_deg)
+        self._hold_target_threshold_deg = float(hold_target_threshold_deg)
 
         self._mode = StreamMode.OFF
         self._last_emitted: Optional[LocomotionCmd] = None
@@ -277,7 +391,7 @@ class IntentDecoder:
           (``turn_left / deg_90`` resp. ``turn_right / deg_90``)
           instead of the default 45° step.
         """
-        if self._mode != StreamMode.LOCOMOTION:
+        if self._mode == StreamMode.OFF:
             return None
 
         if now < self._chord_quiet_until:
@@ -290,6 +404,23 @@ class IntentDecoder:
                 lx=lx, ly=ly, rx=rx, ry=ry,
                 y_held=y_held, a_held=a_held, x_held=x_held,
             )
+
+        # In ARM_MANIPULATION the operator is doing VR-IK on the arms;
+        # we MUST NOT pass through commands that move the robot's base
+        # (walk / fwd_step / back_step / side_left / side_right /
+        # turn_*) because the arm-IK targets are computed in torso
+        # frame and a base translation slides the IK reference out
+        # from under the operator's hands. Continuous waist hold
+        # (hold_torso) is safe -- it only changes waist DOFs (pitch /
+        # roll / yaw) and the IK actually rides along (torso lean
+        # extends the arm reach envelope, which is the whole point
+        # of v7.2 unlocking R-stick in ARM_MAN). Idle commands also
+        # filtered so we don't wash away the planner's STATIC_HOLD
+        # target with stale "go to idle_stand" pulses on every chord
+        # quiet window.
+        if self._mode == StreamMode.ARM_MANIPULATION and cmd.intent != "hold_torso":
+            return None
+
         return self._maybe_emit(cmd, now)
 
     def _cmd_for_inputs(
@@ -306,6 +437,35 @@ class IntentDecoder:
         """Pure stick + button -> LocomotionCmd mapping (no state)."""
         if y_held and self._enable_crouch:
             return LocomotionCmd("crouch", "medium")
+
+        # ---- continuous-locomotion path -------------------------------------
+        # When enabled (kplanner mode), L/R-stick deflections are forwarded
+        # raw (post-deadzone rescale) as ``locomotion / continuous`` so the
+        # downstream planner gets analog control. The discrete fwd_step /
+        # back_step / side_* / turn_* path below is skipped entirely.
+        # ``hold_torso`` (right-stick lean) and ARM_MAN gating still apply
+        # on the calling site; this branch only owns L-stick + R-stick X
+        # axis (rx), leaving the ry-driven hold_torso to the legacy path.
+        if self._enable_continuous_locomotion:
+            stick_fwd, stick_side, stick_yaw = self._continuous_stick_targets(
+                lx=lx, ly=ly, rx=rx,
+            )
+            if (
+                abs(stick_fwd) > 0.0
+                or abs(stick_side) > 0.0
+                or abs(stick_yaw) > 0.0
+            ):
+                return LocomotionCmd(
+                    intent="locomotion",
+                    magnitude="continuous",
+                    stick_fwd=float(stick_fwd),
+                    stick_side=float(stick_side),
+                    stick_yaw=float(stick_yaw),
+                )
+            # All three locomotion sticks released. Fall through to the
+            # ry-driven hold_torso path below so the right thumb can
+            # still lean / twist while neither L-stick nor R-stick X
+            # is deflected.
 
         # Left stick: cardinal direction wins (whichever axis dominates).
         # We bias toward forward/backward when the deflections are
@@ -335,23 +495,31 @@ class IntentDecoder:
                 return LocomotionCmd("side_right", "default")
             return LocomotionCmd("side_left", "default")
 
-        # Right stick: dominant-axis decoder.
+        # Right stick: continuous-hold path wins when enabled, with
+        # hard-turn deflection still pre-empting (operator wants to
+        # PIVOT, not lean). Otherwise fall back to the legacy
+        # dominant-axis decoder so existing scripted regression tests
+        # (test_intent_decoder.py) keep their semantics.
+        if self._enable_continuous_torso:
+            rx_active = abs(rx) >= self._stick_deadzone
+            if rx_active and abs(rx) >= self._turn_threshold:
+                magnitude = "deg_90" if x_held else "deg_45"
+                if rx > 0:
+                    return LocomotionCmd("turn_right", magnitude)
+                return LocomotionCmd("turn_left", magnitude)
+            # v7.2: roll modifier removed; ``a_held`` is intentionally
+            # not forwarded to ``_continuous_hold_cmd``. The operator's
+            # right thumb drives the R-stick, so A on the same
+            # controller is unreachable mid-lean. See the docstring on
+            # ``_continuous_hold_cmd`` for the full rationale.
+            return self._continuous_hold_cmd(rx=rx, ry=ry)
+
+        # ----- Legacy discrete-bin path -----------------------------------
         # Y axis (forward) -> graded lean_fwd_{small,medium,large}
-        #   (gated on ``enable_lean_fwd``; default disabled because the
-        #   bin is a replay-and-snap-back primitive, not a hold).
-        # Y back is unmapped (no lean_back primitive in the planner).
-        # X axis is split by deflection magnitude:
-        #   - hard (|rx| >= turn_threshold) -> turn_left/right (deg_45,
-        #                                       deg_90 with X held)
-        #   - soft (deadzone <= |rx| < turn_threshold) -> torso_left/right
-        #     (deg_30) — gated on ``enable_torso``; default disabled
-        #     because the torso bin is also a replay-and-snap-back
-        #     primitive. With torso disabled the soft band falls through
-        #     to ``idle`` (no spurious commands while the operator is
-        #     thumb-resting on the right stick).
-        # Picking the dominant axis matches the left-stick precedence
-        # convention so a slight diagonal does not jitter between
-        # lean_fwd and torso/turn.
+        #   (gated on ``enable_lean_fwd``).
+        # X axis: hard -> turn_*; soft -> torso_* (gated on enable_torso).
+        # Dominant-axis precedence preserves the legacy "ry > rx wins"
+        # guard so a forward + slight-right push doesn't pivot.
         ry_active = abs(ry) >= self._stick_deadzone
         rx_active = abs(rx) >= self._stick_deadzone
         if ry_active and abs(ry) >= abs(rx):
@@ -361,9 +529,6 @@ class IntentDecoder:
                 if ry >= self._lean_medium_threshold:
                     return LocomotionCmd("lean_fwd", "medium")
                 return LocomotionCmd("lean_fwd", "small")
-            # ry < 0 OR lean disabled: fall through to idle so a back
-            # push (or any forward push when lean_fwd is disabled)
-            # doesn't silently pivot to a torso command.
             return LocomotionCmd("idle", "default")
         if rx_active:
             if abs(rx) >= self._turn_threshold:
@@ -371,19 +536,168 @@ class IntentDecoder:
                 if rx > 0:
                     return LocomotionCmd("turn_right", magnitude)
                 return LocomotionCmd("turn_left", magnitude)
-            # Soft push: torso lean (only when explicitly enabled). The
-            # 30deg variant is the default because deg_15 is barely
-            # visible in the viewer and deg_45 starts to encroach on
-            # the turn behaviour. With torso disabled the soft band
-            # falls through to ``idle``.
             if self._enable_torso:
                 if rx > 0:
                     return LocomotionCmd("torso_right", "deg_30")
                 return LocomotionCmd("torso_left", "deg_30")
             return LocomotionCmd("idle", "default")
 
-        # All sticks neutral.
         return LocomotionCmd("idle", "default")
+
+    def _continuous_stick_targets(
+        self,
+        *,
+        lx: float,
+        ly: float,
+        rx: float,
+    ) -> tuple[float, float, float]:
+        """Return (stick_fwd, stick_side, stick_yaw) in ``[-1, 1]``.
+
+        Each axis is deadzone-clamped to 0 below ``stick_deadzone`` and
+        rescaled to ``[-1, 1]`` outside it (sign preserved). The kplanner
+        squares the value to give the operator's thumb fine resolution
+        near zero with full speed at full deflection.
+
+        Notes on signs vs the legacy bucketed path:
+
+        - ``ly > 0`` -> forward intent -> ``stick_fwd > 0``.
+        - ``lx > 0`` -> right step -> ``stick_side > 0``.
+        - ``rx > 0`` -> turn-right -> ``stick_yaw > 0``.
+
+        These match the bucketed convention so the kplanner's
+        ``_BASE_VELOCITY`` table and the new ``_resolve_locomotion``
+        branch agree on direction sign.
+
+        The yaw axis is additionally clamped to ``±continuous_yaw_max``
+        before publishing. This caps the operator-commanded fraction of
+        the planner's yaw-rate ceiling and lives here (teleop layer)
+        rather than in the planner because turn aggressiveness is an
+        operator-feel concern, not a planner capability. Forward and
+        side axes are unaffected -- those don't suffer from the same
+        "brief stick burst commits to a long turn" failure mode (the
+        operator naturally holds the L-stick to drive).
+        """
+        dz = self._stick_deadzone
+        return (
+            self._rescaled_axis(ly, dz),
+            self._rescaled_axis(lx, dz),
+            self._rescaled_axis(rx, dz) * self._continuous_yaw_max,
+        )
+
+    @staticmethod
+    def _rescaled_axis(value: float, deadzone: float) -> float:
+        """Map raw stick deflection in ``[-1, 1]`` to deadzoned ``[-1, 1]``.
+
+        Below ``deadzone`` -> 0. Above ``deadzone`` -> ``(|v| - dz) / (1 - dz)``
+        clamped to 1, sign preserved. Pure helper for the continuous-
+        locomotion path; kept separate from ``_scaled_axis`` (which is
+        the waist-hold variant that also folds in a ``max_deg`` scale).
+        """
+        sign = 1.0 if value >= 0 else -1.0
+        mag = abs(float(value))
+        if mag <= deadzone:
+            return 0.0
+        denom = max(1.0 - deadzone, 1e-6)
+        return sign * min(1.0, (mag - deadzone) / denom)
+
+    @staticmethod
+    def _scaled_axis(value: float, deadzone: float, max_deg: float) -> float:
+        """Map a raw stick deflection in [-1, 1] to a clamped angle in degrees.
+
+        Below |value| <= deadzone the result is 0 (so a thumb at rest
+        produces a neutral target). Outside the deadzone (deadzone, 1)
+        is rescaled to (0, 1) so that just past the deadzone yields a
+        small angle and full deflection yields ``max_deg``. Sign is
+        preserved.
+        """
+        sign = 1.0 if value >= 0 else -1.0
+        mag = abs(float(value))
+        if mag <= deadzone:
+            return 0.0
+        denom = max(1.0 - deadzone, 1e-6)
+        norm = min(1.0, (mag - deadzone) / denom)
+        return sign * norm * float(max_deg)
+
+    def continuous_waist_target(
+        self,
+        rx: float,
+        ry: float,
+        a_held: bool = False,
+    ) -> tuple[float, float, float]:
+        """Compute the (pitch, roll, yaw) continuous waist target in degrees.
+
+        Public companion to :meth:`_continuous_hold_cmd` for callers
+        (e.g. the Quest 3 manager) that need the *target value* without
+        the dedup / throttle gating done by ``decode_locomotion``. Used
+        to latch the current operator-driven hold pose at the moment
+        the manager flips ``LOCOMOTION -> ARM_MANIPULATION``.
+
+        Always returns clamped, deadzone-aware angles regardless of the
+        decoder's mode or the ``enable_continuous_torso`` flag.
+
+        The ``a_held`` parameter is accepted for backward compatibility
+        with v7.1 callers but is now ignored: see :meth:`_continuous_hold_cmd`
+        for the ergonomic rationale (operator's right thumb cannot reach
+        A while driving the R-stick on the same controller).
+        """
+        del a_held  # v7.2: accepted but ignored
+        cmd = self._continuous_hold_cmd(rx=rx, ry=ry)
+        return (cmd.waist_pitch_deg, cmd.waist_roll_deg, cmd.waist_yaw_deg)
+
+    def _continuous_hold_cmd(
+        self,
+        *,
+        rx: float,
+        ry: float,
+    ) -> LocomotionCmd:
+        """Build a continuous-hold LocomotionCmd from the right-stick state.
+
+        Stick conventions (validated with the operator on 2026-05-13,
+        revised on 2026-05-14 to drop the lateral-lean (roll) axis):
+
+        - ``ry > 0`` (stick up)   -> forward lean (positive pitch).
+          Backward lean is unsupported (no primitive, single-sided cap).
+        - ``rx``                  -> twist (yaw). Stick right (rx > 0)
+          maps to a NEGATIVE waist_yaw, matching ``torso_right_*deg``
+          which uses negative peak_deg.
+
+        ``waist_roll_deg`` is always emitted as 0 from the operator
+        path. The underlying planner / ``make_waist_pose_frame`` still
+        supports continuous roll (and the wire format reserves the
+        field) so scripted demos and future VLA outputs can emit it,
+        but the right thumbstick can no longer steer it. The original
+        v7.1 design used "A held + R-stick X" -> roll, but A and the
+        R-stick share the operator's right thumb; in practice the
+        modifier was unreachable mid-lean. Rather than reassign roll
+        to a left-hand button (and burn a second face button for an
+        axis the operator can already approximate by chaining a brief
+        twist + lean), v7.2 simply removes it from the operator
+        vocabulary. See ``docs/source/tutorials/x2_quest3_planner_stack_cheatsheet.md``
+        for the operator-facing explanation.
+
+        Released stick (in deadzone) yields a (0, 0, 0) hold target;
+        the planner's STATIC_HOLD state slews back to neutral via the
+        same ``_HoldTracker`` path that any other change would use.
+        """
+        # Pitch: clamp ry > 0 to (0, max_waist_pitch_deg]; ry <= 0 -> 0.
+        pitch_deg = max(
+            0.0,
+            self._scaled_axis(
+                max(0.0, ry),
+                self._stick_deadzone,
+                self._max_waist_pitch_deg,
+            ),
+        )
+        yaw_deg = -self._scaled_axis(
+            rx, self._stick_deadzone, self._max_waist_yaw_deg,
+        )
+        return LocomotionCmd(
+            intent="hold_torso",
+            magnitude="continuous",
+            waist_pitch_deg=float(pitch_deg),
+            waist_roll_deg=0.0,
+            waist_yaw_deg=float(yaw_deg),
+        )
 
     def _maybe_emit(
         self,
@@ -399,8 +713,17 @@ class IntentDecoder:
           ``repeat_interval_s > 0`` AND the elapsed time since the
           last emit reaches the threshold.
         - First tick a NEW command appears: emit (resets the timer).
+
+        For ``hold_torso`` commands, "SAME" means the waist targets are
+        within ``hold_target_threshold_deg`` of the previous emit on
+        every axis -- otherwise inevitable thumbstick noise would
+        retrigger the planner at every tick. The planner-side
+        ``_HoldTracker`` slews between coarse waypoints, so this
+        threshold is purely a wire-bandwidth optimisation.
         """
-        if self._last_emitted is None or cmd != self._last_emitted:
+        if self._last_emitted is None or self._is_significant_change(
+            cmd, self._last_emitted
+        ):
             self._last_emitted = cmd
             self._last_emit_t = now
             return cmd
@@ -413,6 +736,38 @@ class IntentDecoder:
             return cmd
 
         return None
+
+    def _is_significant_change(
+        self,
+        new: LocomotionCmd,
+        old: LocomotionCmd,
+    ) -> bool:
+        """True iff ``new`` should be re-emitted relative to ``old``."""
+        if new.intent != old.intent or new.magnitude != old.magnitude:
+            return True
+        if new.intent == "hold_torso":
+            thresh = self._hold_target_threshold_deg
+            return (
+                abs(new.waist_pitch_deg - old.waist_pitch_deg) >= thresh
+                or abs(new.waist_roll_deg - old.waist_roll_deg) >= thresh
+                or abs(new.waist_yaw_deg - old.waist_yaw_deg) >= thresh
+            )
+        if new.intent == "locomotion":
+            # Mirror the hold_torso hysteresis: only re-emit when the
+            # operator has moved a stick by at least the configured
+            # threshold (in normalised post-deadzone units). Without
+            # this every tick of inevitable thumbstick noise would
+            # republish at 50-90 Hz.
+            thresh = self._continuous_stick_threshold
+            return (
+                abs(new.stick_fwd  - old.stick_fwd)  >= thresh
+                or abs(new.stick_side - old.stick_side) >= thresh
+                or abs(new.stick_yaw  - old.stick_yaw)  >= thresh
+            )
+        # Discrete commands: any field change counts (intent/magnitude
+        # already compared above; equality on the dataclass covers any
+        # future fields too).
+        return new != old
 
     # -- introspection (for sidecar logging) ----------------------------------
 

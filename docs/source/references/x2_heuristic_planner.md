@@ -1,5 +1,15 @@
 # X2 Heuristic Locomotion Planner
 
+> **Note (2026-05):** the heuristic planner described here is **no longer
+> the default** in `run_x2_quest3_planner_stack.sh`. The trained neural
+> kplanner now drives the stack by default — see
+> [`x2_kplanner.md`](x2_kplanner.md). The heuristic stays available
+> behind `--planner heuristic` and is still the canonical reference for
+> the FSM, primitives curation pipeline, and v4 future-window contract
+> that the kplanner reuses verbatim. Read this page when you need the
+> bin matrix, the curator, or the wire-format spec; read the kplanner
+> doc for the trained-model replacement.
+
 NVIDIA hasn't released the trained kinematic planner that bridges high-level
 locomotion commands to the SONIC policy on AgiBot X2 Ultra (the way it has for
 Unitree G1's `LocalMotionPlannerTensorRT`). This page documents the
@@ -72,7 +82,7 @@ G1's `LocalMotionPlannerTensorRT`, minus the trained ONNX model.
 ## Bin matrix
 
 Source of truth: `gear_sonic/data/motions/x2_planner_bins.yaml`. The library
-ships **30 bins**; some are reachable only via aliases (see
+ships **36 bins**; some are reachable only via aliases (see
 [Command surface](#command-surface)).
 
 | Family | Bins | Notes |
@@ -83,13 +93,109 @@ ships **30 bins**; some are reachable only via aliases (see
 | `locomotion` (backward step) | `back_step_half_ft`, `back_step_quarter_ft` | Both reachable; the curator's source clip is naturally fast (~32 cm/s) so the scaled half / quarter variants survive policy under-tracking. |
 | `locomotion` (lateral) | `side_left_step`, `side_right_step` | **Aliased**: every `side_left` / `side_right` magnitude resolves to its `*_step` bin (single canonical clip). |
 | `locomotion` (in-place turn) | `turn_left_{15,30,45,90}deg` and the same for `turn_right_*` | Right side derives from left via `mirror_lr`. |
-| `static_upper_body` (lean) | `lean_fwd_small`, `lean_fwd_medium`, `lean_fwd_large` | |
-| `static_upper_body` (torso twist) | `torso_left_{15,30,45}deg` and the same for `torso_right_*` | Right side derives from left via `mirror_lr`. |
+| `static_upper_body` (forward lean) | `lean_fwd_small`, `lean_fwd_medium`, `lean_fwd_large` | **v6 SYNTH**: `synthesize_waist_ramp(axis=pitch)` with `hip_pitch_share=0.30` (natural deadlift-hinge geometry: pelvis follows ~30% of waist pitch). Peaks 8 / 14 / 20°. Replaces v2 `body_check_001__A474_M` mocap + scale_magnitude. |
+| `static_upper_body` (lateral lean, NEW in v6) | `lean_left_{small,medium,large}` and the same for `lean_right_*` | **SYNTH**: `synthesize_waist_ramp(axis=roll)` (pure waist roll; no counter). Peaks 4 / 7 / 10°. Right side derives via `mirror_lr` (clean — no anti-symmetric share to worry about). |
+| `static_upper_body` (torso twist) | `torso_left_{15,30,40}deg` and the same for `torso_right_*` | **v6 SYNTH** with `hip_yaw_share=0.30` (pelvis shares ~30% of waist twist for natural look). Right side is **standalone synth with negative `peak_deg`** (NOT `derive_from + mirror_lr`) because the anti-symmetric `hip_yaw_share` pattern is mirror-invariant — see the regression test `test_synthesize_waist_ramp_yaw_with_hip_share_negates_via_peak_not_mirror`. v5 `_45deg` bins renamed to `_40deg` to match the new yaw cap. |
 | `static_upper_body` (crouch) | `crouch_small`, `crouch_medium`, `crouch_large` | **Aliased**: every `crouch` magnitude resolves to `crouch_medium` (the only one with a true mocap squat reference; small / large are kept as the v4 synthesized primitives but are unreachable from the planner queue). |
+
+### Safety caps on `static_upper_body` synth (v6)
+
+The `op_synthesize_waist_ramp` op enforces hard per-axis ceilings on
+`|peak_deg|`. A recipe asking for an angle above the cap raises
+`ValueError` at build time, so an unstable reference can't reach
+deploy:
+
+| Axis | Cap | Rationale |
+| --- | --- | --- |
+| `pitch` (lean_fwd / lean_back) | **20°** | Foot half-length is ~12 cm; 20° waist pitch + 30% hip_pitch_share puts CG at hip height ~12 cm forward — right at the support-polygon boundary. |
+| `roll` (lean_left / lean_right) | **10°** | Foot half-WIDTH is only ~5 cm. 10° waist_roll shifts CG ~10 cm laterally; beyond this the contralateral foot lifts. |
+| `yaw` (torso_left / torso_right) | **40°** | Hip yaw is unloaded; 40° covers the useful reach envelope without SONIC losing tracking. |
+
+Bumping any cap requires deploy evidence (record SONIC pelvis / foot
+trajectories at the new ceiling and confirm no fall) and edits to
+`_WAIST_RAMP_CAP_DEG` in `gear_sonic/utils/planner/x2_recipes.py`.
 
 The full target XY / yaw / waist-axis values and per-bin tolerances live in
 the YAML — relax / tighten them per bin and re-run the curator without code
 changes.
+
+### v7: continuous waist hold (`STATIC_HOLD`)
+
+The discrete `static_upper_body` bins above each peak at one of three
+fixed magnitudes per axis. v7 adds a *fourth* planner state,
+`STATIC_HOLD`, that re-synthesises a single 31-DOF frame each tick from
+a continuous `(pitch, roll, yaw)` target. Operator-side this surfaces
+as right-stick lean / twist / sway via the VR manager (see
+[`x2_quest3_planner_stack_cheatsheet.md`](../tutorials/x2_quest3_planner_stack_cheatsheet.md));
+runtime there is no pre-baked clip — the planner composes the pose on
+demand.
+
+The runtime helper that does the work, `make_waist_pose_frame()` in
+`gear_sonic/utils/planner/x2_recipes.py`, is the same code path the
+build-time `op_synthesize_waist_ramp` uses for the discrete bins (the
+op delegates to the helper at peak and matches it bit-for-bit, pinned
+by `test_make_waist_pose_frame_matches_op_synthesize_waist_ramp_at_peak`).
+That single source of truth carries the same `_WAIST_RAMP_CAP_DEG`
+safety caps and the same hip / ankle counter-balance shares (default
+`hip_pitch_share = hip_yaw_share = 0.30`, ankle shares = 0).
+
+Runtime guarantees inside `STATIC_HOLD`:
+
+| Property | Value | Where it lives |
+| --- | --- | --- |
+| Target slew limit | **60 °/s** per axis | `HOLD_SLEW_DPS` in `state_machine.py`, applied by `_HoldTracker.step()` |
+| Per-axis clamp | `_WAIST_RAMP_CAP_DEG` (pitch 20°, roll 10°, yaw 40°) | `make_waist_pose_frame(clamp=True)` |
+| Arm DOFs | Frozen at `DEFAULT_STAND_POSE_NP` | Pinned by `test_static_hold_arms_remain_at_default_stand_pose` so the recorder can overlay VR-IK arm targets |
+| `frame_index` | Monotonic across the entire enter / update / exit cycle | Pinned by `test_frame_index_monotonic_through_hold_cycle` |
+| Entry / exit blends | Use `BLEND_FRAMES_STATIC_UPPER_BODY = 16` | Reuses the same crossfade machinery as the discrete bins |
+
+Transitions:
+
+- `IDLE_LOOP` → `BLENDING(idle, hold_target)` → `STATIC_HOLD` on the
+  first `intent="hold_torso"` command.
+- `STATIC_HOLD` → `STATIC_HOLD` (no blend) when subsequent
+  `hold_torso` commands arrive — the `_HoldTracker` updates its target
+  and the slew limit smooths the per-tick delta.
+- `STATIC_HOLD` → `BLENDING(hold_pose, next_primitive)` on any
+  non-hold command (`idle`, `walk`, `turn_left`, etc.).
+
+The hand DOFs and the `motion_token` slot are unchanged from v5 / v6
+(zeros in encoder mode), so the wire format is fully backward-compatible
+with deploys that don't know about the new state.
+
+> **Operator note (v7.1: R-thumbstick waist freeze)** — the
+> `Quest3ManagerX2` exposes a "freeze waist" toggle on the right
+> thumbstick click. When freeze is **ON**, the manager stops publishing
+> `hold_torso` updates so the planner stays in `STATIC_HOLD` at
+> whatever pose was active at click time, even as the operator drives
+> arms via VR IK or walks/turns the robot. Other locomotion commands
+> (`walk`, `turn_left`, `turn_right`, `idle`) still pass through
+> normally — only the continuous waist updates are suppressed. From
+> the planner's perspective freeze is invisible: it just stops
+> receiving target updates and the `_HoldTracker` slews to a stop.
+> Operator details and audio cues live in
+> [`x2_quest3_planner_stack_cheatsheet.md`](../tutorials/x2_quest3_planner_stack_cheatsheet.md).
+> Pre-v7.1 the right click cycled deploy MuJoCo viewer cameras; that
+> binding moved to the **left** thumbstick click in the same release.
+
+> **Operator note (v7.2: R-stick waist hold active in ARM_MANIPULATION)**
+> — the `IntentDecoder` mode gate was relaxed so `hold_torso` commands
+> flow in **both** `LOCOMOTION` and `ARM_MANIPULATION`. The arm IK
+> targets are computed in the robot's torso frame, so a torso lean /
+> twist during arm work cleanly extends the reachable envelope (the
+> arms ride the torso). Walk / step / turn commands are still gated to
+> LOCO mode — translating the base while the operator is targeting an
+> object would slide the IK reference out from under their hands. The
+> v7 B-press latch (LOCO → ARM_MAN samples the live waist target and
+> pins `STATIC_HOLD(latched)`) still fires; it is now best understood
+> as a *no-jump seed* — the planner enters ARM_MAN at exactly the
+> pre-flip pose, and the operator's R-stick continues to slew it from
+> there. The lateral-lean (roll) modifier was simultaneously removed
+> from the operator vocabulary: v7.0 used "A held + R-stick X → roll",
+> but A and the R-stick share the operator's right thumb on the same
+> controller and the modifier was unreachable mid-lean. The wire
+> format still carries `waist_roll_deg` for scripted demos and future
+> VLA outputs; the operator path always emits 0 there.
 
 ### Why some families are alias-collapsed
 
@@ -122,11 +228,13 @@ Removing each alias is a one-line revert in `state_machine.py`.
   `tol_yaw_deg` and stay inside `cross_axis_max_m` of the start XY.
 - **`fwd_walk_standard`** — continuous gait, no end-at-square requirement;
   uses a 12-frame entry/exit blend to merge with shuffle bins on either side.
-- **`static_upper_body` leans / twists** — feet planted, end at apex
-  (the lean / twist is held, not returned). All static-upper-body bins set
-  `freeze_arms_to_default: true`, which causes the curator to overwrite the
-  arm + head DOFs of the curated slice with `DEFAULT_STAND_POSE_MUJOCO_RAD`
-  before writing the PKL. The planner then commands waist-only motion for
+- **`static_upper_body` leans / twists** — feet planted, end-back-at-idle
+  (the v6 synth recipes are full trapezoids 0 → peak → 0 so the runtime
+  can blend in at any phase and the robot returns to stand cleanly when
+  the next idle command arrives). All static-upper-body bins set
+  `freeze_arms_to_default: true`, so the curator overwrites the arm +
+  head DOFs with `DEFAULT_STAND_POSE_MUJOCO_RAD` before writing the PKL.
+  The planner then commands waist + (optionally) hip-share motion for
   these bins; arms stay neutral so the downstream VLA / teleop owns them
   without interference. Implicit "un-lean" / "un-twist" happens by blending
   back to `idle_stand` over the 16-frame static-family window — there is no
@@ -279,6 +387,27 @@ re-merge across messages.
 
 ## State-machine details
 
+The state machine has four operational states (`PlannerState` enum):
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE_LOOP
+    IDLE_LOOP --> BLENDING: any non-idle cmd
+    BLENDING --> PLAYING: blend done (loco / static_upper_body)
+    BLENDING --> STATIC_HOLD: blend done (hold_torso target)
+    BLENDING --> IDLE_LOOP: blend done (idle target)
+    PLAYING --> BLENDING: next cmd ready
+    PLAYING --> IDLE_LOOP: clip ends, queue empty
+    STATIC_HOLD --> STATIC_HOLD: next hold_torso cmd<br/>(slew-limited, no blend)
+    STATIC_HOLD --> BLENDING: any non-hold cmd
+```
+
+`IDLE_LOOP` plays `idle_stand` on a tight loop. `PLAYING` consumes one
+curated primitive frame-by-frame. `BLENDING` runs the crossfade
+between two segments (entry, exit, or mid-segment hand-off).
+`STATIC_HOLD` is the v7 continuous-waist-hold path described in the
+[v7 section above](#v7-continuous-waist-hold-static_hold).
+
 Blend window lengths (in 50 Hz frames):
 
 | From → To | Frames |
@@ -287,6 +416,7 @@ Blend window lengths (in 50 Hz frames):
 | idle ↔ locomotion | 6 |
 | anything ↔ `fwd_walk_standard` | 12 |
 | anything ↔ `static_upper_body` | 16 |
+| anything ↔ `STATIC_HOLD` | 16 (reuses `static_upper_body` window) |
 
 Yaw-cylinder alignment: when transitioning from segment A to segment B, B is
 yaw-rotated as a rigid body so its frame 0 lands at A's last (XY, yaw). This
@@ -299,6 +429,14 @@ Idle interrupt: enqueueing a non-idle command while the planner is in
 processed when that segment completes (no preemption — preemption mid-stride
 would risk a fall).
 
+`STATIC_HOLD` is special: subsequent `hold_torso` commands while
+already in `STATIC_HOLD` do **not** start a new blend. They update the
+`_HoldTracker` target in place; the per-axis 60 °/s slew rate
+guarantees per-tick continuity (pinned by
+`test_static_hold_in_state_target_updates_within_slew_cap`). Only a
+non-hold command (e.g. `walk / forward`, `idle / default`) opens a
+blend window out of the held pose.
+
 Unknown-bin fallback: a command that maps to a missing or partial bin logs a
 warning but never crashes — the planner falls through to `idle_stand` for
 unknown bins and uses the partial clip with a warning otherwise.
@@ -306,8 +444,22 @@ unknown bins and uses the partial clip with a warning otherwise.
 ## Command surface
 
 ```python
-LocomotionCommand(intent: str, magnitude: str, source: str = "scripted")
+LocomotionCommand(
+    intent: str,
+    magnitude: str,
+    source: str = "scripted",
+    waist_pitch_deg: float = 0.0,   # v7: only honoured for intent="hold_torso"
+    waist_roll_deg: float = 0.0,    # v7
+    waist_yaw_deg: float = 0.0,     # v7
+)
 ```
+
+`waist_*_deg` are ignored for every intent except `hold_torso`, so the
+existing two-field wire payload remains valid for all legacy callers.
+The optional fields default to 0 on the receiving side, which means a
+stale consumer that drops them treats every `hold_torso` as a "neutral
+hold" — a defensive degradation that keeps the planner standing
+upright even on a downgrade.
 
 Bin-name resolution (current; **bold rows are alias-collapsed** —
 multiple magnitudes route to one canonical bin, see [Bin matrix](#bin-matrix)):
@@ -323,8 +475,10 @@ multiple magnitudes route to one canonical bin, see [Bin matrix](#bin-matrix)):
 | **`(side_right, *)`** | `side_right_step` (every magnitude) |
 | `(turn_left / turn_right, deg_15/30/45/90)` | `turn_{left,right}_{15,30,45,90}deg` |
 | `(lean_fwd, small / medium / large)` | `lean_fwd_{small,medium,large}` |
-| `(torso_left / torso_right, deg_15/30/45)` | `torso_{left,right}_{15,30,45}deg` |
+| `(lean_left / lean_right, small / medium / large)` | `lean_{left,right}_{small,medium,large}` (v6 lateral lean family) |
+| `(torso_left / torso_right, deg_15/30/40)` | `torso_{left,right}_{15,30,40}deg` (v6: was `_45deg`, capped at yaw=40°) |
 | **`(crouch, *)`** | `crouch_medium` (every magnitude) |
+| `(hold_torso, continuous)` + `waist_*_deg` | **v7 SYNTH**: `STATIC_HOLD` state, no PKL bin. Frame is composed every tick by `make_waist_pose_frame`; clamped to `_WAIST_RAMP_CAP_DEG` and slew-limited at 60 °/s per axis. |
 
 The alias branches live in `LocomotionCommand.as_bin_name` in
 `gear_sonic/utils/planner/state_machine.py`. They were added as a
@@ -352,7 +506,21 @@ External command sources (any combination, behind one `queue.Queue`):
   `KEYBOARD_HELP` printed at startup. Disabled when stdin is not a TTY.
 - **ZMQ control topic** (`--zmq-cmd-host/--zmq-cmd-port/--zmq-cmd-topic`):
   multipart `[topic_bytes, json_payload]`. Send
-  `{"intent": "shutdown"}` to gracefully stop the daemon.
+  `{"intent": "shutdown"}` to gracefully stop the daemon. The JSON
+  payload accepts the legacy `{"intent": str, "magnitude": str}` plus
+  the v7 optional `waist_pitch_deg`, `waist_roll_deg`, `waist_yaw_deg`
+  floats — only meaningful when `intent == "hold_torso"` (see
+  [v7: continuous waist hold](#v7-continuous-waist-hold-static_hold)).
+  Missing fields default to 0, so legacy publishers stay wire-compatible.
+
+  Example payloads:
+
+  ```json
+  {"intent": "walk", "magnitude": "forward"}
+  {"intent": "hold_torso", "magnitude": "continuous",
+   "waist_pitch_deg": 12.0, "waist_roll_deg": 0.0, "waist_yaw_deg": 25.0}
+  {"intent": "idle", "magnitude": "default"}
+  ```
 
 ### Source semantics: append vs replace
 
@@ -492,11 +660,11 @@ deploy-format motion, so you can validate either path independently:
 | --- | --- | --- |
 | `gallery_fwd_back_shuffle.yaml` | `fwd_step_1ft` (×3 via alias), `back_step_half_ft`, `back_step_quarter_ft` | Validate forward and backward shuffle bins + the fwd_step alias collapse. |
 | `gallery_crouch.yaml` | `crouch_medium` (×3 via alias) | Validate the v5 mocap squat (A530_M); same primitive plays three times because of the crouch alias. |
-| `eleven_motion_sequence.yaml` | All 11 working canonical bins (fwd_step, turn_left_45, side_right, turn_right_45, side_left, crouch_medium, back_step, lean_fwd_medium, torso_left_45, lean_fwd_medium, torso_right_45) | End-to-end smoke covering every family at least once. |
+| `eleven_motion_sequence.yaml` | All 11 working canonical bins (fwd_step, turn_left_45, side_right, turn_right_45, side_left, crouch_medium, back_step, lean_fwd_medium, torso_left_40, lean_fwd_medium, torso_right_40) | End-to-end smoke covering every family at least once. |
 | `six_motion_smoke.yaml` | fwd_step, side steps, two turns, back_step | Older shorter smoke, kept for regression. |
 | `side_steps_only_smoke.yaml` | `side_left_step`, `side_right_step` | Used during the side-step debugging saga and the future-window fix verification. |
 | `forward_back_turn.yaml` | `fwd_walk_standard`, `back_walk_standard`, two turns | Continuous-walk variant. |
-| `static_reach.yaml` | leans + torso twists | Static-upper-body smoke. |
+| `static_reach.yaml` | full v6 reach ladder: forward leans (8/14/20°), lateral leans both sides (4/7/10°), torso twists both sides (15/30/40°) | Static-upper-body smoke; exercises every reach primitive in one demo. |
 | `manipulation_approach.yaml` | fwd_step magnitudes + leans | Locomanipulation-style approach + reach. |
 
 ### Sample commands
@@ -628,7 +796,10 @@ and asymmetry metrics. Highlights from the most recent rebases:
 | `side_left_step` / `side_right_step` | `loco__walk_sideway_045_stop_001__A038_M [0, 215]` | The full 7.17 s clip (not a short window) — the user vetted this against 99 candidate side-walks and picked it as the cleanest. |
 | `crouch_medium` (v5, 2026-05-13) | `loco__medium_big_light_two_hands_front_medium_to_front_low_R_001__A530_M [10, 135]` (125 f @ 30 fps = 4.17 s) | True upright squat: ~98° knee bend at apex, ~27 cm pelvis Z drop, **waist pitch ~0°** (torso stays vertical relative to pelvis). Selected from 22 symmetric-squat candidates as the one with the lowest torso lean. Replaces the v4 `synthesize_crouch_ramp(peak_drop_m=0.06)` which had only 6 cm reference Z drop and was under-tracked into a "low lean" with no visible knee bend. |
 | `crouch_small`, `crouch_large` | v4 synthesized (3 / 10 cm pelvis drop) | Still in the PKL but unreachable via the planner queue (alias-collapsed to `crouch_medium`). Kept so existing test fixtures and the curator inventory continue to resolve. |
-| All `lean_fwd_*` / `torso_*` / synth crouches | `synthesize_waist_ramp` / `synthesize_crouch_ramp` | Pure synthesis from stand pose; no mocap candidate scored above 0. |
+| All `lean_fwd_*` (v6) | `synthesize_waist_ramp(axis=pitch, hip_pitch_share=0.30)` | Replaces v2 `body_check_001__A474_M` mocap. Peaks 8 / 14 / 20°; explicit hip-pitch counter recreates the deadlift-hinge geometry that the mocap had implicitly. |
+| All `lean_left/right_*` (v6 NEW) | `synthesize_waist_ramp(axis=roll)` (pure waist roll) | Foot-flat ankle counter is OFF; can be enabled with `ankle_roll_share` if SONIC has trouble keeping the contralateral foot planted at 10° roll. Right side via `mirror_lr` (no anti-symmetric share, so mirror is geometrically clean). |
+| All `torso_left/right_*deg` (v6) | `synthesize_waist_ramp(axis=yaw, hip_yaw_share=0.30)` | Both sides are STANDALONE synth (LEFT with positive `peak_deg`, RIGHT with negative). The `hip_yaw_share` pattern is mirror-invariant under `mirror_lr`, so derived recipes would produce a pelvis-twists-opposite-of-upper-body pose — see the regression test `test_synthesize_waist_ramp_yaw_with_hip_share_negates_via_peak_not_mirror`. |
+| Synth crouches (`crouch_small`, `crouch_large`) | `synthesize_crouch_ramp` | Pure synthesis from stand pose; alias-collapsed to `crouch_medium` at the planner queue. |
 
 ### Op reference
 
@@ -640,7 +811,7 @@ must be a *producer* (`clip_window`, `synthesize_waist_ramp`, or
 | Op | Purpose | Notes |
 | --- | --- | --- |
 | `clip_window {motion_key, start_frame, n_frames}` | Slice a window from a source bones-seed clip. | Producer. Validates bounds. |
-| `synthesize_waist_ramp {axis, peak_deg, ramp_in_frames, hold_frames, ramp_out_frames, fps?}` | Build a static lean / twist from scratch: ramp the named waist axis (`pitch`/`yaw`/`roll`) from 0 → peak → 0. | Producer. Default fps=50; arms/head/legs at default stand pose. |
+| `synthesize_waist_ramp {axis, peak_deg, ramp_in_frames, hold_frames, ramp_out_frames, fps?, hip_pitch_share?, hip_yaw_share?, ankle_pitch_share?, ankle_roll_share?}` | Build a static lean / twist from scratch: ramp the named waist axis (`pitch`/`yaw`/`roll`) from 0 → peak → 0. Optional counter-balance shares co-actuate the hips / ankles in proportion to the waist track for a more natural human "lean" / "twist" pose (defaults 0.0 keep pure-waist behavior). `|peak_deg|` is **HARD-CAPPED** per axis (pitch 20°, roll 10°, yaw 40°). Producer. Default fps=50; arms/head/legs at default stand pose. |
 | `synthesize_crouch_ramp {peak_drop_m, ramp_in_frames, hold_frames, ramp_out_frames, fps?}` | Build a feet-planted squat: ramp pelvis Z down by `peak_drop_m` and bend hips/knees/ankles in a self-consistent triangle (knee = 2·hip, ankle = -hip). | Producer. Use instead of `clip_window + scale_magnitude` for clean shallow / deep crouches; SONIC tracks the synthesized ramp without the lateral drift `scale_magnitude` produces on partial squats. |
 | `freeze {groups: [...]}` | Replace listed joint groups with `DEFAULT_STAND_POSE` for every frame. Groups: `arms`, `legs`, `head`, `waist`, `waist_pitch`, `waist_yaw`, `waist_roll`, `left_arm`, `right_arm`, `left_leg`, `right_leg`, `all_but_legs`, `all_but_waist`, `all_but_legs_and_waist`. | Idempotent; safe to apply twice. |
 | `mirror_lr {also_negate_root_yaw?, also_negate_root_y?}` | Sagittal-plane reflection. Swaps L↔R joint indices, negates anti-symmetric joints (hip / shoulder roll-yaw, wrist yaw-roll, waist yaw-roll, head yaw), mirrors the root quaternion `(-qx, qy, -qz, qw)` and the root_trans Y. | Both negate flags default to `true`. Idle stand pose mirrors to itself (invariant). Used for `turn_right_*`, `side_right_*`, `torso_right_*`. |
@@ -810,9 +981,19 @@ gear_sonic/scripts/run_planner_smoke.sh --cleanup-only
 
 ## Future easy adds
 
-- **Lateral waist-roll lean** — same shape as `lean_fwd_*` but on the
-  `waist_roll` axis. New bins, no code changes.
-- **Head-look primitives** — `head_yaw / head_pitch` deltas. Same as above.
+- **Backward lean** — `synthesize_waist_ramp(axis=pitch, peak_deg<0)`
+  with a small negative `hip_pitch_share`. Capped at 20° pitch (same
+  cap as forward). Useful for "look up at a high shelf" before reaching.
+- **Foot-flat ankle counter for lateral lean** — enable
+  `ankle_roll_share` (~0.5) on `lean_left/right_*` if SONIC has trouble
+  keeping the contralateral foot planted at the 10° cap. Currently OFF
+  to keep the synth minimal.
+- **Pitch + yaw combo (`reach_*`)** — single bin that combines
+  `waist_pitch` + `waist_yaw` for "reach over your shoulder" poses.
+  Needs the synth op to accept two-axis ramps simultaneously, or a new
+  `synthesize_combo_ramp`.
+- **Head-look primitives** — `head_yaw / head_pitch` deltas. Same shape
+  as the v6 lateral lean recipes (single-axis ramp, no counter).
 - **Body-partition stitching** — pull only the arm DOFs from a manipulation
   clip and overlay them onto a locomotion lower body. Needs a new
   partition-aware blender; the planner state machine already stitches

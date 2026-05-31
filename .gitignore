@@ -4,9 +4,10 @@ __pycache__/
 *$py.class
 
 # Vendored upstream repos checked out for development reference. Tracked
-# separately as siblings (Isaac-GR00T lives under external_dependencies/
-# but is its own repo, not part of this tree).
+# separately as siblings (each lives under external_dependencies/ but is
+# its own git repo, not part of this tree).
 /external_dependencies/Isaac-GR00T/
+/external_dependencies/GR00T-VisualSim2Real/
 
 # C extensions
 
@@ -28,6 +29,14 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# ROS 2 / colcon build artefacts created at repo root when the workspace
+# is built in-place (only happens on dev machines / PC2 mirror; CI uses
+# isolated build dirs under /home/run/getsolo/ on PC2). The install/ and
+# log/ dirs carry COLCON_IGNORE markers, so colcon itself treats them
+# as terminal -- safe to drop from version control.
+/install/
+/log/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -79,6 +88,19 @@ data/*
 # matching plots, and per-anchor SUMMARY docs). Tracked in git so the
 # paper artefacts travel with the repo.
 !data/sim_to_real_anchors/
+# Whitelist: shipped deploy policies (each individually re-included
+# down in the model-checkpoints section below, since the *.onnx
+# blanket rule there would otherwise re-ignore them).
+!data/policies/
+
+# …but inside the whitelisted sim-to-real anchors, the heavy per-run
+# binaries (motion bakes, replay videos, raw obs npz, per-tick csv logs)
+# are regenerable locally and would balloon repo size. Keep the README /
+# manifest / eval markdown trackable, drop the blobs.
+data/sim_to_real_anchors/**/*.pkl
+data/sim_to_real_anchors/**/*.mp4
+data/sim_to_real_anchors/**/*.npz
+data/sim_to_real_anchors/**/*.csv
 
 # PyBuilder
 .pybuilder/
@@ -189,6 +211,11 @@ huggingface/
 *.engine
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx
 !decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Walk.onnx
+# X2 SONIC deploy policy (trained on H200, iter 25000, sphere-feet 2026-05-01).
+# Source checkpoint: model_step_025000_g1.onnx from the h200-iter-25000-sphere-feet-20260501
+# run; renamed here for an embodiment-stable filename the deploy can default to.
+# Stored via git-lfs (see .gitattributes *.onnx rule).
+!data/policies/agibot_x2_sonic.onnx
 !motionbricks/out/**/*.ckpt
 
 
@@ -225,6 +252,22 @@ data/motion_lib_bones_seed
 bones_seed_smpl/
 sonic_release/
 
+# Local motion libraries (rebuilt by gear_sonic/scripts/build_x2_planner_motion_lib.py
+# and friends from upstream mocap; tens to hundreds of MB each, regenerable,
+# not source-of-truth for the repo). Recipes that produce them ARE tracked
+# (see gear_sonic/data/x2_planner_primitives_recipes.yaml etc).
+gear_sonic/data/motions/*.pkl
+
+# Synthetic-data-generation (SDG) USD assets. The `grab/` subtree is the
+# upstream GRAB hand-object capture archive (~855 MB, CC-BY-NC, fetched
+# externally), and `simple/` holds bulky binary `.usd` props (table /
+# tray / bottle ~ 14 MB total) sourced from Omniverse-style libraries.
+# Both are regenerable from upstream / re-downloaded on demand and would
+# blow up clone size if tracked. Any hand-authored SDG sources (Python
+# generators under gear_sonic/sdg/{robots,scenes}/, recipe YAMLs, etc.)
+# stay tracked -- only the binary/large asset payload is ignored.
+gear_sonic/sdg/assets/
+
 # Training output logs
 logs_rl/
 logs_eval/
@@ -252,6 +295,15 @@ logs/x2/
 # Generic per-workstation scratch space used by debugging tools (e.g.
 # obs-dump blobs, ad-hoc captures). Never check in.
 scratch/
+
+# X2 MC-motor scan output (gear_sonic_deploy/scripts/x2_scan_mc_motors.sh).
+# Each run drops one mc_motor_scan_<unix_ts>.jsonl in the working
+# directory (typically the repo root). They're per-operator-session
+# captures of the MC's published kp/kd/target plus measured joint state
+# for a nudge test, used to derive the values shipped in
+# gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml. Re-run
+# the scanner to regenerate; the YAML preset is the durable artifact.
+mc_motor_scan_*.jsonl
 
 # Standalone CMake build dir we use for the offline unit tests in
 # gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/. The colcon build/

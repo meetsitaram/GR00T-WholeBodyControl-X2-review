@@ -494,8 +494,18 @@ def test_command_resolves_to_correct_bin_name() -> None:
         (("lean_fwd", "small"), "lean_fwd_small"),
         (("lean_fwd", "medium"), "lean_fwd_medium"),
         (("lean_fwd", "large"), "lean_fwd_large"),
+        # Lateral lean family (NEW in v6) -- direct {intent}_{magnitude}
+        # mapping, no alias collapse.
+        (("lean_left", "small"), "lean_left_small"),
+        (("lean_left", "medium"), "lean_left_medium"),
+        (("lean_left", "large"), "lean_left_large"),
+        (("lean_right", "small"), "lean_right_small"),
+        (("lean_right", "medium"), "lean_right_medium"),
+        (("lean_right", "large"), "lean_right_large"),
         (("torso_left", "deg_30"), "torso_left_30deg"),
-        (("torso_right", "deg_45"), "torso_right_45deg"),
+        # torso_*_45deg renamed to torso_*_40deg in v6 (yaw cap = 40 deg).
+        (("torso_right", "deg_40"), "torso_right_40deg"),
+        (("torso_left", "deg_40"), "torso_left_40deg"),
         # Every crouch magnitude collapses to crouch_medium; see
         # LocomotionCommand.as_bin_name docstring for rationale.
         (("crouch", "small"), "crouch_medium"),
@@ -716,3 +726,105 @@ def test_real_curated_primitives_load_and_run() -> None:
         f"real-data yaw jump {yaw_peak:.2f} deg at tick {yaw_where} "
         f"exceeds {MAX_YAW_JUMP_DEG}"
     )
+
+
+# ---------------------------------------------------------------------------
+# STATIC_HOLD seam continuity
+# ---------------------------------------------------------------------------
+# These tests pin the seam quality of the v7 continuous-waist-hold path.
+# We exercise three seams: idle->hold (entry blend), hold->hold (slew-only,
+# no blend), and hold->walk (exit blend). Per-tick joint jumps must stay
+# within the same MAX_DOF_JUMP_RAD bound the rest of the FSM honors.
+
+
+def _hold_planner() -> HeuristicPlanner:
+    """Planner with the synthetic primitives plus a continuous-walk bin."""
+    return HeuristicPlanner(
+        primitives={
+            "idle_stand": _idle_prim(),
+            "fwd_step_1ft": _fwd_step_prim(),
+            "turn_left_45deg": _turn_left_prim(),
+            "fwd_walk_standard": _fwd_step_prim(distance_m=0.30, n=80),
+        }
+    )
+
+
+def test_static_hold_entry_blend_seam_within_dof_gate() -> None:
+    """idle -> blend -> STATIC_HOLD must respect MAX_DOF_JUMP_RAD per tick."""
+    p = _hold_planner()
+    _drive(p, 5)  # settle in idle
+    p.enqueue(
+        LocomotionCommand(
+            intent="hold_torso",
+            magnitude="continuous",
+            source="test",
+            waist_pitch_deg=18.0,
+            waist_yaw_deg=35.0,
+        )
+    )
+    frames = _drive(p, 80)
+    peak, where = _max_dof_jump(frames)
+    assert peak <= MAX_DOF_JUMP_RAD, (
+        f"idle->STATIC_HOLD entry seam jump {peak:.4f} rad at tick {where} "
+        f"exceeds {MAX_DOF_JUMP_RAD}"
+    )
+    assert any(f.state == PlannerState.STATIC_HOLD for f in frames)
+
+
+def test_static_hold_in_state_target_updates_within_slew_cap() -> None:
+    """Target hops while in STATIC_HOLD must walk the slew cap, not jump."""
+    p = _hold_planner()
+    p.enqueue(
+        LocomotionCommand(
+            intent="hold_torso",
+            magnitude="continuous",
+            source="test",
+            waist_yaw_deg=10.0,
+        )
+    )
+    # Settle in hold.
+    while p.state != PlannerState.STATIC_HOLD:
+        p.step()
+    # Whip the target across the cap repeatedly.
+    big_targets = [40.0, -40.0, 25.0, -10.0, 0.0]
+    frames: list[StreamFrame] = []
+    for tgt in big_targets:
+        p.enqueue(
+            LocomotionCommand(
+                intent="hold_torso",
+                magnitude="continuous",
+                source="test",
+                waist_yaw_deg=tgt,
+            )
+        )
+        frames.extend(_drive(p, 60))
+    peak, where = _max_dof_jump(frames)
+    assert peak <= MAX_DOF_JUMP_RAD, (
+        f"in-state STATIC_HOLD slew jump {peak:.4f} rad at tick {where} "
+        f"exceeds {MAX_DOF_JUMP_RAD} (slew limit failed)"
+    )
+
+
+def test_static_hold_exit_blend_seam_within_dof_gate() -> None:
+    """STATIC_HOLD -> blend -> walking must respect the per-tick gate."""
+    p = _hold_planner()
+    p.enqueue(
+        LocomotionCommand(
+            intent="hold_torso",
+            magnitude="continuous",
+            source="test",
+            waist_pitch_deg=15.0,
+            waist_yaw_deg=20.0,
+        )
+    )
+    while p.state != PlannerState.STATIC_HOLD:
+        p.step()
+    _drive(p, 20)  # dwell at target
+    p.enqueue(LocomotionCommand("walk", "forward"))
+    frames = _drive(p, 120)
+    peak, where = _max_dof_jump(frames)
+    assert peak <= MAX_DOF_JUMP_RAD, (
+        f"STATIC_HOLD->walk exit seam jump {peak:.4f} rad at tick {where} "
+        f"exceeds {MAX_DOF_JUMP_RAD}"
+    )
+    assert any(f.state == PlannerState.PLAYING for f in frames)

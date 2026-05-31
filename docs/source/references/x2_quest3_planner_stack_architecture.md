@@ -14,16 +14,39 @@ This is the engineering reference. Operator-facing tutorials live in:
 
 Lower-level references this doc cites:
 
+* [`x2_split_deploy_pc2.md`](x2_split_deploy_pc2.md) — split-topology
+  deployment where the C++ deploy + hand bridge + motor monitor run
+  on the robot's Jetson (PC2) while only the operator-side
+  manager / planner / recorder stack stays on the laptop. Use the
+  `--remote-deploy HOST` flag on the wrapper described below to
+  switch into split mode. Strongly recommended for any real-robot
+  test run; the SAFE_IDLE state and pose-ref starvation watchdog
+  documented there are the hardware-side recovery path for the
+  laptop-WiFi-blink freeze that motivated the split.
+* [`x2_motor_monitoring.md`](x2_motor_monitoring.md) — JSONL schema +
+  ZMQ summary contract for the new `x2_motor_monitor.py` daemon
+  (PC2 side; events forward into `manager_sidecar.jsonl` on the
+  laptop).
 * [`x2_zmq_protocol.md`](x2_zmq_protocol.md) — packed-message wire
   format spec (`pack_pose_message` / `unpack_message`).
+* [`x2_kplanner.md`](x2_kplanner.md) — the **default** planner since
+  2026-05: trained MotionBricks VQVAE + pose + root checkpoints
+  driving `motion_inference.predict()` on a 4-D velocity intent. Same
+  `body_pose` / `pose` wire as the heuristic.
 * [`x2_heuristic_planner.md`](x2_heuristic_planner.md) — planner FSM,
-  recipe library, future-window semantics.
+  recipe library, future-window semantics. Still the canonical
+  reference for the wire-format spec and curator pipeline; available
+  behind `run_x2_quest3_planner_stack.sh --planner heuristic`.
 * [`x2_groot_robocasa.md`](x2_groot_robocasa.md) — Robocasa scene
   integration plan (G1 architecture).
 * [`x2_isaac_groot_data_contract.md`](x2_isaac_groot_data_contract.md) —
   LeRobot v1 / v2.1 schema for VLA training.
 * [`x2_deployment_code.md`](x2_deployment_code.md) — C++ deploy
   internals.
+* [`x2_vla_motion_token_decoder.md`](x2_vla_motion_token_decoder.md)
+  — why the live VLA bridge has its own SONIC decoder (the C++ deploy
+  ignores `motion_token`), how the bridge closes the body-motion loop
+  on the publish side, and the operator runbook.
 * [`bug-tracker/thumb-closing-bug.md`](../../../bug-tracker/thumb-closing-bug.md)
   — open issue tracker for the OmniHand thumb regression.
 
@@ -46,7 +69,7 @@ flowchart LR
     subgraph Mgr["quest3_manager_x2 (single Python process)"]
         Q3R["Quest3Reader<br/>(WS + HTTPS<br/>background threads)"]
         IK["Retargeter<br/>(IK + finger map)"]
-        ID["IntentDecoder<br/>(left stick + B/A/X/Y)"]
+        ID["IntentDecoder<br/>(L stick + R stick + B/A/X/Y<br/>v7: R stick continuous waist hold<br/>v7.1: R-click toggles waist freeze;<br/>L-click cycles deploy camera)"]
         VCC["ViewerCameraCycler<br/>(xdotool)"]
     end
 
@@ -116,7 +139,7 @@ flowchart LR
 |---|---------|------|---------------|----------------|
 | 1 | **Quest 3 WebXR client** | Reads gamepad + XRHand, sends per-frame JSON over WebSocket; receives `play_audio` cues. | Hosted by manager on HTTPS 8443. | `gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html` |
 | 2 | **Manager** | Hosts Quest3Reader, runs IK retargeter, decodes button intents, publishes 4 ZMQ topics, plays audio cues, cycles MuJoCo viewer cameras. | `python -m gear_sonic.scripts.quest3_manager_x2` | `gear_sonic/scripts/quest3_manager_x2.py` |
-| 3 | **Heuristic planner** | Subscribes to `planner_cmd`, runs the recipe FSM at 50 Hz, publishes `body_pose` with a 9-frame future window. | `python -m gear_sonic.scripts.x2_heuristic_planner` | `gear_sonic/scripts/x2_heuristic_planner.py` + `gear_sonic/utils/planner/state_machine.py` |
+| 3 | **Planner** | Subscribes to `planner_cmd`, publishes `body_pose` with a 9-frame future window at 50 Hz. **Default since 2026-05** is the neural **kplanner** (`--planner kplanner`): trained MotionBricks VQVAE + pose + root checkpoints, with a worker thread running `motion_inference.predict()` on a 4-D velocity-intent vector derived from the latest `planner_cmd` via `intent_to_velocity()` (direction-explicit base × magnitude-scalar dispatcher) — see [`x2_kplanner.md`](x2_kplanner.md). The **heuristic** planner (`--planner heuristic`) remains available: recipe FSM that stitches a curated primitives PKL, optionally pre-loaded with a scripted YAML demo (`--planner-demo PATH.yaml`). | `python -m gear_sonic.scripts.x2_kplanner` (default) or `python -m gear_sonic.scripts.x2_heuristic_planner` | `gear_sonic/scripts/x2_kplanner.py` + `motionbricks/motion_backbone/inference/{neural_planner,load_x2_planner}.py` ‖ `gear_sonic/scripts/x2_heuristic_planner.py` + `gear_sonic/utils/planner/state_machine.py` |
 | 4 | **Recorder** | Two SUB sockets (5564 manager + 5565 planner); merges body + arm + hand into the `pose` payload on 5556; writes LeRobot v2.1 episodes to disk. | `python -m gear_sonic.scripts.record_x2_dataset` | `gear_sonic/scripts/record_x2_dataset.py` + `gear_sonic/utils/teleop/x2_dataset_recorder.py` |
 | 5a | **MuJoCo bridge** | Loads MJCF (bare X2 or robocasa scene), steps physics, publishes joint / IMU state to ROS2, subscribes to deploy actuator commands; in robocasa mode also PUBs `scene_state` and SUBs `scene_reset`. | Spawned by `deploy_x2.sh sim`. | `gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py` |
 | 5b | **C++ deploy** | Loads ONNX policy (SONIC 25k), receives `pose` reference from recorder, runs the tracking inference loop, sends actuator commands over ROS2 to the bridge, publishes `x2_debug` telemetry. | Spawned by `deploy_x2.sh sim`. | `gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp` |
@@ -143,7 +166,7 @@ sequenceDiagram
 
     H->>M: WS JSON {pose, hand_curls, oppose, buttons, sticks}
     M->>M: IK retarget (arms) + finger map (hands)
-    M->>M: IntentDecoder (left stick + buttons -> LocomotionCmd)
+    M->>M: IntentDecoder (L stick + R stick + buttons -> LocomotionCmd<br/>v7: R stick -> hold_torso(pitch,roll,yaw); B-press latches in ARM_MAN)
 
     par To planner
         M->>P: 5563 planner_cmd<br/>{intent, magnitude}
@@ -196,7 +219,7 @@ lines 141-153 — bumping any of them requires updating every consumer.
 |------|-------|-----------|------|------|---------|
 | **5556** | `pose` | recorder PUB → C++ deploy SUB **and** bridge OmniHand SUB | packed | 50 Hz | `joint_pos_mj` (f32, 31), `root_quat_xyzw` (f32, 4), `motion_token` (f32, 64), `left_hand_joints` / `right_hand_joints` (f32, 10), `frame_index` (i64), optional `joint_pos_mj_future` (f32, 9×31), `root_quat_xyzw_future` (f32, 9×4), `joint_vel_mj_future` (f32, 9×31), `frame_index_future` (i64, 9), `future_dt_s` (f32) |
 | **5557** | `x2_debug` | C++ deploy PUB → recorder SUB | packed | 50 Hz | `control_tick` (i64), `ros_timestamp` / `policy_time` (f64), `base_quat` (f64, 4), `base_ang_vel` (f64, 3), `body_q` / `body_dq` / `last_action` (f64, 31), `left_hand_q` / `right_hand_q` (f64, 10), `hand_frame_idx` (i64), `ramp_alpha` (f64), `tilt_trip` / `dry_run` (u8) |
-| **5563** | `planner_cmd` | manager PUB → planner SUB | multipart `[topic, json]` | edge-triggered (intent change) + idle keep-alives | `{"intent": str, "magnitude": str}` |
+| **5563** | `planner_cmd` | manager PUB → planner SUB | multipart `[topic, json]` | edge-triggered (intent change) + idle keep-alives | `{"intent": str, "magnitude": str}`, plus optional v7 `waist_pitch_deg`, `waist_roll_deg`, `waist_yaw_deg` floats when `intent == "hold_torso"` (continuous waist hold; see [`x2_heuristic_planner.md`](x2_heuristic_planner.md#v7-continuous-waist-hold-static_hold)) |
 | **5564** | `arm_targets`, `hand_finger_cmd`, `stream_mode`, `recorder_cmd` (multiplexed on **one** PUB socket) | manager PUB → recorder SUB | multipart `[topic, msgpack/json]` | 50 Hz (arm/hand/mode); edge-triggered (recorder_cmd) | `arm_targets`: 14 floats (left_q ‖ right_q). `hand_finger_cmd`: `{left_hand_q[10], right_hand_q[10]}`. `stream_mode`: `{mode: "OFF"|"LOCOMOTION"|"ARM_MANIPULATION"}`. `recorder_cmd`: `{op: "start"|"save"|"discard"|"estop", tick: int}` |
 | **5565** | `body_pose` | planner PUB → recorder SUB | packed | 50 Hz | Same packed schema as `pose` (planner builds the future window via `state_machine.build_pose_payload`) |
 
@@ -299,7 +322,8 @@ sample at every other frame.
 ## 6. Robocasa scene mode — what changes
 
 When the wrapper is launched with `--robocasa-env X2PickPlaceCube` (or
-`X2PickPlaceBowl`), three things happen on top of the flat-floor flow:
+`X2PickPlaceBowl` / `X2PickPlaceApple`), three things happen on top of
+the flat-floor flow:
 
 1. **Wrapper resolves** `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
    (one-time built via
@@ -402,7 +426,7 @@ The big shell wrappers that bring up multiple processes under one trap.
 
 | Script | Purpose | Default invocation | Most useful variants |
 |--------|---------|---------------------|----------------------|
-| [`gear_sonic/scripts/run_x2_quest3_planner_stack.sh`](../../../gear_sonic/scripts/run_x2_quest3_planner_stack.sh) | **Phase 0 four-process stack**: deploy + planner + manager + recorder. The canonical operator-facing entry point. | `bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh` (600 s, teleop-only) | • Robocasa record: `--robocasa-env X2PickPlaceCube --with-record --output-dir data/lerobot/<name>` <br/> • Flat-floor record: `--with-record --output-dir <path> --task "<lang>"` <br/> • External deploy: `--no-deploy` <br/> • Headless: `--no-sim-viewer` <br/> • Recovery: `--cleanup-only` <br/> • CI dry-run: `--validate-only` |
+| [`gear_sonic/scripts/run_x2_quest3_planner_stack.sh`](../../../gear_sonic/scripts/run_x2_quest3_planner_stack.sh) | **Phase 0 four-process stack**: deploy + planner + manager + recorder. The canonical operator-facing entry point. | `bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh` (600 s, teleop-only) | • Robocasa record: `--robocasa-env X2PickPlaceCube --with-record --output-dir data/lerobot/<name>` <br/> • Flat-floor record: `--with-record --output-dir <path> --task "<lang>"` <br/> • Auto-play scripted demo at startup then idle for VR takeover: `--planner-demo gear_sonic/data/scripted_demos/<name>.yaml` <br/> • External deploy: `--no-deploy` <br/> • Headless: `--no-sim-viewer` <br/> • Recovery: `--cleanup-only` <br/> • CI dry-run: `--validate-only` |
 | [`gear_sonic/scripts/record_x2_dataset.sh`](../../../gear_sonic/scripts/record_x2_dataset.sh) | **Legacy** monolithic wrapper: deploy + `record_x2_dataset.py` (with embedded Quest 3 server, no planner split). Lower body holds SONIC stand pose. | `bash record_x2_dataset.sh --teleop-only --sonic-checkpoint <pt>` | • Full record: `--output-dir <path> --task "<lang>" --sim-omnihand --wrist-bypass ik` <br/> • Robocasa record: `--robocasa-env X2PickPlaceCube` |
 | [`gear_sonic/scripts/run_planner_smoke.sh`](../../../gear_sonic/scripts/run_planner_smoke.sh) | Planner-only smoke (optionally + deploy + kinematic viewer + `dump_x2_debug`). No Quest 3. | `bash run_planner_smoke.sh` (20 s, planner only on 5556) | • Closed-loop sim with keyboard: `--with-deploy --keyboard --duration 120` <br/> • Scripted demo: `--demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml --with-deploy --duration 60` <br/> • Recovery: `--cleanup-only` |
 | [`gear_sonic/scripts/run_live_vla_demo.sh`](../../../gear_sonic/scripts/run_live_vla_demo.sh) | Live GR00T VLA model → pose publisher → `dump_x2_debug` → deploy. No VR headset. | Requires `MODEL_DIR` + `ONNX` envs. | `./run_live_vla_demo.sh stop` to tear down. |
@@ -426,7 +450,7 @@ Run one stage in isolation — useful for debugging without the full stack.
 
 | Script | Purpose |
 |--------|---------|
-| `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env {X2PickPlaceCube,X2PickPlaceBowl,--all}` | Build a robocasa scene MJCF + JSON sidecar. Required before first robocasa launch. |
+| `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env {X2PickPlaceCube,X2PickPlaceBowl,X2PickPlaceApple,--all}` | Build a robocasa scene MJCF + JSON sidecar. Required before first robocasa launch. |
 | `python -m gear_sonic.scripts.build_x2_planner_primitives` | Build the planner's motion primitive PKL from recipe sources. |
 | `python -m gear_sonic.scripts.bake_planner_demo_to_pkl --demo <yaml> --out <pkl>` | Bake a scripted YAML demo into a PKL the deploy can replay via `--motion`. |
 | `python -m gear_sonic.scripts.bake_planner_rsi_anchor` | Bake the RSI anchor PKL used by `--sim-profile parity` (auto-rebuilt by the wrapper if missing). |

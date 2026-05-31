@@ -1,5 +1,44 @@
 # Standard Commands
 
+## custom quick commands
+- record
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 1200 --with-record \
+    --output-dir data/lerobot/x2_pick_place_apple_v1 \
+    --robocasa-env X2PickPlaceApple \
+    --sonic-tokenizer-device cpu
+```
+
+- replay videos:
+```sh
+xdg-open data/lerobot/x2_pick_place_apple_v1/videos/chunk-000/observation.images.ego_view/episode_000005.mp4 &
+xdg-open data/lerobot/x2_pick_place_apple_v1/videos/chunk-000/observation.images.front_cam/episode_000005.mp4 &
+```
+
+- train
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl
+
+deactivate              # leave .venv (uv-managed)
+conda deactivate         # leave whatever conda env is currently on top
+conda activate env_isaaclab
+
+# Verify python now resolves to env_isaaclab
+which python
+# Should print: /home/stickbot/miniconda3/envs/env_isaaclab/bin/python
+
+PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
+    external_dependencies/Isaac-GR00T/gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path data/lerobot/x2_pick_place_apple_v1 \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path gear_sonic/data/x2_modality_config_10dof.py \
+    --num-gpus 1 \
+    --output-dir /tmp/x2_pick_place_apple_v1_run1 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+```
+
 Top-level cheat-sheet for the X2 + Quest 3 teleop / record / replay
 loop. Defaults assume a `uv venv` at `.venv/` and the dataset
 landing under `data/lerobot/`.
@@ -100,8 +139,16 @@ for the full architecture write-up.
 
 ```sh
 cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
+```
+
+Or build them one at a time:
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
 .venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl && \
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceApple
 ```
 
 Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`
@@ -287,6 +334,45 @@ after a fresh checkout to confirm planner / manager / deploy come up.
 gear_sonic/scripts/run_x2_quest3_planner_stack.sh --duration 300
 ```
 
+### Auto-play a scripted demo at startup, then idle for VR takeover
+
+Pre-loads a scripted YAML demo into the planner's command queue at
+boot. The planner plays through the sequence (each `intent: ...`
+entry runs through the FSM blend / play / blend cycle), drains back
+to `idle_stand` when the queue empties, and sits in `IDLE_LOOP`
+indefinitely waiting for the operator. The first VR-driven
+`planner_cmd` (operator straps on the headset, chord-presses
+**A+B+X+Y** to enter LOCOMOTION, then nudges a stick) calls
+`replace_pending` and preempts whatever's still queued, so a
+half-played demo can be interrupted mid-flight without restarting the
+stack.
+
+```sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --duration 0 \
+    --planner-demo gear_sonic/data/scripted_demos/eleven_motion_sequence.yaml
+```
+
+Available demos (full inventory in
+[`x2_heuristic_planner.md` § Scripted demo gallery](docs/source/references/x2_heuristic_planner.md#scripted-demo-gallery)):
+
+| Demo | What it plays |
+| --- | --- |
+| `eleven_motion_sequence.yaml` | 11-bin smoke covering every working family (fwd_step, turns, side steps, crouch, leans, torso twists). |
+| `forward_back_turn.yaml` | continuous walk fwd / back + two turns. |
+| `static_reach.yaml` | full lean + torso-twist reach ladder, no locomotion. |
+| `gallery_crouch.yaml` | crouch_medium ×3. |
+| `gallery_fwd_back_shuffle.yaml` | fwd_step + back_step variants. |
+| `manipulation_approach.yaml` | locomanipulation approach + reach. |
+| `side_steps_only_smoke.yaml` | side_left_step + side_right_step. |
+| `six_motion_smoke.yaml` | shorter 6-bin smoke. |
+
+Mutually exclusive with `--vla-bridge` / `--vla-no-policy` (those
+modes replace the heuristic planner with the live VLA bridge and have
+no command queue to seed). Compatible with `--with-record` if you
+want the auto-played intro stitched into the same LeRobot episode the
+operator records afterward.
+
 ### Record mobile-manipulation episodes (flat floor)
 
 Same scene as the kinematic / SONIC recorders above (no table, no
@@ -411,11 +497,11 @@ crashed deploy.
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
-| `--duration N` | `600` | Auto-shutdown after N seconds (deploy `--max-duration`). |
+| `--duration N` | `0` (unlimited; Ctrl-C to stop) | Auto-shutdown after N seconds (deploy `--max-duration`). Pass `0` (or omit) for no limit. |
 | `--with-record` | off | Spawn the LeRobot recorder. Requires `--output-dir`. |
 | `--output-dir PATH` | — | Required with `--with-record`. |
 | `--task STR` | required in flat-floor; **optional in robocasa** | Language instruction stamped on every frame. Robocasa mode auto-fills from scene metadata. |
-| `--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl}` | `none` | Load a Robocasa scene; flat floor when `none`. Build the XMLs first via `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env <ENV>`. |
+| `--robocasa-env {none,X2PickPlaceCube,X2PickPlaceBowl,X2PickPlaceApple}` | `none` | Load a Robocasa scene; flat floor when `none`. Build the XMLs first via `python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env <ENV>` (or `--all`). |
 | `--scene-xml-path PATH` | auto-resolved from env | Override `gear_sonic/data/assets/robocasa_scenes/<env>.xml`. |
 | `--episode-seed INT` | (numpy global RNG) | Reproducible per-`start` object placement. |
 | `--apply-curl-compensation` / `--no-apply-curl-compensation` | **ON in robocasa**, OFF otherwise | Per-finger curl stretch (boosts mid-range curls toward CLOSED). Applied on the manager side (which owns the Retargeter in subscribe-mode). |
@@ -423,6 +509,7 @@ crashed deploy.
 | `--operator-id NAME` | `default` | Loads `data/operator_calibrations/<NAME>.yaml`. |
 | `--calibration PATH` | auto from `--operator-id` | Explicit calibration override. |
 | `--wrist-bypass {off,ik}` | `ik` | Override SONIC's wrist target with the operator's IK reference. Same semantics as `record_x2_dataset.sh`. |
+| `--planner-demo PATH.yaml` | (none) | Pre-load a scripted-demo YAML into the planner's command queue at startup. The planner plays through it, returns to `idle_stand`, and waits for the operator's first VR `planner_cmd` (which preempts via `replace_pending`). Same YAML schema as `gear_sonic/data/scripted_demos/*.yaml`. Mutually exclusive with `--vla-bridge` / `--vla-no-policy`. |
 | `--no-deploy` | off | Skip launching `deploy_x2.sh` (assume external). |
 | `--no-sim-viewer` | off | Run the deploy headless (no MuJoCo viewer; headset still required). |
 | `--sim-profile {parity,manual}` | `parity` | Deploy SONIC profile. `parity` matches the bake-vs-planner reference; `manual` skips the RSI anchor. |
@@ -438,8 +525,7 @@ that doesn't have them committed), the wrapper will refuse to start
 with a helpful error pointing at the build command. Run it once:
 
 ```sh
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceCube && \
-.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --env X2PickPlaceBowl
+.venv_sim/bin/python -m gear_sonic.scripts.build_x2_robocasa_scene_xml --all
 ```
 
 Output lands in `gear_sonic/data/assets/robocasa_scenes/<env>.xml`

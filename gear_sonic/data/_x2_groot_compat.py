@@ -86,6 +86,7 @@ __all__ = [
     "apply_qwen3_backbone_meta_device_guard",
     "apply_gr00t_n1d7_init_meta_guard",
     "apply_gr00t_n1d7_post_init_freeze_fix",
+    "apply_gr00t_n1d7_action_head_sample_time_guard",
     "apply_all_x2_groot_compat",
 ]
 
@@ -95,6 +96,7 @@ _APPLIED_FLAG_ATTR = "_x2_groot_compat_applied"
 _BACKBONE_PATCH_FLAG = "_x2_backbone_meta_guard_applied"
 _GR00T_INIT_PATCH_FLAG = "_x2_gr00t_init_meta_guard_applied"
 _POSTINIT_PATCH_FLAG = "_x2_postinit_freeze_fix_applied"
+_SAMPLE_TIME_PATCH_FLAG = "_x2_sample_time_autocast_guard_applied"
 
 
 def apply_qwen3vl_transformers5_compat() -> bool:
@@ -433,6 +435,119 @@ def apply_gr00t_n1d7_post_init_freeze_fix() -> bool:
     return True
 
 
+def apply_gr00t_n1d7_action_head_sample_time_guard() -> bool:
+    """Wrap ``Gr00tN1d7ActionHead.sample_time`` so the Beta/Dirichlet draw
+    happens in float32 even when the trainer's outer autocast(bfloat16)
+    context is active.
+
+    Background
+    ----------
+    ``Gr00tN1d7ActionHead.sample_time`` (called once per training step
+    from ``Gr00tN1d7ActionHead.forward`` to draw the diffusion timestep)
+    samples from a ``torch.distributions.Beta`` and casts the result to
+    the model's working dtype::
+
+        def sample_time(self, batch_size, device, dtype):
+            sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+            sample = (1 - sample) * self.config.noise_s
+            return sample
+
+    The cast happens *after* the sample call, so under
+    ``torch.amp.autocast("cuda", dtype=bfloat16)`` (which the
+    transformers Trainer wraps the entire forward in for mixed-precision
+    training) PyTorch tries to draw a bfloat16 Dirichlet sample and
+    crashes with::
+
+        RuntimeError: "dirichlet" not implemented for 'BFloat16'
+
+    The companion patch :func:`apply_gr00t_n1d7_init_meta_guard` already
+    handles the same problem at *construction* time (it disables autocast
+    around ``__init__`` so the ``Beta(alpha, beta)`` constructor doesn't
+    inherit the bfloat16 default dtype). This patch handles the
+    forward-pass equivalent: every time ``sample_time`` runs, we drop
+    out of the autocast region just for the Beta draw, then let the
+    trailing ``.to(dtype=...)`` cast the result back to the working
+    dtype as the upstream code already intends.
+
+    Disabling autocast for ~3 lines per training step has zero measurable
+    perf impact (the dominant cost is the Qwen3 backbone, not a 32-elem
+    scalar draw) but is the difference between a working M4 fine-tune
+    and a hard crash on the very first ``training_step``.
+
+    Confirmed against transformers==5.0.0, torch==2.7.0+cu128
+    (env_isaaclab) on 2026-05-13. Reproduces on
+    ``examples/finetune.sh`` with ``--max-steps 10000 --num-gpus 1``.
+
+    Returns:
+        ``True`` if the patch was applied (or had already been applied),
+        ``False`` if Isaac-GR00T's ``Gr00tN1d7ActionHead`` could not be
+        imported.
+    """
+    try:
+        from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+    except ImportError:
+        _LOG.debug(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.Gr00tN1d7ActionHead not "
+            "importable -- sample-time guard is a no-op."
+        )
+        return False
+
+    if getattr(Gr00tN1d7ActionHead, _SAMPLE_TIME_PATCH_FLAG, False):
+        return True
+
+    import torch
+    from torch.distributions import Beta
+
+    _orig_sample_time = Gr00tN1d7ActionHead.sample_time
+
+    def _patched_sample_time(self, batch_size, device, dtype):  # type: ignore[no-redef]
+        # Two layers of defence against the BF16 Dirichlet gap:
+        # 1. Disable the active autocast region for the Beta draw, in case
+        #    autocast itself would cast the sample call's intermediates.
+        # 2. If the Beta's concentration tensors themselves are non-fp32
+        #    (which happens in practice -- transformers 5.0's
+        #    ``from_pretrained`` cascades ``torch_dtype=bfloat16`` into
+        #    every tensor created during the meta-allocation walk,
+        #    including the Beta's ``concentration0/1`` even though
+        #    ``apply_gr00t_n1d7_init_meta_guard`` tries to suppress this),
+        #    rebuild a float32 Beta on the fly and sample from that.
+        # Either way, the trailing ``.to(dtype=dtype)`` casts the float32
+        # sample back to the working dtype as upstream intends.
+        device_type = device.type if hasattr(device, "type") else "cuda"
+        with torch.amp.autocast(device_type, enabled=False):
+            beta = self.beta_dist
+            c1 = getattr(beta, "concentration1", None)
+            c0 = getattr(beta, "concentration0", None)
+            if (
+                c1 is not None and c0 is not None
+                and (c1.dtype != torch.float32 or c0.dtype != torch.float32)
+            ):
+                # Rebuild the Beta with float32 concentrations; cache it
+                # on the instance so we only pay the construction cost
+                # once (the underlying Dirichlet validation is non-trivial
+                # at construction time).
+                cached = getattr(self, "_x2_beta_dist_fp32", None)
+                if cached is None:
+                    cached = Beta(c1.detach().float(), c0.detach().float())
+                    self._x2_beta_dist_fp32 = cached
+                sample = cached.sample([batch_size]).to(device=device, dtype=dtype)
+                sample = (1 - sample) * self.config.noise_s
+                return sample
+            return _orig_sample_time(self, batch_size, device, dtype)
+
+    _patched_sample_time.__wrapped__ = _orig_sample_time  # type: ignore[attr-defined]
+    Gr00tN1d7ActionHead.sample_time = _patched_sample_time  # type: ignore[method-assign]
+    setattr(Gr00tN1d7ActionHead, _SAMPLE_TIME_PATCH_FLAG, True)
+
+    _LOG.info(
+        "Applied X2 -> Isaac-GR00T Gr00tN1d7ActionHead.sample_time "
+        "autocast guard (Beta/Dirichlet sample stays in float32 even "
+        "when the trainer wraps forward in autocast(bfloat16)). See "
+        "gear_sonic/data/_x2_groot_compat.py for the rationale."
+    )
+    return True
+
+
 def apply_all_x2_groot_compat() -> dict[str, bool]:
     """Apply every X2 -> Isaac-GR00T compat patch in the right order.
 
@@ -445,6 +560,10 @@ def apply_all_x2_groot_compat() -> dict[str, bool]:
     invoked first for symmetry / future-proofing (e.g. should upstream
     add a layer-pruning call that uses ``self.model.visual`` directly).
 
+    The action-head ``sample_time`` autocast guard can be installed any
+    time before ``Gr00tN1d7ActionHead.forward`` runs; we apply it last
+    for clarity.
+
     Returns:
         Dict ``{patch_name: applied}`` for diagnostic logging.
     """
@@ -453,4 +572,5 @@ def apply_all_x2_groot_compat() -> dict[str, bool]:
         "qwen3_backbone_cpu_guard": apply_qwen3_backbone_meta_device_guard(),
         "gr00t_n1d7_init_guard": apply_gr00t_n1d7_init_meta_guard(),
         "gr00t_n1d7_freeze_fix": apply_gr00t_n1d7_post_init_freeze_fix(),
+        "gr00t_n1d7_sample_time_guard": apply_gr00t_n1d7_action_head_sample_time_guard(),
     }

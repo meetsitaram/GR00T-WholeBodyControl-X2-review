@@ -151,6 +151,71 @@ if it's missing and points the user at `gr00t/data/stats.py` to regenerate it.
 those columns are fine to keep — anything not referenced by `modality.json` is
 simply ignored by the loader.
 
+### `action.motion_token` provenance (X2 SONIC datasets)
+
+The `action.motion_token` column is filled **inline at recording
+time** by the X2 dataset recorder — every frame is the SONIC FSQ
+encoding of the **planner's real 10-frame future window** (current
+*commanded* `body_q_mj` stacked in front of 9 future planner frames),
+*not* the observed body_q (which would bake in tracking lag and a
+one-tick self-reference, see `vla_training.md` §5a.4 for the full
+reasoning).
+
+This matches the encoder input the deploy actor's internal encoder
+consumes from the same wire snapshot, so the VLA learns from labels
+that share a representation with the policy.
+
+Provenance is pinned by a YAML config:
+
+* The encoder-observation YAML lives at
+  [`gear_sonic/data/encoder/x2_observation_config.yaml`](../../../gear_sonic/data/encoder/x2_observation_config.yaml)
+  and follows the same schema as G1's release config
+  (`gear_sonic_deploy/policy/release/observation_config.yaml`). See
+  [`x2_encoder_config.md`](x2_encoder_config.md) for the full
+  schema reference and registry contract.
+* The encoder weights are loaded from the SONIC tracker's `.pt`
+  checkpoint via
+  [`gear_sonic/utils/teleop/online_sonic_tokenizer.py`](../../../gear_sonic/utils/teleop/online_sonic_tokenizer.py)
+  (`OnlineSonicTokenizer.from_checkpoint_with_config`). The encoder
+  is **not** present as a standalone ONNX file: it is fused inside
+  the deploy `actor.onnx` graph; the recorder reuses the same
+  weights from the `.pt`.
+* The 680-D observation is built by
+  [`X2EncoderObsBuilder`](../../../gear_sonic/utils/teleop/x2_encoder_obs_builder.py)
+  (Python, recorder side); the deploy's C++ `ZmqPoseInputSource`
+  builds the byte-identical observation from the same wire snapshot
+  (asserted by Layer 3 of the validation pyramid).
+
+Operator surface:
+
+* The wrapper [`run_x2_quest3_planner_stack.sh`](../../../gear_sonic/scripts/run_x2_quest3_planner_stack.sh)
+  auto-resolves the SONIC `.pt` as a sibling of the `--model` ONNX
+  (strip `/exported/`, replace `_g1.onnx` with `.pt`), and **fails
+  pre-flight** if the resolved path is missing — the safety net
+  that prevents accidentally producing a zero-token (non-VLA-
+  trainable) dataset. The encoder YAML is similarly preflighted.
+* `--no-sonic-checkpoint` is the documented escape hatch for
+  kinematic-only smoke tests; it explicitly opts in to a
+  zero-token column and the wrapper's banner switches to
+  `motion_token : DISABLED (...)`.
+* `--encoder-config ''` is a second escape hatch that keeps the
+  tokenizer running but degrades to the **deprecated freeze-pose**
+  path (current body_q tiled 11 times). Tokens encode static
+  intent; the wrapper banner shows `encoder_config :
+  DEPRECATED freeze-pose (...)` so a recording mistake is
+  immediately visible.
+* The recorder logs the resolved state at startup, including the
+  YAML name and selected encoder mode (`[recorder] motion_token
+  tokenizer ready (..., encoder_config=..., modes=[...], multi-
+  frame 10x68 -> 680-D)`), so the contract is auditable from the
+  recorder log alone.
+
+There is **no offline labeling pass** in the X2 pipeline — the
+inline tokenizer makes the dataset training-ready as written. The
+inline tokens differ semantically from the legacy v0 freeze-pose
+labels: real-future tokens encode the operator's anticipated
+trajectory, not just static intent.
+
 ---
 
 ## 3. ModalityConfig contract (Python side)

@@ -44,6 +44,17 @@ Design notes
   timestep, rolling over to the freshest available chunk whenever the
   worker finishes another inference.
 
+* **Planner-shaped safety on the wire:** the publisher always emits the
+  trained ``DEFAULT_STAND_POSE`` as ``joint_pos_mj`` and identity root
+  quat — that is the SONIC tracker setpoint, not a feedback channel.
+  Mirroring the live ``body_q_mj`` from ``x2_debug`` back as the
+  setpoint zeroes the tracking error and the robot falls under gravity
+  (verified empirically 2026-05-14). The motion-token / hand slices
+  come from the latest VLA chunk (zeros until the first inference, or
+  always zero under ``--no-policy``). After a render or policy failure
+  the inference thread posts a **zero-token** chunk so downstream never
+  keeps consuming a bad latent while telemetry recovers.
+
 * The state vector handed to ``Gr00tPolicy`` is in **Pinocchio URDF order**
   (matches ``meta/modality.json``: legs / waist / head / arms / hands),
   while ``body_q`` arriving over ``x2_debug`` is in **MuJoCo joint order**
@@ -71,6 +82,7 @@ import threading
 import time
 from typing import Any, Optional
 
+import joblib
 import numpy as np
 import zmq
 
@@ -92,6 +104,37 @@ SONIC_MOTION_TOKEN_DIM: int = 64
 DEFAULT_HAND_DOF: int = 10
 DEFAULT_PUB_RATE_HZ: float = 50.0
 NUM_BODY_DOFS: int = 31  # MuJoCo joint count
+# Single-tick zero slices for planner-like idle wire (avoid per-tick alloc).
+_ZERO_MOTION_TOKEN_STEP = np.zeros(SONIC_MOTION_TOKEN_DIM, dtype=np.float32)
+_ZERO_HAND_STEP = np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
+# v0 proprio placeholder for the bridge-side SONIC token decoder. The
+# decoder is OOD with this input but still emits non-trivial actions
+# (~0.30 rad RMSE per validate_encode_decode_loop.py); good enough to
+# put dynamic body intent on the wire. A v1 follow-up would assemble a
+# real 990-D proprio from x2_debug history (see
+# gear_sonic/scripts/eval_x2_mujoco.py:493 ProprioceptionBuffer for the
+# canonical layout).
+_PROPRIO_ZERO_990 = np.zeros(990, dtype=np.float32)
+
+# v5 future-window contract -- must mirror DT_FUTURE_REF / NUM_FUTURE_FRAMES
+# in gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/zmq/zmq_pose_input_source.hpp
+# (NUM_FUTURE_FRAMES = 10, k=0 == current frame, so we publish the 9
+# strictly-future slots on the wire). Without this window the deploy's
+# ZmqPoseInputSource falls back to the legacy single-frame Sample() path,
+# which pins all 10 future tokens at the current pose -- the policy was
+# trained with motion-bearing windows and produces saturated raw actions
+# (act_clip ~100 % of ticks, max_pre_clip > action_clip) when fed the
+# legacy fallback, which manifests as a slow gravity tilt after the
+# elastic band releases. The heuristic planner emits the same window
+# shape via :func:`gear_sonic.utils.planner.state_machine.build_pose_payload`,
+# so promoting the bridge to v5 brings the wire to byte-parity with
+# planner-only mode and unblocks --vla-no-policy / closed-loop runs.
+_FUTURE_DT_S: float = 0.1
+_NUM_FUTURE_SLOTS: int = 9
+# step_ticks at 50 Hz so that adjacent future slots are DT_FUTURE_REF
+# (0.1 s) apart -- matches ``planner.step_with_lookahead(step_ticks=5)``.
+_FUTURE_STEP_TICKS: int = int(round(DEFAULT_PUB_RATE_HZ * _FUTURE_DT_S))
+_FUTURE_DT_FIELD = np.array([_FUTURE_DT_S], dtype=np.float32)
 
 
 # Stand-pose fallback (radians, MuJoCo body order). Mirrors the trained
@@ -123,6 +166,372 @@ MJ_TO_PIN: tuple[int, ...] = (
 )
 assert len(MJ_TO_PIN) == NUM_BODY_DOFS
 
+# SONIC / deploy expect a fixed 40-step horizon at 50 Hz unless the
+# policy checkpoint changes modality horizons (we match the default chunk).
+DEFAULT_ACTION_HORIZON: int = 40
+
+
+def _identity_quat_xyzw() -> np.ndarray:
+    return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _default_stand_body_pose_f32() -> np.ndarray:
+    return np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32)
+
+
+# Pre-allocated zero-motion future window. ``_idle_jpos_future`` is 9
+# strictly-future copies of DEFAULT_STAND_POSE; ``_idle_quat_future`` is
+# 9 identity quats; ``_idle_jvel_future`` is the matching zero-velocity
+# slab (finite-diff over identical frames is zero, so we ship it
+# explicitly to skip the deploy's backward-finite-diff path). Mutating
+# the returned arrays is forbidden -- callers should copy if they need
+# to write. We freeze them with WRITEABLE=False so accidental writes
+# raise rather than silently corrupting future ticks.
+def _make_idle_future_window() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    jpos = np.broadcast_to(
+        np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32),
+        (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+    ).copy()
+    quat = np.broadcast_to(
+        np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        (_NUM_FUTURE_SLOTS, 4),
+    ).copy()
+    jvel = np.zeros((_NUM_FUTURE_SLOTS, NUM_BODY_DOFS), dtype=np.float32)
+    for arr in (jpos, quat, jvel):
+        arr.setflags(write=False)
+    return jpos, quat, jvel
+
+
+_IDLE_JPOS_FUTURE, _IDLE_QUAT_FUTURE, _IDLE_JVEL_FUTURE = _make_idle_future_window()
+
+
+def _idle_future_payload_fields(*, base_frame_index: int) -> dict[str, np.ndarray]:
+    """Return the v5 future-window subset of the wire payload.
+
+    The deploy promotes a frame to v5 mode iff it carries BOTH
+    ``joint_pos_mj_future`` and ``root_quat_xyzw_future`` (joint_vel is
+    optional but we ship it to skip the deploy's backward-finite-diff
+    path). ``frame_index_future`` is informational only -- the deploy
+    does not gate v5 promotion on it -- but we keep it consistent so
+    the parity tooling and dataset replays line up.
+    """
+    fidx_future = np.array(
+        [base_frame_index + (k + 1) for k in range(_NUM_FUTURE_SLOTS)],
+        dtype=np.int64,
+    )
+    return {
+        "joint_pos_mj_future": _IDLE_JPOS_FUTURE,
+        "root_quat_xyzw_future": _IDLE_QUAT_FUTURE,
+        "joint_vel_mj_future": _IDLE_JVEL_FUTURE,
+        "frame_index_future": fidx_future,
+        "future_dt_s": _FUTURE_DT_FIELD,
+    }
+
+
+def _build_vla_decoded_pose_payload(
+    *,
+    decoder: Any,
+    proprio_990: np.ndarray,
+    token_chunk: np.ndarray,
+    chunk_step: int,
+    horizon: int,
+    base_frame_index: int,
+) -> Optional[tuple[np.ndarray, dict[str, np.ndarray]]]:
+    """Decode VLA tokens to body trajectory + build wire payload.
+
+    Pulls the current step's motion_token plus 9 future steps spaced
+    :data:`_FUTURE_STEP_TICKS` apart from ``token_chunk``, runs them
+    through :class:`SonicTokenToPoseDecoder` (which mirrors the C++
+    deploy's ``target_mj = default + action_il * action_scale``
+    formula), and returns
+
+    * ``joint_pos_mj_now``: ``(31,) float32`` MuJoCo-order pose for
+      the current tick;
+    * ``future_fields``: dict matching :func:`_idle_future_payload_fields`
+      shape (``joint_pos_mj_future`` etc.) with the next 9 decoded
+      poses.
+
+    Returns ``None`` (caller falls back to idle wire) on any decode
+    failure -- we never want a render glitch / NaN to brick the
+    publisher loop. The publisher is the only thing keeping the deploy
+    upright.
+
+    The future window samples ``token_chunk[step+(k+1)*5]`` for
+    ``k=0..8``, clamped at ``horizon-1``. That mirrors the encoder's
+    ``DT_FUTURE_REF=0.1 s`` sampling at the 50 Hz publisher cadence
+    (``5 ticks = 0.1 s``).
+    """
+    try:
+        from gear_sonic.utils.teleop.sonic_token_to_pose_decoder import (
+            decode_token_chunk_to_pose_chunk,
+        )
+        slot_indices = [
+            min(chunk_step + (k + 1) * _FUTURE_STEP_TICKS, horizon - 1)
+            for k in range(_NUM_FUTURE_SLOTS)
+        ]
+        all_indices = [min(chunk_step, horizon - 1)] + slot_indices
+        sampled_tokens = np.stack(
+            [token_chunk[i] for i in all_indices], axis=0
+        )
+        # decode_chunk handles batched torch inference in one shot so
+        # the per-tick cost stays around 1-2 ms even with the 9 future
+        # slots in the same call.
+        poses = decode_token_chunk_to_pose_chunk(
+            decoder, sampled_tokens.astype(np.float32), proprio_990
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Caller logs (sticky one-shot, see _publisher); we just bail.
+        print(
+            f"[live-VLA] decoder error: {exc} -- falling back to idle wire",
+            flush=True,
+        )
+        return None
+
+    joint_pos_mj_now = poses[0].astype(np.float32, copy=False)
+    joint_pos_mj_future = poses[1:].astype(np.float32, copy=False)
+    # Hold root quat at identity / repeat -- the SONIC decoder does not
+    # predict a root pose (the policy is body-only), so we mirror the
+    # idle wire's identity quat for both current + future. This is the
+    # same convention the heuristic planner uses for IDLE_LOOP frames
+    # (see _IDLE_QUAT_FUTURE construction).
+    quat_future = _IDLE_QUAT_FUTURE
+    # Finite-difference jvel from the decoded pose trajectory so the
+    # deploy's tokenizer_obs gets a non-zero velocity component (rather
+    # than the constant 0 the idle window ships). dt = _FUTURE_DT_S.
+    jvel_future = np.zeros(
+        (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS), dtype=np.float32
+    )
+    prev = joint_pos_mj_now
+    for k in range(_NUM_FUTURE_SLOTS):
+        jvel_future[k] = (
+            (joint_pos_mj_future[k] - prev) / max(_FUTURE_DT_S, 1e-6)
+        )
+        prev = joint_pos_mj_future[k]
+    fidx_future = np.array(
+        [base_frame_index + (k + 1) for k in range(_NUM_FUTURE_SLOTS)],
+        dtype=np.int64,
+    )
+    future_fields = {
+        "joint_pos_mj_future": joint_pos_mj_future,
+        "root_quat_xyzw_future": quat_future,
+        "joint_vel_mj_future": jvel_future,
+        "frame_index_future": fidx_future,
+        "future_dt_s": _FUTURE_DT_FIELD,
+    }
+    return joint_pos_mj_now, future_fields
+
+
+class _IdleStandLoop:
+    """Replay the planner's ``idle_stand`` primitive at 50 Hz.
+
+    The bridge -- when run in idle / ``--no-policy`` mode -- needs to
+    publish a wire-content-byte-equivalent stream to what the heuristic
+    planner emits during IDLE_LOOP. Empirically (2026-05-14):
+
+      * Static stand (DEFAULT_STAND_POSE_NP every tick + identity quat,
+        no future window) makes the policy output saturated raw actions
+        and the robot leans ~25 deg under gravity even with a v5 window.
+      * Replaying ``idle_stand`` (the 30 fps captured stand clip
+        resampled to 50 Hz, ~75 frames) keeps the robot perfectly
+        upright (grav_z = -1.00 for 20k+ ticks under
+        ``--planner-only``).
+
+    The two policies-relevant differences are (a) ``idle_stand[0]``'s
+    waist-yaw is ~33 deg off DEFAULT_STAND_POSE_NP, and (b) the clip
+    has small per-frame DOF jitter the policy was trained against. We
+    reproduce both by indexing into the raw clip arrays and wrapping
+    modulo the clip length. Yaw alignment is a no-op when
+    (xy_world, yaw_world) = (0, 0), which is the bridge's invariant
+    (we do not move the base), so we skip the planner's
+    ``yaw_align_segment`` machinery and read the dof / quat arrays
+    verbatim.
+
+    Future-window slots are pulled from the same clip at
+    ``_FUTURE_STEP_TICKS`` (= 5) tick spacing, mirroring
+    ``planner.step_with_lookahead(num_future=9, step_ticks=5)``. The
+    clip is loopable, so wrap-around at the seam is fine for an idle
+    stand (no DOF discontinuity bigger than a few mrad).
+    """
+
+    def __init__(
+        self,
+        *,
+        dof: np.ndarray,
+        quat_xyzw: np.ndarray,
+        bin_name: str = "idle_stand",
+    ) -> None:
+        if dof.ndim != 2 or dof.shape[1] != NUM_BODY_DOFS:
+            raise ValueError(
+                f"idle_stand dof must be (T,{NUM_BODY_DOFS}), "
+                f"got {dof.shape}"
+            )
+        if quat_xyzw.ndim != 2 or quat_xyzw.shape[1] != 4:
+            raise ValueError(
+                f"idle_stand root_quat_xyzw must be (T,4), got {quat_xyzw.shape}"
+            )
+        if dof.shape[0] != quat_xyzw.shape[0]:
+            raise ValueError(
+                f"idle_stand dof / quat length mismatch: "
+                f"dof={dof.shape[0]} quat={quat_xyzw.shape[0]}"
+            )
+        if dof.shape[0] < 1:
+            raise ValueError("idle_stand clip is empty")
+        self._dof = np.ascontiguousarray(dof, dtype=np.float32)
+        self._quat = np.ascontiguousarray(quat_xyzw, dtype=np.float32)
+        self._n_frames = int(dof.shape[0])
+        self._bin_name = str(bin_name)
+        # Pre-broadcast a zero joint_vel slab (we ship it explicitly so
+        # the deploy skips its finite-diff path; the clip's per-frame
+        # delta is small enough that "zero velocity" is a close enough
+        # IL-time-scale approximation -- the policy treats joint_vel
+        # primarily as a sanity-of-state signal, not a feedforward).
+        self._zero_jvel = np.zeros(
+            (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS), dtype=np.float32
+        )
+        self._zero_jvel.setflags(write=False)
+
+    @property
+    def n_frames(self) -> int:
+        return self._n_frames
+
+    @property
+    def bin_name(self) -> str:
+        return self._bin_name
+
+    def current(self, tick: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(joint_pos_mj, root_quat_xyzw)`` for the current tick."""
+        i = int(tick) % self._n_frames
+        return self._dof[i].copy(), self._quat[i].copy()
+
+    def future_window(self, tick: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(jpos_future, quat_future, jvel_future)`` for the next 9 slots."""
+        idx = np.array(
+            [
+                (int(tick) + (k + 1) * _FUTURE_STEP_TICKS) % self._n_frames
+                for k in range(_NUM_FUTURE_SLOTS)
+            ],
+            dtype=np.int64,
+        )
+        return self._dof[idx].copy(), self._quat[idx].copy(), self._zero_jvel
+
+    def future_payload_fields(
+        self, *, tick: int, base_frame_index: int,
+    ) -> dict[str, np.ndarray]:
+        jpos_future, quat_future, jvel_future = self.future_window(tick)
+        fidx_future = np.array(
+            [base_frame_index + (k + 1) for k in range(_NUM_FUTURE_SLOTS)],
+            dtype=np.int64,
+        )
+        return {
+            "joint_pos_mj_future": jpos_future,
+            "root_quat_xyzw_future": quat_future,
+            "joint_vel_mj_future": jvel_future,
+            "frame_index_future": fidx_future,
+            "future_dt_s": _FUTURE_DT_FIELD,
+        }
+
+
+def _load_idle_stand_loop(
+    primitives_pkl: str | Path,
+) -> _IdleStandLoop:
+    """Load ``idle_stand`` from the planner's primitives PKL.
+
+    The PKL is a ``{bin_name: {dof, root_rot_xyzw, root_trans, fps,
+    motion_key, ...}}`` mapping written by ``curate_x2_primitives.py``.
+    We use ``joblib.load`` here so we don't have to import the planner's
+    state machine (which depends on scipy via ``blending``); the bridge
+    must remain importable in ``--no-policy`` mode without the heavy
+    planner dependency tree.
+
+    Resampling to 50 Hz: at the time of writing, idle_stand ships at
+    30 fps (captured from teleop). We mirror the same
+    ``resample_motion_30_to_50hz`` upcast the planner's
+    ``load_primitives_pkl`` performs so per-frame timing matches the
+    deploy's 50 Hz control loop. The resampler lives in
+    ``gear_sonic.utils.planner.blending`` -- importing it costs scipy
+    on the bridge process, but only when the operator opts into
+    ``--idle-stand-pkl`` (or its default). Without resampling the wire
+    would tick through the clip at 60 % of the policy's expected rate
+    and the per-frame DOF velocity would be 5/3 of training-time --
+    same OOD risk we just got out of.
+    """
+    pkl_path = Path(primitives_pkl)
+    if not pkl_path.is_file():
+        raise FileNotFoundError(f"primitives PKL not found: {pkl_path}")
+
+    raw = joblib.load(pkl_path)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{pkl_path}: expected dict at top level, got {type(raw)}")
+    if "idle_stand" not in raw:
+        raise KeyError(
+            f"{pkl_path}: 'idle_stand' bin missing -- the planner needs this "
+            f"too; re-curate primitives with curate_x2_primitives.py."
+        )
+    payload = raw["idle_stand"]
+    dof_src = np.asarray(payload["dof"], dtype=np.float32)
+    rot_src = np.asarray(payload["root_rot_xyzw"], dtype=np.float32)
+    trans_src = np.asarray(payload["root_trans"], dtype=np.float64)
+    src_fps = float(payload["fps"])
+    target_fps = float(DEFAULT_PUB_RATE_HZ)
+    if abs(src_fps - target_fps) < 0.5:
+        dof_out, rot_out, trans_out = dof_src, rot_src, trans_src
+    else:
+        from gear_sonic.utils.planner.blending import resample_motion_30_to_50hz
+        dof_out, rot_out, trans_out = resample_motion_30_to_50hz(
+            dof_src, rot_src, trans_src, src_fps, target_fps,
+        )
+    # Yaw-align the clip so frame 0's heading sits at (xy=0, yaw=0).
+    # Without this the wire would carry idle_stand's raw 90 deg yaw
+    # (the operator was facing +y when the clip was captured), which
+    # mismatches the deploy's robot-yaw=0 spawn and forces a same-tick
+    # heading correction. The planner's
+    # ``LocalMotionPlanner._start_idle_loop`` does this exact alignment
+    # against ``(self._cur_xy, self._cur_yaw)`` = (0, 0); reproducing
+    # it here keeps wire-content byte-equivalent to the planner.
+    from gear_sonic.utils.planner.blending import yaw_align_segment
+    aligned_dof, aligned_rot, _ = yaw_align_segment(
+        dof_out, rot_out, trans_out,
+        xy_world=np.zeros(2, dtype=np.float64),
+        yaw_world=0.0,
+    )
+    return _IdleStandLoop(dof=aligned_dof, quat_xyzw=aligned_rot)
+
+
+def _zeros_action_horizon(horizon: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Safe SONIC latents + hands (matches bootstrap chunk semantics)."""
+    h = max(int(horizon), 1)
+    zt = np.zeros((h, SONIC_MOTION_TOKEN_DIM), dtype=np.float32)
+    zh = np.zeros((h, DEFAULT_HAND_DOF), dtype=np.float32)
+    return zt, zh, zh
+
+
+def _post_safe_idle_chunk(
+    chunk: _LatestChunk,
+    *,
+    state: _LatestState,
+    last_inference_ms: float,
+    log_line: str | None = None,
+) -> None:
+    """Reset the walking chunk to zero latents; body column mirrors live sim if fresh else stand.
+
+    Called after render / ``get_action`` failures so the 50 Hz publisher
+    does not keep advancing through a broken VLA horizon.
+    """
+    token_cur, _, _, _, _ = chunk.read()
+    h = int(token_cur.shape[0])
+    token, left, right = _zeros_action_horizon(h)
+    bq, _, _, _, _, alive = state.snapshot()
+    body_pose = bq.astype(np.float32, copy=True) if alive else _default_stand_body_pose_f32()
+    chunk.post(
+        token=token,
+        left_hand=left,
+        right_hand=right,
+        body_pose=body_pose,
+        last_inference_ms=float(last_inference_ms),
+    )
+    if log_line:
+        print(log_line, flush=True)
+
 
 def _quat_wxyz_to_projected_gravity(quat_wxyz: np.ndarray) -> np.ndarray:
     """Rotate world ``[0, 0, -1]`` into the body frame using a wxyz quaternion.
@@ -144,6 +553,12 @@ def _quat_wxyz_to_projected_gravity(quat_wxyz: np.ndarray) -> np.ndarray:
     r22 = 1.0 - 2.0 * (x * x + y * y)
     # R.T @ [0, 0, -1] picks out -1 * column 2.
     return np.array([-r02, -r12, -r22], dtype=np.float64)
+
+
+def _quat_wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
+    """MuJoCo / x2_debug use ``wxyz``; ZMQ ``pose`` wire uses SciPy ``xyzw``."""
+    w, x, y, z = (float(v) for v in quat_wxyz.reshape(-1)[:4])
+    return np.array([x, y, z, w], dtype=np.float32)
 
 
 # If we haven't seen a fresh ``x2_debug`` packet within this many seconds
@@ -262,11 +677,17 @@ class _LatestChunk:
     (``chunk_id`` increments), the publisher resets ``step = 0``.
     """
 
-    token: np.ndarray = field(default_factory=lambda: np.zeros((40, SONIC_MOTION_TOKEN_DIM), dtype=np.float32))
-    left_hand: np.ndarray = field(default_factory=lambda: np.zeros((40, DEFAULT_HAND_DOF), dtype=np.float32))
-    right_hand: np.ndarray = field(default_factory=lambda: np.zeros((40, DEFAULT_HAND_DOF), dtype=np.float32))
+    token: np.ndarray = field(
+        default_factory=lambda: np.zeros((DEFAULT_ACTION_HORIZON, SONIC_MOTION_TOKEN_DIM), dtype=np.float32)
+    )
+    left_hand: np.ndarray = field(
+        default_factory=lambda: np.zeros((DEFAULT_ACTION_HORIZON, DEFAULT_HAND_DOF), dtype=np.float32)
+    )
+    right_hand: np.ndarray = field(
+        default_factory=lambda: np.zeros((DEFAULT_ACTION_HORIZON, DEFAULT_HAND_DOF), dtype=np.float32)
+    )
     body_pose: np.ndarray = field(
-        default_factory=lambda: np.tile(np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32), (1, 1))
+        default_factory=lambda: np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32).copy()
     )
     chunk_id: int = 0
     inference_count: int = 0  # how many inferences have completed
@@ -519,9 +940,18 @@ def _x2_debug_subscriber(
     topic: str,
     state: _LatestState,
     stop_event: threading.Event,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> None:
-    """Thread A: SUB to ``x2_debug`` and update :class:`_LatestState`."""
+    """Thread A: SUB to ``x2_debug`` and update :class:`_LatestState`.
+
+    ``verbose`` is honoured for parity with
+    :class:`gear_sonic.utils.teleop.x2_dataset_recorder.X2DatasetRecorder`
+    which reuses this helper and forwards its own ``cfg.verbose`` flag.
+    Setting it to False mutes the one-time SUB-connected print and the
+    per-frame decode-error messages -- useful when this thread is only
+    feeding the recorder's deploy-silent watchdog and the operator does
+    not need a second copy of the bind line in the recorder log.
+    """
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.SUB)
     sock.setsockopt_string(zmq.SUBSCRIBE, topic)
@@ -530,9 +960,12 @@ def _x2_debug_subscriber(
     sock.connect(sub_url)
     poller = zmq.Poller()
     poller.register(sock, zmq.POLLIN)
-    print(f"[live-VLA] x2_debug SUB connected to {sub_url} (topic={topic!r})", flush=True)
+    if verbose:
+        print(
+            f"[live-VLA] x2_debug SUB connected to {sub_url} (topic={topic!r})",
+            flush=True,
+        )
 
-    n = 0
     try:
         while not stop_event.is_set():
             events = dict(poller.poll(200))
@@ -545,7 +978,8 @@ def _x2_debug_subscriber(
             try:
                 msg = unpack_message(raw, expected_topic=topic)
             except ValueError as exc:
-                print(f"[live-VLA] x2_debug decode error: {exc}", flush=True)
+                if verbose:
+                    print(f"[live-VLA] x2_debug decode error: {exc}", flush=True)
                 continue
 
             body_q = np.asarray(msg.fields.get("body_q", DEFAULT_STAND_POSE_MUJOCO_RAD), dtype=np.float64).reshape(-1)
@@ -567,9 +1001,6 @@ def _x2_debug_subscriber(
                 left_hand_q=left_hq,
                 right_hand_q=right_hq,
             )
-            n += 1
-            if verbose and n % 100 == 0:
-                print(f"[live-VLA] x2_debug rx#{n}", flush=True)
     finally:
         try:
             sock.close(linger=0)
@@ -632,8 +1063,8 @@ def _inference_worker(
         if rev <= last_revision:
             continue  # timeout, retry
 
-        body_q_mj, base_quat_wxyz, left_hq, right_hq, revision, received = state.snapshot()
-        if not received:
+        body_q_mj, base_quat_wxyz, left_hq, right_hq, revision, deploy_fresh = state.snapshot()
+        if not deploy_fresh:
             continue
         last_revision = revision
 
@@ -655,6 +1086,12 @@ def _inference_worker(
             )
         except Exception as exc:
             print(f"[live-VLA] render error: {exc}", flush=True)
+            _post_safe_idle_chunk(
+                chunk,
+                state=state,
+                last_inference_ms=0.0,
+                log_line="[live-VLA] render error → zero-token safe chunk posted",
+            )
             time.sleep(0.05)
             continue
 
@@ -671,6 +1108,12 @@ def _inference_worker(
             action, _info = policy.get_action(observation)
         except Exception as exc:
             print(f"[live-VLA] inference error: {exc}", flush=True)
+            _post_safe_idle_chunk(
+                chunk,
+                state=state,
+                last_inference_ms=0.0,
+                log_line="[live-VLA] inference error → zero-token safe chunk posted",
+            )
             time.sleep(0.05)
             continue
         elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -679,12 +1122,42 @@ def _inference_worker(
         token = np.asarray(action["motion_token"], dtype=np.float32)[0]   # (T, 64)
         left = np.asarray(action["left_hand_joints"], dtype=np.float32)[0]  # (T, 10)
         right = np.asarray(action["right_hand_joints"], dtype=np.float32)[0]  # (T, 10)
+        horizon_ok = (
+            token.ndim == 2
+            and token.shape[1] == SONIC_MOTION_TOKEN_DIM
+            and left.ndim == 2
+            and right.ndim == 2
+            and left.shape[1] == DEFAULT_HAND_DOF
+            and right.shape[1] == DEFAULT_HAND_DOF
+            and left.shape[0] == token.shape[0]
+            and right.shape[0] == token.shape[0]
+            and np.isfinite(token).all()
+            and np.isfinite(left).all()
+            and np.isfinite(right).all()
+        )
+        if not horizon_ok:
+            print(
+                "[live-VLA] invalid policy output (shape or non-finite) "
+                "→ zero-token safe chunk posted",
+                flush=True,
+            )
+            _post_safe_idle_chunk(
+                chunk,
+                state=state,
+                last_inference_ms=float(elapsed_ms),
+            )
+            time.sleep(0.05)
+            continue
 
-        # The C++ deploy doesn't actually consume body_pose when motion_token
-        # is the live source-of-truth, but we keep DEFAULT_STAND_POSE on the
-        # wire so legacy tooling (dump_x2_debug.py / parity scripts) still
-        # see a valid "joint_pos_mj" field.
-        body_pose = np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32)
+        # Chunk ``body_pose`` is informational only — kept on the chunk so
+        # ``--dump-chunks-dir`` snapshots include the live observation
+        # alongside the predicted token. The publisher does NOT forward
+        # this back over the wire; ``joint_pos_mj`` on ``pose`` is always
+        # the trained ``DEFAULT_STAND_POSE`` so the C++ deploy's SONIC
+        # tracker has a stable setpoint (mirroring the live observation
+        # back as the setpoint zeroes the tracking error and the robot
+        # falls under gravity — see _publisher docstring).
+        body_pose = body_q_mj.astype(np.float32, copy=True)
 
         chunk.post(
             token=token,
@@ -759,13 +1232,58 @@ def _publisher(
     stop_event: threading.Event,
     protocol_version: int = 4,
     print_every: int = 50,
+    idle_loop: Optional[_IdleStandLoop] = None,
+    silent_wire: bool = False,
+    pose_decoder: Optional[Any] = None,
 ) -> int:
     """Thread C (= main thread): publish action[step] at ``rate_hz``.
 
     Always publishes *something*, even before the first inference completes.
-    The bootstrap chunk is zeros + DEFAULT_STAND_POSE — exactly what the
-    mock VLA helper publishes — so the deploy's safety stack can keep the
-    robot upright until the policy warms up.
+
+    Wire-content contract (matches ``mock_vla_publish_stand_token.py``
+    plus the v5 future-window the heuristic planner emits via
+    :func:`gear_sonic.utils.planner.state_machine.build_pose_payload`):
+
+    * ``joint_pos_mj`` = stand setpoint. When ``idle_loop`` is provided
+      we replay the planner's ``idle_stand`` primitive frame-by-frame
+      so the wire is byte-equivalent to ``--planner-only`` (verified
+      empirically 2026-05-14: ``idle_stand[0]``'s waist-yaw differs
+      from ``DEFAULT_STAND_POSE`` by ~33 deg, and the policy was
+      trained against the clip's per-frame DOF jitter -- without the
+      clip the robot stabilises at a ~25 deg lean even with a v5
+      window). When ``idle_loop`` is None we fall back to
+      ``DEFAULT_STAND_POSE``, which keeps the deploy from outright
+      falling but is NOT recommended.
+      The C++ deploy uses ``joint_pos_mj`` as the **SONIC tracker
+      reference**, NOT as a feedback channel. Mirroring the live
+      ``body_q_mj`` from ``x2_debug`` here makes
+      ``reference == observation`` -> tracking error 0 -> no corrective
+      torque -> the robot falls under gravity (verified empirically
+      2026-05-14).
+    * ``root_quat_xyzw`` = the matching clip frame's quat (or identity
+      when no clip is loaded).
+    * ``motion_token`` / ``left_hand_joints`` / ``right_hand_joints`` =
+      latest chunk step (zeros until the first inference, or always zero
+      under ``--no-policy``).
+    * ``joint_pos_mj_future`` / ``root_quat_xyzw_future`` /
+      ``joint_vel_mj_future`` / ``frame_index_future`` /
+      ``future_dt_s`` = 9 strictly-future slots at ``DT_FUTURE_REF`` =
+      0.1 s spacing. With ``idle_loop`` we sample the clip at
+      ``_FUTURE_STEP_TICKS`` (= 5 ticks) past the current frame; without
+      it we ship 9 copies of the static stand pose. Both shapes promote
+      the deploy to v5 mode. Without ANY future window the deploy's
+      ``ZmqPoseInputSource::Sample()`` falls back to the legacy
+      single-frame path, which pins all 10 future tokens at the current
+      pose; the X2 policy was trained with motion-bearing windows and
+      produces saturated raw actions (act_clip ~100 % of ticks,
+      max_pre_clip > action_clip = 20.0) when fed the legacy fallback,
+      manifesting as a slow gravity tilt after the elastic band
+      releases. (Verified empirically 2026-05-14 -- before the window:
+      grav_z drifted -1.00 -> -0.95 in 9 s under ``--vla-no-policy``.)
+
+    When ``x2_debug`` itself is stale we keep this same idle wire (the
+    fallback branch is essentially a no-op now since the fresh branch is
+    already a stable setpoint).
     """
     period = 1.0 / max(rate_hz, 1e-6)
     next_tick = time.monotonic()
@@ -777,38 +1295,121 @@ def _publisher(
     tick = 0
 
     while not stop_event.is_set() and time.monotonic() < deadline:
-        token, left, right, body_pose, chunk_id = chunk.read()
+        _, _, _, _, _, deploy_fresh = state.snapshot()
+        token, left, right, _body_pose_chunk, chunk_id = chunk.read()
         horizon = int(token.shape[0])
         if chunk_id != last_chunk_id:
             chunk_step = 0
             last_chunk_id = chunk_id
 
         step = min(chunk_step, horizon - 1)
-        payload = {
-            "joint_pos_mj": body_pose,
-            "root_quat_xyzw": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
-            "motion_token": token[step],
-            "left_hand_joints": left[step],
-            "right_hand_joints": right[step],
-            "frame_index": np.array([tick], dtype=np.int64),
-        }
-        msg = pack_pose_message(payload, topic=topic, version=protocol_version)
-        try:
-            pub_sock.send(msg, flags=zmq.NOBLOCK)
-        except zmq.Again:
-            pass
+        if idle_loop is not None:
+            cur_jpos, cur_quat = idle_loop.current(tick)
+            future_fields = idle_loop.future_payload_fields(
+                tick=tick, base_frame_index=tick,
+            )
+        else:
+            cur_jpos = _default_stand_body_pose_f32()
+            cur_quat = _identity_quat_xyzw()
+            future_fields = _idle_future_payload_fields(base_frame_index=tick)
+
+        # SONIC token decoder: decode chunk[step] + 9 future steps to a
+        # body trajectory and publish that as joint_pos_mj instead of
+        # idle_stand. Only kicks in when (a) a decoder was provided, (b)
+        # we have a fresh deploy (so a real chunk is on hand), and (c)
+        # the current chunk's token magnitude is non-trivial -- the
+        # cold-start chunk_id=0 is all zeros and decoding zeros yields
+        # the decoder's "stand" intent which is fine but slightly OOD;
+        # falling back to idle_stand_loop in that window matches the
+        # --vla-no-policy stable wire content. The chunk_id check
+        # avoids any ambiguity.
+        decoded_now = None
+        if (
+            pose_decoder is not None
+            and deploy_fresh
+            and chunk_id > 0
+            and np.linalg.norm(token[step]) > 1e-3
+        ):
+            decoded = _build_vla_decoded_pose_payload(
+                decoder=pose_decoder,
+                proprio_990=_PROPRIO_ZERO_990,
+                token_chunk=token,
+                chunk_step=step,
+                horizon=horizon,
+                base_frame_index=tick,
+            )
+            if decoded is not None:
+                decoded_now, future_fields = decoded
+                cur_jpos = decoded_now
+                # cur_quat stays as the idle_loop / identity choice --
+                # the SONIC body-only decoder doesn't predict root.
+
+        if not deploy_fresh:
+            payload = {
+                "joint_pos_mj": cur_jpos,
+                "root_quat_xyzw": cur_quat,
+                "motion_token": _ZERO_MOTION_TOKEN_STEP,
+                "left_hand_joints": _ZERO_HAND_STEP,
+                "right_hand_joints": _ZERO_HAND_STEP,
+                "frame_index": np.array([tick], dtype=np.int64),
+                **future_fields,
+            }
+        else:
+            payload = {
+                "joint_pos_mj": cur_jpos,
+                "root_quat_xyzw": cur_quat,
+                "motion_token": token[step],
+                "left_hand_joints": left[step],
+                "right_hand_joints": right[step],
+                "frame_index": np.array([tick], dtype=np.int64),
+                **future_fields,
+            }
+        if not silent_wire:
+            msg = pack_pose_message(payload, topic=topic, version=protocol_version)
+            try:
+                pub_sock.send(msg, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                pass
 
         if tick % print_every == 0:
             _, _, _, _, _, alive = state.snapshot()
-            print(
-                f"[live-VLA] pub tick={tick:6d} "
-                f"chunk_id={chunk_id:4d} step={step:2d}/{horizon} "
-                f"|token|={float(np.linalg.norm(token[step])):.3f} "
-                f"|left|={float(np.linalg.norm(left[step])):.3f} "
-                f"deploy_alive={alive}",
-                flush=True,
+            wire_tag = "SILENT wire (no send)" if silent_wire else (
+                "IDLE wire" if not deploy_fresh else None
             )
-
+            if wire_tag is not None:
+                print(
+                    f"[live-VLA] pub tick={tick:6d}  {wire_tag}  "
+                    f"deploy_alive={alive}",
+                    flush=True,
+                )
+            else:
+                if decoded_now is not None:
+                    # Joint-pose deviation from idle so the operator
+                    # can confirm at-a-glance whether the decoded body
+                    # is doing anything meaningful (vs. just hovering
+                    # at the idle setpoint).
+                    if idle_loop is not None:
+                        idle_now, _ = idle_loop.current(tick)
+                    else:
+                        idle_now = _default_stand_body_pose_f32()
+                    pose_delta = float(
+                        np.abs(
+                            decoded_now.astype(np.float32)
+                            - idle_now.astype(np.float32)
+                        ).max()
+                    )
+                    decoded_tag = f"VLA-pose Δ={pose_delta:.3f}rad"
+                else:
+                    decoded_tag = "idle-pose"
+                print(
+                    f"[live-VLA] pub tick={tick:6d} "
+                    f"chunk_id={chunk_id:4d} step={step:2d}/{horizon} "
+                    f"|token|={float(np.linalg.norm(token[step])):.3f} "
+                    f"|left|={float(np.linalg.norm(left[step])):.3f} "
+                    f"{decoded_tag} "
+                    f"deploy_alive={alive}",
+                    flush=True,
+                )
         chunk_step = min(chunk_step + 1, horizon - 1)
         tick += 1
         next_tick += period
@@ -863,9 +1464,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--model-path", required=True,
+        "--model-path", default="",
         help="Path to the fine-tuned Isaac-GR00T checkpoint directory "
-             "(expects model.safetensors + processor/ + experiment_cfg/).",
+             "(expects model.safetensors + processor/ + experiment_cfg/). "
+             "Required UNLESS --no-policy is passed.",
+    )
+    parser.add_argument(
+        "--no-policy", action="store_true",
+        help="Skip the Gr00tPolicy load and inference worker entirely. "
+             "The 50 Hz publisher + x2_debug SUB still run so the wire "
+             "carries the planner-like idle stand reference (live "
+             "joint_pos_mj when x2_debug is fresh, canonical stand "
+             "otherwise; zero motion_token / zero hand joints). Use this "
+             "to validate the recorder + deploy sequence in isolation "
+             "without paying the model-load cost.",
     )
     parser.add_argument(
         "--prompt", default="play minecraft music on piano",
@@ -898,6 +1510,61 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--inference-min-period-s", type=float, default=0.4,
         help="Lower bound on time between successive inferences (s). The "
              "publisher always advances at --rate; this just throttles the GPU.",
+    )
+    parser.add_argument(
+        "--idle-stand-pkl", type=str,
+        default=str(REPO_ROOT / "gear_sonic" / "data" / "motions"
+                    / "x2_planner_primitives.pkl"),
+        help="Primitives PKL containing the planner's 'idle_stand' bin. "
+             "When found, the publisher replays this clip at --rate so the "
+             "wire is byte-equivalent to --planner-only (verified upright "
+             "for 20k+ ticks). Pass an empty string to fall back to the "
+             "static DEFAULT_STAND_POSE reference (NOT recommended -- "
+             "stabilises at ~25 deg lean even with v5 future window).",
+    )
+    parser.add_argument(
+        "--silent-wire", action="store_true",
+        help="Bind the body_pose PUB but skip every send() call -- the "
+             "publisher loop ticks, the x2_debug SUB stays live, and the "
+             "process can be cleanly shut down, but NOTHING reaches the "
+             "deploy. Used to validate the deploy's built-in 'no upstream' "
+             "fallback: ZmqPoseInputSource::Connect() pre-fills its cache "
+             "with default_angles (the trained stand pose), and "
+             "has_body_reference_ stays False, so Sample() always returns "
+             "that prefill. Pair with --no-policy + the recorder's "
+             "--no-idle-publish so neither hop forwards anything either; "
+             "the deploy then holds itself upright on its own reference. "
+             "Without --silent-wire the bridge keeps publishing the "
+             "idle_stand replay, which the deploy commits to the moment "
+             "it decodes the first frame -- and that's the run that leans "
+             "~28 deg under --vla-no-policy.",
+    )
+    parser.add_argument(
+        "--sonic-checkpoint", type=str, default=None,
+        help="Path to a SONIC .pt checkpoint (e.g. model_step_025000.pt) used "
+             "to decode the predicted motion_token chunks back into "
+             "joint_pos_mj poses on the wire. Without this, the bridge emits "
+             "idle_stand for joint_pos_mj on every tick and the C++ deploy's "
+             "fused encoder+FSQ+decoder ONNX re-tokenises that idle reference "
+             "and ignores the live motion_token field (header explicitly "
+             "documents 'motion_token: currently logged but otherwise unused' "
+             "-- see zmq_pose_input_source.hpp:22-25), so the body never "
+             "moves under VLA authority. With --sonic-checkpoint set, each "
+             "publish tick decodes chunk[step] (and 9 future steps) via the "
+             "g1_dyn decoder + the C++ deploy's "
+             "target_mj=default+action_il*scale formula and ships the result "
+             "as joint_pos_mj / joint_pos_mj_future. The deploy's encoder "
+             "then re-tokenises this VLA-driven trajectory, which makes the "
+             "body actually track the predicted motion. Recommended path: "
+             "the .pt that pairs with the deploy ONNX you're running.",
+    )
+    parser.add_argument(
+        "--sonic-decoder-device", type=str, default="cpu",
+        help="Torch device for the bridge-side SONIC decoder. Default cpu "
+             "(decoder is ~5 M params, sub-millisecond per chunk; CPU is "
+             "well within the 20 ms 50 Hz budget). Use cuda:0 only if your "
+             ".venv torch build supports your GPU (see SONIC_TOKENIZER_DEVICE "
+             "comment in run_x2_quest3_planner_stack.sh).",
     )
     parser.add_argument(
         "--dump-chunks-dir", type=str, default=None,
@@ -969,7 +1636,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--video-front-height", type=int, default=720,
         help="Front-view height. Independent of the VLA's --render-height.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.no_policy and not args.model_path:
+        parser.error("--model-path is required unless --no-policy is set")
+    return args
 
 
 def _load_modality_config(path_or_module: str) -> None:
@@ -995,19 +1665,149 @@ def _load_modality_config(path_or_module: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    # ZMQ PUB + 50 Hz bootstrap publisher start **before** modality / torch /
+    # MuJoCo imports so ``run_x2_quest3_planner_stack.sh`` can gate on the
+    # bind log line within milliseconds (conda env first-import can
+    # otherwise stall 10+ s before any log appears). The stack runner also
+    # defers sim deploy until after the recorder is publishing ``pose`` so
+    # the C++ SUB never comes up on a silent port.
+    state = _LatestState()
+    chunk = _LatestChunk()
+    stop_event = threading.Event()
+
+    ctx = zmq.Context.instance()
+    pub_sock = ctx.socket(zmq.PUB)
+    pub_sock.setsockopt(zmq.SNDHWM, 10)
+    pub_sock.setsockopt(zmq.LINGER, 0)
+    pub_url = f"tcp://{args.pub_host}:{args.pub_port}"
+    pub_sock.bind(pub_url)
+    print(
+        f"[live-VLA] pose PUB bound on {pub_url} (topic={args.pub_topic!r}) "
+        f"— streaming bootstrap stand @ {args.rate:g} Hz while policy loads",
+        flush=True,
+    )
+    if args.silent_wire:
+        print(
+            "[live-VLA] --silent-wire ENABLED: publisher loop runs at "
+            f"{args.rate:g} Hz but every send() is skipped. The deploy "
+            "should NEVER decode a body_pose frame in this mode and will "
+            "hold the trained stand pose via its built-in prefill. Use "
+            "this to validate the 'no upstream' fallback path.",
+            flush=True,
+        )
+
+    # Load the planner's idle_stand primitive so the publisher can replay
+    # it instead of repeating DEFAULT_STAND_POSE. We do this BEFORE
+    # spawning the publisher thread so the very first wire frame already
+    # carries idle_stand[0] -- the deploy's WAIT_FOR_CONTROL gate latches
+    # against this frame, and any mismatch shows up as a tracker fight on
+    # tick 0. If loading fails (PKL missing / corrupt / no idle_stand
+    # bin), we keep the bridge alive on the static fallback and surface
+    # a loud warning -- the operator can then re-curate primitives or
+    # pass --idle-stand-pkl="" to silence the warning.
+    idle_loop: Optional[_IdleStandLoop] = None
+    if args.idle_stand_pkl:
+        try:
+            idle_loop = _load_idle_stand_loop(args.idle_stand_pkl)
+            print(
+                f"[live-VLA] idle_stand loop loaded from {args.idle_stand_pkl} "
+                f"({idle_loop.n_frames} frames @ {args.rate:g} Hz, bin="
+                f"{idle_loop.bin_name!r})",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[live-VLA] WARN: could not load idle_stand from "
+                f"{args.idle_stand_pkl}: {exc}. Falling back to static "
+                f"DEFAULT_STAND_POSE -- expect ~25 deg lean post band release.",
+                flush=True,
+            )
+    else:
+        print(
+            "[live-VLA] --idle-stand-pkl is empty: using static "
+            "DEFAULT_STAND_POSE wire reference (NOT recommended).",
+            flush=True,
+        )
+
+    # SONIC token-to-pose decoder. Loaded once on the main thread
+    # before the publisher starts so the very first VLA chunk that
+    # arrives can be decoded without a cold-start hitch. Any failure
+    # here is non-fatal -- the publisher falls back to the idle wire
+    # (same behaviour as before this feature was added) and the
+    # operator can rerun without --sonic-checkpoint to confirm.
+    pose_decoder: Optional[Any] = None
+    if args.sonic_checkpoint and not args.no_policy:
+        try:
+            from gear_sonic.utils.teleop.sonic_token_to_pose_decoder import (
+                SonicTokenToPoseDecoder,
+            )
+            pose_decoder = SonicTokenToPoseDecoder(
+                args.sonic_checkpoint,
+                device=args.sonic_decoder_device,
+            )
+            print(
+                f"[live-VLA] SONIC pose decoder loaded from "
+                f"{args.sonic_checkpoint} (device={args.sonic_decoder_device}). "
+                "Wire joint_pos_mj will be VLA-decoded for chunks with "
+                "|token|>1e-3; cold-start chunks (chunk_id=0, all-zero "
+                "tokens) keep the idle_stand reference.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[live-VLA] WARN: SONIC decoder load failed: {exc}. "
+                "Wire joint_pos_mj will stay at idle_stand and the body "
+                "will not move under VLA authority. Pass --sonic-checkpoint "
+                "to a known-good .pt to fix.",
+                flush=True,
+            )
+    elif args.no_policy:
+        print(
+            "[live-VLA] --no-policy mode: SONIC pose decoder skipped (no "
+            "VLA tokens to decode).",
+            flush=True,
+        )
+    else:
+        print(
+            "[live-VLA] --sonic-checkpoint not set: VLA motion_token will be "
+            "published on the wire but the C++ deploy ignores that field "
+            "(see zmq_pose_input_source.hpp:22-25). Body will track idle "
+            "stand only; hands still get the VLA chunk's per-tick targets "
+            "via AimDK passthrough. Pass --sonic-checkpoint to make the "
+            "body move under VLA control.",
+            flush=True,
+        )
+
+    def _on_signal(signum: int, _frame: Any) -> None:
+        print(f"[live-VLA] caught signal {signum}, shutting down…", flush=True)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    n_ticks_holder: list[int] = [0]
+
+    def _run_publisher() -> None:
+        n_ticks_holder[0] = _publisher(
+            pub_sock=pub_sock, topic=args.pub_topic, rate_hz=args.rate,
+            chunk=chunk, state=state, duration_s=args.duration,
+            stop_event=stop_event,
+            protocol_version=args.protocol_version,
+            print_every=args.print_every,
+            idle_loop=idle_loop,
+            silent_wire=bool(args.silent_wire),
+            pose_decoder=pose_decoder,
+        )
+
+    publisher_thread = threading.Thread(
+        target=_run_publisher,
+        name="pose-publisher",
+        daemon=False,
+    )
+    publisher_thread.start()
+
     _validate_pin_order_or_die()
     _load_modality_config(args.modality_config)
-
-    # Lazy import — pulls in torch + transformers + Isaac-GR00T, which must
-    # only happen after the modality-config side-load.
-    print("[live-VLA] loading Gr00tPolicy …", flush=True)
-    from gr00t.policy.gr00t_policy import Gr00tPolicy
-    policy = Gr00tPolicy(
-        embodiment_tag=args.embodiment_tag,
-        model_path=args.model_path,
-        device=args.device,
-    )
-    print(f"[live-VLA] policy ready (device={args.device})", flush=True)
 
     # The MuJoCo renderer is constructed inside the inference thread (see
     # ``_inference_worker``): MuJoCo's EGL backend uses thread-local GL
@@ -1038,17 +1838,6 @@ def main(argv: list[str] | None = None) -> int:
         height=args.render_height,
     )
 
-    state = _LatestState()
-    chunk = _LatestChunk()
-    stop_event = threading.Event()
-
-    ctx = zmq.Context.instance()
-    pub_sock = ctx.socket(zmq.PUB)
-    pub_sock.setsockopt(zmq.SNDHWM, 10)
-    pub_sock.setsockopt(zmq.LINGER, 0)
-    pub_url = f"tcp://{args.pub_host}:{args.pub_port}"
-    pub_sock.bind(pub_url)
-    print(f"[live-VLA] pose PUB bound on {pub_url} (topic={args.pub_topic!r})", flush=True)
     sub_url = f"tcp://{args.sub_host}:{args.sub_port}"
 
     video_threads: list[threading.Thread] = []
@@ -1092,53 +1881,75 @@ def main(argv: list[str] | None = None) -> int:
         target=_x2_debug_subscriber,
         kwargs=dict(
             sub_url=sub_url, topic=args.sub_topic,
-            state=state, stop_event=stop_event, verbose=not args.quiet,
+            state=state, stop_event=stop_event,
         ),
         name="x2_debug-sub",
         daemon=True,
     )
-    inf_thread = threading.Thread(
-        target=_inference_worker,
-        kwargs=dict(
-            policy=policy, renderer_factory=_renderer_factory,
-            state=state, chunk=chunk,
-            prompt=args.prompt, stop_event=stop_event,
-            min_period_s=args.inference_min_period_s, verbose=not args.quiet,
-            dump_chunks_dir=args.dump_chunks_dir,
-            dump_chunks_every=args.dump_chunks_every,
-        ),
-        name="vla-inference",
-        daemon=True,
-    )
-
-    def _on_signal(signum: int, _frame: Any) -> None:
-        print(f"[live-VLA] caught signal {signum}, shutting down…", flush=True)
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
 
     sub_thread.start()
-    inf_thread.start()
-    for vt in video_threads:
-        vt.start()
     # PUB-SUB late-join: give the deploy a moment to wire up its SUB before
     # we start blasting messages it can't keep up with.
     time.sleep(0.2)
 
-    n_ticks = 0
-    try:
-        n_ticks = _publisher(
-            pub_sock=pub_sock, topic=args.pub_topic, rate_hz=args.rate,
-            chunk=chunk, state=state, duration_s=args.duration,
-            stop_event=stop_event,
-            protocol_version=args.protocol_version,
-            print_every=args.print_every,
+    # Lazy import — pulls in torch + transformers + Isaac-GR00T, which must
+    # only happen after the modality-config side-load. Runs *after* PUB
+    # bind + publisher thread so the deploy never idles without a pose
+    # stream during this window.
+    inf_thread: Optional[threading.Thread] = None
+    if args.no_policy:
+        print(
+            "[live-VLA] --no-policy set: skipping Gr00tPolicy load + inference worker. "
+            "Publisher + x2_debug SUB stay live; wire carries planner-like idle stand "
+            "(live joint_pos_mj when x2_debug is fresh, canonical stand otherwise; "
+            "motion_token + hand joints stay zero).",
+            flush=True,
         )
+    else:
+        print("[live-VLA] loading Gr00tPolicy …", flush=True)
+        from gr00t.policy.gr00t_policy import Gr00tPolicy
+        try:
+            policy = Gr00tPolicy(
+                embodiment_tag=args.embodiment_tag,
+                model_path=args.model_path,
+                device=args.device,
+            )
+        except BaseException:
+            stop_event.set()
+            publisher_thread.join(timeout=30.0)
+            sub_thread.join(timeout=2.0)
+            try:
+                pub_sock.close(linger=0)
+            except Exception:
+                pass
+            raise
+        print(f"[live-VLA] policy ready (device={args.device})", flush=True)
+
+        inf_thread = threading.Thread(
+            target=_inference_worker,
+            kwargs=dict(
+                policy=policy, renderer_factory=_renderer_factory,
+                state=state, chunk=chunk,
+                prompt=args.prompt, stop_event=stop_event,
+                min_period_s=args.inference_min_period_s, verbose=not args.quiet,
+                dump_chunks_dir=args.dump_chunks_dir,
+                dump_chunks_every=args.dump_chunks_every,
+            ),
+            name="vla-inference",
+            daemon=True,
+        )
+        inf_thread.start()
+    for vt in video_threads:
+        vt.start()
+
+    try:
+        publisher_thread.join()
     finally:
         stop_event.set()
+        publisher_thread.join(timeout=5.0)
         sub_thread.join(timeout=1.0)
-        inf_thread.join(timeout=2.0)
+        if inf_thread is not None:
+            inf_thread.join(timeout=2.0)
         # Video threads may need an extra beat to flush the encoder queue.
         for vt in video_threads:
             vt.join(timeout=15.0)
@@ -1147,7 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
         print(
-            f"[live-VLA] done after {n_ticks} pub ticks, "
+            f"[live-VLA] done after {n_ticks_holder[0]} pub ticks, "
             f"{chunk.inference_count} inferences, "
             f"last_inference_ms={chunk.last_inference_ms:.1f}",
             flush=True,

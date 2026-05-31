@@ -348,15 +348,15 @@ def test_right_stick_back_does_not_emit_lean():
 @pytest.mark.parametrize(
     "rx,expected",
     [
-        # Soft push (deadzone <= |rx| < turn_threshold(0.60)) -> torso
+        # Soft push (deadzone <= |rx| < turn_threshold(0.75)) -> torso
         (0.35,  LocomotionCmd("torso_right", "deg_30")),
-        (0.59,  LocomotionCmd("torso_right", "deg_30")),
+        (0.74,  LocomotionCmd("torso_right", "deg_30")),
         (-0.35, LocomotionCmd("torso_left",  "deg_30")),
-        (-0.59, LocomotionCmd("torso_left",  "deg_30")),
-        # Hard push (|rx| >= 0.60) -> 45° turn (default magnitude)
-        (0.60,  LocomotionCmd("turn_right", "deg_45")),
+        (-0.74, LocomotionCmd("torso_left",  "deg_30")),
+        # Hard push (|rx| >= 0.75) -> 45° turn (default magnitude)
+        (0.75,  LocomotionCmd("turn_right", "deg_45")),
         (0.90,  LocomotionCmd("turn_right", "deg_45")),
-        (-0.60, LocomotionCmd("turn_left",  "deg_45")),
+        (-0.75, LocomotionCmd("turn_left",  "deg_45")),
         (-0.90, LocomotionCmd("turn_left",  "deg_45")),
     ],
 )
@@ -447,9 +447,9 @@ def test_torso_disabled_by_default_emits_idle(rx):
     [
         # Hard rx still fires a turn even with torso disabled. This is
         # the operator's primary "pivot the robot" path for now.
-        (0.60,  LocomotionCmd("turn_right", "deg_45")),
+        (0.75,  LocomotionCmd("turn_right", "deg_45")),
         (0.95,  LocomotionCmd("turn_right", "deg_45")),
-        (-0.60, LocomotionCmd("turn_left",  "deg_45")),
+        (-0.75, LocomotionCmd("turn_left",  "deg_45")),
         (-0.95, LocomotionCmd("turn_left",  "deg_45")),
     ],
 )
@@ -686,3 +686,265 @@ def test_last_emitted_tracks_recent_command():
     assert dec.last_emitted() == LocomotionCmd("fwd_step", "default")
     dec.decode_locomotion(-0.9, 0.0, 0.0, 0.0, False, now=0.1)
     assert dec.last_emitted() == LocomotionCmd("side_left", "default")
+
+
+# ---------------------------------------------------------------------------
+# Continuous-locomotion path (enable_continuous_locomotion=True)
+# ---------------------------------------------------------------------------
+
+
+def _make_loco_continuous(
+    *,
+    stick_deadzone: float = 0.30,
+    continuous_stick_threshold: float = 0.02,
+    continuous_yaw_max: float = 1.0,
+) -> IntentDecoder:
+    # NOTE: default ``continuous_yaw_max=1.0`` here so the existing
+    # yaw-axis tests keep the un-clamped behaviour they were written
+    # against. The new clamp-specific tests below pass an explicit
+    # value to exercise the cap.
+    dec = IntentDecoder(
+        stick_deadzone=stick_deadzone,
+        enable_continuous_locomotion=True,
+        continuous_stick_threshold=continuous_stick_threshold,
+        continuous_yaw_max=continuous_yaw_max,
+    )
+    dec.update_mode(_abxy_chord())
+    assert dec.mode is StreamMode.LOCOMOTION
+    return dec
+
+
+def test_continuous_neutral_stick_emits_idle():
+    """All three sticks inside the deadzone -> idle (not locomotion)."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.0, 0.0, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("idle", "default")
+
+
+def test_continuous_fwd_stick_carries_normalised_deflection():
+    """Forward L-stick beyond deadzone emits locomotion / continuous with
+    a positive stick_fwd in (0, 1]. Lateral / yaw stay 0 because lx/rx
+    are inside the deadzone."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.magnitude == "continuous"
+    assert cmd.stick_fwd > 0.0
+    assert cmd.stick_fwd <= 1.0
+    assert cmd.stick_side == 0.0
+    assert cmd.stick_yaw == 0.0
+
+
+def test_continuous_back_stick_carries_negative_fwd():
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, -0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_fwd < 0.0
+    assert cmd.stick_fwd >= -1.0
+
+
+def test_continuous_side_stick_carries_side_only():
+    """Right L-stick deflection -> positive stick_side, others 0."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.9, 0.0, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_side > 0.0
+    assert cmd.stick_fwd == 0.0
+    assert cmd.stick_yaw == 0.0
+
+
+def test_continuous_yaw_stick_carries_yaw_only():
+    """R-stick deflection -> stick_yaw, sign matches rx direction."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.0, 0.0, 0.9, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_yaw > 0.0
+    cmd = dec.decode_locomotion(0.0, 0.0, -0.9, 0.0, False, now=0.1)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_yaw < 0.0
+
+
+def test_continuous_deadzone_clamps_below_threshold():
+    """|stick| <= deadzone produces 0 deflection on that axis."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    # 0.2 is inside the 0.3 deadzone on every axis; should remain idle.
+    cmd = dec.decode_locomotion(0.2, 0.2, 0.2, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("idle", "default")
+
+
+def test_continuous_just_past_deadzone_emits_small_deflection():
+    """Outside the deadzone the rescaled deflection should be small but
+    non-zero, NOT snap to 1.0 -- the operator's thumb owns analog
+    control here."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    cmd = dec.decode_locomotion(0.0, 0.35, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    # (0.35 - 0.30) / (1 - 0.30) ~= 0.071
+    assert 0.0 < cmd.stick_fwd < 0.2
+
+
+def test_continuous_full_deflection_saturates_to_unity():
+    """|stick| = 1.0 -> normalised deflection = 1.0 (full speed)."""
+    dec = _make_loco_continuous(stick_deadzone=0.30)
+    cmd = dec.decode_locomotion(0.0, 1.0, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.stick_fwd == pytest.approx(1.0, abs=1e-6)
+
+
+def test_continuous_combined_stick_carries_all_three_axes():
+    """L-stick fwd + L-stick side + R-stick yaw should populate all
+    three stick_* fields in a single locomotion command."""
+    dec = _make_loco_continuous()
+    cmd = dec.decode_locomotion(0.7, 0.7, 0.7, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_fwd > 0.0
+    assert cmd.stick_side > 0.0
+    assert cmd.stick_yaw > 0.0
+
+
+def test_continuous_repeat_suppressed_when_stick_unchanged():
+    """Steady-state stick -> first tick emits, subsequent ticks suppress."""
+    dec = _make_loco_continuous()
+    first = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert first is not None
+    repeat = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.01)
+    assert repeat is None
+
+
+def test_continuous_micro_jitter_below_threshold_does_not_emit():
+    """Sub-threshold stick changes are filtered by _is_significant_change."""
+    dec = _make_loco_continuous(continuous_stick_threshold=0.05)
+    dec.decode_locomotion(0.0, 0.90, 0.0, 0.0, False, now=0.0)
+    # 0.91 is well within the 0.05 stick-delta threshold of 0.90
+    repeat = dec.decode_locomotion(0.0, 0.91, 0.0, 0.0, False, now=0.02)
+    assert repeat is None
+
+
+def test_continuous_significant_change_re_emits():
+    dec = _make_loco_continuous(continuous_stick_threshold=0.05)
+    dec.decode_locomotion(0.0, 0.50, 0.0, 0.0, False, now=0.0)
+    out = dec.decode_locomotion(0.0, 0.80, 0.0, 0.0, False, now=0.02)
+    assert out is not None
+    assert out.intent == "locomotion"
+
+
+def test_continuous_off_mode_disables_continuous_path():
+    """``enable_continuous_locomotion=False`` (default) keeps the
+    bucketed fwd_step / side_* / turn_* path that the heuristic
+    planner consumes. Regression for the heuristic-mode wrapper."""
+    dec = _make_loco()  # default: continuous disabled
+    cmd = dec.decode_locomotion(0.0, 0.9, 0.0, 0.0, False, now=0.0)
+    assert cmd == LocomotionCmd("fwd_step", "default")
+
+
+# ---------------------------------------------------------------------------
+# continuous_yaw_max clamp -- operator-feel knob that caps how much of
+# the planner's continuous-mode yaw-rate ceiling a full R-stick
+# deflection actually requests. Lives on the teleop side so the planner
+# doesn't have to know about operator-comfort settings.
+# ---------------------------------------------------------------------------
+
+
+def test_continuous_yaw_max_default_caps_full_stick_to_half():
+    """ManagerConfig wires ``intent_continuous_yaw_max=0.5`` as the
+    teleop-side default; a full R-stick deflection should request 0.5
+    (half of the planner's continuous yaw ceiling). This is the
+    primary fix for the 2026-05-30 'brief stick burst -> overshoot'
+    operator report.
+    """
+    dec = _make_loco_continuous(continuous_yaw_max=0.5)
+    cmd = dec.decode_locomotion(0.0, 0.0, 1.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "locomotion"
+    assert cmd.stick_yaw == pytest.approx(0.5, abs=1e-6)
+    cmd_left = dec.decode_locomotion(0.0, 0.0, -1.0, 0.0, False, now=0.05)
+    assert cmd_left is not None
+    assert cmd_left.stick_yaw == pytest.approx(-0.5, abs=1e-6)
+
+
+def test_continuous_yaw_max_scales_linearly_with_stick():
+    """Linear scaling of post-deadzone deflection by the cap means a
+    half-stick command produces half the capped magnitude.
+
+    This is what gives the operator analog control over turn rate
+    *within* the safe envelope, rather than forcing them to slam the
+    stick to get any motion or back off to avoid overshoot.
+    """
+    dec = _make_loco_continuous(stick_deadzone=0.30, continuous_yaw_max=0.5)
+    # rx = 0.65 -> rescaled = (0.65 - 0.30) / 0.70 = 0.50 -> after cap = 0.25
+    cmd = dec.decode_locomotion(0.0, 0.0, 0.65, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.stick_yaw == pytest.approx(0.25, abs=1e-6)
+
+
+def test_continuous_yaw_max_does_not_affect_fwd_or_side():
+    """The clamp is yaw-only: full L-stick forward still produces
+    stick_fwd=1.0 even with a tight yaw cap. Forward / lateral
+    motion doesn't suffer from the same 'brief burst -> overshoot'
+    failure mode that prompted the yaw clamp, so we keep those axes
+    at full operator authority.
+    """
+    dec = _make_loco_continuous(continuous_yaw_max=0.25)
+    cmd = dec.decode_locomotion(1.0, 1.0, 0.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.stick_fwd == pytest.approx(1.0, abs=1e-6)
+    assert cmd.stick_side == pytest.approx(1.0, abs=1e-6)
+
+
+def test_continuous_yaw_max_unity_restores_legacy_full_deflection():
+    """``continuous_yaw_max=1.0`` reproduces the pre-fix behaviour --
+    full R-stick = full planner ceiling -- for A/B regression runs."""
+    dec = _make_loco_continuous(continuous_yaw_max=1.0)
+    cmd = dec.decode_locomotion(0.0, 0.0, 1.0, 0.0, False, now=0.0)
+    assert cmd is not None
+    assert cmd.stick_yaw == pytest.approx(1.0, abs=1e-6)
+
+
+def test_continuous_yaw_max_invalid_values_rejected():
+    """Out-of-range values must fail loudly at construction time --
+    catching typos like ``continuous_yaw_max=50`` (operator meant
+    50% but typed an absolute number) rather than silently amplifying
+    yaw 50x. ``0`` is also rejected because a clamp of zero would
+    silently disable turns entirely; operators wanting that behaviour
+    should pass ``--no-enable-continuous-locomotion``.
+    """
+    with pytest.raises(ValueError):
+        IntentDecoder(enable_continuous_locomotion=True, continuous_yaw_max=0.0)
+    with pytest.raises(ValueError):
+        IntentDecoder(enable_continuous_locomotion=True, continuous_yaw_max=-0.5)
+    with pytest.raises(ValueError):
+        IntentDecoder(enable_continuous_locomotion=True, continuous_yaw_max=1.5)
+    with pytest.raises(ValueError):
+        IntentDecoder(enable_continuous_locomotion=True, continuous_yaw_max=50.0)
+
+
+def test_continuous_yaw_max_clamps_each_tick_independently():
+    """The clamp is stateless -- it's applied at the dispatch site, not
+    as a running smoother -- so successive ticks with varying rx all
+    see the same cap. Regression guard against accidentally moving
+    the clamp into a stateful EWMA (which would change the operator
+    contract from "max amplitude" to "max amplitude after a few
+    frames" and re-introduce the very brief-burst problem this knob
+    exists to solve).
+    """
+    dec = _make_loco_continuous(continuous_yaw_max=0.5)
+    # Push hard, release, push hard -- each "push" tick should report
+    # the same clamped magnitude.
+    out_a = dec.decode_locomotion(0.0, 0.0, 1.0, 0.0, False, now=0.0)
+    out_b = dec.decode_locomotion(0.0, 0.0, 1.0, 0.0, False, now=0.5)
+    assert out_a is not None
+    assert out_a.stick_yaw == pytest.approx(0.5, abs=1e-6)
+    # ``out_b`` is None because _is_significant_change suppresses
+    # identical repeats; we don't care about the emit gating here,
+    # only that nothing inside the decoder has snuck in a smoother.
+    # Force a re-emit with a different yaw magnitude:
+    out_c = dec.decode_locomotion(0.0, 0.0, -1.0, 0.0, False, now=1.0)
+    assert out_c is not None
+    assert out_c.stick_yaw == pytest.approx(-0.5, abs=1e-6)

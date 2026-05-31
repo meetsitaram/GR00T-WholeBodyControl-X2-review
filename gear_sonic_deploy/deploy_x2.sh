@@ -10,9 +10,25 @@ set -e
 # Topologies (per docs/source/user_guide/x2_sonic_deploy_real.md):
 #   local  - Build and run on this machine (your laptop). DDS auto-discovers
 #            the robot via the wired SDK ethernet (laptop NIC at 10.0.1.2/24,
-#            PC2 dev unit at 10.0.1.41).
-#   onbot  - rsync this package + sonic_common to PC2, build and run there.
-#            Eliminates ethernet jitter; recommended for production.
+#            PC2 dev unit at 10.0.1.41). The C++ deploy, MC stop/start
+#            helpers, RAMP_OUT trap, hand bridge and recorder all live on
+#            the laptop. Requires the wired link.
+#   onbot  - Run NATIVELY on PC2 (the robot's onboard Jetson Orin NX). This
+#            script is expected to be executed on PC2 itself -- launched
+#            via ssh from the laptop, typically inside a tmux session
+#            (see scripts/x2_pc2_daemons.sh). Everything bash-side
+#            (Y/n safety gate, MC stop_app/start_app via PC1 EM HTTP
+#            or `aima em` CLI fallback, sentinel handoff, RAMP_OUT trap,
+#            HOLD_FOR_MC handoff) AND the C++ deploy run on the same
+#            shell on PC2, so the orchestration survives a laptop-side
+#            WiFi disconnect mid-run. Assumes ``pc2_bringup.sh`` has
+#            already staged the colcon workspace, Python venv, ONNX
+#            Runtime and ONNX policies under ``$ONBOT_PREFIX`` (default
+#            /home/run/getsolo). The hand bridge and motor monitor are
+#            launched separately by x2_pc2_daemons.sh (so they share
+#            the same lifecycle as the deploy but in their own tmux
+#            sessions). The recorder lives on the laptop with the
+#            planner stack and is not touched here.
 #   sim    - Build + run locally against a MuJoCo physics sim, on isolated
 #            loopback DDS (ROS_LOCALHOST_ONLY=1 + private ROS_DOMAIN_ID).
 #            The sibling Python bridge scripts/x2_mujoco_ros_bridge.py is
@@ -24,11 +40,15 @@ set -e
 #            unitree_sdk2py MuJoCo bridge).
 #
 # Local/onbot pre-flight:
-#   1. Ping PC2 to confirm we can reach the robot.
+#   1. Ping PC2 to confirm we can reach the robot (local mode only;
+#      onbot mode is already ON PC2 so this is skipped).
 #   2. Verify ROS 2 topics are visible (joint state for each group + IMU).
 #   3. Stop the MC module by POSTing stop_app to PC1's Environment Manager
-#      HTTP API (the same mechanism `aima em stop-app mc` uses underneath),
-#      so HAL joint commands take effect. Use --no-stop-mc to skip.
+#      HTTP API (the same mechanism `aima em stop-app mc` uses underneath).
+#      On firmware where the HTTP endpoint has been removed (the EM service
+#      moved to ROS 2 services in late 2026), `mc_em_post` falls back to
+#      `aima em stop-app mc` / `aima em start-app mc` on PC2's PATH.
+#      Use --no-stop-mc to skip.
 #
 # Sim pre-flight:
 #   1. Verify the bridge script + MJCF + Python deps are importable.
@@ -69,6 +89,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # gear_sonic/data/motions/playlists/minimal_v1.yaml`` silently resolves the
 # motion path against gear_sonic_deploy/ and fails to find the file.
 USER_CWD="$(pwd)"
+
+# Repo root (parent of gear_sonic_deploy/). Prefer ``.venv/bin/python`` for
+# auxiliary Python (hand bridge, tuning YAML translator, sim MuJoCo bridge,
+# --record helper, MC escalator) so we do not silently use the host's
+# unconfigured ``python3``. Inside docker_x2, the repo mount may or may not
+# include a .venv; when absent we fall back to ``python3`` (ROS image).
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEPLOY_REPO_VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+if [[ -x "$DEPLOY_REPO_VENV_PYTHON" ]]; then
+    DEPLOY_AUX_PYTHON="$DEPLOY_REPO_VENV_PYTHON"
+else
+    DEPLOY_AUX_PYTHON="python3"
+fi
 
 # ============================================================================
 # Auto-relaunch inside the docker_x2/x2sim container if invoked from a host
@@ -111,6 +144,13 @@ maybe_relaunch_in_docker() {
             # all (just colcon). We don't want to spin up a docker container
             # just to print --help text or rebuild C++.
             --no-docker|-h|--help|--build-only) return 0 ;;
+            # `onbot` mode runs natively on PC2 (the robot's Jetson Orin NX).
+            # PC2 has no docker_x2 image, no /workspace/sonic bind mount, and
+            # ROS is sourced from the host /opt/ros/humble. Trying to relaunch
+            # under docker would fail with "x2sim image not found" at best,
+            # or eat several seconds and emit a confusing error at worst.
+            # Treat onbot exactly like --no-docker.
+            onbot) return 0 ;;
         esac
     done
 
@@ -201,7 +241,27 @@ SONIC_COMMON_REL="src/common"
 MODE_DEFAULT="local"
 ROBOT_HOST_DEFAULT="10.0.1.41"
 ROBOT_USER_DEFAULT="agi"
-ONBOT_WS_DEFAULT="\$HOME/x2_deploy_ws"
+# ONBOT prefix conventions (must match pc2_bringup.sh layout). Everything
+# the bringup script stages on PC2 lives under ONBOT_PREFIX, so flipping
+# --onbot-prefix relocates the entire install in one shot:
+#   $ONBOT_PREFIX/
+#     ws/install/setup.bash       <- colcon overlay  (--onbot-ws)
+#     venv/bin/python3            <- python with pyzmq + system rclpy
+#                                    + aimdk_msgs           (--onbot-venv)
+#     onnxruntime/lib/            <- libonnxruntime.so for the deploy
+#                                                          (--onbot-onnxruntime)
+#     policies/*.onnx             <- pre-staged ONNX checkpoints
+#     log/                        <- per-run CSV dirs, monitor JSONLs,
+#                                    tmux launch scripts
+ONBOT_PREFIX_DEFAULT="/home/run/getsolo"
+ONBOT_WS_DEFAULT="${ONBOT_PREFIX_DEFAULT}/ws"
+ONBOT_VENV_DEFAULT="${ONBOT_PREFIX_DEFAULT}/venv"
+ONBOT_ONNXRUNTIME_DEFAULT="${ONBOT_PREFIX_DEFAULT}/onnxruntime"
+# aimdk_msgs (Python bindings, cmake config, libs) live in the AgiBot
+# system tree on PC2. /opt/ros/humble/setup.bash does NOT add this to
+# AMENT_PREFIX_PATH so the deploy + python helpers can't see it without
+# us doing it explicitly. Same path used by x2_pc2_daemons.sh.
+ONBOT_AIMDK_PREFIX_DEFAULT="/agibot/software/housekeeper/bin/aimdk_msgs"
 ONNXRUNTIME_ROOT_DEFAULT="/opt/onnxruntime"
 SIM_DOMAIN_ID_DEFAULT="73"
 # PC1 (10.0.1.40) Environment Manager HTTP API. This is the underlying
@@ -215,7 +275,11 @@ MC_EM_URL_DEFAULT="http://10.0.1.40:50080"
 MODE="$MODE_DEFAULT"
 ROBOT_HOST="$ROBOT_HOST_DEFAULT"
 ROBOT_USER="$ROBOT_USER_DEFAULT"
+ONBOT_PREFIX="$ONBOT_PREFIX_DEFAULT"
 ONBOT_WS="$ONBOT_WS_DEFAULT"
+ONBOT_VENV="$ONBOT_VENV_DEFAULT"
+ONBOT_ONNXRUNTIME="$ONBOT_ONNXRUNTIME_DEFAULT"
+ONBOT_AIMDK_PREFIX="$ONBOT_AIMDK_PREFIX_DEFAULT"
 ONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT_DEFAULT"
 MC_EM_URL="$MC_EM_URL_DEFAULT"
 # Set to true once we've successfully POSTed stop_app, so the cleanup trap
@@ -237,6 +301,20 @@ VLA_ZMQ_PORT="5556"
 VLA_ZMQ_TOPIC="pose"
 VLA_DEBUG_PORT="5557"
 VLA_DEBUG_TOPIC="x2_debug"
+# SAFE_IDLE recovery channel. Quest 3 A+B chord publishes to this SUB
+# on the laptop side; the C++ deploy SUBs to it from PC2 (onbot) or
+# from the local laptop (local). Empty host = leave the resume socket
+# disabled (the deploy still self-exits SAFE_IDLE on first non-stale
+# pose; the chord just makes it explicit + faster).
+VLA_RESUME_HOST=""
+VLA_RESUME_PORT="5566"
+VLA_RESUME_TOPIC="pose_resume"
+# Generic raw passthrough to the C++ binary. Accumulates across
+# multiple --deploy-extra-arg invocations so callers can add new
+# CliArgs flags without having to plumb a new --foo flag through
+# this wrapper every time. Order is preserved; appended after
+# everything else so it wins last-write-wins parsing.
+DEPLOY_EXTRA_ARGS=()
 
 # Wrist bypass: forwarded to the deploy binary as --wrist-bypass {off,ik}.
 # When set to "ik" (and --vla is also set), the C++ deploy overwrites
@@ -264,10 +342,95 @@ MAX_DURATION=""
 TILT_COS=""
 RAMP_SECONDS=""
 # Per-joint hard clamp on |target - default_angles|, in radians. Empty string
-# = leave it disabled (legacy behaviour). Recommended for first powered runs:
-# --max-target-dev 0.05 (about 3 deg). See policy_parameters.hpp for the
-# trained standing pose this clamps around.
+# = leave it disabled (legacy behaviour). Historically grounded values from
+# this repo's recorded runs (see docs/source/user_guide/x2_sim_to_real_wip.md
+# §"Recordings inventory" and the milestones under
+# docs/source/user_guide/milestones/):
+#   * 0.30  -- "first powered run with a new checkpoint OR new motion playlist"
+#              (the conservative.yaml preset value). This is what every actual
+#              first-powered run on this robot has used: iter-4k minimal_v1
+#              stand (2026-05-02), all early take_a_sip shakeouts, and is the
+#              right starting point for the first powered Quest 3 teleop run
+#              (operator-driven motion = "new motion playlist" by the rule).
+#   * 0.80  -- the expressive.yaml preset; switch to this once conservative
+#              has cleared on the same model+motion class (paired with
+#              --target-lpf-hz 8 for real-sensor jitter tame).
+#   * 1.50  -- the value used for the first iter-22000 powered walk
+#              (2026-05-03 casual_walk_v1) and shipped in the published
+#              sim-to-real anchors b/c/d. Settled "play freely" value once
+#              the full pipeline is trusted.
+# Cleaner than inlining: pass --tuning-config configs/real_deploy_tuning/
+# {conservative,expressive}.yaml (also gives the matching ramp_seconds /
+# return_seconds / tilt_cos). See policy_parameters.hpp for the trained
+# standing pose this clamps around.
 MAX_TARGET_DEV=""
+
+# Per-group max_target_dev overrides, forwarded to the deploy binary as
+# --max-target-dev-{leg,waist,arm,head}. Empty = inherit MAX_TARGET_DEV
+# (the global) for that group; positive number = clamp this group at the
+# given radian deviation. Designed for the case where one joint family
+# can safely take more travel than another -- e.g. on X2 Ultra the legs
+# run kp ~99 Nm/rad and the arms kp ~14 Nm/rad, so a 1.50 rad uniform
+# clamp produces ~7x the leg torque for the same nominal travel as the
+# arms. Tight legs/waist + wide arms is the natural setting for any
+# teleop-driven session (see configs/real_deploy_tuning/expressive.yaml,
+# which now sets leg=0.30, arm=1.50 by default).
+MAX_TARGET_DEV_LEG=""
+MAX_TARGET_DEV_WAIST=""
+MAX_TARGET_DEV_ARM=""
+MAX_TARGET_DEV_HEAD=""
+
+# Deployment-time PD trim, forwarded to the binary as --kp-scale[-FAMILY]
+# and --kd-scale[-FAMILY]. Empty string = use binary default (1.0, no
+# trim) unless the tuning config sets a value. Real-deploy only -- the
+# wrapper does NOT block these flags in sim mode the way it blocks
+# --tuning-config, because the operator might want to A/B a PD bump in
+# MuJoCo before pushing to robot; just be aware that doing so DEFEATS
+# sim-profile parity with eval_x2_mujoco.py for the duration of that run.
+#
+# Why this exists: IsaacLab integrates PD implicitly against the joint-
+# space inertia + armature at training, while MuJoCo and real X2 apply
+# explicit ctrl-driven torque, so the same numerical KP behaves softer
+# at deploy than at training. Symptom: robot stands fine but wobbles on
+# nudge. Standard fix is to bump deployed PD per joint family: G16b for
+# X2 has set ankle=1.5 since November 2025 (in eval_x2_mujoco.py); real-
+# robot operators commonly need waist=1.5 on top of that. See
+# configs/real_deploy_tuning/expressive.yaml.
+KP_SCALE=""
+KP_SCALE_HIP=""
+KP_SCALE_KNEE=""
+# Ankle alias + split. The alias (KP_SCALE_ANKLE) multiplies both
+# subgroups for backward compat; KP_SCALE_ANKLE_PITCH and
+# KP_SCALE_ANKLE_ROLL target the sagittal vs frontal axes respectively.
+# MC publishes asymmetric PD (pitch 40/3.0, roll 30/2.0), so the split
+# knobs are the only way to match MC exactly.
+KP_SCALE_ANKLE=""
+KP_SCALE_ANKLE_PITCH=""
+KP_SCALE_ANKLE_ROLL=""
+# Waist alias + split. The alias (KP_SCALE_WAIST) multiplies both
+# subgroups for backward compat; KP_SCALE_WAIST_YAW and KP_SCALE_WAIST_PR
+# target waist_yaw_joint vs waist_pitch_joint + waist_roll_joint
+# respectively. See expressive.yaml for the MC-matched values.
+KP_SCALE_WAIST=""
+KP_SCALE_WAIST_YAW=""
+KP_SCALE_WAIST_PR=""
+KP_SCALE_SHOULDER=""
+KP_SCALE_ELBOW=""
+KP_SCALE_WRIST=""
+KP_SCALE_HEAD=""
+KD_SCALE=""
+KD_SCALE_HIP=""
+KD_SCALE_KNEE=""
+KD_SCALE_ANKLE=""
+KD_SCALE_ANKLE_PITCH=""
+KD_SCALE_ANKLE_ROLL=""
+KD_SCALE_WAIST=""
+KD_SCALE_WAIST_YAW=""
+KD_SCALE_WAIST_PR=""
+KD_SCALE_SHOULDER=""
+KD_SCALE_ELBOW=""
+KD_SCALE_WRIST=""
+KD_SCALE_HEAD=""
 
 # Output-side target LPF cutoff in Hz, forwarded to the deploy binary as
 # --target-lpf-hz. Empty string = use binary default (0 = bypass = parity-
@@ -337,6 +500,37 @@ HOLD_FOR_MC_EXIT_SENTINEL=""
 MC_FIRST_PUBLISH_SENTINEL=""
 ESCALATOR_OK_SENTINEL=""
 ESCALATOR_PID=""
+# Soft-shutdown trigger sentinel. On Ctrl-C, bash touches this file to
+# tell deploy "please RAMP_OUT + HOLD_FOR_MC gracefully" instead of
+# exiting immediately. Empty disables the graceful path (legacy
+# behaviour: Ctrl-C -> immediate exit -> ~1-2 s zero-torque drop while
+# MC reboots through PASSIVE_DEFAULT). Auto-populated alongside the
+# other HOLD_FOR_MC sentinels in the launch-prep block below.
+SOFT_SHUTDOWN_SENTINEL=""
+# Max seconds to wait in the cleanup trap for deploy to acknowledge
+# the soft-shutdown trigger and reach HOLD_FOR_MC before we POST
+# start_app. Should be larger than --return-seconds (RAMP_OUT
+# duration). Default is generous; the trap exits early as soon as
+# HOLD_FOR_MC_SENTINEL appears.
+SOFT_SHUTDOWN_WAIT_S="6"
+# Set to true once we've touched the soft-shutdown trigger, so a
+# second Ctrl-C inside the wait loop knows to abort the wait and fall
+# through to the legacy hard-exit path. (Escape hatch in case the
+# graceful path hangs.)
+SOFT_SHUTDOWN_TRIGGERED=false
+SOFT_SHUTDOWN_ABORTED=false
+# Soft-shutdown opt-in. DEFAULT IS DISABLED (2026-05-15) -- field
+# testing showed the graceful RAMP_OUT path was producing 4-6 s of
+# motor whir on Ctrl-C and the robot still collapsed at the end
+# (because MC restarts in PASSIVE_DEFAULT regardless of our graceful
+# exit). The hard-exit path is shorter in total motor activity and
+# therefore safer for the actuators until the bash<->deploy<->MC
+# handoff is reworked to avoid the dual-publisher window during
+# MC's PASSIVE->JOINT->STAND boot. Pass --enable-soft-shutdown to
+# opt back in (e.g. for development of the handoff fix). The legacy
+# --no-soft-shutdown flag is retained as a no-op for any scripts
+# already passing it.
+SOFT_SHUTDOWN_DISABLED=true
 # When true, abort with a friendly error if MC is not currently in
 # STAND_DEFAULT mode at script entry. The smooth handoff assumes MC is
 # alive and balancing the robot before we take the bus -- if MC is in
@@ -350,6 +544,17 @@ NO_STOP_MC=false
 NO_CONFIRM=false
 NO_BUILD=false
 BUILD_ONLY=false
+# Wire-freshness probe before the MC-stop safety gate. Opens a ZMQ SUB on
+# the deploy's actual --vla-zmq-host/-port (= localhost:proxy-port in
+# split-topology onbot mode; = laptop:5556 in local mode without proxy)
+# and counts frames received in --wire-probe-secs (default 1.0). Aborts
+# the launch BEFORE stop_app if zero frames -- catches the "proxy not
+# running" / "planner stack not started" / "wrong wire host" failure
+# modes that would otherwise drop MC onto a silent wire and lean the
+# robot. Default ON; pass --no-wire-probe for unattended CI runs or
+# when intentionally testing a starvation path.
+NO_WIRE_PROBE=false
+WIRE_PROBE_SECS="1.0"
 # Real-robot pre-flight (gear_sonic_deploy/scripts/x2_preflight.py): the
 # gantry-aware safety check that validates topics + MC presence + joint
 # pose/vel/effort + IMU upright/quiet. Runs after the lightweight ros2
@@ -373,7 +578,7 @@ PREFLIGHT_ARGS=""
 # Sim mode (MuJoCo bridge is the only sim driver)
 SIM_DOMAIN_ID="$SIM_DOMAIN_ID_DEFAULT"
 SIM_BRIDGE_REL="scripts/x2_mujoco_ros_bridge.py"
-SIM_PYTHON="${SIM_PYTHON:-python3}"
+SIM_PYTHON="${SIM_PYTHON:-$DEPLOY_AUX_PYTHON}"
 SIM_MJCF=""
 SIM_MOTION=""
 SIM_INIT_FRAME=""
@@ -439,6 +644,32 @@ SIM_NO_HAND_ZMQ=false
 SIM_BRIDGE_PID=""
 SIM_RECORD_PID=""
 
+# Hand bridge (REAL-ROBOT only). Republishes ZMQ pose
+# left_hand_joints / right_hand_joints onto /aima/hal/joint/hand/command
+# (aimdk_msgs/HandCommandArray) so the OmniHand HAL drives finger
+# motors. The C++ deploy harness reads these wire fields into
+# x2_debug echoes only -- it does NOT publish them to AimDK -- so
+# without this bridge real-robot teleop fingers never close even
+# though sim does (sim's MuJoCo bridge has its own
+# _omnihand_zmq_thread that writes finger qpos directly; this script
+# is the real-robot equivalent of that thread).
+#
+# Only auto-spawned in MODE=local: it's started AFTER MC has been
+# verified silent (so its engage burst isn't eaten by mc's own hand
+# republish loop) and reaped via the same restart_mc_on_exit trap
+# the deploy uses. sim mode uses the existing --with-omnihand path
+# instead. onbot users should launch the bridge manually -- the SSH
+# topology there has no laptop-side handoff hook to wire it into.
+HAND_BRIDGE_ENABLED=true
+HAND_BRIDGE_SIDES="auto"
+HAND_BRIDGE_ENGAGE_SHOTS=3
+HAND_BRIDGE_MAX_STALE_S="0.20"
+HAND_BRIDGE_PUBLISH_HZ="50"
+HAND_BRIDGE_PYTHON=""
+HAND_BRIDGE_SCRIPT_REL="scripts/x2_hand_zmq_to_aimdk_bridge.py"
+HAND_BRIDGE_PID=""
+HAND_BRIDGE_LOG=""
+
 # Run recorder (--record) -- a sibling background process that subscribes to
 # /aima/hal/joint/{leg,waist,arm,head}/{state,command} + the IMU and dumps
 # everything to an .npz so we can do post-mortem cmd/state tracking-error
@@ -470,8 +701,15 @@ Deploy the agi_x2_deploy_onnx_ref ROS 2 node onto an AgiBot X2 Ultra.
 Modes:
   local           Build + run on this machine; talk to robot via DDS over
                   the wired SDK ethernet (default).
-  onbot           rsync + build + run on the robot's PC2 development unit
-                  via ssh. Recommended for production.
+  onbot           Run NATIVELY on PC2 (the robot's onboard Jetson Orin
+                  NX). Expects pc2_bringup.sh to have staged the
+                  workspace + venv + ONNX Runtime under \$ONBOT_PREFIX
+                  (default $ONBOT_PREFIX_DEFAULT). Bash orchestration,
+                  MC stop/start, sentinel handoff and the deploy all
+                  run on PC2 in the same shell, so the lifecycle
+                  survives a laptop-side WiFi disconnect. Recommended
+                  for split-topology production runs; pair with
+                  scripts/x2_pc2_daemons.sh as the launcher.
   sim             Build + run locally on isolated loopback DDS, paired with
                   the MuJoCo bridge (scripts/x2_mujoco_ros_bridge.py)
                   launched as a background child. Bridge steps physics at
@@ -540,6 +778,87 @@ Optional deploy flags (forwarded to ros2 run):
                               obs-construction bug cannot drive any joint
                               more than RAD away from the trained standing
                               pose, regardless of what the ONNX session emits.
+                              Acts as the GLOBAL default for joints with no
+                              per-group override below.
+  --max-target-dev-leg RAD    Per-group override (MJ joints 0..11 = both
+                              hips, knees, ankles). >0 wins over the global
+                              --max-target-dev for these joints; omitted =
+                              inherit the global. Typical pairing for VR
+                              teleop: leg=0.30 (~17 deg), arm=1.50 (~86 deg).
+                              Legs need to stay tight: kp ~99 Nm/rad means
+                              the same nominal travel produces ~7x the
+                              torque arms do.
+  --max-target-dev-waist RAD  Per-group override (MJ joints 12..14 = waist
+                              yaw/pitch/roll). Same semantics as --leg.
+  --max-target-dev-arm RAD    Per-group override (MJ joints 15..28 = both
+                              shoulders, elbows, wrists). Set this loose
+                              (e.g. 1.50) for teleop where IK can drive
+                              the wrist far from default.
+  --max-target-dev-head RAD   Per-group override (MJ joints 29..30 = head
+                              yaw, pitch). Same semantics as --leg.
+  --kp-scale FACTOR           REAL-DEPLOY ONLY (parity-breaking in sim).
+                              Multiplicative trim on every joint's KP.
+                              Default 1.0 = ship trained kps[] from
+                              policy_parameters.hpp as-is. The trained
+                              KP is the value IsaacLab used at training;
+                              IsaacLab integrates PD implicitly against
+                              joint inertia + armature, so the same
+                              numerical KP behaves softer at deploy
+                              (MuJoCo + real X2 both apply explicit
+                              ctrl). Symptom of leaving this at 1.0 on
+                              the real robot: stands fine static, wobbles
+                              when nudged. Standard fix: per-family bumps
+                              below.
+  --kp-scale-FAMILY FACTOR    Per-family override; FAMILY is one of
+                              hip / knee / ankle / waist / shoulder /
+                              elbow / wrist / head (substring match on
+                              joint name; mirrors eval_x2_mujoco.py).
+                              Effective scale on a joint = global *
+                              family. The ankle and waist families have
+                              FURTHER subgroup knobs (see below).
+  --kp-scale-ankle-pitch FACTOR ankle_pitch_joint ONLY. Trained kp=21.38;
+                              1.87 matches MC's 40 N*m/rad sagittal KP.
+                              The G16b-validated default for fwd/back
+                              recovery.
+  --kp-scale-ankle-roll FACTOR ankle_roll_joint ONLY. Trained kp=21.38;
+                              1.40 matches MC's 30 N*m/rad frontal KP.
+                              Deliberately softer than pitch so sideways
+                              disturbances absorb without snapping the
+                              foot.
+  --kp-scale-waist-yaw FACTOR waist_yaw_joint ONLY. Trained kp=40.18
+                              matches MC's published 40 exactly, so the
+                              typical value is 1.00 -- bumping is more
+                              likely to ring than to help.
+  --kp-scale-waist-pr FACTOR  waist_pitch + waist_roll. Trained kp=14.25
+                              but MC publishes 40 N*m/rad -> 2.81 matches
+                              MC exactly. This is the recommended knob
+                              if you're chasing forward/back nudge
+                              wobble. Pre-set in expressive.yaml.
+  --kd-scale FACTOR           Same as --kp-scale but for damping.
+                              Default 1.0 (no trim). Watch the kp/kd
+                              ratio: bumping kp without kd lowers the
+                              effective damping ratio. If a kp-bumped
+                              run rings, try matching kd-scale 1.2 as
+                              a first knob before backing off kp.
+  --kd-scale-FAMILY FACTOR    Per-family kd override; same FAMILY set
+                              as --kp-scale-FAMILY. The ankle and waist
+                              families have split subgroup knobs (below).
+  --kd-scale-ankle-pitch FACTOR ankle_pitch_joint ONLY. MC publishes
+                              kd=3.0 vs trained 0.907 -> 3.31 matches
+                              MC. Under-damped pitch is the usual cause
+                              of 'foot-feels-springy' on fwd/back
+                              ankle-direct nudges.
+  --kd-scale-ankle-roll FACTOR ankle_roll_joint ONLY. MC publishes
+                              kd=2.0 vs trained 0.907 -> 2.20 matches
+                              MC. Less damping than pitch (frontal plane
+                              is intrinsically more rigid).
+  --kd-scale-waist-yaw FACTOR waist_yaw_joint ONLY. MC publishes kd=8.0
+                              vs trained 2.56 -> 3.13 matches MC exactly.
+  --kd-scale-waist-pr FACTOR  waist_pitch + waist_roll. MC publishes
+                              kd=5.0 vs trained 0.907 -> 5.51 matches MC.
+                              This is the SINGLE biggest knob for
+                              closing the fwd/back nudge gap on the real
+                              robot. Pre-set in expressive.yaml.
   --target-lpf-hz HZ          REAL-DEPLOY ONLY. First-order EMA cutoff (Hz)
                               applied to the published joint targets AFTER the
                               safety stack and BEFORE the bus, to tame jitter
@@ -582,9 +901,33 @@ Optional deploy flags (forwarded to ros2 run):
                               gear_sonic_deploy/scripts/compare_deploy_vs_isaaclab_obs.py
 
 Robot connection (onbot mode):
-  --robot-host HOST           PC2 IP/hostname (default: $ROBOT_HOST_DEFAULT)
-  --robot-user USER           PC2 ssh user (default: $ROBOT_USER_DEFAULT)
-  --onbot-ws PATH             colcon workspace on PC2 (default: $ONBOT_WS_DEFAULT)
+  --robot-host HOST           PC2 IP/hostname (default: $ROBOT_HOST_DEFAULT).
+                              IGNORED in the current onbot mode -- onbot
+                              runs natively on PC2, so there is no ssh
+                              target. Kept for backward compatibility.
+  --robot-user USER           PC2 ssh user (default: $ROBOT_USER_DEFAULT).
+                              Same: ignored in onbot mode.
+  --onbot-prefix DIR          PC2 install prefix (default: $ONBOT_PREFIX_DEFAULT).
+                              All other onbot paths default to subdirs of
+                              this; pass once to relocate the whole install
+                              (matching pc2_bringup.sh --prefix).
+  --onbot-ws PATH             colcon workspace on PC2 (default:
+                              \$ONBOT_PREFIX/ws). Must contain
+                              install/setup.bash built by pc2_bringup.sh.
+  --onbot-venv PATH           Python venv on PC2 (default: \$ONBOT_PREFIX/venv).
+                              Used for all auxiliary python (tuning YAML
+                              translator, MC escalator, preflight). Created
+                              with --system-site-packages so it inherits
+                              the system rclpy and aimdk_msgs bindings.
+  --onbot-onnxruntime PATH    Prebuilt ONNX Runtime install on PC2 (default:
+                              \$ONBOT_PREFIX/onnxruntime). lib/ is added to
+                              LD_LIBRARY_PATH so the deploy can dlopen
+                              libonnxruntime.so.
+  --onbot-aimdk-prefix PATH   aimdk_msgs install on PC2 (default:
+                              $ONBOT_AIMDK_PREFIX_DEFAULT). cmake config,
+                              libs and python bindings live here; added
+                              to AMENT_PREFIX_PATH, LD_LIBRARY_PATH and
+                              PYTHONPATH at launch.
 
 MC stop / restart (local + onbot modes):
   --mc-em-url URL             PC1 Environment Manager HTTP API URL.
@@ -735,7 +1078,8 @@ Sim mode (only applies when 'sim' is selected; all optional):
   --sim-dt SECS               Physics step (default: 0.001 = 1 kHz).
   --sim-print-scene           Dump bodies/joints/actuators/sensors on start.
   --sim-python PATH           Python interpreter for the bridge
-                              (default: \$SIM_PYTHON or python3).
+                              (default: repo .venv/bin/python when that
+                              file is executable, else python3).
   --sim-record-commands PATH  Record the deploy's command topics to this
                               rosbag2 directory (handy for diffing sim/real).
   --sim-domain-id N           ROS_DOMAIN_ID to isolate the sim from any real
@@ -756,6 +1100,17 @@ docs/source/references/x2_zmq_protocol.md):
   --vla-debug-port PORT       Port for the deploy's x2_debug PUB socket
                               (default: $VLA_DEBUG_PORT). Set 0 to disable.
                               dump_x2_debug.py is the reference subscriber.
+  --vla-resume-host HOST      Host of the SAFE_IDLE resume PUB (the laptop
+                              manager publishes when the Quest 3 operator
+                              hits the A+B chord). Empty = leave the
+                              resume socket disabled.
+  --vla-resume-port PORT      Port for the resume PUB (default: $VLA_RESUME_PORT).
+  --vla-resume-topic TOPIC    Topic prefix for resume frames
+                              (default: $VLA_RESUME_TOPIC).
+  --deploy-extra-arg ARG      Forward ARG verbatim to the C++ deploy binary.
+                              Repeat for multiple args. Useful for new C++
+                              CliArgs flags before they get a dedicated
+                              wrapper flag here.
   --vla-debug-topic TOPIC     Topic prefix for x2_debug frames
                               (default: $VLA_DEBUG_TOPIC).
   --wrist-bypass MODE         {off, ik}. Forwarded to the deploy binary as
@@ -772,7 +1127,45 @@ docs/source/references/x2_zmq_protocol.md):
                               sim-to-real fidelity tests. Default: empty
                               (= binary default of 'off').
 
+OmniHand bridge (REAL ROBOT, MODE=local only -- sim uses --with-omnihand instead):
+  --no-hand-bridge            Skip auto-spawning the ZMQ -> AimDK
+                              HandCommandArray bridge. The C++ deploy
+                              never publishes /aima/hal/joint/hand/command
+                              on its own, so without the bridge real-robot
+                              teleop cannot close fingers (wire fields land
+                              in x2_debug only). Default: bridge is ON.
+                              Pass this for arm/leg-only sessions where
+                              the hands aren't connected.
+  --hand-bridge-sides STR     {auto,left,right,both,off}. 'auto' detects
+                              attached sides from the latched HandStateArray
+                              on /aima/hal/joint/hand/state. (default: auto)
+  --hand-bridge-engage-shots N
+                              Number of position=0 shots to fire at startup
+                              so the OmniHand HAL exits its 'no command yet'
+                              state and enables motors. Set 0 only when
+                              piggy-backing on an already-engaged HAL.
+                              (default: 3, 1Hz spacing)
+  --hand-bridge-max-stale-s S Wire frame is considered stale after this
+                              many seconds with no update. Stale -> the
+                              bridge republishes last-good positions
+                              instead of dribbling zeros. (default: 0.20s)
+  --hand-bridge-publish-hz HZ Publish loop rate (default: 50, matches the
+                              deploy CONTROL tick).
+  --hand-bridge-python PATH   Python interpreter to launch the bridge with.
+                              Default: same as other auxiliary Python in
+                              this script (repo .venv/bin/python when that
+                              file is executable, otherwise python3; in
+                              docker_x2 the image python3 carries rclpy).
+
 Pre-flight + behaviour toggles:
+  --no-wire-probe             Skip the pre-MC-stop ZMQ wire-freshness probe.
+                              The default probe SUBs to the deploy's actual
+                              --vla-zmq-host/-port for --wire-probe-secs and
+                              aborts if zero frames arrive (catches dead
+                              pose proxy / missing planner stack BEFORE MC
+                              is stopped). Disable for unattended CI / when
+                              intentionally testing starvation.
+  --wire-probe-secs SECONDS   How long the wire probe listens (default: 1.0).
   --no-stop-mc                Skip the stop_app POST (assume MC is already
                               stopped, or you're using JOINT_DEFAULT mode).
                               The cleanup trap that restarts MC on exit is
@@ -797,6 +1190,30 @@ Pre-flight + behaviour toggles:
                               disables HOLD_FOR_MC entirely (legacy:
                               deploy exits on RAMP_OUT, then bash starts
                               MC -- there will be a zero-torque window).
+  --soft-shutdown-wait-s N    (Only relevant with --enable-soft-shutdown.)
+                              Seconds the bash cleanup trap waits for
+                              deploy to reach HOLD_FOR_MC after Ctrl-C
+                              before falling through and POSTing
+                              start_app anyway (default 6). Should be
+                              larger than --return-seconds (RAMP_OUT
+                              duration) plus a small DDS-discovery
+                              margin. The wait is interruptible: a
+                              second Ctrl-C bails immediately to the
+                              legacy hard-exit path.
+  --enable-soft-shutdown      OPT IN to the graceful Ctrl-C / RAMP_OUT
+                              path. DISABLED BY DEFAULT as of
+                              2026-05-15: field testing showed the
+                              graceful path causes 4-6 s of motor whir
+                              on Ctrl-C and the robot still collapses
+                              at the end (because MC restarts in
+                              PASSIVE_DEFAULT regardless). The hard-
+                              exit path is shorter in total motor
+                              activity and therefore safer for the
+                              actuators. Use this flag only when
+                              actively developing the soft-shutdown
+                              handoff.
+  --no-soft-shutdown          Legacy no-op (kept for backward compat).
+                              Soft-shutdown is now off by default.
   --no-confirm                Skip the final "proceed?" prompt (for CI)
   --no-build                  Skip the colcon build step (use the existing
                               install/ tree as-is)
@@ -834,11 +1251,15 @@ Examples:
   # Bring-up dry run from your laptop (most common first command):
   $0 --model /opt/x2_models/model_step_016000_g1.onnx --dry-run --autostart-after 5
 
-  # On-bot powered run with operator gate (after dry-run looks clean):
+  # On-bot powered run (split-topology). Must be invoked ON PC2 after
+  # pc2_bringup.sh has staged the workspace. Typically launched via
+  # scripts/x2_pc2_daemons.sh from the laptop; this is what ends up
+  # inside the x2_deploy tmux session:
   $0 onbot \\
-      --model /opt/x2_models/model_step_016000_g1.onnx \\
-      --motion /opt/x2_motions/standing.x2m2 \\
-      --log-dir scratch/runs/x2_powered_\$(date +%Y%m%d_%H%M%S)
+      --vla --vla-zmq-host 192.168.86.22 --vla-zmq-port 5556 \\
+      --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \\
+      --tuning-config /tmp/expressive.yaml --wrist-bypass ik \\
+      --log-dir /home/run/getsolo/log/x2_powered_\$(date +%Y%m%d_%H%M%S)
 
   # Closed-loop sim in MuJoCo with viewer (no robot needed):
   $0 sim \\
@@ -873,11 +1294,57 @@ while [[ $# -gt 0 ]]; do
         --tilt-cos)           TILT_COS="$2"; shift 2 ;;
         --ramp-seconds)       RAMP_SECONDS="$2"; shift 2 ;;
         --max-target-dev)     MAX_TARGET_DEV="$2"; shift 2 ;;
+        --max-target-dev-leg)   MAX_TARGET_DEV_LEG="$2"; shift 2 ;;
+        --max-target-dev-waist) MAX_TARGET_DEV_WAIST="$2"; shift 2 ;;
+        --max-target-dev-arm)   MAX_TARGET_DEV_ARM="$2"; shift 2 ;;
+        --max-target-dev-head)  MAX_TARGET_DEV_HEAD="$2"; shift 2 ;;
+        --kp-scale)             KP_SCALE="$2"; shift 2 ;;
+        --kp-scale-hip)         KP_SCALE_HIP="$2"; shift 2 ;;
+        --kp-scale-knee)        KP_SCALE_KNEE="$2"; shift 2 ;;
+        --kp-scale-ankle)       KP_SCALE_ANKLE="$2"; shift 2 ;;
+        --kp-scale-ankle-pitch) KP_SCALE_ANKLE_PITCH="$2"; shift 2 ;;
+        --kp-scale-ankle-roll)  KP_SCALE_ANKLE_ROLL="$2"; shift 2 ;;
+        --kp-scale-waist)       KP_SCALE_WAIST="$2"; shift 2 ;;
+        --kp-scale-waist-yaw)   KP_SCALE_WAIST_YAW="$2"; shift 2 ;;
+        --kp-scale-waist-pr)    KP_SCALE_WAIST_PR="$2"; shift 2 ;;
+        --kp-scale-shoulder)    KP_SCALE_SHOULDER="$2"; shift 2 ;;
+        --kp-scale-elbow)       KP_SCALE_ELBOW="$2"; shift 2 ;;
+        --kp-scale-wrist)       KP_SCALE_WRIST="$2"; shift 2 ;;
+        --kp-scale-head)        KP_SCALE_HEAD="$2"; shift 2 ;;
+        --kd-scale)             KD_SCALE="$2"; shift 2 ;;
+        --kd-scale-hip)         KD_SCALE_HIP="$2"; shift 2 ;;
+        --kd-scale-knee)        KD_SCALE_KNEE="$2"; shift 2 ;;
+        --kd-scale-ankle)       KD_SCALE_ANKLE="$2"; shift 2 ;;
+        --kd-scale-ankle-pitch) KD_SCALE_ANKLE_PITCH="$2"; shift 2 ;;
+        --kd-scale-ankle-roll)  KD_SCALE_ANKLE_ROLL="$2"; shift 2 ;;
+        --kd-scale-waist)       KD_SCALE_WAIST="$2"; shift 2 ;;
+        --kd-scale-waist-yaw)   KD_SCALE_WAIST_YAW="$2"; shift 2 ;;
+        --kd-scale-waist-pr)    KD_SCALE_WAIST_PR="$2"; shift 2 ;;
+        --kd-scale-shoulder)    KD_SCALE_SHOULDER="$2"; shift 2 ;;
+        --kd-scale-elbow)       KD_SCALE_ELBOW="$2"; shift 2 ;;
+        --kd-scale-wrist)       KD_SCALE_WRIST="$2"; shift 2 ;;
+        --kd-scale-head)        KD_SCALE_HEAD="$2"; shift 2 ;;
         --target-lpf-hz)      TARGET_LPF_HZ="$2"; shift 2 ;;
         --action-clip)        ACTION_CLIP="$2"; shift 2 ;;
         --return-seconds)     RETURN_SECONDS="$2"; shift 2 ;;
         --stand-pose-yaml)    STAND_POSE_YAML="$2"; shift 2 ;;
         --hold-for-mc-timeout-s) HOLD_FOR_MC_TIMEOUT_S="$2"; shift 2 ;;
+        --soft-shutdown-wait-s) SOFT_SHUTDOWN_WAIT_S="$2"; shift 2 ;;
+        --no-soft-shutdown)
+            # Legacy no-op: soft-shutdown is now DISABLED by default
+            # (see SOFT_SHUTDOWN_DISABLED definition above). Kept so
+            # existing CI / wrapper scripts that already pass this
+            # flag don't break.
+            SOFT_SHUTDOWN_DISABLED=true
+            shift ;;
+        --enable-soft-shutdown)
+            # Opt back IN to the graceful Ctrl-C / RAMP_OUT path. Use
+            # only when actively developing / debugging the soft-shutdown
+            # handoff -- field-tested behaviour as of 2026-05-15 is
+            # WORSE than hard-exit (4-6 s motor whir + still collapses
+            # on MC PASSIVE_DEFAULT boot). See deploy_x2.sh head comment.
+            SOFT_SHUTDOWN_DISABLED=false
+            shift ;;
         --no-require-stand-default) REQUIRE_STAND_DEFAULT=false; shift ;;
         --imu-topic)          IMU_TOPIC="$2"; shift 2 ;;
         --intra-op-threads)   INTRA_OP_THREADS="$2"; shift 2 ;;
@@ -885,11 +1352,29 @@ while [[ $# -gt 0 ]]; do
         --dry-run)            DRY_RUN=true; shift ;;
         --robot-host)         ROBOT_HOST="$2"; shift 2 ;;
         --robot-user)         ROBOT_USER="$2"; shift 2 ;;
+        --onbot-prefix)
+            ONBOT_PREFIX="$2"
+            # Re-derive any unset-by-flag downstream paths so --onbot-prefix
+            # actually relocates the whole install in one shot, matching the
+            # pc2_bringup.sh / x2_pc2_daemons.sh --prefix behaviour. Anything
+            # the user passed explicitly via --onbot-ws / --onbot-venv /
+            # --onbot-onnxruntime survives because those CLI flags come
+            # after the case branch consumes them; we only override the
+            # default-derived ones here.
+            ONBOT_WS="${ONBOT_PREFIX}/ws"
+            ONBOT_VENV="${ONBOT_PREFIX}/venv"
+            ONBOT_ONNXRUNTIME="${ONBOT_PREFIX}/onnxruntime"
+            shift 2 ;;
         --onbot-ws)           ONBOT_WS="$2"; shift 2 ;;
+        --onbot-venv)         ONBOT_VENV="$2"; shift 2 ;;
+        --onbot-onnxruntime)  ONBOT_ONNXRUNTIME="$2"; shift 2 ;;
+        --onbot-aimdk-prefix) ONBOT_AIMDK_PREFIX="$2"; shift 2 ;;
         --onnxruntime-root)   ONNXRUNTIME_ROOT="$2"; shift 2 ;;
         --mc-em-url)          MC_EM_URL="$2"; shift 2 ;;
         --no-stop-mc)         NO_STOP_MC=true; shift ;;
         --no-confirm)         NO_CONFIRM=true; shift ;;
+        --no-wire-probe)      NO_WIRE_PROBE=true; shift ;;
+        --wire-probe-secs)    WIRE_PROBE_SECS="$2"; shift 2 ;;
         --no-build)           NO_BUILD=true; shift ;;
         --build-only)         BUILD_ONLY=true; shift ;;
         --no-preflight-py)    NO_PREFLIGHT_PY=true; shift ;;
@@ -929,7 +1414,17 @@ while [[ $# -gt 0 ]]; do
         --vla-zmq-topic)      VLA_ZMQ_TOPIC="$2"; shift 2 ;;
         --vla-debug-port)     VLA_DEBUG_PORT="$2"; shift 2 ;;
         --vla-debug-topic)    VLA_DEBUG_TOPIC="$2"; shift 2 ;;
+        --vla-resume-host)    VLA_RESUME_HOST="$2"; shift 2 ;;
+        --vla-resume-port)    VLA_RESUME_PORT="$2"; shift 2 ;;
+        --vla-resume-topic)   VLA_RESUME_TOPIC="$2"; shift 2 ;;
+        --deploy-extra-arg)   DEPLOY_EXTRA_ARGS+=("$2"); shift 2 ;;
         --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
+        --no-hand-bridge)             HAND_BRIDGE_ENABLED=false; shift ;;
+        --hand-bridge-sides)          HAND_BRIDGE_SIDES="$2"; shift 2 ;;
+        --hand-bridge-engage-shots)   HAND_BRIDGE_ENGAGE_SHOTS="$2"; shift 2 ;;
+        --hand-bridge-max-stale-s)    HAND_BRIDGE_MAX_STALE_S="$2"; shift 2 ;;
+        --hand-bridge-publish-hz)     HAND_BRIDGE_PUBLISH_HZ="$2"; shift 2 ;;
+        --hand-bridge-python)         HAND_BRIDGE_PYTHON="$2"; shift 2 ;;
         local|onbot|sim)      MODE="$1"; shift ;;
         *)
             echo -e "${RED}Error: unknown argument: $1${NC}" >&2
@@ -954,12 +1449,76 @@ if [[ "$MODE" != "local" && "$MODE" != "onbot" && "$MODE" != "sim" ]]; then
     exit 1
 fi
 
-# Resolve absolute paths for local artefacts so onbot rsync works. We
-# resolve relative paths against $USER_CWD (the directory the user ran us
-# from, captured BEFORE we cd into SCRIPT_DIR) -- this matches how every
-# other CLI tool in the world treats paths. Failing the resolution loudly
-# (rather than silently producing /$basename) catches typos before they
-# turn into "file not found" deep inside a phase that already started.
+# ============================================================================
+# Onbot runtime env (hoisted to run BEFORE preflight)
+# ----------------------------------------------------------------------------
+# The preflight phase shells out to x2_preflight.py (which imports rclpy)
+# and probes `ros2 topic list`, the tuning-config translator runs another
+# python helper, and the launch dispatch sources the colcon overlay. In
+# `local` mode all of that just inherits the user's shell env (laptop has
+# ROS sourced via docker_x2 or .bashrc, and DEPLOY_AUX_PYTHON points at
+# the repo .venv). In `onbot` mode we are on PC2 in a vanilla shell, so
+# we have to set up the env OURSELVES before the first phase that needs
+# it -- otherwise preflight aborts with "ModuleNotFoundError: rclpy" /
+# "ros2 not in PATH" and we never get to the launch dispatch where the
+# env used to be sourced.
+#
+# Previously this block lived inside the launch dispatch (way too late);
+# moving it here means preflight, tuning translator AND the launch all
+# see a fully-sourced PC2 env. Layout matches pc2_bringup.sh + the
+# x2_pc2_daemons.sh env_prelude so all three stay byte-identical.
+if [[ "$MODE" == "onbot" ]]; then
+    if [[ ! -f "$ONBOT_WS/install/setup.bash" ]]; then
+        echo -e "${RED}Error: onbot workspace missing at $ONBOT_WS/install/setup.bash${NC}" >&2
+        echo -e "${YELLOW}       Run pc2_bringup.sh from the laptop first:${NC}" >&2
+        echo -e "${YELLOW}         ./gear_sonic_deploy/scripts/pc2_bringup.sh --pc2-host <PC2_IP>${NC}" >&2
+        exit 1
+    fi
+    ros_setup="/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
+    if [[ ! -f "$ros_setup" ]]; then
+        echo -e "${RED}Error: ROS 2 setup.bash missing at $ros_setup${NC}" >&2
+        echo -e "${YELLOW}       deploy_x2.sh onbot requires ROS 2 ${ROS_DISTRO:-humble} on PC2.${NC}" >&2
+        exit 1
+    fi
+    # aimdk_msgs first so its cmake/lib show up before ros2 sets up the
+    # rest of the chain.
+    export AMENT_PREFIX_PATH="${ONBOT_AIMDK_PREFIX}:${AMENT_PREFIX_PATH:-}"
+    export LD_LIBRARY_PATH="${ONBOT_AIMDK_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+    # shellcheck disable=SC1090
+    source "$ros_setup"
+    # shellcheck disable=SC1091
+    source "$ONBOT_WS/install/setup.bash"
+    export LD_LIBRARY_PATH="${ONBOT_ONNXRUNTIME}/lib:${LD_LIBRARY_PATH:-}"
+    # PYTHONPATH so the venv python sees aimdk_msgs (no env hook ships
+    # it; it lives at <aimdk_prefix>/local/lib/python3.10/dist-packages)
+    # AND so SCRIPT_DIR-relative imports inside x2_preflight.py /
+    # tuning_config_to_args.py resolve.
+    export PYTHONPATH="${ONBOT_AIMDK_PREFIX}/local/lib/python3.10/dist-packages:${ONBOT_WS}/src:${PYTHONPATH:-}"
+    # Re-point every python invocation in this script at the bringup
+    # venv. CRITICAL: SIM_PYTHON was captured from DEPLOY_AUX_PYTHON
+    # near the top of the script (long before MODE was parsed) and is
+    # what the preflight + sim-bridge launches actually use. Update
+    # BOTH so preflight no longer falls back to the system python3
+    # (which has no rclpy / no pyzmq / no aimdk_msgs).
+    if [[ -x "$ONBOT_VENV/bin/python3" ]]; then
+        DEPLOY_AUX_PYTHON="$ONBOT_VENV/bin/python3"
+        SIM_PYTHON="$ONBOT_VENV/bin/python3"
+    fi
+    echo -e "${BLUE}[onbot]${NC} runtime env ready"
+    echo -e "${BLUE}[onbot]${NC}   ros:        $ros_setup"
+    echo -e "${BLUE}[onbot]${NC}   overlay:    $ONBOT_WS/install/setup.bash"
+    echo -e "${BLUE}[onbot]${NC}   aimdk:      $ONBOT_AIMDK_PREFIX"
+    echo -e "${BLUE}[onbot]${NC}   onnxruntime: $ONBOT_ONNXRUNTIME"
+    echo -e "${BLUE}[onbot]${NC}   aux python: $DEPLOY_AUX_PYTHON"
+    unset ros_setup
+fi
+
+# Resolve absolute paths for local artefacts. We resolve relative paths
+# against $USER_CWD (the directory the user ran us from, captured BEFORE
+# we cd into SCRIPT_DIR) -- this matches how every other CLI tool in the
+# world treats paths. Failing the resolution loudly (rather than silently
+# producing /$basename) catches typos before they turn into "file not
+# found" deep inside a phase that already started.
 abspath() {
     local p="$1"
     if [[ -z "$p" ]]; then
@@ -1058,8 +1617,8 @@ if [[ "$MODE" == "local" || "$MODE" == "sim" ]]; then
     [[ -n "$LOG_DIR" ]]    && assert_host_persistent_path "--log-dir"    "$LOG_DIR"
     [[ -n "$RECORD_OUT" ]] && assert_host_persistent_path "--record-out" "$RECORD_OUT"
 fi
-# onbot also needs an absolute MOTION path (so abspath sees the local file
-# before we rsync it over) -- the rsync block reads $MOTION as a local path.
+# onbot is now PC2-native (no rsync), so MOTION resolution is just
+# abspath against the current cwd -- matches local mode behavior.
 if [[ "$MODE" == "onbot" && -n "$MOTION" ]]; then
     MOTION="$(abspath "$MOTION")"
 fi
@@ -1369,8 +1928,14 @@ echo -e "${NC}"
 echo -e "${BLUE}[Mode]${NC}                $MODE"
 echo -e "${BLUE}[Package]${NC}             $PKG_NAME"
 if [[ "$MODE" == "onbot" ]]; then
-    echo -e "${BLUE}[Robot host]${NC}          $ROBOT_USER@$ROBOT_HOST"
-    echo -e "${BLUE}[On-bot workspace]${NC}    $ONBOT_WS"
+    echo -e "${BLUE}[Onbot prefix]${NC}        $ONBOT_PREFIX"
+    echo -e "${BLUE}[Onbot workspace]${NC}     $ONBOT_WS"
+    echo -e "${BLUE}[Onbot venv]${NC}          $ONBOT_VENV"
+    echo -e "${BLUE}[Onbot onnxruntime]${NC}   $ONBOT_ONNXRUNTIME"
+    echo -e "${BLUE}[Onbot aimdk_msgs]${NC}    $ONBOT_AIMDK_PREFIX"
+    if [[ -n "$ROBOT_HOST" || -n "$ROBOT_USER" ]]; then
+        echo -e "${BLUE}[Robot host]${NC}          $ROBOT_USER@$ROBOT_HOST ${YELLOW}(ignored: PC2-native)${NC}"
+    fi
 fi
 echo ""
 
@@ -1403,12 +1968,50 @@ if [[ -n "${VLA_DEBUG_PORT:-}" && "${VLA_DEBUG_PORT}" != "0" ]]; then
     ROS2_ARGS+=("--zmq-debug-port" "${VLA_DEBUG_PORT}")
     ROS2_ARGS+=("--zmq-debug-topic" "${VLA_DEBUG_TOPIC:-x2_debug}")
 fi
+# SAFE_IDLE resume socket (Quest 3 A+B chord). Wired when VLA mode is on
+# AND a resume host was passed (we don't want the deploy to fail to
+# subscribe to a phantom socket in legacy --motion runs).
+if [[ "${VLA_MODE:-false}" == "true" && -n "${VLA_RESUME_HOST}" ]]; then
+    ROS2_ARGS+=("--zmq-resume-host"  "${VLA_RESUME_HOST}")
+    ROS2_ARGS+=("--zmq-resume-port"  "${VLA_RESUME_PORT}")
+    ROS2_ARGS+=("--zmq-resume-topic" "${VLA_RESUME_TOPIC}")
+fi
 [[ -n "$LOG_DIR" ]]           && ROS2_ARGS+=("--log-dir" "$LOG_DIR")
 [[ -n "$AUTOSTART" ]]         && ROS2_ARGS+=("--autostart-after" "$AUTOSTART")
 [[ -n "$MAX_DURATION" ]]      && ROS2_ARGS+=("--max-duration" "$MAX_DURATION")
 [[ -n "$TILT_COS" ]]          && ROS2_ARGS+=("--tilt-cos" "$TILT_COS")
 [[ -n "$RAMP_SECONDS" ]]      && ROS2_ARGS+=("--ramp-seconds" "$RAMP_SECONDS")
-[[ -n "$MAX_TARGET_DEV" ]]    && ROS2_ARGS+=("--max-target-dev" "$MAX_TARGET_DEV")
+[[ -n "$MAX_TARGET_DEV" ]]       && ROS2_ARGS+=("--max-target-dev" "$MAX_TARGET_DEV")
+[[ -n "$MAX_TARGET_DEV_LEG" ]]   && ROS2_ARGS+=("--max-target-dev-leg"   "$MAX_TARGET_DEV_LEG")
+[[ -n "$MAX_TARGET_DEV_WAIST" ]] && ROS2_ARGS+=("--max-target-dev-waist" "$MAX_TARGET_DEV_WAIST")
+[[ -n "$MAX_TARGET_DEV_ARM" ]]   && ROS2_ARGS+=("--max-target-dev-arm"   "$MAX_TARGET_DEV_ARM")
+[[ -n "$MAX_TARGET_DEV_HEAD" ]]  && ROS2_ARGS+=("--max-target-dev-head"  "$MAX_TARGET_DEV_HEAD")
+[[ -n "$KP_SCALE" ]]             && ROS2_ARGS+=("--kp-scale"             "$KP_SCALE")
+[[ -n "$KP_SCALE_HIP" ]]         && ROS2_ARGS+=("--kp-scale-hip"         "$KP_SCALE_HIP")
+[[ -n "$KP_SCALE_KNEE" ]]        && ROS2_ARGS+=("--kp-scale-knee"        "$KP_SCALE_KNEE")
+[[ -n "$KP_SCALE_ANKLE" ]]       && ROS2_ARGS+=("--kp-scale-ankle"       "$KP_SCALE_ANKLE")
+[[ -n "$KP_SCALE_ANKLE_PITCH" ]] && ROS2_ARGS+=("--kp-scale-ankle-pitch" "$KP_SCALE_ANKLE_PITCH")
+[[ -n "$KP_SCALE_ANKLE_ROLL" ]]  && ROS2_ARGS+=("--kp-scale-ankle-roll"  "$KP_SCALE_ANKLE_ROLL")
+[[ -n "$KP_SCALE_WAIST" ]]       && ROS2_ARGS+=("--kp-scale-waist"       "$KP_SCALE_WAIST")
+[[ -n "$KP_SCALE_WAIST_YAW" ]]   && ROS2_ARGS+=("--kp-scale-waist-yaw"   "$KP_SCALE_WAIST_YAW")
+[[ -n "$KP_SCALE_WAIST_PR" ]]    && ROS2_ARGS+=("--kp-scale-waist-pr"    "$KP_SCALE_WAIST_PR")
+[[ -n "$KP_SCALE_SHOULDER" ]]    && ROS2_ARGS+=("--kp-scale-shoulder"    "$KP_SCALE_SHOULDER")
+[[ -n "$KP_SCALE_ELBOW" ]]       && ROS2_ARGS+=("--kp-scale-elbow"       "$KP_SCALE_ELBOW")
+[[ -n "$KP_SCALE_WRIST" ]]       && ROS2_ARGS+=("--kp-scale-wrist"       "$KP_SCALE_WRIST")
+[[ -n "$KP_SCALE_HEAD" ]]        && ROS2_ARGS+=("--kp-scale-head"        "$KP_SCALE_HEAD")
+[[ -n "$KD_SCALE" ]]             && ROS2_ARGS+=("--kd-scale"             "$KD_SCALE")
+[[ -n "$KD_SCALE_HIP" ]]         && ROS2_ARGS+=("--kd-scale-hip"         "$KD_SCALE_HIP")
+[[ -n "$KD_SCALE_KNEE" ]]        && ROS2_ARGS+=("--kd-scale-knee"        "$KD_SCALE_KNEE")
+[[ -n "$KD_SCALE_ANKLE" ]]       && ROS2_ARGS+=("--kd-scale-ankle"       "$KD_SCALE_ANKLE")
+[[ -n "$KD_SCALE_ANKLE_PITCH" ]] && ROS2_ARGS+=("--kd-scale-ankle-pitch" "$KD_SCALE_ANKLE_PITCH")
+[[ -n "$KD_SCALE_ANKLE_ROLL" ]]  && ROS2_ARGS+=("--kd-scale-ankle-roll"  "$KD_SCALE_ANKLE_ROLL")
+[[ -n "$KD_SCALE_WAIST" ]]       && ROS2_ARGS+=("--kd-scale-waist"       "$KD_SCALE_WAIST")
+[[ -n "$KD_SCALE_WAIST_YAW" ]]   && ROS2_ARGS+=("--kd-scale-waist-yaw"   "$KD_SCALE_WAIST_YAW")
+[[ -n "$KD_SCALE_WAIST_PR" ]]    && ROS2_ARGS+=("--kd-scale-waist-pr"    "$KD_SCALE_WAIST_PR")
+[[ -n "$KD_SCALE_SHOULDER" ]]    && ROS2_ARGS+=("--kd-scale-shoulder"    "$KD_SCALE_SHOULDER")
+[[ -n "$KD_SCALE_ELBOW" ]]       && ROS2_ARGS+=("--kd-scale-elbow"       "$KD_SCALE_ELBOW")
+[[ -n "$KD_SCALE_WRIST" ]]       && ROS2_ARGS+=("--kd-scale-wrist"       "$KD_SCALE_WRIST")
+[[ -n "$KD_SCALE_HEAD" ]]        && ROS2_ARGS+=("--kd-scale-head"        "$KD_SCALE_HEAD")
 [[ -n "$TARGET_LPF_HZ" ]]     && ROS2_ARGS+=("--target-lpf-hz" "$TARGET_LPF_HZ")
 [[ -n "$ACTION_CLIP" ]]       && ROS2_ARGS+=("--action-clip" "$ACTION_CLIP")
 [[ -n "$RETURN_SECONDS" ]]    && ROS2_ARGS+=("--return-seconds" "$RETURN_SECONDS")
@@ -1419,11 +2022,19 @@ fi
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
 
 # ────────────────────────────────────────────────────────────────────────
-# Smooth-handoff flags: only meaningful for real-robot modes (local/onbot).
-# In sim mode there is no MC to hand off to; the bridge owns the bus the
-# whole time, so HOLD_FOR_MC + the stand-pose YAML would be no-ops.
+# Stand-default pose YAML (RAMP_OUT / HOLD_FOR_MC target in the C++ node).
+#
+# Real-robot modes (local/onbot): always forward when the file exists.
+#
+# Sim: historically omitted under the assumption HOLD_FOR_MC is unused.
+# Sim + --vla still runs the handoff RAMP_OUT path against ``default_angles``
+# unless we pass the captured MC stand YAML — which logs a loud warning
+# and can snap elbows vs gantry_hang. Forward the shipped YAML for VLA sim
+# only; pure --motion sim stays unchanged.
+#
+# HOLD_FOR_MC sentinels + timeout remain local/onbot-only (no MC bus in sim).
 # ────────────────────────────────────────────────────────────────────────
-if [[ "$MODE" != "sim" ]]; then
+if [[ "$MODE" != "sim" ]] || [[ "${VLA_MODE:-false}" == "true" ]]; then
     if [[ -z "$STAND_POSE_YAML" ]]; then
         # Default to the captured pose shipped in the repo. The C++ binary
         # falls back to default_angles if the file is missing, but it also
@@ -1437,6 +2048,8 @@ if [[ "$MODE" != "sim" ]]; then
         echo -e "${YELLOW}NOTE: --stand-pose-yaml '$STAND_POSE_YAML' not found;${NC}"
         echo -e "${YELLOW}      deploy node will fall back to default_angles for HOLD_FOR_MC.${NC}"
     fi
+fi
+if [[ "$MODE" != "sim" ]]; then
     if [[ -n "$HOLD_FOR_MC_TIMEOUT_S" && "$HOLD_FOR_MC_TIMEOUT_S" != "0" ]]; then
         ROS2_ARGS+=("--hold-for-mc-timeout-s" "$HOLD_FOR_MC_TIMEOUT_S")
         # Sentinel goes in $RUN_LOG_DIR if available (per-run dir; gets
@@ -1457,6 +2070,21 @@ if [[ "$MODE" != "sim" ]]; then
         ROS2_ARGS+=("--hold-for-mc-sentinel" "$HOLD_FOR_MC_SENTINEL")
         ROS2_ARGS+=("--hold-for-mc-exit-sentinel" "$HOLD_FOR_MC_EXIT_SENTINEL")
         ROS2_ARGS+=("--mc-first-publish-sentinel" "$MC_FIRST_PUBLISH_SENTINEL")
+        # Soft-shutdown trigger sentinel: touched on Ctrl-C by the cleanup
+        # trap so deploy can enter RAMP_OUT -> HOLD_FOR_MC instead of
+        # exiting immediately. Co-located with the other HOLD_FOR_MC
+        # sentinels so the same RUN_LOG_DIR cleanup picks it up.
+        # Skipped when --no-soft-shutdown is passed; in that case deploy
+        # uses rclcpp's default SIGINT handler (legacy hard-exit path).
+        if ! $SOFT_SHUTDOWN_DISABLED; then
+            if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+                SOFT_SHUTDOWN_SENTINEL="$RUN_LOG_DIR/soft_shutdown.sentinel"
+            else
+                SOFT_SHUTDOWN_SENTINEL="/tmp/x2_soft_shutdown.$$.sentinel"
+            fi
+            rm -f "$SOFT_SHUTDOWN_SENTINEL"
+            ROS2_ARGS+=("--soft-shutdown-trigger-sentinel" "$SOFT_SHUTDOWN_SENTINEL")
+        fi
     fi
 
     # ────────────────────────────────────────────────────────────────────
@@ -1538,7 +2166,7 @@ if [[ -n "$TUNING_CONFIG" ]]; then
         echo -e "${RED}ERROR: tuning translator missing: $TUNING_TRANSLATOR${NC}" >&2
         exit 1
     fi
-    if ! mapfile -t TUNING_ARGS < <(python3 "$TUNING_TRANSLATOR" "$TUNING_CONFIG"); then
+    if ! mapfile -t TUNING_ARGS < <("$DEPLOY_AUX_PYTHON" "$TUNING_TRANSLATOR" "$TUNING_CONFIG"); then
         echo -e "${RED}ERROR: failed to parse tuning config $TUNING_CONFIG${NC}" >&2
         exit 1
     fi
@@ -1554,6 +2182,13 @@ if [[ -n "$TUNING_CONFIG" ]]; then
     fi
 fi
 
+# Append any --deploy-extra-arg ... values at the very end so they win
+# last-write-wins parsing inside the C++ binary, regardless of where
+# they appear on the wrapper command line.
+if [[ "${#DEPLOY_EXTRA_ARGS[@]}" -gt 0 ]]; then
+    ROS2_ARGS+=("${DEPLOY_EXTRA_ARGS[@]}")
+fi
+
 # ============================================================================
 # MC (Motion Control) HTTP helpers + cleanup trap
 # ----------------------------------------------------------------------------
@@ -1564,19 +2199,92 @@ fi
 # agitbot-x2-record-and-replay/src/x2_recorder/mc_control.py.
 # ============================================================================
 
+probe_pose_wire() {
+    # Open a ZMQ SUB on the deploy's actual pose-input host:port for
+    # WIRE_PROBE_SECS and count frames. Echoes a single line of the form
+    #     OK frames=<N> dt_first_ms=<M>
+    # on success (returns 0), or
+    #     SILENT frames=0
+    # on failure (returns 1). The caller is expected to wrap this with
+    # operator-facing diagnostics. Idempotent and side-effect free:
+    # no socket binds, only a connect+recv. Uses DEPLOY_AUX_PYTHON
+    # (resolved in the onbot-env block) so the venv's pyzmq is in scope.
+    local host="$1"; local port="$2"; local topic="$3"; local secs="$4"
+    local py
+    if [[ -n "${DEPLOY_AUX_PYTHON:-}" && -x "$DEPLOY_AUX_PYTHON" ]]; then
+        py="$DEPLOY_AUX_PYTHON"
+    elif command -v python3 &>/dev/null; then
+        py="$(command -v python3)"
+    else
+        echo "ERROR_NO_PYTHON"
+        return 1
+    fi
+    "$py" - "$host" "$port" "$topic" "$secs" <<'PYEOF'
+import sys, time
+try:
+    import zmq
+except ImportError as e:
+    print(f"ERROR_NO_PYZMQ: {e}")
+    sys.exit(2)
+host, port, topic, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+ctx = zmq.Context.instance()
+sub = ctx.socket(zmq.SUB)
+sub.setsockopt(zmq.RCVHWM, 100)
+sub.connect(f"tcp://{host}:{port}")
+sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+poller = zmq.Poller()
+poller.register(sub, zmq.POLLIN)
+deadline = time.monotonic() + secs
+n = 0
+first_rx_s = None
+while time.monotonic() < deadline:
+    socks = dict(poller.poll(timeout=50))
+    if sub in socks:
+        try:
+            sub.recv(zmq.NOBLOCK)
+            if first_rx_s is None:
+                first_rx_s = time.monotonic()
+            n += 1
+        except zmq.Again:
+            pass
+sub.close(linger=0)
+if n > 0:
+    dt = int((first_rx_s - (deadline - secs)) * 1000) if first_rx_s else -1
+    print(f"OK frames={n} dt_first_ms={dt}")
+    sys.exit(0)
+else:
+    print("SILENT frames=0")
+    sys.exit(1)
+PYEOF
+}
+
 mc_em_post() {
     # $1 = action ("stop_app" or "start_app")
+    #
+    # Tries the legacy HTTP endpoint first (older PC1 firmware exposes
+    # it on $MC_EM_URL/json/start_app | stop_app). Newer firmware (post
+    # ~2026-05 on this fleet) dropped the HTTP wrapper entirely: the EM
+    # service moved to ROS 2 services (/aimdk.protocol.EmAppService/
+    # StartApp + StopApp), and the supported CLI on PC2 is `aima em
+    # start-app mc` / `aima em stop-app mc`, which wraps those services.
+    # When the HTTP POST fails AND we're on a host that has `aima` on
+    # PATH (i.e. we're running on PC2 in onbot mode), fall back to the
+    # CLI so the operator does not have to know which firmware they're
+    # on. Useful for both onbot mode (PC2-native) and any future
+    # firmware update on the local-mode laptop.
     local action="$1"
     local url="$MC_EM_URL/json/$action"
+    local http_rc=0
     if command -v curl &>/dev/null; then
-        curl -fsS -X POST -H 'Content-Type: application/json' \
+        if curl -fsS -X POST -H 'Content-Type: application/json' \
             --connect-timeout 3 --max-time 5 \
             -d '{"app_name":"mc"}' \
-            "$url" >/dev/null
-    else
-        # Fallback: python3 (always present in our docker image, and on any
-        # ROS 2 install). Avoids a hard dependency on curl.
-        python3 - "$url" <<'PY'
+            "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        http_rc=$?
+    elif command -v python3 &>/dev/null; then
+        if python3 - "$url" <<'PY' 2>/dev/null
 import json, sys, urllib.request
 url = sys.argv[1]
 req = urllib.request.Request(
@@ -1585,10 +2293,33 @@ req = urllib.request.Request(
     headers={"Content-Type": "application/json"},
     method="POST",
 )
-with urllib.request.urlopen(req, timeout=5) as r:
-    r.read()
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        r.read()
+except Exception:
+    sys.exit(1)
 PY
+        then
+            return 0
+        fi
+        http_rc=$?
     fi
+    # HTTP failed. Try the `aima em` CLI fallback (PC2 only).
+    local aima_subcmd=""
+    case "$action" in
+        stop_app)  aima_subcmd="stop-app" ;;
+        start_app) aima_subcmd="start-app" ;;
+    esac
+    if [[ -n "$aima_subcmd" ]] && command -v aima &>/dev/null; then
+        echo -e "$(ts) ${YELLOW}[mc-em]${NC} HTTP $url failed (rc=$http_rc); trying 'aima em $aima_subcmd mc' ..." >&2
+        if aima em "$aima_subcmd" mc >/dev/null 2>&1; then
+            echo -e "$(ts) ${GREEN}[mc-em]${NC} aima em $aima_subcmd mc OK." >&2
+            return 0
+        fi
+        echo -e "$(ts) ${RED}[mc-em]${NC} aima em $aima_subcmd mc also failed." >&2
+        return 1
+    fi
+    return $http_rc
 }
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1996,7 +2727,7 @@ start_run_recorder() {
     # to pull the analysis. Inheriting our shell's ROS env (sourced by the
     # docker auto-relaunch) means the recorder lands on the same domain as
     # the deploy with no extra setup.
-    python3 "$recorder" \
+    "$DEPLOY_AUX_PYTHON" "$recorder" \
         --out "$RECORD_OUT" \
         --note "deploy_x2.sh $MODE @ $(date -Iseconds)" \
         --quiet &
@@ -2019,6 +2750,101 @@ stop_run_recorder() {
     RUN_RECORD_PID=""
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Hand bridge (ZMQ pose -> AimDK HandCommandArray) lifecycle
+# ─────────────────────────────────────────────────────────────────────
+# Spawned in MODE=local AFTER MC has been verified silenced (so its
+# engage burst lands cleanly on a quiet bus). Reaped via the same
+# restart_mc_on_exit trap that handles the deploy + run recorder, so
+# Ctrl-C / abort / normal exit all converge on the same teardown path.
+# Sim mode does NOT call this -- the MuJoCo bridge with --with-omnihand
+# already writes finger qpos directly into MuJoCo and there's no AimDK
+# HAL to publish to. onbot mode does not call this either -- the hand
+# bridge is owned by scripts/x2_pc2_daemons.sh, which launches it in
+# its own tmux session on PC2 alongside the deploy and motor monitor
+# (so all three share the same WiFi-disconnect-tolerant lifecycle).
+start_hand_bridge() {
+    $HAND_BRIDGE_ENABLED || return 0
+    if [[ "$MODE" != "local" ]]; then
+        return 0
+    fi
+    if [[ "$HAND_BRIDGE_SIDES" == "off" ]]; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} --hand-bridge-sides=off; not starting."
+        return 0
+    fi
+
+    local script_path="$SCRIPT_DIR/$HAND_BRIDGE_SCRIPT_REL"
+    if [[ ! -f "$script_path" ]]; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} script not found: $script_path -- skipping." >&2
+        return 0
+    fi
+
+    local py="${HAND_BRIDGE_PYTHON:-$DEPLOY_AUX_PYTHON}"
+    if ! command -v "$py" &>/dev/null; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} python interpreter '$py' not on PATH; skipping." >&2
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} pass --hand-bridge-python /path/to/python or --no-hand-bridge to silence." >&2
+        return 0
+    fi
+
+    if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+        HAND_BRIDGE_LOG="$RUN_LOG_DIR/hand_bridge.log"
+    else
+        HAND_BRIDGE_LOG="/tmp/x2_hand_bridge.$$.log"
+    fi
+
+    local args=(
+        "$script_path"
+        --zmq-host "${VLA_ZMQ_HOST:-localhost}"
+        --zmq-port "${VLA_ZMQ_PORT:-5556}"
+        --zmq-topic "${VLA_ZMQ_TOPIC:-pose}"
+        --sides "$HAND_BRIDGE_SIDES"
+        --engage-shots "$HAND_BRIDGE_ENGAGE_SHOTS"
+        --max-stale-s "$HAND_BRIDGE_MAX_STALE_S"
+        --publish-hz "$HAND_BRIDGE_PUBLISH_HZ"
+        --duration 0
+    )
+
+    echo -e "$(ts) ${BLUE}[hand-bridge]${NC} spawning: $py ${args[*]}"
+    echo -e "$(ts) ${BLUE}[hand-bridge]${NC} stdout/stderr -> $HAND_BRIDGE_LOG"
+    "$py" "${args[@]}" >"$HAND_BRIDGE_LOG" 2>&1 &
+    HAND_BRIDGE_PID=$!
+
+    # Best-effort liveness check: if the bridge died inside the
+    # detect-timeout window (e.g. aimdk_msgs missing on PYTHONPATH or
+    # zmq import failed), surface that immediately so the operator
+    # isn't surprised at the first failed grasp.
+    sleep 0.5
+    if ! kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} exited immediately; tail of log:" >&2
+        tail -n 20 "$HAND_BRIDGE_LOG" 2>/dev/null | sed 's/^/  /' >&2 || true
+        echo -e "$(ts) ${YELLOW}[hand-bridge]${NC} continuing without hand publishing -- fingers will not move." >&2
+        HAND_BRIDGE_PID=""
+        return 0
+    fi
+    echo -e "$(ts) ${GREEN}[hand-bridge]${NC} pid $HAND_BRIDGE_PID up (sides=$HAND_BRIDGE_SIDES)."
+}
+
+stop_hand_bridge() {
+    [[ -z "$HAND_BRIDGE_PID" ]] && return 0
+    if kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} stopping hand bridge (pid $HAND_BRIDGE_PID) ..."
+        kill -INT "$HAND_BRIDGE_PID" 2>/dev/null || true
+        # Bridge handles SIGINT cleanly; small grace then SIGTERM if it
+        # didn't notice (engage timer mid-tick, etc).
+        local i
+        for i in 1 2 3 4 5; do
+            kill -0 "$HAND_BRIDGE_PID" 2>/dev/null || break
+            sleep 0.2
+        done
+        if kill -0 "$HAND_BRIDGE_PID" 2>/dev/null; then
+            kill -TERM "$HAND_BRIDGE_PID" 2>/dev/null || true
+            wait "$HAND_BRIDGE_PID" 2>/dev/null || true
+        fi
+        echo -e "$(ts) ${GREEN}[cleanup]${NC} hand bridge stopped."
+    fi
+    HAND_BRIDGE_PID=""
+}
+
 cleanup_sim() {
     local rc=$?
     if [[ -n "$SIM_BRIDGE_PID" ]] && kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
@@ -2036,14 +2862,94 @@ cleanup_sim() {
     exit $rc
 }
 
+soft_shutdown_wait() {
+    # Graceful Ctrl-C path. Cooperates with the C++ deploy's custom
+    # SIGINT/SIGTERM handler (--soft-shutdown-trigger-sentinel) so the
+    # robot stays under torque all the way through MC's PASSIVE_DEFAULT
+    # boot -- no zero-torque drop.
+    #
+    # Flow:
+    #   1. Touch SOFT_SHUTDOWN_SENTINEL (belt + suspenders: if deploy's
+    #      in-process flag missed for any reason, the next OnControl
+    #      tick will see the file and still RAMP_OUT).
+    #   2. Wait up to SOFT_SHUTDOWN_WAIT_S for HOLD_FOR_MC_SENTINEL to
+    #      appear, which means deploy has finished RAMP_OUT and is now
+    #      publishing MC's STAND_DEFAULT pose with MC-stand gains.
+    #   3. While waiting, a SECOND Ctrl-C sets SOFT_SHUTDOWN_ABORTED and
+    #      we bail out early -- the caller falls through to the legacy
+    #      hard-exit cleanup (POST start_app immediately).
+    #
+    # Safe no-op when:
+    #   * soft-shutdown was never wired (SOFT_SHUTDOWN_SENTINEL empty)
+    #   * deploy has already exited (no PID alive)
+    #   * we've already run once this exit (SOFT_SHUTDOWN_TRIGGERED true)
+    if [[ -z "${SOFT_SHUTDOWN_SENTINEL:-}" ]]; then
+        return 0
+    fi
+    if $SOFT_SHUTDOWN_TRIGGERED; then
+        return 0
+    fi
+    SOFT_SHUTDOWN_TRIGGERED=true
+    if [[ -z "${DEPLOY_PID:-}" ]] || ! kill -0 "$DEPLOY_PID" 2>/dev/null; then
+        # Deploy already gone. Nothing to coordinate with; let the
+        # legacy MC-restart path run.
+        return 0
+    fi
+    # Re-trap SIGINT inside the wait loop so a second Ctrl-C trips
+    # SOFT_SHUTDOWN_ABORTED instead of immediately re-firing the EXIT
+    # trap (which would loop us back here). On exit from this function
+    # the caller will install the next trap as appropriate.
+    trap 'SOFT_SHUTDOWN_ABORTED=true; echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} second Ctrl-C -> aborting graceful wait, falling through to MC restart."' INT
+    echo ""
+    echo -e "$(ts) ${BLUE}[soft-shutdown]${NC} touching trigger sentinel '$SOFT_SHUTDOWN_SENTINEL' -> deploy RAMP_OUT -> HOLD_FOR_MC."
+    echo -e "$(ts) ${BLUE}[soft-shutdown]${NC}   Press Ctrl-C again within ${SOFT_SHUTDOWN_WAIT_S}s to abort the graceful wait and force MC restart immediately."
+    : > "$SOFT_SHUTDOWN_SENTINEL"
+    # Poll for HOLD_FOR_MC_SENTINEL (deploy has reached HOLD_FOR_MC and
+    # is publishing the stand pose). We sleep 0.1s between checks for
+    # snappy response to the second-Ctrl-C abort. Total budget is
+    # SOFT_SHUTDOWN_WAIT_S seconds.
+    local deadline_ns
+    deadline_ns=$(( $(date +%s%N) + SOFT_SHUTDOWN_WAIT_S * 1000000000 ))
+    while ! $SOFT_SHUTDOWN_ABORTED; do
+        if [[ -n "${HOLD_FOR_MC_SENTINEL:-}" && -f "$HOLD_FOR_MC_SENTINEL" ]]; then
+            echo -e "$(ts) ${GREEN}[soft-shutdown]${NC} deploy reached HOLD_FOR_MC -> safe to restart MC."
+            break
+        fi
+        # Deploy died mid-RAMP_OUT (uncaught crash, segfault, OOM, ...).
+        # No point waiting further; fall through to MC restart.
+        if ! kill -0 "$DEPLOY_PID" 2>/dev/null; then
+            echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} deploy exited before reaching HOLD_FOR_MC -> falling through to MC restart."
+            break
+        fi
+        if [[ $(date +%s%N) -ge $deadline_ns ]]; then
+            echo -e "$(ts) ${YELLOW}[soft-shutdown]${NC} timed out after ${SOFT_SHUTDOWN_WAIT_S}s waiting for HOLD_FOR_MC sentinel -> falling through to MC restart. (Deploy may still be in RAMP_OUT -- check the deploy log.)"
+            break
+        fi
+        sleep 0.1
+    done
+}
+
 restart_mc_on_exit() {
     # Always called via the trap once we've stopped MC. Idempotent + safe to
     # call multiple times. Preserves the original exit code so a failing
     # deploy run still surfaces its non-zero status to the caller / CI.
     local rc=$?
-    # Stop the run recorder FIRST so it captures the deploy's RAMP_OUT and
+    # Graceful Ctrl-C: give deploy time to RAMP_OUT and reach HOLD_FOR_MC
+    # BEFORE we POST start_app to MC. Without this step, deploy exits on
+    # SIGINT (~50 ms) and the bus goes silent for the 1-2 s MC takes to
+    # boot through PASSIVE_DEFAULT -- robot drops under gravity. With it,
+    # deploy keeps publishing the stand pose with MC-stand gains
+    # throughout MC's boot. No-op if --soft-shutdown-trigger-sentinel
+    # wasn't wired (SOFT_SHUTDOWN_SENTINEL empty) or deploy already exited.
+    soft_shutdown_wait
+    # Stop the run recorder so it captures the deploy's RAMP_OUT and
     # the silence between deploy-exit and MC-restart in the same npz.
     stop_run_recorder
+    # Stop the hand bridge BEFORE MC restarts, so MC's own hand
+    # republish loop owns /aima/hal/joint/hand/command exclusively
+    # again and we don't dual-publish for the brief window between
+    # mc start_app and the bridge's SIGINT-driven exit.
+    stop_hand_bridge
     # Clear all sentinels so stale files from a crashed run cannot
     # mis-trigger the next invocation. Best-effort.
     if [[ -n "${HOLD_FOR_MC_SENTINEL:-}" ]]; then
@@ -2054,6 +2960,9 @@ restart_mc_on_exit() {
     fi
     if [[ -n "${MC_FIRST_PUBLISH_SENTINEL:-}" ]]; then
         rm -f "$MC_FIRST_PUBLISH_SENTINEL"
+    fi
+    if [[ -n "${SOFT_SHUTDOWN_SENTINEL:-}" ]]; then
+        rm -f "$SOFT_SHUTDOWN_SENTINEL"
     fi
     if [[ -n "${ESCALATOR_OK_SENTINEL:-}" ]]; then
         rm -f "$ESCALATOR_OK_SENTINEL"
@@ -2292,24 +3201,43 @@ check_local_file() {
     fi
 }
 
+MISSING=0
+check_local_file "$MODEL" "Model"      || MISSING=$((MISSING+1))
+# --motion is meaningless once VLA mode is on (deploy reads pose refs
+# from ZMQ, not from the .x2m2 file); we tolerate it being absent then.
+if [[ -n "$MOTION" ]] && ! $VLA_MODE; then
+    check_local_file "$MOTION"  "Motion"  || MISSING=$((MISSING+1))
+fi
+if [[ "$MODE" == "sim" ]]; then
+    check_local_file "$SCRIPT_DIR/$SIM_BRIDGE_REL" "MuJoCo bridge" \
+        || MISSING=$((MISSING+1))
+    [[ -n "$SIM_MJCF" ]] && { check_local_file "$SIM_MJCF" "MJCF override" \
+        || MISSING=$((MISSING+1)); }
+    [[ -n "$SIM_MOTION" ]] && { check_local_file "$SIM_MOTION" "Sim RSI motion" \
+        || MISSING=$((MISSING+1)); }
+fi
 if [[ "$MODE" == "onbot" ]]; then
-    echo "  (asset existence will be checked on $ROBOT_HOST after rsync)"
-else
-    MISSING=0
-    check_local_file "$MODEL" "Model"      || MISSING=$((MISSING+1))
-    [[ -n "$MOTION" ]]  && { check_local_file "$MOTION"  "Motion"  || MISSING=$((MISSING+1)); }
-    if [[ "$MODE" == "sim" ]]; then
-        check_local_file "$SCRIPT_DIR/$SIM_BRIDGE_REL" "MuJoCo bridge" \
-            || MISSING=$((MISSING+1))
-        [[ -n "$SIM_MJCF" ]] && { check_local_file "$SIM_MJCF" "MJCF override" \
-            || MISSING=$((MISSING+1)); }
-        [[ -n "$SIM_MOTION" ]] && { check_local_file "$SIM_MOTION" "Sim RSI motion" \
-            || MISSING=$((MISSING+1)); }
+    # New onbot semantics: we ARE on PC2, so file paths are local. Verify
+    # the bringup-staged install layout too so a missing pc2_bringup.sh
+    # run fails fast with a clear hint instead of cryptically later.
+    check_local_file "$ONBOT_WS/install/setup.bash" "onbot workspace install/setup.bash" \
+        || MISSING=$((MISSING+1))
+    check_local_file "$ONBOT_VENV/bin/python3" "onbot venv python" \
+        || MISSING=$((MISSING+1))
+    check_local_file "$ONBOT_ONNXRUNTIME/lib/libonnxruntime.so" "onbot ONNX Runtime lib" \
+        || MISSING=$((MISSING+1))
+    check_local_file "$ONBOT_AIMDK_PREFIX/local/lib/python3.10/dist-packages" \
+        "onbot aimdk_msgs python bindings dir" \
+        || MISSING=$((MISSING+1))
+fi
+if [[ $MISSING -gt 0 ]]; then
+    echo -e "${RED}  $MISSING asset(s) missing. Aborting.${NC}"
+    if [[ "$MODE" == "onbot" ]]; then
+        echo -e "${YELLOW}  If onbot paths are missing, run pc2_bringup.sh from the${NC}"
+        echo -e "${YELLOW}  laptop first: ./gear_sonic_deploy/scripts/pc2_bringup.sh${NC}"
+        echo -e "${YELLOW}    --pc2-host <PC2_IP> --model /path/to/policy.onnx${NC}"
     fi
-    if [[ $MISSING -gt 0 ]]; then
-        echo -e "${RED}  $MISSING asset(s) missing. Aborting.${NC}"
-        exit 1
-    fi
+    exit 1
 fi
 echo ""
 
@@ -2340,53 +3268,31 @@ build_local() {
 }
 
 build_onbot() {
-    echo "  Syncing package to $ROBOT_USER@$ROBOT_HOST:$ONBOT_WS/src/ ..."
-    ssh -o ConnectTimeout=5 "$ROBOT_USER@$ROBOT_HOST" "mkdir -p $ONBOT_WS/src"
-    rsync -az --delete \
-        "$SCRIPT_DIR/$PKG_DIR_REL/" \
-        "$ROBOT_USER@$ROBOT_HOST:$ONBOT_WS/src/$PKG_NAME/"
-    rsync -az --delete \
-        "$SCRIPT_DIR/$SONIC_COMMON_REL/" \
-        "$ROBOT_USER@$ROBOT_HOST:$ONBOT_WS/src/sonic_common/"
-
-    if [[ -n "$MODEL" ]]; then
-        echo "  Syncing model to $ROBOT_HOST:/tmp/x2_model.onnx ..."
-        rsync -az "$MODEL" "$ROBOT_USER@$ROBOT_HOST:/tmp/x2_model.onnx"
-        MODEL_REMOTE="/tmp/x2_model.onnx"
+    # New onbot semantics (2026-05): this script runs natively on PC2,
+    # so there is no rsync + ssh build path. The colcon workspace at
+    # $ONBOT_WS/install/setup.bash is staged by pc2_bringup.sh and we
+    # just verify it exists. To rebuild after C++ changes, re-run
+    # pc2_bringup.sh from the laptop (which rsyncs + colcons on PC2)
+    # rather than building from here.
+    if [[ ! -f "$ONBOT_WS/install/setup.bash" ]]; then
+        echo -e "${RED}  onbot workspace not found at $ONBOT_WS/install/setup.bash${NC}"
+        echo -e "${YELLOW}  This script must be run on PC2 with the workspace pre-built.${NC}"
+        echo -e "${YELLOW}  From the laptop run:${NC}"
+        echo -e "${YELLOW}    ./gear_sonic_deploy/scripts/pc2_bringup.sh --pc2-host <PC2_IP>${NC}"
+        echo -e "${YELLOW}  then re-run this script ON PC2.${NC}"
+        exit 1
     fi
-    if [[ -n "$MOTION" ]]; then
-        echo "  Syncing motion to $ROBOT_HOST:/tmp/x2_motion.x2m2 ..."
-        rsync -az "$MOTION" "$ROBOT_USER@$ROBOT_HOST:/tmp/x2_motion.x2m2"
-        MOTION_REMOTE="/tmp/x2_motion.x2m2"
-    fi
-
     if $NO_BUILD; then
-        echo -e "${YELLOW}  --no-build set; skipping colcon build on $ROBOT_HOST.${NC}"
+        echo -e "${YELLOW}  --no-build set; (onbot is build-free anyway -- noop).${NC}"
     else
-        echo "  Running colcon build on $ROBOT_HOST ..."
-        ssh "$ROBOT_USER@$ROBOT_HOST" \
-            "source /opt/ros/humble/setup.bash && \
-             cd $ONBOT_WS && \
-             colcon build --packages-select $PKG_NAME \
-                 --cmake-args -DONNXRUNTIME_ROOT=$ONNXRUNTIME_ROOT"
-        echo -e "${GREEN}  Remote build OK.${NC}"
+        echo -e "${GREEN}  onbot workspace OK at $ONBOT_WS/install/setup.bash${NC}"
+        echo "  (Skipping colcon build -- run pc2_bringup.sh to rebuild after C++ changes.)"
     fi
 }
 
 if [[ "$MODE" == "onbot" ]]; then
     build_onbot
-    # Rewrite ROS2_ARGS to point at the rsync'd remote paths.
-    NEW_ARGS=()
-    skip_next=false
-    for a in "${ROS2_ARGS[@]}"; do
-        if $skip_next; then skip_next=false; continue; fi
-        case $a in
-            --model)  NEW_ARGS+=("--model" "$MODEL_REMOTE"); skip_next=true ;;
-            --motion) [[ -n "$MOTION_REMOTE" ]] && { NEW_ARGS+=("--motion" "$MOTION_REMOTE"); skip_next=true; } ;;
-            *)        NEW_ARGS+=("$a") ;;
-        esac
-    done
-    ROS2_ARGS=("${NEW_ARGS[@]}")
+    # New onbot: paths are LOCAL on PC2; no remote rewrite of --model / --motion.
 else
     build_local
 fi
@@ -2454,15 +3360,32 @@ if [[ "$MODE" == "sim" ]]; then
         echo -e "  Record commands:    ${GREEN}$SIM_RECORD_COMMANDS${NC}"
     echo -e "  DDS isolation:      ${GREEN}ROS_LOCALHOST_ONLY=1, ROS_DOMAIN_ID=$SIM_DOMAIN_ID${NC}"
 fi
+if [[ "$MODE" == "local" ]]; then
+    if $HAND_BRIDGE_ENABLED && [[ "$HAND_BRIDGE_SIDES" != "off" ]]; then
+        echo -e "  Hand bridge:        ${GREEN}ON${NC} (py=${HAND_BRIDGE_PYTHON:-$DEPLOY_AUX_PYTHON}, sides=$HAND_BRIDGE_SIDES, engage=${HAND_BRIDGE_ENGAGE_SHOTS}x@1Hz, publish=${HAND_BRIDGE_PUBLISH_HZ}Hz, max_stale=${HAND_BRIDGE_MAX_STALE_S}s)"
+    else
+        echo -e "  Hand bridge:        ${YELLOW}OFF${NC} (real-robot hands will not move)"
+    fi
+elif [[ "$MODE" == "onbot" ]]; then
+    echo -e "  Hand bridge:        ${YELLOW}skipped${NC} (onbot mode -- owned by x2_pc2_daemons.sh in its own tmux session)"
+    echo -e "  Recorder:           ${YELLOW}skipped${NC} (onbot mode -- recorder lives on the laptop with the planner stack)"
+fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "${YELLOW}The following command will be executed:${NC}"
 echo ""
 if [[ "$MODE" == "onbot" ]]; then
-    echo -e "${BLUE}ssh $ROBOT_USER@$ROBOT_HOST 'source /opt/ros/humble/setup.bash && \\"
-    echo -e "    source $ONBOT_WS/install/setup.bash && \\"
-    echo -e "    ros2 run $PKG_NAME x2_deploy_onnx_ref ${ROS2_ARGS[*]}'${NC}"
+    echo -e "${BLUE}source /opt/ros/humble/setup.bash${NC}"
+    echo -e "${BLUE}source $ONBOT_WS/install/setup.bash${NC}"
+    echo -e "${BLUE}ros2 run $PKG_NAME x2_deploy_onnx_ref \\"
+    for ((i=0; i<${#ROS2_ARGS[@]}; i++)); do
+        if [[ $((i+1)) -lt ${#ROS2_ARGS[@]} ]]; then
+            echo -e "${BLUE}    ${ROS2_ARGS[i]} \\"
+        else
+            echo -e "${BLUE}    ${ROS2_ARGS[i]}${NC}"
+        fi
+    done
 else
     echo -e "${BLUE}source install/setup.bash${NC}"
     echo -e "${BLUE}ros2 run $PKG_NAME x2_deploy_onnx_ref \\"
@@ -2519,17 +3442,7 @@ echo ""
 # need to interleave starts.
 start_run_recorder
 
-if [[ "$MODE" == "onbot" ]]; then
-    REMOTE_CMD="source /opt/ros/humble/setup.bash && \
-        source $ONBOT_WS/install/setup.bash && \
-        ros2 run $PKG_NAME x2_deploy_onnx_ref"
-    for a in "${ROS2_ARGS[@]}"; do
-        REMOTE_CMD+=" $(printf %q "$a")"
-    done
-    # NOT `exec` -- we want the restart_mc_on_exit trap to fire after ssh
-    # returns. Capture the exit code, propagate via the trap.
-    ssh -t "$ROBOT_USER@$ROBOT_HOST" "$REMOTE_CMD"
-elif [[ "$MODE" == "sim" ]]; then
+if [[ "$MODE" == "sim" ]]; then
     if [[ -f install/setup.bash ]]; then
         source install/setup.bash
     fi
@@ -2594,8 +3507,24 @@ elif [[ "$MODE" == "sim" ]]; then
     echo -e "$(ts) ${BLUE}[sim]${NC} starting deploy (cleanup trap installed; Ctrl-C to stop)"
     ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}"
 else
-    if [[ -f install/setup.bash ]]; then
-        source install/setup.bash
+    # local + onbot share the cold-warm orchestration below. The only
+    # asymmetry is which colcon overlay we source: local uses the
+    # repo-root install/ (built by build_local), onbot already sourced
+    # the bringup-staged $ONBOT_WS/install/setup.bash way up at the
+    # top of the script (right after mode validation, so preflight +
+    # the tuning translator could see ros2/rclpy/aimdk_msgs). We just
+    # verify the overlay registered the deploy node here.
+    if [[ "$MODE" == "onbot" ]]; then
+        if ! ros2 pkg prefix "$PKG_NAME" >/dev/null 2>&1; then
+            echo -e "$(ts) ${RED}[onbot]${NC} colcon overlay missing $PKG_NAME at runtime."
+            echo -e "$(ts) ${RED}[onbot]${NC} overlay was sourced from $ONBOT_WS/install/setup.bash;"
+            echo -e "$(ts) ${RED}[onbot]${NC} re-run pc2_bringup.sh with --force-build to rebuild."
+            exit 1
+        fi
+    else
+        if [[ -f install/setup.bash ]]; then
+            source install/setup.bash
+        fi
     fi
     # NOT `exec` -- we need the EXIT trap (restart_mc_on_exit) to fire after
     # the deploy returns / Ctrl-C. The trap re-exit()s with the deploy's
@@ -2701,6 +3630,62 @@ else
         echo -e "$(ts) ${GREEN}[handoff]${NC} deploy is in STANDBY and ready."
 
         # ────────────────────────────────────────────────────────────────
+        # WIRE-FRESHNESS PROBE -- catch "dead pose proxy / silent wire"
+        # BEFORE we ask the operator to confirm MC-stop. Without this,
+        # the operator can answer 'y' to the safety gate while the
+        # pose proxy is dead (or the planner stack never started), MC
+        # stops onto a silent wire, the deploy's ZmqPoseInputSource
+        # returns its bootstrap default_angles forever, and the robot
+        # ends up tracking an out-of-distribution reference. See the
+        # 2026-05 whirring incident postmortem.
+        #
+        # Probe target = ${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}, which is what
+        # the deploy will actually SUB to:
+        #   * split-topology onbot mode: localhost:5558 (proxy output;
+        #     proxy publishes idle_stand even when laptop is silent, so
+        #     this gate only fires when the proxy itself is dead).
+        #   * local mode without proxy: <laptop_ip>:5556 (planner stack
+        #     output directly; gate fires if planner not running).
+        # ────────────────────────────────────────────────────────────────
+        if ! $NO_WIRE_PROBE; then
+            echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
+            probe_rc=$?
+            if [[ $probe_rc -ne 0 ]]; then
+                echo ""
+                echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${RED}  WIRE-FRESHNESS PROBE FAILED -- ABORTING BEFORE MC-STOP${NC}"
+                echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -e "${RED}  probe result: ${probe_out}${NC}"
+                echo -e "${RED}  No pose frames received on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}${NC}"
+                echo -e "${RED}  topic=${VLA_ZMQ_TOPIC} in ${WIRE_PROBE_SECS}s.${NC}"
+                echo ""
+                echo -e "${YELLOW}  Likely causes:${NC}"
+                if [[ "${VLA_ZMQ_HOST}" == "localhost" || "${VLA_ZMQ_HOST}" == "127.0.0.1" ]]; then
+                    echo -e "${YELLOW}    (split-topology) The PC2 pose proxy is not running. Check:${NC}"
+                    echo -e "${YELLOW}      x2_pc2_daemons.sh logs proxy --pc2-host <pc2_ip>${NC}"
+                    echo -e "${YELLOW}      x2_pc2_daemons.sh status --pc2-host <pc2_ip>${NC}"
+                    echo -e "${YELLOW}    If the proxy session exited, look in ${PC2_LOG_ROOT:-/home/run/getsolo/log}/pose_proxy_*.log${NC}"
+                else
+                    echo -e "${YELLOW}    The laptop pose publisher is not running on ${VLA_ZMQ_HOST}. Start:${NC}"
+                    echo -e "${YELLOW}      ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --no-deploy${NC}"
+                    echo -e "${YELLOW}    on the laptop and wait for 'PUB bound on tcp://*:${VLA_ZMQ_PORT}'.${NC}"
+                fi
+                echo -e "${YELLOW}    Or: --vla-zmq-host / --vla-zmq-port don't match what's publishing.${NC}"
+                echo ""
+                echo -e "${YELLOW}  To override (NOT recommended on a live robot): re-run with${NC}"
+                echo -e "${YELLOW}    --no-wire-probe${NC}"
+                echo -e "${YELLOW}  MC is still up; robot is unchanged.${NC}"
+                cleanup_bg_deploy_on_cancel
+                exit 1
+            fi
+            echo -e "$(ts) ${GREEN}[handoff]${NC} wire probe OK: ${probe_out}"
+        else
+            echo -e "$(ts) ${YELLOW}[handoff]${NC} --no-wire-probe: skipping pre-stop wire-freshness check."
+        fi
+
+        # ────────────────────────────────────────────────────────────────
         # SAFETY GATE -- merged stop_app + launch confirmation. The
         # robot is still under MC; the bg deploy is silent. Operator
         # has one decision to make.
@@ -2798,6 +3783,15 @@ else
         : > "$START_TRIGGER_SENTINEL"
         echo -e "$(ts) ${GREEN}[handoff]${NC} start-trigger sentinel touched -> deploy entering CONTROL."
 
+        # Hand bridge: MC has been silenced and the deploy is about to
+        # publish its first body command; this is the right moment to
+        # bring the OmniHand HAL up. Spawning earlier would let MC
+        # eat the engage burst (mc republishes its own HandCommandArray
+        # at high rate); spawning later means the first user grasp
+        # fires before motors are enabled. Reaped via stop_hand_bridge
+        # in restart_mc_on_exit. Sim mode does not call this.
+        start_hand_bridge
+
         # Now stream the deploy's pre-trigger output (everything from
         # boot through STANDBY) and tail-follow it for the rest of the
         # run. Tail is killed when the bg deploy exits.
@@ -2833,6 +3827,18 @@ else
         # kept defensively): launch in foreground-as-background, no
         # STANDBY pre-launch.
         echo -e "$(ts) ${YELLOW}[handoff]${NC} STANDBY sentinels not configured; using legacy stop_app -> launch flow."
+        # Wire-freshness probe (same rationale as the STANDBY path).
+        if ! $NO_WIRE_PROBE; then
+            echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
+            probe_rc=$?
+            if [[ $probe_rc -ne 0 ]]; then
+                echo -e "${RED}wire probe FAILED (${probe_out}): no frames on ${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}. Aborting before MC-stop.${NC}"
+                echo -e "${YELLOW}Re-run with --no-wire-probe to override (NOT recommended on a live robot).${NC}"
+                exit 1
+            fi
+            echo -e "$(ts) ${GREEN}[handoff]${NC} wire probe OK: ${probe_out}"
+        fi
         # Operator confirmation BEFORE stop_app for the legacy path.
         if ! $NO_CONFIRM; then
             read -p "$(echo -e ${RED}Stop MC and launch policy? [y/N]: ${NC})" mc_confirm
@@ -2847,6 +3853,10 @@ else
             trap restart_mc_on_exit EXIT INT TERM
             sleep 1
         fi
+        # Same rationale as the STANDBY-path call above: spawn the
+        # hand bridge after MC is verified silenced so its engage
+        # burst doesn't get clobbered by mc's own hand publish loop.
+        start_hand_bridge
         echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC sentinel:        $HOLD_FOR_MC_SENTINEL"
         echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC exit-sentinel:   $HOLD_FOR_MC_EXIT_SENTINEL"
         echo -e "$(ts) ${BLUE}[handoff]${NC} MC first-publish sentinel:   $MC_FIRST_PUBLISH_SENTINEL"
@@ -2857,6 +3867,18 @@ else
         # foreground; the cleanup trap brings MC back after deploy
         # exits. There is a zero-torque window between deploy-exit
         # and MC-up here.
+        # Wire-freshness probe (same rationale as the STANDBY path).
+        if ! $NO_WIRE_PROBE; then
+            echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
+            probe_rc=$?
+            if [[ $probe_rc -ne 0 ]]; then
+                echo -e "${RED}wire probe FAILED (${probe_out}): no frames on ${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}. Aborting before MC-stop.${NC}"
+                echo -e "${YELLOW}Re-run with --no-wire-probe to override (NOT recommended on a live robot).${NC}"
+                exit 1
+            fi
+            echo -e "$(ts) ${GREEN}[handoff]${NC} wire probe OK: ${probe_out}"
+        fi
         if ! $NO_CONFIRM; then
             read -p "$(echo -e ${RED}Stop MC and launch policy? [y/N]: ${NC})" mc_confirm
             if [[ ! "$mc_confirm" =~ ^[Yy]$ ]]; then
@@ -2960,7 +3982,7 @@ else
                         fi
                         ESCALATOR_PID=""
                         if [[ -f "$ESCALATOR_SCRIPT" ]]; then
-                            python3 "$ESCALATOR_SCRIPT" \
+                            "$DEPLOY_AUX_PYTHON" "$ESCALATOR_SCRIPT" \
                                 --target JOINT_DEFAULT \
                                 --rate-hz 20 \
                                 --timeout-s 30 \

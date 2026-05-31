@@ -203,6 +203,46 @@ let fpsRing = [];
 let prevBtns = { a: false, b: false, x: false, y: false,
                  leftStickClick: false, rightStickClick: false };
 
+/* --- Diagnostics that get sent back over WS so they show up in
+ *     the Python-side ``manager.log`` even after the operator has
+ *     taken the headset off. The single most common cause of
+ *     "controllers stopped responding" turns out to be the headset
+ *     visibility going ``hidden`` (operator removes it, system
+ *     menu opens, pass-through dialog blocks the app, etc.) at
+ *     which point ``onXRFrame`` callbacks stop firing entirely
+ *     while the Python pipeline keeps running on stale data. ---
+ */
+let lastFrameTs       = 0;     /* performance.now() of previous onXRFrame */
+let lastHeartbeatTs   = 0;     /* performance.now() of previous WS heartbeat */
+let lastFpsValue      = 0;     /* most recent computed XR fps (for heartbeat payload) */
+let prevVisibility    = null;  /* cached XRSession.visibilityState; emit on change */
+let prevLeftEmulated  = null;  /* per-side emulatedPosition state (camera-tracked vs IMU) */
+let prevRightEmulated = null;
+let prevLeftHasPose   = null;  /* per-side gripSpace pose presence (controller LOST events) */
+let prevRightHasPose  = null;
+/* Cumulative button rising-edge counts since last heartbeat. Reset
+ * on heartbeat send. Lets the Python log show "the operator did
+ * mash B 47 times in the last 2 s but no mode flip happened". */
+let btnEdgeCounts = { a: 0, b: 0, x: 0, y: 0,
+                      leftStickClick: 0, rightStickClick: 0 };
+/* Frame-stall threshold: if the gap between consecutive
+ * onXRFrame() callbacks exceeds this, we send a one-shot
+ * frame_stall event with the gap. Quest's compositor occasionally
+ * pauses the rAF loop for system overlays / hand-off transitions,
+ * and the operator perceives this as "the robot froze". 250 ms is
+ * a 12-frame gap @ 50 Hz -- well past anything the IK pipeline
+ * could absorb. */
+const FRAME_STALL_MS  = 250;
+const HEARTBEAT_MS    = 2000;
+
+function safeWsSend(payload) {
+  /* Centralised guard: silently drop sends when WS is dead so
+   * heartbeat/visibility code paths never throw. */
+  if (!ws || ws.readyState !== 1) return false;
+  try { ws.send(JSON.stringify(payload)); return true; }
+  catch (e) { return false; }
+}
+
 /* ------------------------------------------------------------------ */
 /* Debug logger                                                        */
 /* ------------------------------------------------------------------ */
@@ -785,12 +825,24 @@ async function toggleVR() {
     document.getElementById('btnVR').textContent = 'Stop VR';
 
     xrSession.addEventListener('end', () => {
+      safeWsSend({
+        _type: 'status', event: 'xr_session_ended',
+        frame_count: frameCount, t: performance.now(),
+      });
       xrSession = null; refSpace = null; xrGL = null;
       document.getElementById('xrStatus').textContent = 'ended';
       document.getElementById('xrStatus').className = 'value warn';
       document.getElementById('btnVR').textContent = 'Start VR';
       document.getElementById('inputState').textContent = 'No XR session active';
       debugLog('XR session ended', 'log-xr');
+      /* Reset per-session diagnostic latches so a subsequent
+       * "Start VR" run doesn't re-emit stale change events. */
+      lastFrameTs = 0; lastHeartbeatTs = 0;
+      prevVisibility = null;
+      prevLeftEmulated = null; prevRightEmulated = null;
+      prevLeftHasPose = null; prevRightHasPose = null;
+      btnEdgeCounts = { a: 0, b: 0, x: 0, y: 0,
+                        leftStickClick: 0, rightStickClick: 0 };
     });
 
     /* WebGL context with alpha for passthrough transparency */
@@ -856,6 +908,49 @@ async function toggleVR() {
                  : 'unknown';
       debugLog('Initial input: ' + src.handedness + ' = ' + type, 'log-xr');
     }
+
+    /* visibilitychange: the single most useful diagnostic for
+     * "the controllers stopped responding". When the operator
+     * removes the headset, opens the system menu, or the
+     * Guardian boundary triggers, ``visibilityState`` flips from
+     * ``visible`` -> ``hidden`` / ``visible-blurred`` and the
+     * compositor STOPS calling our requestAnimationFrame
+     * callback. Forward the transition so the Python log shows
+     * exactly when (and what state) it happened. */
+    xrSession.addEventListener('visibilitychange', () => {
+      const state = xrSession ? xrSession.visibilityState : 'unknown';
+      debugLog('visibility -> ' + state, 'log-xr');
+      safeWsSend({
+        _type: 'status', event: 'visibility',
+        state: state, t: performance.now(),
+      });
+      prevVisibility = state;
+    });
+
+    /* XR-level button events. These fire from the underlying
+     * WebXR runtime and are independent of the gamepad polling
+     * path -- if `onXRFrame` is delivering frames but `gamepad`
+     * reads return stale buttons (Quest sometimes goes through
+     * this state right after a hand-off / multimodal swap), the
+     * `select` / `squeeze` events still fire. Forwarding them
+     * proves the headset is still alive at the WebXR layer even
+     * when the gamepad path looks dead. */
+    const _emitXRButton = (kind, ev) => {
+      safeWsSend({
+        _type: 'status', event: 'xr_button',
+        kind: kind,
+        handedness: ev.inputSource && ev.inputSource.handedness,
+        has_grip: !!(ev.inputSource && ev.inputSource.gripSpace),
+        has_hand: !!(ev.inputSource && ev.inputSource.hand),
+        t: performance.now(),
+      });
+      debugLog('xr ' + kind + ' (' +
+        (ev.inputSource && ev.inputSource.handedness || '?') + ')', 'log-btn');
+    };
+    xrSession.addEventListener('selectstart',  (ev) => _emitXRButton('selectstart',  ev));
+    xrSession.addEventListener('selectend',    (ev) => _emitXRButton('selectend',    ev));
+    xrSession.addEventListener('squeezestart', (ev) => _emitXRButton('squeezestart', ev));
+    xrSession.addEventListener('squeezeend',   (ev) => _emitXRButton('squeezeend',   ev));
 
     xrSession.requestAnimationFrame(onXRFrame);
   } catch (e) {
@@ -1219,6 +1314,44 @@ function onXRFrame(time, frame) {
 
   try {
 
+  /* Frame-stall detection. Compares the gap between this and the
+   * previous onXRFrame() call against ``FRAME_STALL_MS``. Quest
+   * pauses the rAF loop on system overlays / boundary breach /
+   * head-off; the operator perceives the resulting freeze as
+   * "controllers stopped responding". Emit at most one event per
+   * stall (we'll naturally emit again on the NEXT stall because
+   * lastFrameTs is reset every frame). */
+  const _now = performance.now();
+  if (lastFrameTs > 0) {
+    const _gap = _now - lastFrameTs;
+    if (_gap > FRAME_STALL_MS) {
+      safeWsSend({
+        _type: 'status', event: 'frame_stall',
+        gap_ms: Math.round(_gap),
+        vis: xrSession.visibilityState,
+        t: _now,
+      });
+      debugLog('frame stall ' + Math.round(_gap) + 'ms', 'log-err');
+    }
+  }
+  lastFrameTs = _now;
+
+  /* visibilityState change tracker -- runs in addition to the
+   * `visibilitychange` listener above so we ALSO catch initial
+   * transitions and any case where the listener missed an edge
+   * (e.g. fired before WS was ready). */
+  const _vis = xrSession.visibilityState;
+  if (_vis !== prevVisibility) {
+    if (prevVisibility !== null) {
+      safeWsSend({
+        _type: 'status', event: 'visibility',
+        state: _vis, prev: prevVisibility, t: _now,
+      });
+      debugLog('visibility -> ' + _vis + ' (was ' + prevVisibility + ')', 'log-xr');
+    }
+    prevVisibility = _vis;
+  }
+
   if (xrFirstFrame) {
     debugLog('First XR frame! inputSources: ' + xrSession.inputSources.length, 'log-xr');
     for (const src of xrSession.inputSources) {
@@ -1260,7 +1393,8 @@ function onXRFrame(time, frame) {
     /* Thumbstick clicks (gpad.buttons[3] in the oculus-touch /
      * standard gamepad mapping). Currently consumed by
      * Quest3ManagerX2 to cycle the deploy MuJoCo viewer's fixed
-     * cameras (Tab-equivalent) without occupying any face button. */
+     * cameras (synthesises a `]` keystroke -- mujoco's next-fixed-
+     * camera key) without occupying any face button. */
     leftStickClick: false, rightStickClick: false
   };
   const axes = { lx: 0, ly: 0, rx: 0, ry: 0 };
@@ -1411,12 +1545,38 @@ function onXRFrame(time, frame) {
         numControllers++;
         const pp = gp.transform.position;
         const po = gp.transform.orientation;
+        /* ``emulatedPosition`` is true when the platform is
+         * dead-reckoning the pose from the controller's IMU
+         * because the headset cameras can no longer see it
+         * (out of FOV, occluded, low light). The pose still
+         * looks plausible but drifts -- worth knowing in the
+         * log when it transitions, since that's a frequent
+         * cause of "the IK feels weird" without any explicit
+         * error. */
+        const isEmu = !!gp.emulatedPosition;
         const poseArr = {
           position: [pp.x, pp.y, pp.z],
-          orientation: [po.x, po.y, po.z, po.w]
+          orientation: [po.x, po.y, po.z, po.w],
+          emulated: isEmu
         };
         const gpad = src.gamepad;
         if (src.handedness === 'left') {
+          if (isEmu !== prevLeftEmulated) {
+            safeWsSend({
+              _type: 'status', event: 'tracking',
+              side: 'left', emulated: isEmu, t: _now,
+            });
+            debugLog('L tracking -> ' + (isEmu ? 'IMU-only' : 'camera'), 'log-xr');
+            prevLeftEmulated = isEmu;
+          }
+          if (prevLeftHasPose === false) {
+            safeWsSend({
+              _type: 'status', event: 'controller_pose',
+              side: 'left', has_pose: true, t: _now,
+            });
+            debugLog('L controller pose RECOVERED', 'log-xr');
+          }
+          prevLeftHasPose = true;
           leftCtrlPose = poseArr;
           if (gpad) {
             buttons.leftTrigger    = gpad.buttons[0] ? gpad.buttons[0].value : 0;
@@ -1432,6 +1592,22 @@ function onXRFrame(time, frame) {
             axes.ly = -(gpad.axes[3] || 0);
           }
         } else if (src.handedness === 'right') {
+          if (isEmu !== prevRightEmulated) {
+            safeWsSend({
+              _type: 'status', event: 'tracking',
+              side: 'right', emulated: isEmu, t: _now,
+            });
+            debugLog('R tracking -> ' + (isEmu ? 'IMU-only' : 'camera'), 'log-xr');
+            prevRightEmulated = isEmu;
+          }
+          if (prevRightHasPose === false) {
+            safeWsSend({
+              _type: 'status', event: 'controller_pose',
+              side: 'right', has_pose: true, t: _now,
+            });
+            debugLog('R controller pose RECOVERED', 'log-xr');
+          }
+          prevRightHasPose = true;
           rightCtrlPose = poseArr;
           if (gpad) {
             buttons.rightTrigger    = gpad.buttons[0] ? gpad.buttons[0].value : 0;
@@ -1442,6 +1618,30 @@ function onXRFrame(time, frame) {
             axes.rx = gpad.axes[2] || 0;
             axes.ry = -(gpad.axes[3] || 0);
           }
+        }
+      } else {
+        /* gripSpace exists on the input source but
+         * frame.getPose() returned null this frame -- the
+         * controller is in the operator's hand but the
+         * tracking system has lost it (cameras occluded,
+         * out of guardian, etc.). Emit a one-shot lost
+         * event per side so the Python log can correlate
+         * "robot stopped responding to L stick" against
+         * "L controller pose LOST at HH:MM:SS". */
+        if (src.handedness === 'left' && prevLeftHasPose !== false) {
+          safeWsSend({
+            _type: 'status', event: 'controller_pose',
+            side: 'left', has_pose: false, t: _now,
+          });
+          debugLog('L controller pose LOST', 'log-err');
+          prevLeftHasPose = false;
+        } else if (src.handedness === 'right' && prevRightHasPose !== false) {
+          safeWsSend({
+            _type: 'status', event: 'controller_pose',
+            side: 'right', has_pose: false, t: _now,
+          });
+          debugLog('R controller pose LOST', 'log-err');
+          prevRightHasPose = false;
         }
       }
     }
@@ -1507,13 +1707,17 @@ function onXRFrame(time, frame) {
     }
   }
 
-  /* Edge-triggered button logging */
-  if (buttons.a && !prevBtns.a) debugLog('A pressed', 'log-btn');
-  if (buttons.b && !prevBtns.b) debugLog('B pressed', 'log-btn');
-  if (buttons.x && !prevBtns.x) debugLog('X pressed', 'log-btn');
-  if (buttons.y && !prevBtns.y) debugLog('Y pressed', 'log-btn');
-  if (buttons.leftStickClick  && !prevBtns.leftStickClick)  debugLog('L-stick click', 'log-btn');
-  if (buttons.rightStickClick && !prevBtns.rightStickClick) debugLog('R-stick click', 'log-btn');
+  /* Edge-triggered button logging. ALSO accumulate per-button
+   * rising-edge counts since the last heartbeat -- the heartbeat
+   * payload reports them so the Python log can show "operator
+   * pressed B 12 times in 2s but no mode flip happened" even
+   * when the per-button HUD lines aren't visible. */
+  if (buttons.a && !prevBtns.a) { debugLog('A pressed', 'log-btn'); btnEdgeCounts.a++; }
+  if (buttons.b && !prevBtns.b) { debugLog('B pressed', 'log-btn'); btnEdgeCounts.b++; }
+  if (buttons.x && !prevBtns.x) { debugLog('X pressed', 'log-btn'); btnEdgeCounts.x++; }
+  if (buttons.y && !prevBtns.y) { debugLog('Y pressed', 'log-btn'); btnEdgeCounts.y++; }
+  if (buttons.leftStickClick  && !prevBtns.leftStickClick)  { debugLog('L-stick click', 'log-btn'); btnEdgeCounts.leftStickClick++; }
+  if (buttons.rightStickClick && !prevBtns.rightStickClick) { debugLog('R-stick click', 'log-btn'); btnEdgeCounts.rightStickClick++; }
   if (!buttons.a && prevBtns.a) debugLog('A released', 'log-btn');
   if (!buttons.b && prevBtns.b) debugLog('B released', 'log-btn');
   if (!buttons.x && prevBtns.x) debugLog('X released', 'log-btn');
@@ -1556,7 +1760,35 @@ function onXRFrame(time, frame) {
   if (fpsRing.length > FPS_WINDOW) fpsRing.shift();
   if (fpsRing.length > 1) {
     const dt = (fpsRing[fpsRing.length-1] - fpsRing[0]) / (fpsRing.length - 1);
-    document.getElementById('fps').textContent = (1000 / dt).toFixed(1);
+    lastFpsValue = 1000 / dt;
+    document.getElementById('fps').textContent = lastFpsValue.toFixed(1);
+  }
+
+  /* Periodic heartbeat sent over WS so the Python ``manager.log``
+   * sees a regular pulse from the browser even when the operator
+   * is idle. Includes:
+   *   - visibility state    -> catches "headset off" silently
+   *   - rolling fps         -> catches XR frame slowdowns
+   *   - input_sources count -> catches mid-session source drops
+   *   - btn_edges           -> catches "user pressed B 12x but
+   *                            no mode flip" (reported on the
+   *                            Python side as a WARN). */
+  if (now - lastHeartbeatTs >= HEARTBEAT_MS) {
+    safeWsSend({
+      _type: 'status', event: 'heartbeat',
+      vis: xrSession.visibilityState,
+      fps: Number(lastFpsValue.toFixed(1)),
+      frame_count: frameCount,
+      input_sources: xrSession.inputSources.length,
+      n_controllers: numControllers,
+      btn_edges: { ...btnEdgeCounts },
+      left_emulated: prevLeftEmulated,
+      right_emulated: prevRightEmulated,
+      t: now,
+    });
+    btnEdgeCounts = { a: 0, b: 0, x: 0, y: 0,
+                      leftStickClick: 0, rightStickClick: 0 };
+    lastHeartbeatTs = now;
   }
 
   } catch (err) {
@@ -1586,6 +1818,37 @@ function onXRFrame(time, frame) {
     debugLog('WebXR NOT available on this browser', 'log-err');
   }
   debugLog('Auto-filled WS URL: ' + proto + '://' + host + ':8765', 'log-ws');
+
+  /* Browser tear-down hooks. ``pagehide`` fires whenever the
+   * page is being unloaded (browser closed, navigated away,
+   * background tab purged) -- catching it lets the Python log
+   * record exactly when the operator killed the session, vs
+   * just seeing the WebSocket drop. ``beforeunload`` is the
+   * synchronous-only cousin and not always reliable on
+   * mobile / Quest browsers, so we register both. */
+  window.addEventListener('pagehide', (ev) => {
+    safeWsSend({
+      _type: 'status', event: 'page_hidden',
+      persisted: !!ev.persisted, t: performance.now(),
+    });
+    debugLog('pagehide (persisted=' + !!ev.persisted + ')', 'log-ws');
+  });
+  window.addEventListener('beforeunload', () => {
+    safeWsSend({
+      _type: 'status', event: 'page_unload',
+      t: performance.now(),
+    });
+  });
+  document.addEventListener('visibilitychange', () => {
+    /* Browser-level visibility (separate from XR session
+     * visibility -- this fires when the user switches tabs or
+     * minimises the Quest browser, even with no XR session). */
+    safeWsSend({
+      _type: 'status', event: 'doc_visibility',
+      state: document.visibilityState, t: performance.now(),
+    });
+    debugLog('doc visibility -> ' + document.visibilityState, 'log-ws');
+  });
 })();
 </script>
 </body>

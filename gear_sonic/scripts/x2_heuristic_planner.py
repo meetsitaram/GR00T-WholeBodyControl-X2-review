@@ -202,10 +202,20 @@ X2 heuristic planner — keyboard commands:
    Q / E    turn_left_90deg / turn_right_90deg
    1 / 3    turn_left_15deg / turn_right_15deg
    2 / 4    turn_left_30deg / turn_right_30deg
-   l        lean_fwd_medium    (capital L for lean_fwd_large)
-   ,        torso_left_30deg
-   .        torso_right_30deg
-   space    idle_stand
+   k / l / L    lean_fwd small / medium / large
+   j / ;        lean_left_medium / lean_right_medium
+   J / :        lean_left_large  / lean_right_large
+   ,        torso_left_30deg   (< = torso_left_40deg)
+   .        torso_right_30deg  (> = torso_right_40deg)
+
+Continuous waist hold (STATIC_HOLD) -- nudges a single target pose
+that the planner slews to and holds indefinitely. Use this to verify
+the VR right-stick path from a TTY:
+   T        enter hold at neutral (resets continuous target to 0,0,0)
+   i / o    pitch -2 / +2 deg  (forward lean)
+   u / p    yaw   -5 / +5 deg  (twist left / right)
+   y / h    roll  -2 / +2 deg  (lean left / right)
+   space    idle_stand          (also exits STATIC_HOLD)
    x        quit
 
 Each keypress REPLACES any pending commands -- the latest press wins.
@@ -231,14 +241,35 @@ KEYBOARD_MAP: dict[str, tuple[str, str]] = {
     "4": ("turn_right", "deg_30"),
     "e": ("turn_right", "deg_45"),
     "E": ("turn_right", "deg_90"),
+    "k": ("lean_fwd", "small"),
     "l": ("lean_fwd", "medium"),
     "L": ("lean_fwd", "large"),
-    "k": ("lean_fwd", "small"),
+    "j": ("lean_left", "medium"),
+    "J": ("lean_left", "large"),
+    ";": ("lean_right", "medium"),
+    ":": ("lean_right", "large"),
     ",": ("torso_left", "deg_30"),
-    "<": ("torso_left", "deg_45"),
+    "<": ("torso_left", "deg_40"),
     ".": ("torso_right", "deg_30"),
-    ">": ("torso_right", "deg_45"),
+    ">": ("torso_right", "deg_40"),
     " ": ("idle", "default"),
+}
+
+# Per-keypress nudge step (degrees) for the continuous-hold debug keys.
+# Smaller for pitch/roll because the safety caps there are tight (20/10).
+_HOLD_NUDGE_PITCH_DEG: float = 2.0
+_HOLD_NUDGE_ROLL_DEG: float = 2.0
+_HOLD_NUDGE_YAW_DEG: float = 5.0
+# Maps a keypress to (axis, signed_step_deg). The keyboard thread keeps
+# a local (pitch, roll, yaw) state and re-emits a hold_torso command
+# with the updated target after each nudge.
+_HOLD_NUDGE_KEYS: dict[str, tuple[str, float]] = {
+    "i": ("pitch", -_HOLD_NUDGE_PITCH_DEG),
+    "o": ("pitch", +_HOLD_NUDGE_PITCH_DEG),
+    "u": ("yaw", -_HOLD_NUDGE_YAW_DEG),
+    "p": ("yaw", +_HOLD_NUDGE_YAW_DEG),
+    "y": ("roll", -_HOLD_NUDGE_ROLL_DEG),
+    "h": ("roll", +_HOLD_NUDGE_ROLL_DEG),
 }
 
 
@@ -296,11 +327,25 @@ def _zmq_command_thread(
                     stop_event.set()
                     continue
                 magnitude = str(payload.get("magnitude", "default"))
-            except (json.JSONDecodeError, KeyError) as exc:
+                # Optional continuous waist targets (degrees). Only the
+                # ``hold_torso`` intent reads them; for every other
+                # intent the LocomotionCommand defaults (0.0) are
+                # ignored downstream by the state machine.
+                waist_pitch_deg = float(payload.get("waist_pitch_deg", 0.0))
+                waist_roll_deg = float(payload.get("waist_roll_deg", 0.0))
+                waist_yaw_deg = float(payload.get("waist_yaw_deg", 0.0))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 log.warning("zmq command source: bad payload %r: %s", parts[1], exc)
                 continue
             cmd_queue.put(
-                LocomotionCommand(intent=intent, magnitude=magnitude, source="zmq")
+                LocomotionCommand(
+                    intent=intent,
+                    magnitude=magnitude,
+                    source="zmq",
+                    waist_pitch_deg=waist_pitch_deg,
+                    waist_roll_deg=waist_roll_deg,
+                    waist_yaw_deg=waist_yaw_deg,
+                )
             )
     finally:
         sock.close(linger=0)
@@ -310,7 +355,15 @@ def _keyboard_command_thread(
     cmd_queue: "queue.Queue[LocomotionCommand]",
     stop_event: threading.Event,
 ) -> None:
-    """Single-character TTY input. Requires stdin to be a real TTY."""
+    """Single-character TTY input. Requires stdin to be a real TTY.
+
+    Most keys map 1:1 through ``KEYBOARD_MAP`` to a discrete
+    ``(intent, magnitude)`` pair. The continuous-hold debug keys
+    (``T``, ``i/o``, ``u/p``, ``y/h``) maintain a local
+    ``(pitch, roll, yaw)`` target and re-emit ``hold_torso`` commands
+    after each nudge so the operator can drive STATIC_HOLD without
+    needing the VR stack.
+    """
     if not sys.stdin.isatty():
         log.error("keyboard source: stdin is not a TTY; refusing to start")
         return
@@ -318,6 +371,29 @@ def _keyboard_command_thread(
     import tty
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    # Local hold target (degrees) -- updated by 'T' (reset to 0) and the
+    # nudge keys.
+    hold_target: dict[str, float] = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0}
+
+    def _emit_hold() -> None:
+        cmd_queue.put(
+            LocomotionCommand(
+                intent="hold_torso",
+                magnitude="continuous",
+                source="kbd",
+                waist_pitch_deg=hold_target["pitch"],
+                waist_roll_deg=hold_target["roll"],
+                waist_yaw_deg=hold_target["yaw"],
+            )
+        )
+        print(
+            "  -> hold_torso "
+            f"pitch={hold_target['pitch']:+.1f} "
+            f"roll={hold_target['roll']:+.1f} "
+            f"yaw={hold_target['yaw']:+.1f}",
+            flush=True,
+        )
+
     try:
         tty.setcbreak(fd)
         print(KEYBOARD_HELP, flush=True)
@@ -326,6 +402,15 @@ def _keyboard_command_thread(
             if ch in ("x", "\x03"):  # x or Ctrl-C
                 stop_event.set()
                 return
+            if ch == "T":
+                hold_target.update(pitch=0.0, roll=0.0, yaw=0.0)
+                _emit_hold()
+                continue
+            if ch in _HOLD_NUDGE_KEYS:
+                axis, step = _HOLD_NUDGE_KEYS[ch]
+                hold_target[axis] += step
+                _emit_hold()
+                continue
             if ch in KEYBOARD_MAP:
                 intent, mag = KEYBOARD_MAP[ch]
                 cmd_queue.put(

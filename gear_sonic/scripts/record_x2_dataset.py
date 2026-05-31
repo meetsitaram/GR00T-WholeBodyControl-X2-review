@@ -43,6 +43,29 @@ if str(REPO_ROOT) not in sys.path:
 # happens inside ``main()`` -- see the deferred-import comment below.
 
 
+def _resolve_front_cam_default(
+    explicit: bool | None,
+    scene_xml_path: Path | None,
+) -> bool:
+    """Resolve ``--front-cam`` / ``--no-front-cam`` to a ``bool``.
+
+    Precedence:
+      1. Explicit operator flag (``True`` / ``False``) wins.
+      2. Otherwise default to ``True`` iff a scene XML is loaded
+         (``front_cam`` only exists in the robocasa-built MJCFs --
+         see ``_WORKSPACE_CAMERAS`` in
+         ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``).
+
+    Centralized here so the wrapper script
+    (``run_x2_quest3_planner_stack.sh``) doesn't need to mirror the
+    decision: passing ``--robocasa-env <env>`` alone is enough to
+    light up both the scene XML and the second camera.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return scene_xml_path is not None
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -55,11 +78,49 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sonic-checkpoint", type=Path, default=None,
-        help="(Reserved for offline post-processing.) The live recorder "
-             "does NOT load this; the deploy's tracking policy follows "
-             "joint_pos_mj as reference. Provide this only if you plan "
-             "to attach FSQ motion_token labels in a follow-up offline "
-             "pass; the recorder itself never reads it.",
+        help="SONIC tracker .pt checkpoint. When provided, the recorder "
+             "loads OnlineSonicTokenizer once at startup and encodes the "
+             "commanded body_q into action.motion_token in the LeRobot "
+             "dataset every tick. Required for VLA training; without it "
+             "the column is all zeros and the dataset is kinematic-only "
+             "(intentional for smoke tests, never correct for production "
+             "data collection). The wrapper "
+             "run_x2_quest3_planner_stack.sh auto-resolves this from the "
+             "deploy ONNX path.",
+    )
+    parser.add_argument(
+        "--sonic-tokenizer-device", type=str, default="cuda:0",
+        help="Torch device for the inline SONIC tokenizer ('cpu', "
+             "'cuda:0', 'cuda:N'). Default cuda:0 keeps per-tick cost "
+             "<100 us; cpu adds ~1 ms per tick (still well under the "
+             "20 ms 50 Hz budget). Use cpu if cuda:0 is contended by "
+             "the deploy / VLA on the same GPU.",
+    )
+    parser.add_argument(
+        "--encoder-config", type=Path,
+        default=Path("gear_sonic/data/encoder/x2_observation_config.yaml"),
+        help="YAML encoder-observation config (G1-style schema). When "
+             "set AND --body-pose-source=zmq (subscribe mode), the "
+             "inline tokenizer builds the same 680-D 10-frame future "
+             "observation the deploy actor's internal encoder consumes "
+             "and runs the encoder on that exact obs. The default "
+             "ships at gear_sonic/data/encoder/x2_observation_config"
+             ".yaml. Pass --encoder-config '' to disable and fall "
+             "back to the deprecated freeze-pose path (one body_q "
+             "tiled 11 times -- semantically incorrect for VLA "
+             "training, kept for backward compat with the v0 direct-"
+             "mode loop).",
+    )
+    parser.add_argument(
+        "--obs-dump-recorder", type=Path, default=None,
+        help="Layer 3 byte-parity probe. When set, the subscribe-mode "
+             "loop writes a torch .pt snapshot (snap dict + 680-D "
+             "builder obs) on the first fully-populated tick to this "
+             "path and continues running. Pair with the deploy's "
+             "--obs-dump and run "
+             "gear_sonic_deploy/scripts/compare_recorder_vs_deploy"
+             "_obs.py to assert byte-equal observations between the "
+             "Python gather and the C++ ZmqPoseInputSource.",
     )
     parser.add_argument(
         "--task", type=str, default="",
@@ -73,6 +134,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "and watch the SONIC + deploy follow them in MuJoCo, but do "
              "NOT build an exporter / renderer / write any dataset files. "
              "B/X/Y buttons become no-ops; A still engages IK calibration.",
+    )
+    parser.add_argument(
+        "--no-idle-publish", action="store_true",
+        help="Subscribe-mode only: while waiting for the first body_pose "
+             "from the upstream planner / VLA bridge, do NOT publish the "
+             "static DEFAULT_STAND_POSE on the pose wire. The deploy's "
+             "ZmqPoseInputSource then never sees a frame, has_body_reference_ "
+             "stays False, and Sample() falls back to its prefilled "
+             "default_angles (the trained stand pose). Pair with the "
+             "bridge's --silent-wire under --vla-no-policy to validate "
+             "the 'no upstream' fallback path: wrist_bypass_ticks should "
+             "stay at 0 for the whole run and grav_z should pin at -1.00.",
     )
 
     # ZMQ
@@ -132,28 +205,38 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "held-pose latch. Default 0.005.",
     )
 
-    # Per-finger / thumb-oppose stretch (opt-in binarisation). See
+    # Per-finger / thumb-oppose stretch (opt-in additional shaping
+    # on top of the per-operator affine normalisation). See
     # docs/source/tutorials/x2_dataset_record_and_replay.md
-    # § "Why we abandoned the global power-curve compensation". The
-    # affine normalisation from the operator-calibration window is
-    # always on; these knobs ADDITIONALLY apply the piecewise power-
-    # curve from ``stretch_finger_curls`` / ``stretch_thumb_oppose``
-    # which pushes mid-range curls toward the OPEN/CLOSED endpoints.
+    # § "Why we abandoned the global power-curve compensation".
+    #
+    # As of 2026-05-13 the default ``stretch_finger_curls`` /
+    # ``stretch_thumb_oppose`` parameters are SMOOTH PROPORTIONAL
+    # (``dz=0.05, full=0.95, gamma=1`` -- linear in the active zone
+    # with tiny rest-noise / saturation cushions), so enabling
+    # these flags on top of an operator calibration leaves
+    # mid-range curls intact and the operator gets continuous
+    # control of the closure depth. The previous defaults were
+    # bimodal (``dz=0.35, full=0.40, gamma=5``) and silently
+    # destroyed the proportional response of a calibrated teleop
+    # loop -- see the long block-comment above
+    # DEFAULT_CURL_DEADZONE_PER_FINGER in
+    # gear_sonic/utils/teleop/x2_hand_retarget.py for the history.
     parser.add_argument(
         "--apply-curl-compensation", action="store_true",
-        help="Enable the per-finger curl stretch curve on top of the "
-             "operator's affine normalisation. Use for tight power-"
-             "grasp pick-and-place tasks where the OmniHand fingers "
-             "need to fully wrap a small object even when the operator "
-             "only squeezes ~70-85%% of their calibrated max. Trade-off: "
-             "deliberately intermediate gestures (half-grasp, soft "
-             "pinch) snap closer to OPEN/CLOSED.",
+        help="Apply the per-finger curl stretch curve on top of the "
+             "operator's affine normalisation. With the smooth-"
+             "proportional defaults this only adds a tiny rest-noise "
+             "cutoff and saturation cushion; pass explicit per-finger "
+             "params to recover the legacy bimodal 'isolated-curl "
+             "detector' behaviour for tight power-grasp tasks.",
     )
     parser.add_argument(
         "--apply-oppose-compensation", action="store_true",
-        help="Enable the thumb-opposition stretch curve. Pair with "
-             "--apply-curl-compensation when fingers need to fully "
-             "close on small objects.",
+        help="Apply the thumb-opposition stretch curve on top of the "
+             "operator's affine normalisation. Smooth-proportional by "
+             "default; pair with --apply-curl-compensation for "
+             "consistent shaping across the curl and oppose channels.",
     )
 
     # SONIC corrective-delta observability (v1 schema)
@@ -212,7 +295,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--robocasa-env",
-        choices=("none", "X2PickPlaceCube", "X2PickPlaceBowl"),
+        choices=("none", "X2PickPlaceCube", "X2PickPlaceBowl", "X2PickPlaceApple"),
         default="none",
         help="When != 'none', the recorder switches into robocasa scene "
              "mode: it loads "
@@ -256,6 +339,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional RNG seed for the RobocasaTaskMirror's per-episode "
              "reset (object placement randomization). Useful for "
              "reproducible smoke tests.",
+    )
+    # ── Wide-angle world-fixed witness camera (`front_cam`) ────────────
+    # The robocasa scene XMLs (built by build_x2_robocasa_scene_xml.py)
+    # bake in a 120° FoV camera 3 ft in front of the robot launch
+    # position at chest height. When --front-cam is set, the recorder
+    # builds a second MujocoFrameRenderer pinned to it and writes the
+    # frames as `observation.images.front_cam` alongside the existing
+    # `observation.images.ego_view`. Defaults to None so we can flip
+    # to True iff a scene XML is actually loaded (the legacy flat-floor
+    # MJCF doesn't contain the camera). Pass --no-front-cam to opt out
+    # explicitly (e.g. to keep the legacy single-camera schema for an
+    # existing dataset directory you're appending to).
+    front_grp = parser.add_argument_group("front_cam (witness view)")
+    front_grp.add_argument(
+        "--front-cam", dest="front_cam",
+        action="store_true", default=None,
+        help=(
+            "Enable the world-fixed wide-angle witness camera "
+            "(observation.images.front_cam). Defaults to True iff "
+            "--robocasa-env != none / --scene-xml-path resolves; pass "
+            "--no-front-cam to opt out. The camera lives in the scene "
+            "XML (see _WORKSPACE_CAMERAS in "
+            "gear_sonic/scripts/build_x2_robocasa_scene_xml.py); "
+            "asking for it without a scene XML is a no-op + warning "
+            "(legacy flat-floor MJCF has no front_cam definition)."
+        ),
+    )
+    front_grp.add_argument(
+        "--no-front-cam", dest="front_cam",
+        action="store_false",
+        help=(
+            "Suppress the front_cam video track. Use this when "
+            "appending to a pre-existing single-camera LeRobot "
+            "dataset directory whose meta/info.json was written "
+            "without the front_cam feature (the exporter rejects "
+            "post-hoc schema additions)."
+        ),
     )
     # Stash the resolved scenes dir on the parser so the resolver in
     # main() can find scene XMLs without recomputing the path.
@@ -411,6 +531,14 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         task=args.task,
         sonic_checkpoint=args.sonic_checkpoint,
+        sonic_tokenizer_device=args.sonic_tokenizer_device,
+        sonic_encoder_config=(
+            None
+            if args.encoder_config is None
+            or str(args.encoder_config).strip() == ""
+            else args.encoder_config
+        ),
+        obs_dump_recorder_path=args.obs_dump_recorder,
         teleop_only=args.teleop_only,
         pub_host=args.pub_host,
         pub_port=args.pub_port,
@@ -442,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
         log_sonic_correction=(not args.no_sonic_correction_log),
         scene_xml_path=scene_xml_path,
         robocasa_env=robocasa_env_name,
+        record_front_cam=_resolve_front_cam_default(
+            args.front_cam, scene_xml_path
+        ),
         scene_state_sub_host=args.scene_state_sub_host,
         scene_state_sub_port=args.scene_state_sub_port,
         scene_reset_pub_host=args.scene_reset_pub_host,
@@ -454,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         body_pose_sub_topic=args.body_pose_sub_topic,
         arm_and_hands_sub_host=args.arm_and_hands_sub_host,
         arm_and_hands_sub_port=args.arm_and_hands_sub_port,
+        idle_publish_enabled=(not args.no_idle_publish),
         verbose=(not args.quiet),
     )
 

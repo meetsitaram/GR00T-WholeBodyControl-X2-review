@@ -79,7 +79,9 @@ class SceneState:
 
     mutable_body_pos: dict[str, list[float]] = field(default_factory=dict)
     """``{body_name: 3-vec world pos}`` for welded bodies whose position
-    can change at episode reset (e.g. ``"bowl_body"`` for X2PickPlaceCube)."""
+    can change at episode reset (e.g. ``"bowl_body"`` for the
+    X2PickPlaceCube + X2PickPlaceApple bowls, ``"target_body"`` for the
+    X2PickPlaceBowl target zone)."""
 
     grasp_contacts: dict[str, dict[str, bool]] = field(default_factory=dict)
     """``{logical_object_name: {"left": bool, "right": bool, "any": bool}}``
@@ -417,6 +419,192 @@ def _subtasks_pick_place_cube(
 
 
 @dataclass(frozen=True)
+class _PickPlaceAppleConstants:
+    """Constants for the X2PickPlaceApple oracle.
+
+    Structurally identical to :class:`_PickPlaceCubeConstants` but for
+    the real-mesh apple variant: only the body name and the object
+    half-extents change. Everything else (table body, bowl body, bowl
+    geometry, approach distance, lift threshold) matches the cube task
+    on purpose so a mixed-scene VLA training set sees a consistent
+    reward landscape.
+    """
+
+    apple_body: str = "apple_main"
+    bowl_body: str = "bowl_body"
+    table_body: str = "table_body_main"
+    apple_half_size: float = 0.037
+    """Apple horizontal half-width (~3.7 cm). The apple is roughly
+    spherical at the asset's scale=1.0, so we use the same value for
+    'fits inside bowl' and 'object footprint' tests."""
+    bowl_half_size_xy: float = 0.075
+    bowl_wall_height: float = 0.045
+    """Apple-task bowl is 5 mm taller than the cube task's bowl
+    (0.040) so a soft-dropped apple doesn't roll over the rim. Mirrors
+    ``X2PickPlaceApple.BOWL_WALL_HEIGHT``."""
+    approach_distance: float = 0.08
+    lift_above_table: float = 0.025
+    above_bowl_z_clearance: float = 0.0
+
+
+def _min_fingertip_distance_to_object(
+    obj_pos: np.ndarray,
+    fingertip_pos: Mapping[str, list[list[float]]],
+) -> float:
+    """Min Euclidean distance from any fingertip (either side) to *obj_pos*.
+
+    Generic helper that the per-object phase functions delegate to (the
+    cube oracle has its own thin wrapper kept for back-compat with its
+    test suite). Returns ``+inf`` when no fingertips were reported.
+    """
+    best = float("inf")
+    for tips in fingertip_pos.values():
+        for tip in tips:
+            if len(tip) < 3:
+                continue
+            dx = float(tip[0]) - float(obj_pos[0])
+            dy = float(tip[1]) - float(obj_pos[1])
+            dz = float(tip[2]) - float(obj_pos[2])
+            d = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if d < best:
+                best = d
+    return best
+
+
+def _phase_pick_place_apple(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    grasp_contacts: Mapping[str, Mapping[str, bool]],
+    fingertip_pos: Mapping[str, list[list[float]]],
+    *,
+    constants: _PickPlaceAppleConstants = _PickPlaceAppleConstants(),
+) -> dict[str, bool]:
+    """Compute the boolean state of every shaping phase for the apple task.
+
+    Returned dict has stable keys ``approach_apple``, ``touch_apple``,
+    ``grasp_apple``, ``apple_off_table``, ``apple_above_bowl``,
+    ``apple_in_bowl``. Mirrors :func:`_phase_pick_place_cube` -- the
+    apple just substitutes for the cube body and its larger half-size
+    (~3.7 cm vs the cube's 2.2 cm). Uprightness is *not* enforced for
+    the in-bowl phase because the apple is roughly spherical and
+    settles on its side just as often as upright.
+    """
+    apple_pos = _world_pos(model, data, constants.apple_body)
+    bowl_pos = _world_pos(model, data, constants.bowl_body)
+    table_pos = _world_pos(model, data, constants.table_body)
+    apple_grasp = grasp_contacts.get("apple", {})
+
+    nearest = _min_fingertip_distance_to_object(apple_pos, fingertip_pos)
+    approach = nearest <= constants.approach_distance
+
+    touch = bool(
+        apple_grasp.get("left", False)
+        or apple_grasp.get("right", False)
+    )
+    grasp = bool(apple_grasp.get("right", False))
+
+    table_top_z = float(table_pos[2])
+    apple_off_table = (
+        grasp
+        and float(apple_pos[2]) > table_top_z + constants.lift_above_table
+    )
+
+    in_xy = (
+        abs(float(apple_pos[0]) - float(bowl_pos[0]))
+        <= constants.bowl_half_size_xy - constants.apple_half_size
+    ) and (
+        abs(float(apple_pos[1]) - float(bowl_pos[1]))
+        <= constants.bowl_half_size_xy - constants.apple_half_size
+    )
+    bowl_floor_z = float(bowl_pos[2])
+    above_bowl = bool(
+        in_xy
+        and float(apple_pos[2]) >= bowl_floor_z + constants.bowl_wall_height
+        - constants.above_bowl_z_clearance
+    )
+
+    # In-bowl (== success): apple settled inside, no uprightness check.
+    # The apple is roughly spherical; "settled inside" is enough.
+    in_z = (
+        bowl_floor_z + constants.apple_half_size * 0.5
+        <= float(apple_pos[2])
+        <= bowl_floor_z + constants.bowl_wall_height + 0.04
+    )
+    in_bowl = bool(in_xy and in_z)
+
+    return {
+        "approach_apple": bool(approach),
+        "touch_apple": bool(touch),
+        "grasp_apple": bool(grasp),
+        "apple_off_table": bool(apple_off_table),
+        "apple_above_bowl": bool(above_bowl),
+        "apple_in_bowl": bool(in_bowl),
+    }
+
+
+# Per-phase rewards for the apple task. Identical weights to the cube
+# task so a mixed cube + apple training set sees a consistent reward
+# landscape across the two scenes -- the only delta is the per-phase
+# key prefix (``apple_`` vs ``cube_``).
+_PICK_PLACE_APPLE_PHASE_REWARDS: tuple[tuple[str, float], ...] = (
+    ("approach_apple", 0.10),
+    ("touch_apple", 0.25),
+    ("grasp_apple", 0.45),
+    ("apple_off_table", 0.65),
+    ("apple_above_bowl", 0.80),
+    ("apple_in_bowl", 1.00),
+)
+
+
+def _success_pick_place_apple(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    grasp_contacts: Mapping[str, Mapping[str, bool]],
+    fingertip_pos: Mapping[str, list[list[float]]],
+    *,
+    constants: _PickPlaceAppleConstants = _PickPlaceAppleConstants(),
+) -> bool:
+    """Mirror of :meth:`X2PickPlaceApple._check_success`."""
+    phases = _phase_pick_place_apple(
+        model, data, grasp_contacts, fingertip_pos, constants=constants
+    )
+    return phases["apple_in_bowl"]
+
+
+def _reward_pick_place_apple(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    grasp_contacts: Mapping[str, Mapping[str, bool]],
+    fingertip_pos: Mapping[str, list[list[float]]],
+    *,
+    constants: _PickPlaceAppleConstants = _PickPlaceAppleConstants(),
+) -> float:
+    phases = _phase_pick_place_apple(
+        model, data, grasp_contacts, fingertip_pos, constants=constants
+    )
+    score = 0.0
+    for phase, weight in _PICK_PLACE_APPLE_PHASE_REWARDS:
+        if phases.get(phase, False):
+            if weight > score:
+                score = weight
+    return float(score)
+
+
+def _subtasks_pick_place_apple(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    grasp_contacts: Mapping[str, Mapping[str, bool]],
+    fingertip_pos: Mapping[str, list[list[float]]],
+    *,
+    constants: _PickPlaceAppleConstants = _PickPlaceAppleConstants(),
+) -> dict[str, int]:
+    phases = _phase_pick_place_apple(
+        model, data, grasp_contacts, fingertip_pos, constants=constants
+    )
+    return {name: int(active) for name, active in phases.items()}
+
+
+@dataclass(frozen=True)
 class _PickPlaceBowlConstants:
     bowl_body: str = "bowl_body"
     target_body: str = "target_body"
@@ -513,6 +701,12 @@ _ORACLES: dict[str, _TaskOracle] = {
         subtasks_fn=_subtasks_pick_place_bowl,
         needs_contacts=True,  # success 'bowl_on_target' uses contacts
     ),
+    "X2PickPlaceApple": _TaskOracle(
+        success_fn=_success_pick_place_apple,
+        reward_fn=_reward_pick_place_apple,
+        subtasks_fn=_subtasks_pick_place_apple,
+        needs_contacts=True,  # all phases consume the contact map
+    ),
 }
 
 
@@ -536,6 +730,14 @@ _STATIC_SUBTASK_SIGNALS: dict[str, tuple[str, ...]] = {
     ),
     "X2PickPlaceBowl": (
         "bowl_off_table",
+    ),
+    "X2PickPlaceApple": (
+        "approach_apple",
+        "touch_apple",
+        "grasp_apple",
+        "apple_off_table",
+        "apple_above_bowl",
+        "apple_in_bowl",
     ),
 }
 
@@ -779,9 +981,18 @@ class RobocasaTaskMirror:
     # Oracle queries
     # ──────────────────────────────────────────────────────────────────
 
+    # X2PickPlaceCube + X2PickPlaceApple share the same oracle call
+    # signature -- both consume the per-tick contact map AND the
+    # per-tick fingertip world positions for their approach phase.
+    # X2PickPlaceBowl only needs the contact map.
+    _ENVS_NEEDING_FINGERTIPS: tuple[str, ...] = (
+        "X2PickPlaceCube",
+        "X2PickPlaceApple",
+    )
+
     def check_success(self) -> bool:
         """Return True iff the operator just satisfied the task spec."""
-        if self._env_name == "X2PickPlaceCube":
+        if self._env_name in self._ENVS_NEEDING_FINGERTIPS:
             return bool(self._oracle.success_fn(
                 self.mj_model, self.mj_data,
                 self._latest_grasp_contacts, self._latest_fingertip_pos,
@@ -793,7 +1004,7 @@ class RobocasaTaskMirror:
         return bool(self._oracle.success_fn(self.mj_model, self.mj_data))
 
     def compute_reward(self) -> float:
-        if self._env_name == "X2PickPlaceCube":
+        if self._env_name in self._ENVS_NEEDING_FINGERTIPS:
             return float(self._oracle.reward_fn(
                 self.mj_model, self.mj_data,
                 self._latest_grasp_contacts, self._latest_fingertip_pos,
@@ -811,7 +1022,7 @@ class RobocasaTaskMirror:
         :attr:`SceneState.fingertip_pos`; the rest are pure-geometry
         queries against the mirror's ``mj_data``.
         """
-        if self._env_name == "X2PickPlaceCube":
+        if self._env_name in self._ENVS_NEEDING_FINGERTIPS:
             return self._oracle.subtasks_fn(
                 self.mj_model, self.mj_data,
                 self._latest_grasp_contacts, self._latest_fingertip_pos,

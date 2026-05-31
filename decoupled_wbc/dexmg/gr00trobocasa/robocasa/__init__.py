@@ -43,6 +43,7 @@ from robocasa.environments.locomanipulation.x2_tabletop_pnp import (
     LMTabletopFixedBase,
     X2PickPlaceCube,
     X2PickPlaceBowl,
+    X2PickPlaceApple,
 )
 
 # from robosuite.controllers import ALL_CONTROLLERS, load_controller_config

@@ -49,6 +49,16 @@ EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
 """Ego-view image width (pixels)."""
 
+FRONT_CAM_HEIGHT: int = 480
+"""``front_cam`` image height (pixels). Matched to ``EGO_VIEW_HEIGHT``
+so both video tracks land in the same per-episode mp4 codec config and
+the trainer can assemble matched RGB pairs without per-camera resize
+gymnastics. The render path itself is independent of the head camera
+(see :class:`gear_sonic.scripts.render_smoketest_episode_video.MujocoFrameRenderer`)."""
+
+FRONT_CAM_WIDTH: int = 640
+"""``front_cam`` image width (pixels). See :data:`FRONT_CAM_HEIGHT`."""
+
 FPS: int = 50
 """Dataset frame rate. Matches the SONIC tracking-policy control rate
 and the upstream ``unitree_g1_sonic`` reference."""
@@ -201,17 +211,20 @@ def get_features_x2_vla(
     hand_dof_per_side: int = HAND_DOF_OMNI,
     *,
     post_sonic_canonical: bool = True,
+    include_front_cam: bool = False,
 ) -> dict:
     """Return the LeRobot v2.1 ``features`` dict for the X2 SONIC dataset.
 
     Action surface (v1 schema, ``post_sonic_canonical=True``):
 
-    * ``action.motion_token`` (64-D) -- legacy / v1 surface kept for
-      cross-embodiment compat with ``unitree_g1_sonic``. During live
-      recording this field is filled with zeros and is meant to be
-      overwritten by an offline labeling pass that runs
-      ``SonicMotionTokenLabeler`` over ``action.body_q_mj`` (see
-      ``label_recorded_dataset.py``).
+    * ``action.motion_token`` (64-D) -- the SONIC FSQ encoding of the
+      *commanded* ``body_q_mj`` (operator intent), filled inline by the
+      recorder via
+      :class:`~gear_sonic.utils.teleop.online_sonic_tokenizer.OnlineSonicTokenizer`
+      when ``--sonic-checkpoint`` is set. **This is the supervision
+      target for VLA training on top of SONIC.** When the checkpoint is
+      not provided (kinematic-only smoke tests) this column is all
+      zeros and the recorder warns once at startup.
     * ``action.body_q_mj`` (``num_body``-D, MuJoCo joint ordering) --
       **CANONICAL training target**. The post-SONIC executed q (what
       the trained tracking policy actually achieved, i.e. what's
@@ -241,6 +254,18 @@ def get_features_x2_vla(
     For pure-kinematic recordings (``post_sonic_canonical=False``)
     these debug siblings are omitted because there's no SONIC in the
     loop to correct anything.
+
+    When ``include_front_cam=True``, a second video feature
+    ``observation.images.front_cam`` is added with shape
+    ``(FRONT_CAM_HEIGHT, FRONT_CAM_WIDTH, 3)``. This corresponds to
+    the world-fixed wide-angle witness camera defined in the robocasa
+    scene XMLs (see ``front_cam`` in
+    ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``
+    :data:`_WORKSPACE_CAMERAS`). The recorder enables this flag
+    automatically in robocasa scene mode and writes both ``ego_view``
+    and ``front_cam`` per frame; non-robocasa recordings keep the
+    original single-camera schema for backwards compat with existing
+    parquet files.
     """
     body_joint_names = robot_model.joint_names
     num_body = robot_model.num_joints
@@ -271,6 +296,14 @@ def get_features_x2_vla(
             "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
             "names": ["height", "width", "channel"],
         },
+    }
+    if include_front_cam:
+        features["observation.images.front_cam"] = {
+            "dtype": "video",
+            "shape": [FRONT_CAM_HEIGHT, FRONT_CAM_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        }
+    features.update({
         "observation.state": {
             "dtype": "float64",
             "shape": (state_dim,),
@@ -301,7 +334,7 @@ def get_features_x2_vla(
             "shape": (hand_dof_per_side,),
             "names": list(finger_names_right),
         },
-    }
+    })
 
     if post_sonic_canonical:
         features["action.body_q_mj_pre_sonic"] = {
@@ -333,9 +366,30 @@ def get_features_x2_vla(
 # ---------------------------------------------------------------------------
 
 
+def _video_modality(*, include_front_cam: bool) -> dict:
+    """Build the ``video`` block of ``meta/modality.json``.
+
+    Single-source-of-truth helper so :func:`get_modality_config_x2_vla`
+    and :func:`get_features_x2_vla` can't drift on whether
+    ``front_cam`` is in the schema. Both should be called with the same
+    ``include_front_cam`` value (the recorder enforces this; mismatched
+    callers will get a LeRobot exporter error at first frame).
+    """
+    video = {
+        "ego_view": {"original_key": "observation.images.ego_view"},
+    }
+    if include_front_cam:
+        video["front_cam"] = {
+            "original_key": "observation.images.front_cam",
+        }
+    return video
+
+
 def get_modality_config_x2_vla(
     robot_model: RobotModel,
     hand_dof_per_side: int = HAND_DOF_OMNI,
+    *,
+    include_front_cam: bool = False,
 ) -> dict:
     """Return the ``meta/modality.json`` content for the X2 SONIC dataset.
 
@@ -347,6 +401,13 @@ def get_modality_config_x2_vla(
 
     Action surface uses three keys to match ``unitree_g1_sonic``:
     ``motion_token`` (64), ``left_hand_joints`` (10 or 7), ``right_hand_joints`` (10 or 7).
+
+    When ``include_front_cam=True`` the returned dict's ``video`` block
+    additionally maps ``front_cam -> observation.images.front_cam`` so
+    the trainer learns a second world-fixed witness view (see
+    :func:`get_features_x2_vla`). Must match the recorder's
+    ``record_front_cam`` setting; mismatches will be rejected by the
+    LeRobot exporter's ``validate_frame`` at runtime.
     """
     if hand_dof_per_side not in (HAND_DOF_OMNI, HAND_DOF_G1_COMPAT):
         raise ValueError(
@@ -397,9 +458,7 @@ def get_modality_config_x2_vla(
                 "original_key": "action.right_hand_joints",
             },
         },
-        "video": {
-            "ego_view": {"original_key": "observation.images.ego_view"},
-        },
+        "video": _video_modality(include_front_cam=include_front_cam),
         "annotation": {
             "human.task_description": {"original_key": "task_index"},
         },
@@ -410,6 +469,8 @@ __all__ = [
     "EGO_VIEW_HEIGHT",
     "EGO_VIEW_WIDTH",
     "FPS",
+    "FRONT_CAM_HEIGHT",
+    "FRONT_CAM_WIDTH",
     "HAND_DOF_G1_COMPAT",
     "HAND_DOF_OMNI",
     "MUJOCO_JOINT_NAMES",

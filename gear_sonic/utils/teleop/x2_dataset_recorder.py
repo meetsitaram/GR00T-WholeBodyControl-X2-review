@@ -20,7 +20,10 @@ Architecture overview
                                        ┌──────────────────────────────┐
                   pose ZMQ PUB :5556───┤ X2DatasetRecorder            │
                                        │  • publishes joint_pos_mj +  │
-                                       │    zero motion_token @ 50 Hz │
+                                       │    motion_token @ 50 Hz      │
+                                       │    (zeros for planner path;  │
+                                       │     passthrough when present │
+                                       │     on body_pose, e.g. VLA)  │
                                        │  • subscribes x2_debug :5557 │
                                        │  • renders ego_view via      │
                                        │    MujocoFrameRenderer       │
@@ -30,23 +33,40 @@ Architecture overview
                                                     ▼
                                           ``Gr00tDataExporter``
 
-There is **no SONIC FSQ encoder in the live recording loop**. The dataset
-is built from the operator's *intent* (pre-SONIC ``body_q`` + hand joints)
-plus the deploy's observed proprio + ego_view. If you want VLA training
-labels (FSQ ``motion_token``) attached, run the offline labeler in a
-post-processing pass over the recorded ``action.body_q_mj`` (post-SONIC
-canonical) trajectories. Putting an FSQ encoder *inside* a "data to
-train a VLA" recording loop would just bake that VLA's biases into its
-own training data.
+**Inline SONIC FSQ encoder for VLA-training-ready labels.** When the
+operator passes ``--sonic-checkpoint`` (the wrapper auto-resolves the
+``.pt`` sibling of the deploy ONNX), the recorder loads
+:class:`~gear_sonic.utils.teleop.online_sonic_tokenizer.OnlineSonicTokenizer`
+once at startup and encodes every commanded ``body_q_mj`` into a 64-D
+FSQ token in-process. The token lands as ``action.motion_token`` in the
+parquet so the dataset is VLA-trainable directly off disk -- no
+post-recording label step. Without ``--sonic-checkpoint`` the recorder
+emits zero tokens and a single one-shot warning so the operator knows
+the dataset is kinematic-only (intentional for smoke tests, never
+correct for production data collection).
+
+This is the right shape because the SONIC tracking encoder is **not**
+the VLA -- it's the canonical decoder-side reference that every VLA on
+top of SONIC must target. Labeling with the SONIC encoder gives the VLA
+a consistent ground-truth signal; using anything else (raw body_q,
+identity tokens) means the VLA has no consistent target to optimize
+against.
+
+The wire's ``motion_token`` field is normally zeros in the planner-driven
+stack (the heuristic planner does not populate it). When a
+``body_pose`` publisher includes a 64-D ``motion_token`` (the live VLA
+bridge in recorder-first layout), the subscribe-mode loop forwards that
+tensor verbatim on the deploy ``pose`` topic so closed-loop SONIC+VLA
+matches the direct-bridge contract. The inline tokenizer remains
+dataset-only for ``action.motion_token`` labels.
 
 The script is meant to be co-launched with the C++ deploy in VLA-input
 mode (``deploy_x2.sh sim --vla --sim-profile gantry --sim-with-omnihand``).
 The deploy consumes ``joint_pos_mj`` from the wire as the SONIC tracking
-policy's reference motion (the actor *ignores* ``motion_token`` today --
-the field is documented as a "v1 hook for VLA-direct token streaming"
-in ``zmq_pose_input_source.hpp``). The deploy's MuJoCo replica then
-publishes the resulting body / hand / pelvis state back over
-``x2_debug`` for ground-truth proprioception.
+policy's reference motion; ``motion_token`` is the VLA / SONIC latent
+hook documented in ``zmq_pose_input_source.hpp`` (non-zero on VLA runs).
+The deploy's MuJoCo replica then publishes the resulting body / hand /
+pelvis state back over ``x2_debug`` for ground-truth proprioception.
 
 Recording lifecycle (Quest 3 controller buttons)
 -------------------------------------------------
@@ -128,6 +148,10 @@ from gear_sonic.utils.teleop.x2_hand_retarget import (
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
 
+# Prior ``Quest3Reader.get_hand_curls`` ``*_source`` for filter reset
+# (distinct from ``None`` meaning unknown on the wire).
+_PREV_Q3_HAND_SRC_UNSET: Any = object()
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -150,7 +174,60 @@ class RecorderConfig:
     output_dir: Optional[Path]
     task: str
     sonic_checkpoint: Optional[Path] = None
+    """SONIC tracker ``.pt`` checkpoint. When provided, the recorder runs
+    :class:`~gear_sonic.utils.teleop.online_sonic_tokenizer.OnlineSonicTokenizer`
+    per tick to fill ``action.motion_token`` in the LeRobot dataset
+    directly. Required for VLA training; if ``None`` the recorder emits
+    zero tokens and warns once at startup."""
+
+    sonic_tokenizer_device: str = "cuda:0"
+    """Torch device for the inline tokenizer. ``cuda:0`` keeps per-tick
+    cost under 100 us; ``cpu`` adds ~1 ms per tick (still well within
+    the 20 ms budget at 50 Hz). Use ``cpu`` if cuda:0 is contended by
+    the deploy / VLA on the same GPU."""
+
+    sonic_encoder_config: Optional[Path] = None
+    """Path to the YAML encoder-observation config (parses to
+    :class:`~gear_sonic.utils.teleop.x2_encoder_obs_builder.X2EncoderConfig`).
+    When set *and* the recorder is in subscribe mode (planner-driven),
+    the inline tokenizer builds the same 680-D 10-frame future
+    observation the deploy actor consumes from the wire and encodes
+    it via the YAML-selected encoder mode. When ``None``, or when the
+    recorder is in direct mode (Quest-driven, no planner), the
+    tokenizer falls back to the legacy freeze-pose path (one body_q
+    tiled 11 times) and prints a one-shot deprecation warning. The
+    canonical config lives at
+    ``gear_sonic/data/encoder/x2_observation_config.yaml`` and the
+    wrapper :file:`run_x2_quest3_planner_stack.sh` forwards it
+    automatically."""
+
+    obs_dump_recorder_path: Optional[Path] = None
+    """Layer 3 byte-parity probe. When set, the subscribe-mode loop
+    writes a ``.pt`` snapshot of the first tick whose planner future
+    window is fully populated (snap dict + 680-D builder obs) to this
+    path and continues running normally. Pair with the deploy's
+    ``--obs-dump`` to assert byte-equal observations between the
+    recorder's Python gather path and the deploy's C++
+    ``ZmqPoseInputSource`` -- diffed by
+    :file:`gear_sonic_deploy/scripts/compare_recorder_vs_deploy_obs.py`.
+    Has no effect outside subscribe mode."""
+
     teleop_only: bool = False
+
+    idle_publish_enabled: bool = True
+    """When True (default), the subscribe-mode loop calls
+    :meth:`X2DatasetRecorder._publish_idle` every tick that no
+    ``body_pose`` has arrived yet, so the C++ deploy SUB at
+    :attr:`pub_port` always sees a stand-pose reference on the wire.
+    Set to False (via ``--no-idle-publish``) to keep the recorder
+    completely silent on the ``pose`` topic until a real ``body_pose``
+    arrives -- the deploy will then never decode a frame and falls back
+    to ``ZmqPoseInputSource``'s built-in ``default_angles`` prefill.
+    Use that combination together with the bridge's ``--silent-wire``
+    to validate the deploy's true 'no upstream' behaviour under
+    ``--vla-no-policy``: the goal is ``has_body_reference_=False`` for
+    the entire run, ``wrist_bypass_ticks=0``, and the robot held
+    upright by the deploy's own reference cache."""
 
     # Networking
     pub_host: str = "*"
@@ -298,6 +375,38 @@ class RecorderConfig:
     """Robocasa env name (e.g. ``"X2PickPlaceCube"``). Falls back to the
     metadata sidecar's ``env_name`` field when not set explicitly."""
 
+    record_front_cam: bool = False
+    """When True, the recorder builds a second :class:`MujocoFrameRenderer`
+    bound to the scene XML's ``front_cam`` (a wide-angle world-fixed
+    witness camera baked in by ``_WORKSPACE_CAMERAS`` -- see
+    ``gear_sonic/scripts/build_x2_robocasa_scene_xml.py``) and writes
+    its frames to ``observation.images.front_cam`` alongside
+    ``observation.images.ego_view``. Also flips ``include_front_cam=True``
+    on :func:`get_features_x2_vla` / :func:`get_modality_config_x2_vla`
+    so the LeRobot v2.1 schema declares the second video track up
+    front; mismatches trip the exporter's per-frame validator. The
+    ``record_x2_dataset.py`` CLI defaults this to True iff
+    ``--scene-xml-path`` resolves (i.e. ``--robocasa-env != none``),
+    since the camera only exists in robocasa-built scenes; pass
+    ``--no-front-cam`` to opt out (e.g. for legacy single-camera
+    parquets). Has no effect in ``--teleop-only`` mode (no recorder ->
+    no schema)."""
+
+    robot_pose_sub_host: str = "localhost"
+    robot_pose_sub_port: int = 5570
+    robot_pose_sub_topic: str = "robot_pose"
+    """Bridge -> recorder pelvis-pose telemetry (see
+    :mod:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`). Defaults match
+    ``x2_mujoco_ros_bridge.py --robot-pose-pub-port`` (5570). The
+    recorder uses the freshest pelvis ``(x, y, z)`` from this topic to
+    drive ``MujocoFrameRenderer.render_frame(root_pos_xyz=…)`` so a
+    fixed witness camera (``front_cam``) actually sees the robot
+    translate when it walks; the head-mounted ``ego_view`` is
+    insensitive to root translation but using the live value here keeps
+    both renderers consistent. Falls back to the renderer's hardcoded
+    ``(0, 0, 0.793)`` when no ``robot_pose`` packet has arrived yet
+    (e.g. before the bridge has written its first tick)."""
+
     scene_state_sub_host: str = "localhost"
     scene_state_sub_port: int = 5559
     scene_reset_pub_host: str = "*"
@@ -380,6 +489,9 @@ class _SubscribeModeState:
         self._pending_recorder_cmd: list[tuple[str, int]] = []
         self._last_body_pose_t: float = 0.0
         self._last_arm_targets_t: float = 0.0
+        # Optional 64-D wire token from body_pose (VLA bridge). None when
+        # absent or invalid — subscribe loop then publishes zeros on pose.
+        self._wire_motion_token: Optional[np.ndarray] = None
 
     def update_body_pose(
         self,
@@ -391,6 +503,7 @@ class _SubscribeModeState:
         joint_vel_mj_future: Optional[np.ndarray] = None,
         frame_index_future: Optional[np.ndarray] = None,
         future_dt_s: Optional[float] = None,
+        wire_motion_token: Optional[np.ndarray] = None,
     ) -> None:
         """Atomically refresh the planner's body_pose snapshot.
 
@@ -426,14 +539,50 @@ class _SubscribeModeState:
                 None if future_dt_s is None else float(future_dt_s)
             )
             self._last_body_pose_t = time.time()
+            if wire_motion_token is None:
+                self._wire_motion_token = None
+            else:
+                mt = np.asarray(wire_motion_token, dtype=np.float32).reshape(-1)
+                if mt.shape == (SONIC_MOTION_TOKEN_DIM,):
+                    self._wire_motion_token = mt.copy()
+                else:
+                    self._wire_motion_token = None
 
     def update_arm_targets(
-        self, left: np.ndarray, right: np.ndarray, engaged: bool,
+        self,
+        left: np.ndarray,
+        right: np.ndarray,
+        engaged: bool,
+        passthrough_arm_targets: bool = False,
     ) -> None:
+        """Update cached arm IK targets from the manager.
+
+        ``passthrough_arm_targets=True`` is the
+        ``LOCO_DECOUPLED_ARMS=0`` sentinel: the manager is signalling
+        that for this message it has no arm override and the recorder
+        should let the planner-predicted arms (from ``body_pose``)
+        flow through the merge step unmodified. We implement that by
+        nulling the cached arm pose so the existing validity gate in
+        the merge loop (``if left_arm_valid: body_q_mj[slice] = ...``)
+        skips the override. The next non-passthrough message
+        repopulates the cache normally, so this gate is per-message
+        and not sticky -- if the operator toggles modes mid-walk the
+        recorder immediately recovers.
+
+        ``passthrough_arm_targets`` is a kwarg with a False default so
+        legacy callers (and tests that mock this method) keep working
+        without rewrites; older managers that don't include the wire
+        field also fall through to the legacy real-arms-override path.
+        """
         with self._lock:
-            self._arm_left_q = left.copy()
-            self._arm_right_q = right.copy()
-            self._arm_engaged = bool(engaged)
+            if passthrough_arm_targets:
+                self._arm_left_q = None
+                self._arm_right_q = None
+                self._arm_engaged = False
+            else:
+                self._arm_left_q = left.copy()
+                self._arm_right_q = right.copy()
+                self._arm_engaged = bool(engaged)
             self._last_arm_targets_t = time.time()
 
     def update_hand_finger_cmd(
@@ -501,6 +650,10 @@ class _SubscribeModeState:
                 "stream_mode": self._stream_mode,
                 "last_body_pose_t": self._last_body_pose_t,
                 "last_arm_targets_t": self._last_arm_targets_t,
+                "wire_motion_token": (
+                    None if self._wire_motion_token is None
+                    else self._wire_motion_token.copy()
+                ),
             }
 
 
@@ -639,6 +792,12 @@ def _handle_body_pose_msg(
         if rq.shape == (4,):
             root_quat = rq
 
+    wire_mt: Optional[np.ndarray] = None
+    if "motion_token" in fields:
+        mt = np.asarray(fields["motion_token"], dtype=np.float32).reshape(-1)
+        if mt.shape == (SONIC_MOTION_TOKEN_DIM,):
+            wire_mt = mt
+
     # Future-window fields are only forwarded when ALL the required
     # parts are present and self-consistent. A partial window would
     # confuse the C++ deploy (it requires both jpos+rotation futures
@@ -693,9 +852,12 @@ def _handle_body_pose_msg(
             joint_vel_mj_future=jvel_future_arr,
             frame_index_future=fidx_future_arr,
             future_dt_s=future_dt_val,
+            wire_motion_token=wire_mt,
         )
     else:
-        state.update_body_pose(q, root_quat_xyzw=root_quat)
+        state.update_body_pose(
+            q, root_quat_xyzw=root_quat, wire_motion_token=wire_mt,
+        )
 
 
 def _handle_arm_and_hands_msg(
@@ -717,7 +879,20 @@ def _handle_arm_and_hands_msg(
         msg = msgpack.unpackb(payload_bytes, raw=False)
         l = np.asarray(msg["left_q_rad"], dtype=np.float64)
         r = np.asarray(msg["right_q_rad"], dtype=np.float64)
-        state.update_arm_targets(l, r, bool(msg.get("is_engaged", False)))
+        # ``passthrough_arm_targets`` (added 2026-05-30) is the
+        # LOCO_DECOUPLED_ARMS=0 sentinel from the manager: when True
+        # the recorder treats this message as "no arm override" and
+        # nulls its cache so the merge falls through to planner arms.
+        # Missing key defaults to False for wire-format back-compat
+        # with older manager builds.
+        state.update_arm_targets(
+            l,
+            r,
+            bool(msg.get("is_engaged", False)),
+            passthrough_arm_targets=bool(
+                msg.get("passthrough_arm_targets", False)
+            ),
+        )
     elif topic == hand_finger_cmd_topic:
         msg = msgpack.unpackb(payload_bytes, raw=False)
         l = np.asarray(msg["left_hand_q"], dtype=np.float64)
@@ -781,10 +956,10 @@ class X2DatasetRecorder:
             self._cfg.output_dir.parent.mkdir(parents=True, exist_ok=True)
         # The recorder drives the SONIC *tracking policy* via ``joint_pos_mj``
         # on the wire; the C++ deploy's actor consumes the reference motion,
-        # not the FSQ-encoded ``motion_token``. So the tokenizer is only
-        # needed if/when we add offline post-recording motion-token
-        # labelling for VLA training. For live teleop it stays out of
-        # the loop.
+        # not the FSQ-encoded ``motion_token`` over the wire. The tokenizer
+        # below is *dataset-only*: it produces the ground-truth
+        # ``action.motion_token`` column the VLA trains against. The wire
+        # motion_token field stays as zeros regardless.
         self._cfg.sonic_checkpoint = (
             Path(cfg.sonic_checkpoint) if cfg.sonic_checkpoint is not None else None
         )
@@ -795,10 +970,14 @@ class X2DatasetRecorder:
         print("[recorder] loading X2 robot model + features …", flush=True)
         self._robot_model = get_x2_robot_model(hand_variant="omnihand_10")
         self._features = get_features_x2_vla(
-            self._robot_model, hand_dof_per_side=HAND_DOF_OMNI
+            self._robot_model,
+            hand_dof_per_side=HAND_DOF_OMNI,
+            include_front_cam=cfg.record_front_cam,
         )
         self._modality_cfg = get_modality_config_x2_vla(
-            self._robot_model, hand_dof_per_side=HAND_DOF_OMNI
+            self._robot_model,
+            hand_dof_per_side=HAND_DOF_OMNI,
+            include_front_cam=cfg.record_front_cam,
         )
         if self._robot_model.num_joints != NUM_BODY_DOFS:
             raise RuntimeError(
@@ -807,18 +986,113 @@ class X2DatasetRecorder:
             )
 
         # The recorder drives the deploy via ``joint_pos_mj`` on the wire
-        # (which the SONIC tracking policy consumes as reference motion).
-        # ``motion_token`` is published as zeros for forward-compat with the
-        # protocol-v4 schema; the C++ actor ignores it today (the field is
-        # documented as a "v1 hook for VLA-direct token streaming").
+        # (SONIC tracking reference). ``motion_token`` on the wire is
+        # zeros unless ``body_pose`` carried a 64-D tensor (VLA bridge);
+        # the planner path leaves the field unset so we publish zeros.
         self._zero_motion_token = np.zeros(
             SONIC_MOTION_TOKEN_DIM, dtype=np.float64
         )
-        print(
-            "[recorder] tokenizer skipped (live loop drives SONIC via "
-            "joint_pos_mj; motion_token=zeros, ignored by deploy actor)",
-            flush=True,
-        )
+
+        # Layer 3 byte-parity probe state: dumps once per process the
+        # first time the subscribe loop sees a fully-populated snap.
+        self._obs_dump_recorder_done: bool = False
+
+        # Inline SONIC FSQ tokenizer for ``action.motion_token`` in the
+        # LeRobot dataset. Loaded once at startup (~50 MB of encoder
+        # weights from the ~398 MB ``.pt``), then called per tick in
+        # :meth:`_encode_motion_token` (direct mode) or
+        # :meth:`_encode_motion_token_from_snapshot` (subscribe mode).
+        # When ``cfg.sonic_checkpoint`` is ``None`` we leave
+        # ``self._tokenizer`` unset and the helper falls back to zeros
+        # + a one-shot warning so the operator knows the dataset is
+        # kinematic-only (intentional for smoke tests, never correct
+        # for production data collection).
+        #
+        # Two construction paths:
+        #
+        # * ``from_checkpoint_with_config`` (recommended) -- subscribe
+        #   mode + an encoder YAML. The recorder builds the same
+        #   680-D 10-frame future observation the deploy actor's
+        #   internal encoder consumes (via X2EncoderObsBuilder) and
+        #   runs the encoder on that exact obs. Token labels are
+        #   semantically aligned with what the policy sees.
+        #
+        # * ``from_checkpoint`` (legacy) -- direct mode (Quest-driven,
+        #   no planner snapshot to source a real future window from)
+        #   or subscribe mode without --encoder-config. Tiles the
+        #   current body_q 11 times into a freeze-pose virtual clip
+        #   and encodes that. Tokens encode static intent and the VLA
+        #   will only learn to predict "stay where you are". A one-
+        #   shot deprecation warning fires on first encode().
+        self._tokenizer = None
+        if self._cfg.sonic_checkpoint is not None:
+            from gear_sonic.utils.teleop.online_sonic_tokenizer import (
+                OnlineSonicTokenizer,
+            )
+            use_subscribe_mode_path = (
+                self._subscribe_mode
+                and self._cfg.sonic_encoder_config is not None
+            )
+            if use_subscribe_mode_path:
+                self._tokenizer = (
+                    OnlineSonicTokenizer.from_checkpoint_with_config(
+                        self._cfg.sonic_checkpoint,
+                        self._cfg.sonic_encoder_config,
+                        device=self._cfg.sonic_tokenizer_device,
+                    )
+                )
+                builder = self._tokenizer.obs_builder
+                assert builder is not None
+                modes = ", ".join(m.name for m in builder.encoder_modes)
+                print(
+                    f"[recorder] motion_token tokenizer ready "
+                    f"(checkpoint={self._cfg.sonic_checkpoint.name}, "
+                    f"device={self._cfg.sonic_tokenizer_device}, "
+                    f"encoder_config="
+                    f"{Path(self._cfg.sonic_encoder_config).name}, "
+                    f"modes=[{modes}], multi-frame=10x68 -> 680-D)",
+                    flush=True,
+                )
+            else:
+                self._tokenizer = OnlineSonicTokenizer.from_checkpoint(
+                    self._cfg.sonic_checkpoint,
+                    device=self._cfg.sonic_tokenizer_device,
+                )
+                if self._subscribe_mode:
+                    # Subscribe mode without --encoder-config. We still
+                    # have a real planner snapshot but no YAML to drive
+                    # the gather. Operator has explicitly opted out of
+                    # the multi-frame path -- warn loudly.
+                    print(
+                        "[recorder] WARNING: subscribe mode is ON but "
+                        "no --encoder-config was passed; falling back "
+                        "to the DEPRECATED freeze-pose path (current "
+                        "body_q tiled 11 times). Resulting "
+                        "action.motion_token labels encode static "
+                        "intent and the VLA will only learn 'stand "
+                        "still'. Pass --encoder-config "
+                        "gear_sonic/data/encoder/x2_observation_config"
+                        ".yaml for training-ready labels.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[recorder] motion_token tokenizer ready "
+                        f"(checkpoint={self._cfg.sonic_checkpoint.name}, "
+                        f"device={self._cfg.sonic_tokenizer_device}, "
+                        "DEPRECATED freeze-pose mode -- direct-mode "
+                        "loop has no planner future to encode)",
+                        flush=True,
+                    )
+        else:
+            print(
+                "[recorder] WARNING: no --sonic-checkpoint provided; "
+                "action.motion_token will be ZEROS for every frame. "
+                "Dataset will NOT be VLA-trainable. Re-record with "
+                "--sonic-checkpoint <path/to/model_step_*.pt> for "
+                "training-ready data.",
+                flush=True,
+            )
         # Calibration is loaded lazily after Quest 3 boot in case
         # --recalibrate is set (the inline capture flow needs a live
         # WebXR client). The teleop is created in start() once we have
@@ -926,6 +1200,30 @@ class X2DatasetRecorder:
         # renderer. The recording loop needs it, so we delay until that
         # loop spins up.
         self._renderer: Any | None = None
+        # Optional second renderer for ``front_cam`` (gated on
+        # ``cfg.record_front_cam`` and on ``cfg.scene_xml_path`` actually
+        # containing a camera with that name). Same EGL-thread-pinning
+        # constraint, same lazy build-on-recording-thread pattern. See
+        # :meth:`_build_renderer` and :meth:`_record_frame`.
+        self._front_cam_renderer: Any | None = None
+
+        # ── Live pelvis-pose cache ─────────────────────────────────────
+        # Most-recent ``(x, y, z)`` from the bridge's ``robot_pose`` PUB
+        # (see :data:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`). The
+        # background SUB thread (:meth:`_robot_pose_subscriber`) keeps
+        # this current at state-rate; the recording loop reads it every
+        # frame so the rendered scene -- particularly the world-fixed
+        # ``front_cam`` -- shows the robot wherever the deploy actually
+        # placed it, instead of the renderer's hardcoded
+        # ``(0, 0, 0.793)`` default. The latch starts at the renderer's
+        # default so the very first render before any ``robot_pose``
+        # packet arrives still composes a sensible frame.
+        self._pelvis_pose_lock = threading.Lock()
+        self._latest_pelvis_xyz: np.ndarray = np.array(
+            [0.0, 0.0, 0.793], dtype=np.float64
+        )
+        self._pelvis_pose_seen_any: bool = False
+        self._robot_pose_thread: Optional[threading.Thread] = None
 
         # ── Robocasa scene plumbing (G1) ───────────────────────────────
         # Mirror is constructed eagerly here (its underlying robosuite
@@ -996,6 +1294,22 @@ class X2DatasetRecorder:
             self._scene_state_thread = threading.Thread(
                 target=self._scene_state_subscriber,
                 name="scene-state-sub",
+                daemon=True,
+            )
+
+            # robot_pose SUB (bridge -> recorder, sim-only ground-truth
+            # pelvis qpos). Always-on companion to ``scene_state``: the
+            # bridge publishes this unconditionally on the default port
+            # (5570) regardless of recorder config, and we want the
+            # cache primed so the very first ``front_cam`` render lands
+            # at the actual robot location instead of the hardcoded
+            # ``(0, 0, 0.793)`` default. Only spun up in scene mode
+            # because that's the only mode where the bridge runs at
+            # all (the legacy flat-floor recorder path doesn't talk to
+            # the bridge).
+            self._robot_pose_thread = threading.Thread(
+                target=self._robot_pose_subscriber,
+                name="robot-pose-sub",
                 daemon=True,
             )
 
@@ -1079,6 +1393,16 @@ class X2DatasetRecorder:
         self._deploy_was_alive: bool = False
         self._last_deploy_silent_warn_t: float = 0.0
 
+        # Hand diagnostic snapshot, populated each tick from the
+        # dispatch site (raw Quest 3 inputs + filtered values + final
+        # hand_q published to deploy). Read by ``_log_hand_diag`` on
+        # the same throttle as ``_print_status`` so we don't spam the
+        # terminal. Set to ``None`` here so the diag is a no-op until
+        # at least one tick has run. The diag is most useful for
+        # debugging "thumb won't close" / "controller trigger
+        # ignored" issues -- it makes the per-tick dispatch explicit.
+        self._last_hand_diag: Optional[dict] = None
+
         if cfg.teleop_only:
             print(
                 f"[recorder] init done. mode=TELEOP_ONLY (no dataset writes) "
@@ -1103,6 +1427,8 @@ class X2DatasetRecorder:
         # Robocasa scene_state subscriber (no-op when not in scene mode).
         if self._scene_state_thread is not None:
             self._scene_state_thread.start()
+        if self._robot_pose_thread is not None:
+            self._robot_pose_thread.start()
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
@@ -1141,6 +1467,8 @@ class X2DatasetRecorder:
             self._finger_filter_right: Optional[FingerSignalFilter] = (
                 FingerSignalFilter(self._cfg.finger_filter_params)
             )
+            self._prev_q3_left_hand_src: Any = _PREV_Q3_HAND_SRC_UNSET
+            self._prev_q3_right_hand_src: Any = _PREV_Q3_HAND_SRC_UNSET
             if self._cfg.verbose:
                 p = self._cfg.finger_filter_params
                 print(
@@ -1152,6 +1480,8 @@ class X2DatasetRecorder:
         else:
             self._finger_filter_left = None
             self._finger_filter_right = None
+            self._prev_q3_left_hand_src = _PREV_Q3_HAND_SRC_UNSET
+            self._prev_q3_right_hand_src = _PREV_Q3_HAND_SRC_UNSET
             if self._cfg.verbose:
                 print(
                     "[recorder] finger filter DISABLED",
@@ -1233,6 +1563,11 @@ class X2DatasetRecorder:
                 self._scene_state_thread.join(timeout=1.0)
             except Exception:
                 pass
+        if self._robot_pose_thread is not None:
+            try:
+                self._robot_pose_thread.join(timeout=1.0)
+            except Exception:
+                pass
         try:
             self._pub_sock.close(linger=0)
         except Exception:
@@ -1255,6 +1590,11 @@ class X2DatasetRecorder:
         if self._renderer is not None:
             try:
                 self._renderer.close()
+            except Exception:
+                pass
+        if self._front_cam_renderer is not None:
+            try:
+                self._front_cam_renderer.close()
             except Exception:
                 pass
 
@@ -1280,6 +1620,17 @@ class X2DatasetRecorder:
                 vr_pose = self._quest.get_3pt_pose()
                 buttons = self._quest.get_buttons()
                 triggers = self._quest.get_controller_inputs()
+                # Snapshot the raw + filtered finger inputs so the
+                # throttled hand-diag log (every status_log_period_s)
+                # can render exactly what the dispatch saw this tick.
+                # We populate this dict at the *end* of the dispatch
+                # block once we know the final ``hand_q`` values, but
+                # initialise it here so an early `continue` (e.g. no
+                # vr_pose this frame) doesn't leak last tick's diag.
+                hand_diag_capture: dict = {
+                    "tick": tick,
+                    "triggers": triggers,
+                }
 
                 if vr_pose is None:
                     if not wait_msg:
@@ -1303,24 +1654,58 @@ class X2DatasetRecorder:
                 # holding controllers). Fall back to the controller
                 # trigger/grip scalar only when XRHand is not available.
                 #
-                # IMPORTANT: do NOT gate on ``l_src``. In multimodal the
-                # WebXR client tags ``source = "controller"`` because
-                # gripSpace wins for IK pose, but the same frame still
-                # carries XRHand curls + the thumb opposition signal.
-                # Gating on source kind would spuriously route us to the
-                # uniform-trigger path in multimodal and throw away the
-                # per-finger detail AND the thumb opposition correction.
-                l_curls, r_curls, l_src, r_src = self._quest.get_hand_curls()
-                l_oppose, r_oppose = self._quest.get_thumb_opposition()
+                # IMPORTANT: do NOT gate XRHand vs controller *dispatch*
+                # on ``l_src`` alone. In multimodal mode the WebXR client
+                # tags ``source = "controller"`` because gripSpace wins
+                # for IK pose, but the same frame can still carry XRHand
+                # curls + thumb opposition.
+                #
+                # DO reset :class:`FingerSignalFilter` when ``l_src`` /
+                # ``r_src`` *change* (``hand`` <-> ``controller`` /
+                # ``None``). Otherwise the filter's NaN-holding EMA
+                # freezes the last XRHand curls while raw ``curls`` are
+                # ``None`` after returning to controllers-only, and
+                # trigger/grip never drives ``hand_q`` again.
+                l_curls_raw, r_curls_raw, l_src, r_src = self._quest.get_hand_curls()
+                l_oppose_raw, r_oppose_raw = self._quest.get_thumb_opposition()
                 l_finger_tip_oppose, r_finger_tip_oppose = (
                     self._quest.get_finger_tip_oppose()
                 )
+                # Capture the unfiltered values so the diag can show
+                # both raw and filtered (so we can tell whether it's
+                # the headset or the FingerSignalFilter zeroing out
+                # the thumb).
+                hand_diag_capture["l_src"] = l_src
+                hand_diag_capture["r_src"] = r_src
+                hand_diag_capture["l_curls_raw"] = (
+                    None if l_curls_raw is None else np.asarray(l_curls_raw).copy()
+                )
+                hand_diag_capture["r_curls_raw"] = (
+                    None if r_curls_raw is None else np.asarray(r_curls_raw).copy()
+                )
+                hand_diag_capture["l_oppose_raw"] = l_oppose_raw
+                hand_diag_capture["r_oppose_raw"] = r_oppose_raw
 
                 # Apply the per-side smoothing filter on top of the raw
                 # Quest 3 inputs. The retargeter sees only the filtered
                 # values; the raw values are no longer kept (the SONIC-
                 # record path doesn't write a debug NPZ).
+                l_curls, r_curls = l_curls_raw, r_curls_raw
+                l_oppose, r_oppose = l_oppose_raw, r_oppose_raw
                 if self._finger_filter_left is not None and self._finger_filter_right is not None:
+                    if (
+                        self._prev_q3_left_hand_src is not _PREV_Q3_HAND_SRC_UNSET
+                        and l_src != self._prev_q3_left_hand_src
+                    ):
+                        self._finger_filter_left.reset()
+                    if (
+                        self._prev_q3_right_hand_src is not _PREV_Q3_HAND_SRC_UNSET
+                        and r_src != self._prev_q3_right_hand_src
+                    ):
+                        self._finger_filter_right.reset()
+                    self._prev_q3_left_hand_src = l_src
+                    self._prev_q3_right_hand_src = r_src
+
                     l_curls, l_oppose, l_finger_tip_oppose = (
                         self._finger_filter_left.update(
                             l_curls, l_oppose, l_finger_tip_oppose,
@@ -1331,6 +1716,14 @@ class X2DatasetRecorder:
                             r_curls, r_oppose, r_finger_tip_oppose,
                         )
                     )
+                hand_diag_capture["l_curls_filt"] = (
+                    None if l_curls is None else np.asarray(l_curls).copy()
+                )
+                hand_diag_capture["r_curls_filt"] = (
+                    None if r_curls is None else np.asarray(r_curls).copy()
+                )
+                hand_diag_capture["l_oppose_filt"] = l_oppose
+                hand_diag_capture["r_oppose_filt"] = r_oppose
 
                 hr = self._calibration.hand_range if self._calibration is not None else None
                 l_hr = hr.left if hr is not None else None
@@ -1347,6 +1740,7 @@ class X2DatasetRecorder:
                         oppose_ceiling=l_hr.oppose_ceiling if l_hr is not None else None,
                     )
                     left_ratio = float(np.mean(l_curls))
+                    hand_diag_capture["l_dispatch"] = "xrhand"
                 else:
                     left_ratio, _ = controller_grasp_ratio(
                         left_trigger=triggers[0],
@@ -1356,6 +1750,7 @@ class X2DatasetRecorder:
                         mode=self._cfg.hand_input_mode,
                     )
                     left_hand_q = grasp_command_from_ratio("left", left_ratio)
+                    hand_diag_capture["l_dispatch"] = "controller"
 
                 if r_curls is not None:
                     right_hand_q = per_finger_grasp_command_from_curls_and_oppose(
@@ -1369,6 +1764,7 @@ class X2DatasetRecorder:
                         oppose_ceiling=r_hr.oppose_ceiling if r_hr is not None else None,
                     )
                     right_ratio = float(np.mean(r_curls))
+                    hand_diag_capture["r_dispatch"] = "xrhand"
                 else:
                     _, right_ratio = controller_grasp_ratio(
                         left_trigger=triggers[0],
@@ -1378,6 +1774,17 @@ class X2DatasetRecorder:
                         mode=self._cfg.hand_input_mode,
                     )
                     right_hand_q = grasp_command_from_ratio("right", right_ratio)
+                    hand_diag_capture["r_dispatch"] = "controller"
+
+                # Final per-tick capture: the actual 10-D commands the
+                # bridge will see for each hand. Indices 0/1/2 are
+                # thumb_roll / thumb_abad / thumb_mcp -- the diag log
+                # focuses on those because that's where the "thumb
+                # won't close" symptom shows up.
+                hand_diag_capture["left_hand_q"] = left_hand_q.copy()
+                hand_diag_capture["right_hand_q"] = right_hand_q.copy()
+                hand_diag_capture["engaged"] = bool(self._teleop.is_engaged)
+                self._last_hand_diag = hand_diag_capture
 
                 # Run IK; if not engaged, this returns the operator's
                 # calibrated neutral q (a posture that is *not* the
@@ -1406,17 +1813,23 @@ class X2DatasetRecorder:
                         DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64
                     )
 
-                # ``motion_token`` is a forward-compat wire field; the
-                # current C++ deploy actor consumes only ``joint_pos_mj``
-                # as reference motion. Send zeros so we don't pin a CPU
-                # core spinning the SONIC encoder at 50 Hz for output
-                # nobody reads.
-                token = self._zero_motion_token
+                # The wire's ``motion_token`` field is always zeros (the
+                # C++ deploy actor consumes only ``joint_pos_mj`` as
+                # reference motion -- spending CPU/GPU on the wire copy
+                # would burn power for no consumer). The dataset's
+                # ``action.motion_token`` column, however, is the SONIC
+                # FSQ encoding of the *commanded* body_q (operator
+                # intent) and is the supervision target for VLA
+                # training. ``_encode_motion_token`` returns zeros if
+                # no ``--sonic-checkpoint`` was provided (warning
+                # already printed at startup).
+                wire_token = self._zero_motion_token
+                dataset_token = self._encode_motion_token(body_q_mj)
 
                 # Publish to deploy.
                 self._publish_pose(
                     body_q_mj=body_q_mj,
-                    motion_token=token,
+                    motion_token=wire_token,
                     left_hand_q=left_hand_q,
                     right_hand_q=right_hand_q,
                     tick=tick,
@@ -1430,7 +1843,7 @@ class X2DatasetRecorder:
                         commanded_body_q_mj=body_q_mj,
                         commanded_left_hand_q=left_hand_q,
                         commanded_right_hand_q=right_hand_q,
-                        commanded_token=token,
+                        commanded_token=dataset_token,
                     )
 
                 # Two independent operator-visibility hooks:
@@ -1448,6 +1861,7 @@ class X2DatasetRecorder:
                 ):
                     self._last_status_log_t = now_log
                     self._print_status(tick=tick, tick_result=tick_result)
+                    self._log_hand_diag()
 
                 tick += 1
                 next_tick += period
@@ -1523,16 +1937,23 @@ class X2DatasetRecorder:
                 body_pose = snap["body_pose_q_mj"]
                 if body_pose is None:
                     if not wait_msg:
+                        suffix = (
+                            ""
+                            if self._cfg.idle_publish_enabled
+                            else "  [no-idle-publish: pose wire stays SILENT]"
+                        )
                         print(
                             f"[recorder] subscribe-mode: waiting for first "
                             f"body_pose on tcp://"
                             f"{self._cfg.body_pose_sub_host}:"
                             f"{self._cfg.body_pose_sub_port} topic="
-                            f"{self._cfg.body_pose_sub_topic!r} …",
+                            f"{self._cfg.body_pose_sub_topic!r} …"
+                            f"{suffix}",
                             flush=True,
                         )
                         wait_msg = True
-                    self._publish_idle()
+                    if self._cfg.idle_publish_enabled:
+                        self._publish_idle()
                     next_tick += period
                     self._sleep_until(next_tick)
                     continue
@@ -1612,11 +2033,35 @@ class X2DatasetRecorder:
                     right_hand if right_hand is not None else zero_hand
                 )
 
-                token = self._zero_motion_token
+                # Dataset token: SONIC FSQ encoding of the planner's (or
+                # VLA body's) future window for ``action.motion_token``.
+                # Wire token: passthrough 64-D ``motion_token`` from
+                # ``body_pose`` when present (live VLA); else zeros
+                # (heuristic planner omits the field).
+                merged_snap = dict(snap)
+                merged_snap["body_pose_q_mj"] = body_q_mj
+                if jpos_future_overlaid is not None:
+                    merged_snap["joint_pos_mj_future"] = (
+                        jpos_future_overlaid
+                    )
+                wt = snap["wire_motion_token"]
+                if wt is not None and wt.shape == (SONIC_MOTION_TOKEN_DIM,):
+                    wire_token = wt.astype(np.float64, copy=False)
+                else:
+                    wire_token = self._zero_motion_token
+                dataset_token = self._encode_motion_token_from_snapshot(
+                    merged_snap
+                )
+
+                # Layer 3 byte-parity probe: dump the first
+                # fully-populated snapshot + builder obs to disk and
+                # continue. Triggered once per process; safe to leave
+                # enabled across long sessions.
+                self._maybe_dump_recorder_obs(merged_snap)
 
                 self._publish_pose(
                     body_q_mj=body_q_mj,
-                    motion_token=token,
+                    motion_token=wire_token,
                     left_hand_q=left_hand_q,
                     right_hand_q=right_hand_q,
                     tick=tick,
@@ -1632,7 +2077,7 @@ class X2DatasetRecorder:
                         commanded_body_q_mj=body_q_mj,
                         commanded_left_hand_q=left_hand_q,
                         commanded_right_hand_q=right_hand_q,
-                        commanded_token=token,
+                        commanded_token=dataset_token,
                     )
 
                 now_log = time.monotonic()
@@ -1711,8 +2156,10 @@ class X2DatasetRecorder:
         # window doesn't leak state from the previous episode.
         if self._finger_filter_left is not None:
             self._finger_filter_left.reset()
+            self._prev_q3_left_hand_src = _PREV_Q3_HAND_SRC_UNSET
         if self._finger_filter_right is not None:
             self._finger_filter_right.reset()
+            self._prev_q3_right_hand_src = _PREV_Q3_HAND_SRC_UNSET
 
         # Robocasa: re-randomise scene objects via the task mirror's
         # placement_initializer, then push the new poses to the deploy.
@@ -1819,6 +2266,175 @@ class X2DatasetRecorder:
         body[_LEFT_ARM_MJ_SLICE] = left_arm_q
         body[_RIGHT_ARM_MJ_SLICE] = right_arm_q
         return body
+
+    def _encode_motion_token(
+        self,
+        body_q_mj: np.ndarray,
+        root_quat_xyzw: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """DEPRECATED freeze-pose chokepoint for the direct-mode loop.
+
+        Tiles the current ``body_q_mj`` 11 times and runs the SONIC
+        encoder at frame 0. Used by the recorder's direct mode (Quest-
+        driven, no planner snapshot to source a real future window
+        from). The first call prints a one-shot deprecation warning
+        from :meth:`OnlineSonicTokenizer.encode`. Prefer
+        :meth:`_encode_motion_token_from_snapshot` whenever a planner
+        snapshot is available (subscribe mode).
+
+        Args:
+            body_q_mj: ``(31,)`` MuJoCo-order commanded body pose
+                (operator intent, post-IK + post-planner merge).
+            root_quat_xyzw: optional ``(4,)`` xyzw root quaternion. The
+                manager / planner publish wxyz; callers should convert
+                before passing here. Defaults to identity (operator
+                intent for the gantry profile keeps the pelvis upright).
+
+        Returns:
+            ``(64,)`` float64 token. When the recorder was started
+            without ``--sonic-checkpoint`` this is the cached zero
+            vector (the warning was printed once at startup).
+        """
+        if self._tokenizer is None:
+            return self._zero_motion_token
+        return self._tokenizer.encode(
+            body_q_mj, root_rot_xyzw=root_quat_xyzw
+        )
+
+    def _encode_motion_token_from_snapshot(
+        self,
+        snap: dict,
+    ) -> np.ndarray:
+        """Encode a planner snapshot into a 64-D SONIC motion token.
+
+        Subscribe-mode chokepoint. Builds the 680-D 10-frame future
+        observation via :class:`X2EncoderObsBuilder` (real planner
+        future, not freeze pose) and runs the SONIC encoder + FSQ on
+        it. Token labels are byte-identical to what the deploy actor's
+        internal encoder would emit from the same wire snapshot
+        (Layer 3 byte-parity test asserts this).
+
+        Falls back to :meth:`_encode_motion_token` when the planner
+        future window is missing (planner not yet warm) or when the
+        tokenizer was constructed without an obs builder.
+
+        Args:
+            snap: Planner snapshot from
+                :meth:`_SubscribeModeState.snapshot`. Must contain
+                ``body_pose_q_mj``, ``root_quat_xyzw``,
+                ``joint_pos_mj_future``, ``root_quat_xyzw_future``.
+
+        Returns:
+            ``(64,)`` float64 token.
+        """
+        if self._tokenizer is None:
+            return self._zero_motion_token
+        if self._tokenizer.obs_builder is None:
+            return self._encode_motion_token(
+                snap["body_pose_q_mj"],
+                root_quat_xyzw=snap.get("root_quat_xyzw"),
+            )
+        if (
+            snap.get("body_pose_q_mj") is None
+            or snap.get("root_quat_xyzw") is None
+            or snap.get("joint_pos_mj_future") is None
+            or snap.get("root_quat_xyzw_future") is None
+        ):
+            return self._encode_motion_token(
+                snap.get("body_pose_q_mj"),
+                root_quat_xyzw=snap.get("root_quat_xyzw"),
+            )
+        return self._tokenizer.encode_with_snapshot(snap)
+
+    def _maybe_dump_recorder_obs(self, snap: dict) -> None:
+        """Layer 3 probe: write one snap + builder obs to disk.
+
+        Triggered exactly once, on the first subscribe-mode tick where
+        ``snap`` is fully populated. The dump is consumed by
+        :file:`gear_sonic_deploy/scripts/compare_recorder_vs_deploy_obs.py`
+        which diffs it against the deploy's matching ``--obs-dump``
+        blob (Layer 3 of the validation pyramid).
+
+        Schema: a torch ``.pt`` file containing a dict with::
+
+            {
+              "kind": "x2_recorder_obs_dump_v1",
+              "snap": {
+                "body_pose_q_mj":         (31,) float64,
+                "root_quat_xyzw":         (4,) float64,
+                "joint_pos_mj_future":    (F, 31) float64,
+                "root_quat_xyzw_future":  (F, 4) float64,
+              },
+              "encoder_obs":           (680,) float32,  # gather output
+              "encoder_config":        path str,        # YAML used
+              "checkpoint":            path str,        # .pt used
+            }
+
+        Silently no-ops when ``--obs-dump-recorder`` was not set,
+        when the dump has already fired, when the planner future is
+        not yet warm, or when the tokenizer has no obs_builder.
+        """
+        if self._obs_dump_recorder_done:
+            return
+        if self._cfg.obs_dump_recorder_path is None:
+            return
+        if self._tokenizer is None or self._tokenizer.obs_builder is None:
+            return
+        if (
+            snap.get("body_pose_q_mj") is None
+            or snap.get("root_quat_xyzw") is None
+            or snap.get("joint_pos_mj_future") is None
+            or snap.get("root_quat_xyzw_future") is None
+        ):
+            return
+
+        try:
+            import torch
+            obs_680 = self._tokenizer.obs_builder.build_obs(snap)
+            payload = {
+                "kind": "x2_recorder_obs_dump_v1",
+                "snap": {
+                    "body_pose_q_mj": np.asarray(
+                        snap["body_pose_q_mj"], dtype=np.float64
+                    ),
+                    "root_quat_xyzw": np.asarray(
+                        snap["root_quat_xyzw"], dtype=np.float64
+                    ),
+                    "joint_pos_mj_future": np.asarray(
+                        snap["joint_pos_mj_future"], dtype=np.float64
+                    ),
+                    "root_quat_xyzw_future": np.asarray(
+                        snap["root_quat_xyzw_future"], dtype=np.float64
+                    ),
+                },
+                "encoder_obs": obs_680.astype(np.float32, copy=False),
+                "encoder_config": (
+                    str(self._cfg.sonic_encoder_config)
+                    if self._cfg.sonic_encoder_config is not None
+                    else ""
+                ),
+                "checkpoint": (
+                    str(self._cfg.sonic_checkpoint)
+                    if self._cfg.sonic_checkpoint is not None
+                    else ""
+                ),
+            }
+            out_path = Path(self._cfg.obs_dump_recorder_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, str(out_path))
+            print(
+                f"[recorder] Layer 3 obs dump written to {out_path} "
+                f"(680-D obs + snap; checkpoint+config recorded)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[recorder] WARNING: --obs-dump-recorder failed: "
+                f"{exc!r}; continuing without dump",
+                flush=True,
+            )
+        finally:
+            self._obs_dump_recorder_done = True
 
     def _publish_pose(
         self,
@@ -1970,11 +2586,21 @@ class X2DatasetRecorder:
         # dataset's image and proprio tracks the actual robot, not the
         # commanded target. (Otherwise the frames would diverge from
         # ground truth whenever the tracking policy lags.)
+        #
+        # ``root_pos_xyz`` comes from the bridge's ``robot_pose`` PUB
+        # (cached by :meth:`_robot_pose_subscriber`). The head-mounted
+        # ego_view is rigidly attached to the robot so its visual
+        # output is invariant under root translation -- but the
+        # world-fixed ``front_cam`` is not: it needs the live root pos
+        # to actually see the robot move. We pass the same value to
+        # both renderers so any future debug overlays stay consistent.
+        pelvis_xyz = self._snapshot_pelvis_xyz()
         try:
             ego_view = self._renderer.render_frame(  # type: ignore[union-attr]
                 body_q=obs_body_q_mj,
                 left_active=obs_left_hand_q.astype(np.float64),
                 right_active=obs_right_hand_q.astype(np.float64),
+                root_pos_xyz=pelvis_xyz,
                 root_quat_wxyz=obs_base_quat_wxyz,
             )
         except Exception as exc:
@@ -1991,6 +2617,45 @@ class X2DatasetRecorder:
                 flush=True,
             )
             return
+
+        # Optional second view: the world-fixed wide-angle ``front_cam``
+        # baked into the robocasa scene XMLs. Renders the SAME body_q +
+        # base_quat + pelvis_xyz from a different MJCF camera, so the
+        # two video tracks are bit-for-bit synchronized at the proprio
+        # level. Render failures here are non-fatal: we drop the whole
+        # frame (rather than write a partial one with a missing
+        # ``observation.images.front_cam`` key) so the LeRobot
+        # exporter's ``validate_frame`` strict-schema check stays
+        # happy. ``front_view`` lives in local scope here and is
+        # spliced into ``frame_data`` just below.
+        front_view: np.ndarray | None = None
+        if self._front_cam_renderer is not None:
+            try:
+                front_view = self._front_cam_renderer.render_frame(
+                    body_q=obs_body_q_mj,
+                    left_active=obs_left_hand_q.astype(np.float64),
+                    right_active=obs_right_hand_q.astype(np.float64),
+                    root_pos_xyz=pelvis_xyz,
+                    root_quat_wxyz=obs_base_quat_wxyz,
+                )
+            except Exception as exc:
+                print(
+                    f"[recorder] front_cam render warn (frame skipped): "
+                    f"{exc}",
+                    flush=True,
+                )
+                return
+            front_view = np.ascontiguousarray(front_view, dtype=np.uint8)
+            if front_view.shape != (
+                self._cfg.render_height, self._cfg.render_width, 3,
+            ):
+                print(
+                    f"[recorder] WARN: front_cam shape {front_view.shape} "
+                    f"!= ({self._cfg.render_height}, "
+                    f"{self._cfg.render_width}, 3); skipping frame",
+                    flush=True,
+                )
+                return
 
         # v1 schema: bare-canonical action columns carry the post-SONIC
         # executed q (what the trained tracking policy achieved, i.e.
@@ -2046,6 +2711,13 @@ class X2DatasetRecorder:
             "observation.images.ego_view": ego_view,
             "task": self._episode_buffer.task,
         }
+        if front_view is not None:
+            # Schema parity with :func:`get_features_x2_vla`: the key
+            # exists in ``self._features`` iff
+            # ``cfg.record_front_cam=True``. Conditionally emitting it
+            # here mirrors the conditional render above; the exporter
+            # rejects either side mismatching at validate time.
+            frame_data["observation.images.front_cam"] = front_view
         # Robocasa mode: append per-frame success / reward / subtask
         # signals from the task mirror. The mirror's mj_data has been
         # synced from the deploy bridge's most recent ``scene_state``
@@ -2159,6 +2831,103 @@ class X2DatasetRecorder:
         except Exception:
             pass
 
+    def _robot_pose_subscriber(self) -> None:
+        """Background SUB on the bridge's ``robot_pose`` topic.
+
+        Updates :attr:`_latest_pelvis_xyz` whenever a fresh packet
+        arrives so :meth:`_record_frame` can pass the live pelvis
+        ``(x, y, z)`` into :meth:`MujocoFrameRenderer.render_frame` as
+        ``root_pos_xyz``. Bridge publishes at state-rate (default
+        200 Hz); we use ``CONFLATE=1`` to avoid backlog. The orientation
+        component (``[3:7]``) is currently ignored here -- the recorder
+        already gets that via the ``x2_debug`` ``base_quat`` field
+        (cached in :class:`_LatestState`) and the two paths must agree
+        on the same fresh ``base_quat`` for the rendered ``ego_view`` /
+        ``front_cam`` to look right.
+
+        No-op when the bridge isn't running (recv just times out
+        forever); the recorder stays alive on the renderer's hardcoded
+        ``(0, 0, 0.793)`` fallback.
+        """
+        try:
+            from gear_sonic.utils.teleop.zmq.robot_pose_zmq import (
+                unpack_robot_pose,
+            )
+        except ImportError as exc:
+            print(f"[recorder] robot_pose SUB import failed: {exc}",
+                  flush=True)
+            return
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(
+            zmq.SUBSCRIBE, self._cfg.robot_pose_sub_topic.encode()
+        )
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        endpoint = (
+            f"tcp://{self._cfg.robot_pose_sub_host}:"
+            f"{self._cfg.robot_pose_sub_port}"
+        )
+        try:
+            sock.connect(endpoint)
+        except Exception as exc:
+            print(f"[recorder] robot_pose SUB connect to {endpoint} "
+                  f"failed: {exc}", flush=True)
+            sock.close(linger=0)
+            return
+        print(
+            f"[recorder] robot_pose SUB connected at {endpoint} "
+            f"(topic={self._cfg.robot_pose_sub_topic!r})",
+            flush=True,
+        )
+        first = True
+        while not self._stop_event.is_set():
+            try:
+                raw = sock.recv()
+            except zmq.error.Again:
+                continue
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as exc:
+                print(f"[recorder] robot_pose SUB recv error: {exc}",
+                      flush=True)
+                continue
+            try:
+                payload = unpack_robot_pose(raw)
+            except ValueError as exc:
+                print(f"[recorder] robot_pose decode error: {exc}",
+                      flush=True)
+                continue
+            qpos = payload.get("pelvis_qpos_wxyz")
+            if not isinstance(qpos, list) or len(qpos) < 3:
+                continue
+            xyz = np.array(qpos[0:3], dtype=np.float64)
+            with self._pelvis_pose_lock:
+                self._latest_pelvis_xyz = xyz
+                self._pelvis_pose_seen_any = True
+            if first:
+                first = False
+                print(
+                    f"[recorder] robot_pose SUB: first packet "
+                    f"(pelvis_xyz={xyz.tolist()})",
+                    flush=True,
+                )
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+    def _snapshot_pelvis_xyz(self) -> np.ndarray:
+        """Return the latest cached pelvis ``(x, y, z)``.
+
+        Returns a copy so callers can pass it straight into the
+        renderer without worrying about the SUB thread overwriting it
+        mid-render. Falls back to the renderer's default
+        ``(0, 0, 0.793)`` when no ``robot_pose`` packet has arrived.
+        """
+        with self._pelvis_pose_lock:
+            return self._latest_pelvis_xyz.copy()
+
     def _drain_scene_state_into_mirror(self) -> None:
         """Pull the latest scene_state snapshot and apply it to the mirror.
 
@@ -2200,6 +2969,44 @@ class X2DatasetRecorder:
             f"{self._renderer.height}, omnihand={self._renderer.with_omnihand})",
             flush=True,
         )
+        # Optional second renderer for the wide-angle world-fixed
+        # ``front_cam`` baked into the robocasa scene XMLs. Spinning up
+        # a second :class:`MujocoFrameRenderer` keeps the per-camera
+        # render path completely independent (separate ``mjData``,
+        # separate EGL framebuffer) -- ~20-40 MB extra GPU/CPU memory
+        # and one extra ``render()`` call per tick (sub-millisecond at
+        # 640x480 on a modern GPU). Only built when (a) the operator
+        # asked for it AND (b) we're in scene mode (the camera doesn't
+        # exist in the legacy flat-floor MJCF). See
+        # ``RecorderConfig.record_front_cam``.
+        if self._cfg.record_front_cam and scene_xml_path is not None:
+            print("[recorder] building MuJoCo front_cam renderer …", flush=True)
+            self._front_cam_renderer = MujocoFrameRenderer(
+                camera="front_cam",
+                width=self._cfg.render_width,
+                height=self._cfg.render_height,
+                with_omnihand=self._cfg.with_omnihand,
+                egl=True,
+                scene_xml_path=scene_xml_path,
+            )
+            print(
+                f"[recorder] front_cam renderer ready "
+                f"({self._front_cam_renderer.width}x"
+                f"{self._front_cam_renderer.height})",
+                flush=True,
+            )
+        elif self._cfg.record_front_cam:
+            # Operator opted in but we're not in scene mode -> the
+            # ``front_cam`` camera does not exist in the legacy MJCF.
+            # Don't blow up; just warn loudly so the missing video
+            # track in the dataset is obvious during triage.
+            print(
+                "[recorder] WARN: record_front_cam=True but "
+                "scene_xml_path is None -- the legacy flat-floor MJCF "
+                "has no 'front_cam' camera. Skipping the second "
+                "renderer; dataset will only contain ego_view.",
+                flush=True,
+            )
 
     def _ensure_exporter(self) -> None:
         if self._exporter is not None:
@@ -2309,6 +3116,107 @@ class X2DatasetRecorder:
             f"[recorder] tick={tick:6d} engaged={eng} state={rec} "
             f"buffered={n} deploy_alive={alive} "
             f"|ik_err|=({l_err:.3f}, {r_err:.3f}) m",
+            flush=True,
+        )
+
+    def _log_hand_diag(self) -> None:
+        """Per-side hand diagnostic: raw vs filtered curls + final hand_q.
+
+        Throttled by the same ``status_log_period_s`` cadence as
+        :meth:`_print_status` (default 5 s) so it doesn't spam the
+        terminal at 50 Hz. Useful for "thumb won't close" /
+        "controller trigger ignored" investigations because it makes
+        the per-tick dispatch path explicit:
+
+          * ``src``      -- which Quest 3 source is feeding the curls
+                            (xrhand, controller, multimodal). When the
+                            headset reports multimodal we **always**
+                            take the xrhand path -- the controller
+                            triggers are silently ignored. That's by
+                            design but trips up operators who think
+                            the trigger should still close fingers.
+          * ``raw``      -- the unfiltered Quest 3 thumb_flex + oppose
+                            values. If raw thumb_flex maxes out around
+                            0.10-0.20 then the calibration floor (0.198
+                            in the bundled default) is clamping it to
+                            zero before per-finger retargeting ever
+                            sees it.
+          * ``filt``     -- post FingerSignalFilter. If raw is healthy
+                            but filt is zero, the filter's smoothing
+                            constants are eating the signal.
+          * ``hand_q``   -- the final 10-D command published to the
+                            bridge. Indices 0/1/2 are
+                            thumb_roll / thumb_abad / thumb_mcp -- the
+                            three actuators that drive the thumb's
+                            "close into palm" motion. If these are
+                            non-zero in the recorder log but the robot
+                            doesn't move, the bug is in the bridge
+                            (actuator routing, contact gate, etc) not
+                            the recorder.
+
+        We only print when at least one tick has populated the diag
+        snapshot, and we keep the line under 200 cols so it survives
+        operator log scraping.
+        """
+        diag = self._last_hand_diag
+        if diag is None:
+            return
+
+        def _fmt_arr(a: Any, n: int = 5) -> str:
+            if a is None:
+                return "None"
+            arr = np.asarray(a)
+            if arr.size < n:
+                n = int(arr.size)
+            parts = ",".join(f"{float(arr[i]):+.2f}" for i in range(n))
+            return f"[{parts}]"
+
+        def _fmt_scalar(v: Any) -> str:
+            if v is None:
+                return " None"
+            return f"{float(v):+.2f}"
+
+        triggers = diag.get("triggers")
+        if triggers is None:
+            tr_str = "trig=None"
+        else:
+            t0, t1, g0, g1 = triggers
+            tr_str = (
+                f"trig=L_t{float(t0):+.2f}/g{float(g0):+.2f} "
+                f"R_t{float(t1):+.2f}/g{float(g1):+.2f}"
+            )
+
+        def _safe_str(v: Any, default: str = "None") -> str:
+            # Quest3Reader can return ``None`` for the per-side source
+            # tag when no XR hand input is bound yet (controller-only,
+            # or before the first hand-tracking frame), and any other
+            # diag field can race during shutdown. Coerce so the
+            # f-string format spec ``{:<11s}`` doesn't blow up.
+            return default if v is None else str(v)
+
+        for side, hand_key in (("l", "left_hand_q"), ("r", "right_hand_q")):
+            label = "LEFT " if side == "l" else "RIGHT"
+            src = _safe_str(diag.get(f"{side}_src"))
+            dispatch = _safe_str(diag.get(f"{side}_dispatch"), default="?")
+            curls_raw = diag.get(f"{side}_curls_raw")
+            curls_filt = diag.get(f"{side}_curls_filt")
+            opp_raw = diag.get(f"{side}_oppose_raw")
+            opp_filt = diag.get(f"{side}_oppose_filt")
+            hand_q = diag.get(hand_key)
+            print(
+                f"[hand-diag] {label} src={src:<11s} dispatch={dispatch:<10s} "
+                f"curls_raw={_fmt_arr(curls_raw)} curls_filt={_fmt_arr(curls_filt)} "
+                f"oppose_raw={_fmt_scalar(opp_raw)} oppose_filt={_fmt_scalar(opp_filt)} "
+                f"hand_q[0:3]={_fmt_arr(hand_q, 3)} "
+                f"hand_q[3:5]={_fmt_arr(hand_q[3:5] if hand_q is not None else None, 2)} "
+                f"hand_q[5:10]={_fmt_arr(hand_q[5:10] if hand_q is not None else None, 5)}",
+                flush=True,
+            )
+        engaged = diag.get("engaged", False)
+        print(
+            f"[hand-diag] {tr_str} engaged={engaged} "
+            f"compensation curl={self._cfg.apply_curl_compensation} "
+            f"oppose={self._cfg.apply_oppose_compensation}",
             flush=True,
         )
 

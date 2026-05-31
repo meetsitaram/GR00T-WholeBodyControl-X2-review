@@ -29,6 +29,10 @@ Code taken from ``gear_sonic/utils/teleop/x2_dataset_recorder.py``:
 - ``_compose_body_q`` (recorder line ~1055) -> :func:`compose_body_q`.
 - The hand-input dispatch around recorder lines ~778-845 (XRHand
   fast path + controller fallback + finger filter) -> :class:`Retargeter`.
+  Optional ``left_hand_source`` / ``right_hand_source`` on
+  :class:`RetargetTickInput` reset the filter on Quest ``hands.*.source``
+  transitions without affecting NPZ replay (sources default to
+  ``None``).
 - Recorder lines ~847-872 (engaged -> compose body_q overlay; idle ->
   return DEFAULT_STAND_POSE) -> :class:`Retargeter.step`.
 
@@ -38,9 +42,13 @@ Behaviour is preserved bit-for-bit; the parity test enforces this.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
+
+# Sentinel for "no prior Quest ``hands.*.source`` yet" (distinct from
+# ``None`` meaning unknown / absent on the wire this frame).
+_PREV_HAND_SRC_UNSET: Any = object()
 
 from gear_sonic.scripts.live_vla_publish_motion_token import (
     DEFAULT_STAND_POSE_MUJOCO_RAD,
@@ -100,6 +108,18 @@ class RetargetTickInput:
     """``(4,)`` per-non-thumb finger -> thumb-tip proximity scalar; the
     "thumb-tip-touches-finger-tip" pinch signal."""
     right_finger_tip_oppose: Optional[np.ndarray]
+
+    left_hand_source: Optional[str] = None
+    """Quest ``hands.left.source`` (``"hand"`` / ``"controller"``) from
+    :meth:`Quest3Reader.get_hand_curls`, or ``None`` when absent.
+
+    Used only to reset :class:`FingerSignalFilter` on source transitions
+    so the filter's NaN-holding EMA cannot freeze XRHand curls across a
+    controller-only segment (which would strand dispatch on the XRHand
+    path and ignore trigger/grip forever).
+    """
+    right_hand_source: Optional[str] = None
+    """Same as ``left_hand_source`` for the right side."""
 
 
 @dataclass
@@ -228,6 +248,9 @@ class Retargeter:
             self._filt_left = None
             self._filt_right = None
 
+        self._prev_left_hand_src: Any = _PREV_HAND_SRC_UNSET
+        self._prev_right_hand_src: Any = _PREV_HAND_SRC_UNSET
+
         self._hand_input_mode = hand_input_mode
         self._apply_curl_comp = bool(apply_curl_compensation)
         self._apply_oppose_comp = bool(apply_oppose_compensation)
@@ -253,6 +276,8 @@ class Retargeter:
             self._filt_left.reset()
         if self._filt_right is not None:
             self._filt_right.reset()
+        self._prev_left_hand_src = _PREV_HAND_SRC_UNSET
+        self._prev_right_hand_src = _PREV_HAND_SRC_UNSET
 
     @property
     def calibration(self) -> OperatorCalibration:
@@ -267,8 +292,27 @@ class Retargeter:
         lines ~778-872. The blocking parity test verifies that this
         produces bit-equivalent outputs to the recorder.
         """
-        # Apply the per-side finger filter on top of the raw inputs.
+        # When the WebXR client flips ``hands.*.source`` between
+        # ``"hand"`` and ``"controller"`` (operator toggles hand-tracking
+        # vs controllers-only), clear the per-side finger filter. Without
+        # this, ``FingerSignalFilter``'s NaN-tolerant EMA keeps outputting
+        # the last finite XRHand curls while raw ``curls`` are ``None``,
+        # so ``l_curls is not None`` stays true and trigger/grip never
+        # reaches ``grasp_command_from_ratio`` again.
         if self._filt_left is not None and self._filt_right is not None:
+            if (
+                self._prev_left_hand_src is not _PREV_HAND_SRC_UNSET
+                and inp.left_hand_source != self._prev_left_hand_src
+            ):
+                self._filt_left.reset()
+            if (
+                self._prev_right_hand_src is not _PREV_HAND_SRC_UNSET
+                and inp.right_hand_source != self._prev_right_hand_src
+            ):
+                self._filt_right.reset()
+            self._prev_left_hand_src = inp.left_hand_source
+            self._prev_right_hand_src = inp.right_hand_source
+
             l_curls, l_oppose, l_tip = self._filt_left.update(
                 inp.left_curls, inp.left_thumb_oppose, inp.left_finger_tip_oppose,
             )

@@ -608,6 +608,124 @@ class Quest3Reader:
                               f"Pose from gripSpace, finger curls from XRHand.")
                     else:
                         print(f"[Quest3Reader]   Controllers detected — buttons and joysticks active.")
+            elif event == "visibility":
+                # XRSession visibility flip ("hidden" / "visible" /
+                # "visible-blurred"). When this goes "hidden" the
+                # compositor stops calling onXRFrame entirely, so
+                # the operator perceives "controllers stopped
+                # responding" even though the manager loop is fine.
+                state = data.get("state", "?")
+                prev = data.get("prev")
+                if prev is not None:
+                    print(f"[Quest3Reader] XR visibility: {prev} -> {state}")
+                else:
+                    print(f"[Quest3Reader] XR visibility: {state}")
+                if state != "visible":
+                    print(
+                        f"[Quest3Reader]   WARNING: XR frames will pause "
+                        f"while visibility != 'visible'. Operator likely "
+                        f"removed the headset, opened the system menu, "
+                        f"or stepped outside Guardian."
+                    )
+            elif event == "frame_stall":
+                # WebXR rAF gap exceeded the browser-side threshold
+                # (default 250ms). Indicates the compositor paused
+                # frame delivery -- a much more reliable signal than
+                # waiting for `[Quest3Reader] msgs` fps to dip,
+                # because msgs/fps is averaged over 100-msg windows.
+                gap = data.get("gap_ms", "?")
+                vis = data.get("vis", "?")
+                print(
+                    f"[Quest3Reader] WARN: WebXR frame stall {gap}ms "
+                    f"(visibility={vis})"
+                )
+            elif event == "heartbeat":
+                # 2s pulse from the browser. Useful even when idle:
+                # confirms the headset/browser is alive AND tells
+                # us how many button rising edges happened in the
+                # last 2s. The latter is the diagnostic that
+                # catches "operator mashed B 12 times but no mode
+                # flip happened in manager.log".
+                vis = data.get("vis", "?")
+                fps = data.get("fps", 0)
+                ncon = data.get("n_controllers", "?")
+                edges = data.get("btn_edges") or {}
+                edge_str = " ".join(
+                    f"{k}={v}" for k, v in edges.items() if v
+                )
+                if not edge_str:
+                    edge_str = "(no btn edges)"
+                left_emu = data.get("left_emulated")
+                right_emu = data.get("right_emulated")
+                emu_bits = []
+                if left_emu is True:
+                    emu_bits.append("L=IMU-only")
+                if right_emu is True:
+                    emu_bits.append("R=IMU-only")
+                emu_str = (" [" + ",".join(emu_bits) + "]") if emu_bits else ""
+                print(
+                    f"[Quest3Reader] heartbeat vis={vis} fps={fps} "
+                    f"controllers={ncon} edges=({edge_str}){emu_str}"
+                )
+                # Promote to WARN when the operator was clearly
+                # acting but the gamepad path is the only thing
+                # carrying it (no XR-level select/squeeze) AND
+                # visibility is anything other than visible. This
+                # is the smoking-gun pattern for the
+                # "mode chord doesn't fire" footgun.
+                if vis != "visible" and any(edges.values()):
+                    print(
+                        f"[Quest3Reader]   WARNING: button presses "
+                        f"recorded but XR visibility is '{vis}'. "
+                        f"The Python decoder likely never saw them."
+                    )
+            elif event == "tracking":
+                # Per-side controller tracking source flipped
+                # between camera-tracked and IMU dead-reckoning.
+                side = data.get("side", "?")
+                emu = data.get("emulated")
+                print(
+                    f"[Quest3Reader] {side} controller tracking -> "
+                    f"{'IMU-only (camera lost it)' if emu else 'camera (recovered)'}"
+                )
+            elif event == "controller_pose":
+                side = data.get("side", "?")
+                has_pose = data.get("has_pose", True)
+                if has_pose:
+                    print(
+                        f"[Quest3Reader] {side} controller pose RECOVERED "
+                        f"(gripSpace getPose() succeeding again)"
+                    )
+                else:
+                    print(
+                        f"[Quest3Reader] WARN: {side} controller pose LOST "
+                        f"(gripSpace getPose() returning null -- controller "
+                        f"in operator's hand but tracking system can't see it)"
+                    )
+            elif event == "xr_button":
+                kind = data.get("kind", "?")
+                handed = data.get("handedness") or "?"
+                print(f"[Quest3Reader] XR {kind} ({handed})")
+            elif event == "xr_session_ended":
+                fc = data.get("frame_count", "?")
+                print(
+                    f"[Quest3Reader] XR session ended cleanly "
+                    f"(browser-side frame_count={fc})"
+                )
+            elif event == "page_hidden":
+                persisted = data.get("persisted", False)
+                print(
+                    f"[Quest3Reader] WARN: browser page hidden "
+                    f"(persisted={persisted}) -- the WebXR client is "
+                    f"about to disconnect."
+                )
+            elif event == "page_unload":
+                print(f"[Quest3Reader] WARN: browser unload event received.")
+            elif event == "doc_visibility":
+                state = data.get("state", "?")
+                # Document-level (not XR session-level) visibility:
+                # fires when the user switches tabs in the browser.
+                print(f"[Quest3Reader] document visibility -> {state}")
             else:
                 print(f"[Quest3Reader] Status: {data}")
             return

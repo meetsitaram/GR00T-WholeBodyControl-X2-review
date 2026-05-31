@@ -37,11 +37,18 @@ synthesize_*); later ops are *transforms*.
       Take frames [s:s+n] of a source clip. Producer.
 
   synthesize_waist_ramp {axis, peak_deg, ramp_in_frames, hold_frames,
-                         ramp_out_frames, fps?}
+                         ramp_out_frames, fps?,
+                         hip_pitch_share?, hip_yaw_share?,
+                         ankle_pitch_share?, ankle_roll_share?}
       Build from DEFAULT_STAND_POSE: ramp the waist axis (pitch/yaw/roll)
       from 0 -> peak over ramp_in, hold for hold_frames, ramp back to 0
       over ramp_out. Root quat = identity, root XY = 0, Z = DEFAULT_PELVIS_Z.
-      Producer.
+      Optional counter-balance shares co-actuate the hips / ankles in
+      proportion to the waist track so the synthesized pose stays closer
+      to the natural human "lean" / "twist" pattern (defaults 0.0 keep
+      the pure-waist behavior). |peak_deg| is HARD-CAPPED per axis
+      (pitch 20, roll 10, yaw 40) -- a buggy recipe asking for an
+      unstable angle fails at build time. Producer.
 
   synthesize_crouch_ramp {peak_drop_m, ramp_in_frames, hold_frames,
                           ramp_out_frames, fps?}
@@ -134,15 +141,21 @@ from .constants import (
     DEFAULT_STAND_POSE_NP,
     HEAD_INDICES,
     LEFT_ANKLE_PITCH_IDX,
+    LEFT_ANKLE_ROLL_IDX,
     LEFT_ARM_INDICES,
     LEFT_HIP_PITCH_IDX,
+    LEFT_HIP_ROLL_IDX,
+    LEFT_HIP_YAW_IDX,
     LEFT_KNEE_IDX,
     LEFT_LEG_INDICES,
     LEG_INDICES,
     NUM_BODY_DOFS,
     RIGHT_ANKLE_PITCH_IDX,
+    RIGHT_ANKLE_ROLL_IDX,
     RIGHT_ARM_INDICES,
     RIGHT_HIP_PITCH_IDX,
+    RIGHT_HIP_ROLL_IDX,
+    RIGHT_HIP_YAW_IDX,
     RIGHT_KNEE_IDX,
     RIGHT_LEG_INDICES,
     WAIST_INDICES,
@@ -303,15 +316,217 @@ def op_clip_window(
     )
 
 
+# Hard safety caps on the synthesized waist ramp peak. The op REFUSES to
+# build a primitive that exceeds these -- a buggy recipe should fail at
+# build time, not mid-deploy. Values are based on the SONIC tracking
+# envelope around DEFAULT_STAND_POSE:
+#   pitch (lean_fwd / lean_back): foot half-length is ~12 cm; 20 deg total
+#     torso pitch puts the wrist + payload CG at the front of the support
+#     polygon. Anything larger needs a stepping recovery, which static
+#     bins can't provide.
+#   roll  (lean_left / lean_right): foot half-WIDTH is only ~5 cm, so the
+#     CG margin is tighter. 10 deg waist roll is right at the edge of the
+#     standing support polygon.
+#   yaw   (torso_left / torso_right): hip yaw is unloaded; 40 deg covers
+#     the useful reach envelope without the SONIC policy losing tracking.
+#
+# Bumping these requires a deploy-side validation pass (record SONIC
+# pelvis / foot trajectories at the new cap and confirm no fall).
+_WAIST_RAMP_CAP_DEG: dict[str, float] = {
+    "pitch": 20.0,
+    "roll": 10.0,
+    "yaw": 40.0,
+}
+
+# Maximum |share| for any of the counter-balance share parameters. Above
+# this the leg / ankle deltas exceed the natural human "deadlift hinge"
+# proportion (hip flex up to ~1.5x waist pitch) and start to look OOD to
+# the SONIC policy.
+_MAX_SHARE_MAGNITUDE: float = 1.5
+
+
+def _validate_share_magnitudes(
+    *,
+    hip_pitch_share: float,
+    hip_yaw_share: float,
+    ankle_pitch_share: float,
+    ankle_roll_share: float,
+    src_label: str,
+) -> None:
+    """Common share-magnitude check used by build-time op + runtime helper."""
+    for name, val in (
+        ("hip_pitch_share", hip_pitch_share),
+        ("hip_yaw_share", hip_yaw_share),
+        ("ankle_pitch_share", ankle_pitch_share),
+        ("ankle_roll_share", ankle_roll_share),
+    ):
+        if abs(val) > _MAX_SHARE_MAGNITUDE:
+            raise ValueError(
+                f"{src_label}: |{name}|={abs(val):.2f} exceeds "
+                f"{_MAX_SHARE_MAGNITUDE} (would over-actuate the leg / "
+                f"ankle joints relative to the waist track)."
+            )
+
+
+def make_waist_pose_frame(
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+    yaw_deg: float = 0.0,
+    *,
+    hip_pitch_share: float = 0.0,
+    hip_yaw_share: float = 0.0,
+    ankle_pitch_share: float = 0.0,
+    ankle_roll_share: float = 0.0,
+    clamp: bool = True,
+) -> np.ndarray:
+    """Build one 31-DOF frame layered on DEFAULT_STAND_POSE.
+
+    Composes pitch + roll + yaw simultaneously (the build-time
+    ``op_synthesize_waist_ramp`` drives one axis at a time; this helper
+    stacks all three so the runtime planner can drive a continuous
+    "lean + twist + sway" target from VR sticks).
+
+    Args:
+        pitch_deg / roll_deg / yaw_deg: signed angles in degrees.
+        hip_pitch_share, hip_yaw_share, ankle_pitch_share,
+        ankle_roll_share: counter-balance shares -- same convention as
+            ``op_synthesize_waist_ramp``. Each defaults to 0.0 (pure
+            waist motion). |share| is hard-capped at ``_MAX_SHARE_MAGNITUDE``.
+        clamp: if True (default) angles outside ``_WAIST_RAMP_CAP_DEG``
+            are clamped to the cap before evaluation. The build-time op
+            instead RAISES at build time if peak_deg exceeds the cap;
+            the runtime helper clamps because the operator's stick
+            should not be able to crash the planner with a bad value.
+
+    Returns:
+        ``(NUM_BODY_DOFS,)`` float64 array, copy of DEFAULT_STAND_POSE
+        with waist + counter-balance offsets applied.
+    """
+    _validate_share_magnitudes(
+        hip_pitch_share=hip_pitch_share,
+        hip_yaw_share=hip_yaw_share,
+        ankle_pitch_share=ankle_pitch_share,
+        ankle_roll_share=ankle_roll_share,
+        src_label="make_waist_pose_frame",
+    )
+
+    if clamp:
+        cap_p = _WAIST_RAMP_CAP_DEG["pitch"]
+        cap_r = _WAIST_RAMP_CAP_DEG["roll"]
+        cap_y = _WAIST_RAMP_CAP_DEG["yaw"]
+        pitch_deg = max(-cap_p, min(cap_p, float(pitch_deg)))
+        roll_deg = max(-cap_r, min(cap_r, float(roll_deg)))
+        yaw_deg = max(-cap_y, min(cap_y, float(yaw_deg)))
+    else:
+        pitch_deg = float(pitch_deg)
+        roll_deg = float(roll_deg)
+        yaw_deg = float(yaw_deg)
+
+    pitch_rad = float(np.deg2rad(pitch_deg))
+    roll_rad = float(np.deg2rad(roll_deg))
+    yaw_rad = float(np.deg2rad(yaw_deg))
+
+    template = DEFAULT_STAND_POSE_NP.astype(np.float64)
+    out = template.copy()
+
+    # Primary waist DOFs.
+    out[WAIST_PITCH_IDX] = template[WAIST_PITCH_IDX] + pitch_rad
+    out[WAIST_ROLL_IDX] = template[WAIST_ROLL_IDX] + roll_rad
+    out[WAIST_YAW_IDX] = template[WAIST_YAW_IDX] + yaw_rad
+
+    # Counter-balance shares (same per-axis convention as the build-time
+    # op; see op_synthesize_waist_ramp docstring for the sign rationale).
+    if hip_pitch_share != 0.0 and pitch_rad != 0.0:
+        out[LEFT_HIP_PITCH_IDX] = (
+            template[LEFT_HIP_PITCH_IDX] - pitch_rad * hip_pitch_share
+        )
+        out[RIGHT_HIP_PITCH_IDX] = (
+            template[RIGHT_HIP_PITCH_IDX] - pitch_rad * hip_pitch_share
+        )
+    if ankle_pitch_share != 0.0 and pitch_rad != 0.0:
+        out[LEFT_ANKLE_PITCH_IDX] = (
+            template[LEFT_ANKLE_PITCH_IDX] - pitch_rad * ankle_pitch_share
+        )
+        out[RIGHT_ANKLE_PITCH_IDX] = (
+            template[RIGHT_ANKLE_PITCH_IDX] - pitch_rad * ankle_pitch_share
+        )
+    if hip_yaw_share != 0.0 and yaw_rad != 0.0:
+        out[LEFT_HIP_YAW_IDX] = (
+            template[LEFT_HIP_YAW_IDX] + yaw_rad * hip_yaw_share
+        )
+        out[RIGHT_HIP_YAW_IDX] = (
+            template[RIGHT_HIP_YAW_IDX] - yaw_rad * hip_yaw_share
+        )
+    if ankle_roll_share != 0.0 and roll_rad != 0.0:
+        out[LEFT_ANKLE_ROLL_IDX] = (
+            template[LEFT_ANKLE_ROLL_IDX] + roll_rad * ankle_roll_share
+        )
+        out[RIGHT_ANKLE_ROLL_IDX] = (
+            template[RIGHT_ANKLE_ROLL_IDX] - roll_rad * ankle_roll_share
+        )
+
+    return out
+
+
 def op_synthesize_waist_ramp(
     args: dict[str, Any],
     _buf: Buffer | None,
     _src: dict[str, SourceClip],
 ) -> Buffer:
+    """Synthesize a feet-planted lean / twist (parameterized by signed waist angle).
+
+    Layered on top of DEFAULT_STAND_POSE: ramps a single waist axis
+    (``pitch``/``yaw``/``roll``) from 0 to ``peak_deg`` over ``ramp_in_frames``,
+    holds for ``hold_frames``, then ramps back to 0 over ``ramp_out_frames``.
+
+    Optional counter-balance shares co-actuate the hips / ankles in
+    proportion to the waist track to keep the synthesized pose closer to
+    the natural human "lean" / "twist" the SONIC policy was trained
+    against. Each share defaults to 0.0 (pure waist motion -- backward
+    compatible with v1 torso_* recipes).
+
+    Args:
+        axis: ``pitch`` (forward/back lean), ``yaw`` (left/right twist),
+            or ``roll`` (left/right lateral lean).
+        peak_deg: signed peak angle in degrees. ABSOLUTE value is hard-
+            capped per axis (``_WAIST_RAMP_CAP_DEG``); a buggy recipe
+            asking for 30 deg roll will fail at build time.
+        ramp_in_frames / hold_frames / ramp_out_frames: trapezoid envelope
+            shape. Total >= 2 frames.
+        fps: optional override (default 50, matches OUTPUT_FPS).
+        hip_pitch_share: applied when ``axis=pitch``. Both hips flex by
+            ``share * waist_track`` (more negative hip_pitch). 0.0 = pure
+            waist motion; ~0.30 produces a natural pelvis-and-torso lean
+            (matches the v2 ``body_check_001__A474_M`` mocap reference).
+        hip_yaw_share: applied when ``axis=yaw``. LEFT hip_yaw rotates
+            ``+share * waist_track`` and RIGHT hip_yaw rotates the
+            opposite (anti-symmetric joint axis), which under L<->R
+            mirror produces the correct sign for ``torso_right_*`` --
+            see ``_POST_SWAP_NEGATE_INDICES``. 0.0 = pure waist twist;
+            ~0.30 produces a natural pelvis-shares-the-twist look.
+        ankle_pitch_share: applied when ``axis=pitch``. Both ankles
+            counter-rotate by ``-share * waist_track`` so the foot stays
+            flatter as the body pitches forward. 0.0 = no counter.
+        ankle_roll_share: applied when ``axis=roll``. LEFT and RIGHT
+            ankle_roll co-rotate (anti-symmetric joint axis, same world
+            direction) by ``share * waist_track`` so the feet stay
+            flatter as the body tips sideways. 0.0 = no counter.
+
+    Producer op (no input buffer required).
+    """
     axis = str(args["axis"]).lower()
     if axis not in {"pitch", "yaw", "roll"}:
         raise ValueError(f"synthesize_waist_ramp: axis must be pitch/yaw/roll, got {axis!r}")
-    peak_rad = float(np.deg2rad(float(args["peak_deg"])))
+    peak_deg = float(args["peak_deg"])
+    cap_deg = _WAIST_RAMP_CAP_DEG[axis]
+    if abs(peak_deg) > cap_deg + 1e-6:
+        raise ValueError(
+            f"synthesize_waist_ramp: |peak_deg|={abs(peak_deg):.2f} exceeds "
+            f"axis={axis!r} cap of {cap_deg:.1f} deg. Either lower peak_deg "
+            f"or, if you have deploy evidence the new value is trackable, "
+            f"raise _WAIST_RAMP_CAP_DEG in x2_recipes.py."
+        )
+    peak_rad = float(np.deg2rad(peak_deg))
     ramp_in = int(args.get("ramp_in_frames", 30))
     hold = int(args.get("hold_frames", 20))
     ramp_out = int(args.get("ramp_out_frames", 30))
@@ -321,6 +536,21 @@ def op_synthesize_waist_ramp(
         raise ValueError(
             "synthesize_waist_ramp: ramp_in + hold + ramp_out must be >= 2"
         )
+
+    hip_pitch_share = float(args.get("hip_pitch_share", 0.0))
+    hip_yaw_share = float(args.get("hip_yaw_share", 0.0))
+    ankle_pitch_share = float(args.get("ankle_pitch_share", 0.0))
+    ankle_roll_share = float(args.get("ankle_roll_share", 0.0))
+    # Safety: counter-shares can produce huge joint deltas for large
+    # waist peaks. 1.5 covers the natural "deadlift hinge" (hip flex up
+    # to 1.5x waist pitch) without going OOD.
+    _validate_share_magnitudes(
+        hip_pitch_share=hip_pitch_share,
+        hip_yaw_share=hip_yaw_share,
+        ankle_pitch_share=ankle_pitch_share,
+        ankle_roll_share=ankle_roll_share,
+        src_label="synthesize_waist_ramp",
+    )
 
     axis_idx = {
         "pitch": WAIST_PITCH_IDX,
@@ -340,20 +570,77 @@ def op_synthesize_waist_ramp(
         )
 
     dof = np.broadcast_to(_stand_pose_64(), (total, NUM_BODY_DOFS)).copy()
-    dof[:, axis_idx] = (
-        DEFAULT_STAND_POSE_NP[axis_idx].astype(np.float64) + waist_track
-    )
+    template = DEFAULT_STAND_POSE_NP.astype(np.float64)
+    dof[:, axis_idx] = template[axis_idx] + waist_track
+
+    # Counter-balance application (axis-specific). All shares default to
+    # 0.0, so existing torso_* recipes (which never set them) build the
+    # exact same pure-waist pose as before.
+    #
+    # Same sign conventions as the runtime ``make_waist_pose_frame`` --
+    # the regression test ``test_make_waist_pose_frame_matches_op_*``
+    # asserts the two paths agree up to float tolerance.
+    if axis == "pitch":
+        if hip_pitch_share != 0.0:
+            # Hip pitch baseline is NEGATIVE (-0.312 rad = forward flex).
+            # Forward waist pitch (peak_deg > 0) -> add MORE flex
+            # (subtract from the negative baseline). Backward lean
+            # (peak_deg < 0) -> subtract less (extend), same formula.
+            dof[:, LEFT_HIP_PITCH_IDX] = (
+                template[LEFT_HIP_PITCH_IDX] - waist_track * hip_pitch_share
+            )
+            dof[:, RIGHT_HIP_PITCH_IDX] = (
+                template[RIGHT_HIP_PITCH_IDX] - waist_track * hip_pitch_share
+            )
+        if ankle_pitch_share != 0.0:
+            # Ankle pitch baseline is NEGATIVE (-0.363 rad). Counter-
+            # rotate so the foot stays flatter as the body tips.
+            dof[:, LEFT_ANKLE_PITCH_IDX] = (
+                template[LEFT_ANKLE_PITCH_IDX] - waist_track * ankle_pitch_share
+            )
+            dof[:, RIGHT_ANKLE_PITCH_IDX] = (
+                template[RIGHT_ANKLE_PITCH_IDX] - waist_track * ankle_pitch_share
+            )
+    elif axis == "yaw":
+        if hip_yaw_share != 0.0:
+            # See make_waist_pose_frame docstring for the sign rationale
+            # on anti-symmetric joints.
+            dof[:, LEFT_HIP_YAW_IDX] = (
+                template[LEFT_HIP_YAW_IDX] + waist_track * hip_yaw_share
+            )
+            dof[:, RIGHT_HIP_YAW_IDX] = (
+                template[RIGHT_HIP_YAW_IDX] - waist_track * hip_yaw_share
+            )
+    elif axis == "roll":
+        if ankle_roll_share != 0.0:
+            dof[:, LEFT_ANKLE_ROLL_IDX] = (
+                template[LEFT_ANKLE_ROLL_IDX] + waist_track * ankle_roll_share
+            )
+            dof[:, RIGHT_ANKLE_ROLL_IDX] = (
+                template[RIGHT_ANKLE_ROLL_IDX] - waist_track * ankle_roll_share
+            )
 
     rot = np.broadcast_to(_identity_quat(), (total, 4)).copy()
     trans = np.zeros((total, 3), dtype=np.float64)
     trans[:, 2] = DEFAULT_PELVIS_Z_M
+
+    src_tag = f"synth:waist_{axis}_ramp(peak={peak_rad:.4f}rad"
+    if hip_pitch_share != 0.0:
+        src_tag += f",hip_pitch_share={hip_pitch_share:.2f}"
+    if hip_yaw_share != 0.0:
+        src_tag += f",hip_yaw_share={hip_yaw_share:.2f}"
+    if ankle_pitch_share != 0.0:
+        src_tag += f",ankle_pitch_share={ankle_pitch_share:.2f}"
+    if ankle_roll_share != 0.0:
+        src_tag += f",ankle_roll_share={ankle_roll_share:.2f}"
+    src_tag += ")"
 
     return Buffer(
         dof=dof,
         root_rot_xyzw=rot,
         root_trans=trans,
         fps=fps,
-        sources=[f"synth:waist_{axis}_ramp(peak={peak_rad:.4f}rad)"],
+        sources=[src_tag],
     )
 
 
@@ -1028,6 +1315,7 @@ __all__ = [
     "Recipe",
     "SourceClip",
     "load_recipes",
+    "make_waist_pose_frame",
     "run_recipe",
     # Op functions exposed for unit tests:
     "op_clip_window",

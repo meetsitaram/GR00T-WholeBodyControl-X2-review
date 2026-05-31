@@ -14,6 +14,9 @@
 #
 # Usage:
 #   gear_sonic/scripts/run_planner_smoke.sh [--demo PATH.yaml] [--duration N]
+#                                           [--planner {heuristic,kplanner}]
+#                                           [--kplanner-{vqvae,pose,root}-ckpt PATH]
+#                                           [--kplanner-device {cuda,cpu}]
 #                                           [--with-deploy] [--with-debug]
 #                                           [--with-viewer] [--pub-port N]
 #                                           [--cleanup-only] [--keyboard]
@@ -26,10 +29,20 @@
 # robot spawns on the floor. Pass `--sim-profile manual` if you need
 # the legacy band-catch-from-air behaviour.
 #
+# Default --planner is `heuristic`. Pass `--planner kplanner` to
+# drive the SAME YAML demos through the trained neural daemon ->
+# deploy bridge -> SONIC policy chain (with NO Quest3 manager in the
+# loop). This is the canonical isolation test for "is the bug in
+# the kplanner -> sonic link or in the Quest3 -> planner link?".
+#
 # Examples:
 #   # Scripted demo end-to-end with SONIC physics + MuJoCo viewer:
 #   ./run_planner_smoke.sh --demo gear_sonic/data/scripted_demos/forward_back_turn.yaml \
 #                          --with-deploy --duration 30
+#
+#   # SAME demo but driven through the NEURAL planner (isolation test):
+#   ./run_planner_smoke.sh --demo gear_sonic/data/scripted_demos/forward_back_turn.yaml \
+#                          --with-deploy --duration 30 --planner kplanner
 #
 #   # Keyboard teleop with SONIC physics + MuJoCo viewer (W/A/S/D/Q/E/...):
 #   ./run_planner_smoke.sh --with-deploy --keyboard --duration 120
@@ -77,6 +90,8 @@ if [[ ! -x "${PYTHON}" ]]; then
 fi
 
 PID_FILE="/tmp/x2_heuristic_planner.pid"
+# Resolved after --planner parsing below.
+PID_FILE_KPLANNER="/tmp/x2_kplanner.pid"
 LOG_DIR="${REPO_ROOT}/data/sim_to_real_anchors/planner_smoke"
 
 # --------------------------------------------------------------------------
@@ -92,6 +107,31 @@ WITH_VIEWER=0
 KEYBOARD=0
 CLEANUP_ONLY=0
 SIM_VIEWER=1            # opens MuJoCo window when --with-deploy is set
+# Planner backend selector. ``heuristic`` is the historical default and
+# the one the YAML demos under gear_sonic/data/scripted_demos/ were
+# authored for; ``kplanner`` swaps in the neural daemon so we can pipe
+# a YAML demo straight through the trained models -> deploy bridge ->
+# SONIC policy chain, bypassing Quest3 entirely. The intent / magnitude
+# vocabulary in the YAMLs is identical (the kplanner routes them through
+# the same _BASE_VELOCITY / _WALK_VELOCITY_BY_MAGNITUDE tables) so the
+# scripted demos under gear_sonic/data/scripted_demos/ work for both.
+PLANNER_KIND="heuristic"
+# kplanner-specific paths. Defaults mirror the production wrapper
+# (``run_x2_quest3_planner_stack.sh``); override with the env vars below
+# or the matching CLI flag if you want to validate an alternate ckpt.
+KPL_VQVAE_CKPT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt"
+KPL_POSE_CKPT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt"
+KPL_ROOT_CKPT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt"
+KPL_VQVAE_CKPT="${KPLANNER_VQVAE_CKPT:-}"
+KPL_POSE_CKPT="${KPLANNER_POSE_CKPT:-}"
+KPL_ROOT_CKPT="${KPLANNER_ROOT_CKPT:-}"
+KPL_DEVICE="${KPLANNER_DEVICE:-cuda}"
+KPL_REPLAN_THRESHOLD="${KPLANNER_REPLAN_THRESHOLD_FRAMES:-16}"
+# Kplanner RSI anchor PKL (separate from the heuristic primitive PKL).
+# Auto-baked on first use against the warmup qpos that the kplanner
+# daemon will emit on tick 0, so the bridge RSI = planner wire content
+# at boot -> no tracker-error fight on first frame.
+KPL_SIM_RSI_PKL="${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_kplanner_rsi_anchor.pkl"
 # Default to PARITY profile (RSI from a stand-pose PKL, elastic band
 # OFF, ramp 0, autostart 0) so the planner-driven sim mirrors
 # `deploy_x2.sh sim --motion <pkl>` exactly: robot spawns ON THE FLOOR
@@ -144,10 +184,42 @@ while [[ $# -gt 0 ]]; do
         --sim-cam-elevation) SIM_CAM_ELEVATION="$2"; shift 2 ;;
         --sim-cam-azimuth) SIM_CAM_AZIMUTH="$2"; shift 2 ;;
         --no-sim-cam-track) SIM_CAM_TRACK_BODY=""; shift ;;
+        --planner) PLANNER_KIND="$2"; shift 2 ;;
+        --kplanner-vqvae-ckpt) KPL_VQVAE_CKPT="$2"; shift 2 ;;
+        --kplanner-pose-ckpt) KPL_POSE_CKPT="$2"; shift 2 ;;
+        --kplanner-root-ckpt) KPL_ROOT_CKPT="$2"; shift 2 ;;
+        --kplanner-device) KPL_DEVICE="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
 done
+
+case "${PLANNER_KIND}" in
+    heuristic|kplanner) ;;
+    *)
+        echo "--planner must be 'heuristic' or 'kplanner' (got: ${PLANNER_KIND})" >&2
+        exit 2
+        ;;
+esac
+
+# Apply ckpt defaults only for kplanner mode (heuristic mode ignores
+# these and the defaults reference cloud-trained PKLs that the user may
+# not always have on disk).
+if [[ "${PLANNER_KIND}" == "kplanner" ]]; then
+    KPL_VQVAE_CKPT="${KPL_VQVAE_CKPT:-${KPL_VQVAE_CKPT_DEFAULT}}"
+    KPL_POSE_CKPT="${KPL_POSE_CKPT:-${KPL_POSE_CKPT_DEFAULT}}"
+    KPL_ROOT_CKPT="${KPL_ROOT_CKPT:-${KPL_ROOT_CKPT_DEFAULT}}"
+    # Route SIM_RSI_PKL through the kplanner anchor since the bridge
+    # RSI must match the kplanner's first emitted frame, not the
+    # heuristic's curated stand pose. ``--sim-rsi-pkl`` overrides
+    # both flavours when the user wants a custom RSI.
+    if [[ "${SIM_RSI_PKL}" == "${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_planner_rsi_anchor.pkl" ]]; then
+        SIM_RSI_PKL="${KPL_SIM_RSI_PKL}"
+    fi
+    # Use the kplanner-specific PID file so a stale heuristic PID file
+    # doesn't false-positive the readiness check, and vice versa.
+    PID_FILE="${PID_FILE_KPLANNER}"
+fi
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -300,14 +372,28 @@ fi
 # Pre-flight
 # --------------------------------------------------------------------------
 
-if [[ ! -f "${PRIMITIVES_PKL}" ]]; then
-    err "primitives PKL not found: ${PRIMITIVES_PKL}"
-    err "run: ${PYTHON} -m gear_sonic.scripts.curate_x2_primitives"
-    exit 1
-fi
-if [[ ! -f "${BINS_YAML}" ]]; then
-    err "bins YAML not found: ${BINS_YAML}"
-    exit 1
+if [[ "${PLANNER_KIND}" == "heuristic" ]]; then
+    if [[ ! -f "${PRIMITIVES_PKL}" ]]; then
+        err "primitives PKL not found: ${PRIMITIVES_PKL}"
+        err "run: ${PYTHON} -m gear_sonic.scripts.curate_x2_primitives"
+        exit 1
+    fi
+    if [[ ! -f "${BINS_YAML}" ]]; then
+        err "bins YAML not found: ${BINS_YAML}"
+        exit 1
+    fi
+else
+    # kplanner mode: validate ckpts are reachable before spending time
+    # on the deploy bring-up. The neural daemon will refuse to start
+    # otherwise (with a less actionable error).
+    for ck in "${KPL_VQVAE_CKPT}" "${KPL_POSE_CKPT}" "${KPL_ROOT_CKPT}"; do
+        if [[ ! -f "${ck}" ]]; then
+            err "kplanner ckpt not found: ${ck}"
+            err "override with --kplanner-{vqvae,pose,root}-ckpt PATH or env"
+            err "  KPLANNER_VQVAE_CKPT / KPLANNER_POSE_CKPT / KPLANNER_ROOT_CKPT"
+            exit 1
+        fi
+    done
 fi
 if port_in_use "${PUB_PORT}"; then
     err "publish port ${PUB_PORT} is in use; run: $0 --cleanup-only"
@@ -362,20 +448,36 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
     # mode (the C++ deploy ignores --motion under --vla but the bridge
     # uses MOTION_SOURCE for RSI). Auto-bake the canonical anchor PKL
     # if it's missing so a fresh checkout (or one where primitives were
-    # rebuilt) just works.
+    # rebuilt) just works. The bake target differs by planner kind:
+    # heuristic -> idle_stand[0] from the curated primitives PKL,
+    # kplanner -> the warmup qpos the neural daemon emits on tick 0.
     if [[ "${SIM_PROFILE}" == "parity" ]]; then
-        if [[ ! -f "${SIM_RSI_PKL}" ]]; then
-            log "RSI anchor PKL not found at ${SIM_RSI_PKL}; baking now..."
-            if ! "${PYTHON}" -m gear_sonic.scripts.bake_planner_rsi_anchor \
-                    --primitives-pkl "${PRIMITIVES_PKL}" \
-                    --bins-yaml "${BINS_YAML}" \
+        if [[ "${PLANNER_KIND}" == "heuristic" ]]; then
+            if [[ ! -f "${SIM_RSI_PKL}" ]]; then
+                log "RSI anchor PKL not found at ${SIM_RSI_PKL}; baking now..."
+                if ! "${PYTHON}" -m gear_sonic.scripts.bake_planner_rsi_anchor \
+                        --primitives-pkl "${PRIMITIVES_PKL}" \
+                        --bins-yaml "${BINS_YAML}" \
+                        --out "${SIM_RSI_PKL}" \
+                        >>"${LOG_DIR}/rsi_anchor_bake.log" 2>&1; then
+                    err "failed to bake RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
+                    exit 1
+                fi
+            fi
+        else
+            # Always re-bake the kplanner anchor (it's <300 ms and
+            # depends only on the daemon's warmup qpos source). Mirrors
+            # run_x2_quest3_planner_stack.sh's behaviour so changes to
+            # the warmup qpos take effect without a manual rebuild.
+            log "baking kplanner RSI anchor PKL -> ${SIM_RSI_PKL}"
+            if ! "${PYTHON}" -m gear_sonic.scripts.bake_kplanner_rsi_anchor \
                     --out "${SIM_RSI_PKL}" \
                     >>"${LOG_DIR}/rsi_anchor_bake.log" 2>&1; then
-                err "failed to bake RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
+                err "failed to bake kplanner RSI anchor; see ${LOG_DIR}/rsi_anchor_bake.log"
                 exit 1
             fi
         fi
-        log "parity RSI source: ${SIM_RSI_PKL}"
+        log "parity RSI source: ${SIM_RSI_PKL}  (planner=${PLANNER_KIND})"
     fi
     # Deploy runs for the full duration plus a small headroom so it
     # doesn't terminate mid-clip if the planner takes a moment to come
@@ -392,6 +494,17 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
         --model "${SIM_MODEL}"
         --autostart-after 0
         --max-duration "${DEPLOY_DURATION_S}"
+        # Disable the C++ deploy's pose-ref starvation watchdog. In the
+        # smoke flow the planner takes ~3 s to load + warmup before it
+        # streams the first pose frame, which is longer than the C++
+        # binary's 0.5 s SAFE_IDLE trip. Once tripped, exit requires an
+        # operator resume chord on tcp://localhost:5566 -- which nobody
+        # publishes here (no Quest3 manager). The deploy then holds
+        # default_angles with 4x kd, the spawn-pose <-> default_angles
+        # delta tips the robot, and the kplanner+sonic combo gets blamed.
+        # Same fix the production wrapper (run_x2_quest3_planner_stack.sh)
+        # applies in local-sim mode via ``POSE_REF_WATCHDOG=auto -> off``.
+        --deploy-extra-arg --disable-pose-ref-watchdog
     )
     if [[ "${SIM_PROFILE}" == "parity" ]]; then
         DEPLOY_ARGS+=(--motion "${SIM_RSI_PKL}")
@@ -430,24 +543,50 @@ fi
 # --------------------------------------------------------------------------
 
 PLANNER_LOG="${LOG_DIR}/planner_$(date +%Y%m%d_%H%M%S).log"
-log "spawning planner -> ${PLANNER_LOG}"
-PLANNER_ARGS=(
-    -m gear_sonic.scripts.x2_heuristic_planner
-    --primitives "${PRIMITIVES_PKL}"
-    --bins "${BINS_YAML}"
-    --pub-host "127.0.0.1"
-    --pub-port "${PUB_PORT}"
-    --pid-file "${PID_FILE}"
-    --duration-s "${DURATION_S}"
-)
+log "spawning planner (kind=${PLANNER_KIND}) -> ${PLANNER_LOG}"
+if [[ "${PLANNER_KIND}" == "heuristic" ]]; then
+    PLANNER_ARGS=(
+        -m gear_sonic.scripts.x2_heuristic_planner
+        --primitives "${PRIMITIVES_PKL}"
+        --bins "${BINS_YAML}"
+        --pub-host "127.0.0.1"
+        --pub-port "${PUB_PORT}"
+        --pid-file "${PID_FILE}"
+        --duration-s "${DURATION_S}"
+    )
+else
+    # kplanner publishes directly on the deploy's pose topic at PUB_PORT
+    # (no --body-pose-port -> no recorder-merge mode), so the scripted
+    # YAML drives the deploy bridge in isolation from the Quest3 stack.
+    PLANNER_ARGS=(
+        -m gear_sonic.scripts.x2_kplanner
+        --pub-host "127.0.0.1"
+        --pub-port "${PUB_PORT}"
+        --vqvae-ckpt "${KPL_VQVAE_CKPT}"
+        --pose-ckpt "${KPL_POSE_CKPT}"
+        --root-ckpt "${KPL_ROOT_CKPT}"
+        --device "${KPL_DEVICE}"
+        --replan-threshold-frames "${KPL_REPLAN_THRESHOLD}"
+        --pid-file "${PID_FILE}"
+        --duration-s "${DURATION_S}"
+    )
+fi
 [[ -n "${DEMO}" ]] && PLANNER_ARGS+=(--demo "${DEMO}")
 [[ "${KEYBOARD}" -eq 1 ]] && PLANNER_ARGS+=(--keyboard)
 
 cd "${REPO_ROOT}"
+# Inject the motionbricks editable install onto PYTHONPATH so the
+# neural daemon (which imports motionbricks.motion_backbone.*) resolves
+# regardless of whether the interpreter has run ``pip install -e
+# motionbricks/``. Idempotent on .venv runs because the editable
+# install masks the path entry. Mirrors run_x2_quest3_planner_stack.sh.
+PLANNER_ENV_PYTHONPATH="${REPO_ROOT}/motionbricks:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 if [[ "${KEYBOARD}" -eq 1 ]]; then
-    "${PYTHON}" "${PLANNER_ARGS[@]}" 2>&1 | tee "${PLANNER_LOG}" &
+    PYTHONPATH="${PLANNER_ENV_PYTHONPATH}" \
+        "${PYTHON}" "${PLANNER_ARGS[@]}" 2>&1 | tee "${PLANNER_LOG}" &
 else
-    "${PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
+    PYTHONPATH="${PLANNER_ENV_PYTHONPATH}" \
+        "${PYTHON}" "${PLANNER_ARGS[@]}" >"${PLANNER_LOG}" 2>&1 &
 fi
 PLANNER_PID=$!
 CHILD_PIDS+=("${PLANNER_PID}")

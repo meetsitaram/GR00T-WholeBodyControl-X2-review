@@ -1316,24 +1316,35 @@ cognitive load.
 | [`gear_sonic_deploy/deploy_x2.sh`](../../../gear_sonic_deploy/deploy_x2.sh) | `--wrist-bypass` passthrough plumbing. |
 | [`gear_sonic/scripts/record_x2_dataset.sh`](../../../gear_sonic/scripts/record_x2_dataset.sh) | Default `--wrist-bypass ik` for VLA dataset recording; suppressed automatically under `--no-vla` (would be a no-op). |
 
-### Hand retargeting journey log (v0 → v0.4)
+### Hand retargeting journey log (v0 → v0.7)
 
 The next several subsections (`OmniHand vs human hand` through
 `Open: non-thumb fingertip-to-thumb touch`) describe the chain of
 problems we hit moving the OmniHand mapping from "vendored upstream
 constants + uniform trigger" to "per-finger XRHand retargeting
-that survives a thumb-fingertip touch gesture". Each subsection
-follows the same template — what the operator saw, what the data
-showed, what we changed, and what's still imperfect — so the log
-doubles as a debugging crib sheet for future hand work.
+that survives a thumb-fingertip touch gesture, works inside a
+robocasa kitchen scene, and stays proportional in hand-tracking
+mode". Each subsection follows the same template — what the
+operator saw, what the data showed, what we changed, and what's
+still imperfect — so the log doubles as a debugging crib sheet
+for future hand work.
 
 The relevant code is in
 [`gear_sonic/utils/teleop/x2_hand_retarget.py`](../../../gear_sonic/utils/teleop/x2_hand_retarget.py)
 on the Python side and in
 [`gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html`](../../../gear_sonic/utils/teleop/vr/quest3_webxr_app/index.html)
 (`computeHandCurls` / `computeThumbOpposition`) on the WebXR side.
-A self-contained session wrap-up of the May 10 iteration lives at
-[`milestones/2026-05-10_omnihand_finger_tuning.md`](../user_guide/milestones/2026-05-10_omnihand_finger_tuning.md).
+Self-contained session wrap-ups of the major iterations live at:
+
+* [`milestones/2026-05-10_omnihand_finger_tuning.md`](../user_guide/milestones/2026-05-10_omnihand_finger_tuning.md)
+  — May 10 thumb opposition / anchor expansion / `thumb_mcp` join.
+* [`milestones/2026-05-12_finger_signal_filter.md`](../user_guide/milestones/2026-05-12_finger_signal_filter.md)
+  — May 12 EMA + deadband-hold signal smoothing.
+* [`milestones/2026-05-13_robocasa_finger_fixes.md`](../user_guide/milestones/2026-05-13_robocasa_finger_fixes.md)
+  — May 13 robocasa unblock: pre-OmniHand wrist mesh disable,
+  hand-source filter reset on mode switches, smooth-proportional
+  compensation defaults (kills the "fingers are bang-bang in
+  hand-tracking mode" report), and natural resting thumb pose.
 
 ### OmniHand has fewer flexion DOFs than the human hand
 
@@ -1379,22 +1390,34 @@ this section.
 Joint hardware ranges (per
 [`gear_sonic/data/assets/robot_description/omnihand/omnihand_*.urdf`](../../../gear_sonic/data/assets/robot_description/omnihand/), live in `HAND_FINGER_NAMES_PER_SIDE` order):
 
-| # | Active joint    | Range (°)            | OPEN (°) | CLOSED (°)        |
-|--:|-----------------|----------------------|---------:|------------------:|
-| 1 | `thumb_roll`    | (-50, +10) L / (-10, +50) R | 0   | -40 L / +40 R |
-| 2 | `thumb_abad`    | (0, +100) L / (-100, 0) R   | ±10 | +80 L / -80 R |
-| 3 | `thumb_mcp`     | (-49, 0) L / (0, +49) R     | ∓5  | -40 L / +40 R |
-| 4 | `index_abad`    | (0, +12) L / (-12, 0) R     | 0   | ±6 |
-| 5 | `index_pip`     | (0, +90)             | 5    | 80                |
-| 6 | `middle_pip`    | (0, +90)             | 5    | 80                |
-| 7 | `ring_abad`     | (-10, 0) L / (0, +10) R     | 0   | ∓5 |
-| 8 | `ring_pip`      | (0, +90)             | 5    | 80                |
-| 9 | `pinky_abad`    | (-10, 0) L / (0, +10) R     | 0   | ∓5 |
-| 10| `pinky_pip`     | (0, +90)             | 5    | 80                |
+| # | Active joint    | Range (°)            | OPEN (°)        | CLOSED (°)        |
+|--:|-----------------|----------------------|----------------:|------------------:|
+| 1 | `thumb_roll`    | (-50, +10) L / (-10, +50) R | **−12 L / +12 R** | -40 L / +40 R |
+| 2 | `thumb_abad`    | (0, +100) L / (-100, 0) R   | **+35 L / −35 R** | +80 L / -80 R |
+| 3 | `thumb_mcp`     | (-49, 0) L / (0, +49) R     | ∓5             | -40 L / +40 R |
+| 4 | `index_abad`    | (0, +12) L / (-12, 0) R     | 0              | ±6 |
+| 5 | `index_pip`     | (0, +90)             | 5               | 88                |
+| 6 | `middle_pip`    | (0, +90)             | 5               | 88                |
+| 7 | `ring_abad`     | (-10, 0) L / (0, +10) R     | 0              | ∓5 |
+| 8 | `ring_pip`      | (0, +90)             | 5               | 88                |
+| 9 | `pinky_abad`    | (-10, 0) L / (0, +10) R     | 0              | ∓5 |
+| 10| `pinky_pip`     | (0, +90)             | 5               | 88                |
 
-Where the CLOSED column has two values, left vs right is mirrored
-because the abad ranges are physically mirrored across the body
-midline. Where it has a single value, both sides are identical.
+Where the OPEN / CLOSED columns have two values, left vs right is
+mirrored because the abad / roll ranges are physically mirrored
+across the body midline. Where there's a single value, both sides
+are identical.
+
+Notes on the bolded `thumb_roll` / `thumb_abad` OPEN values
+(2026-05-13): these were biased into a natural resting pose
+(thumb sits ~35° across the palm at rest, pad rolled slightly
+inward) instead of the previous near-perpendicular `0° / ±10°`.
+CLOSED anchors did not move, so hardware hardstop headroom is
+unchanged. See
+[2026-05-13 robocasa finger-fix milestone](../user_guide/milestones/2026-05-13_robocasa_finger_fixes.md)
+§4 for the rationale and trade-off (visible-motion span shrinks
+slightly; iterate visually in the MuJoCo viewer if these need
+further tuning).
 
 ### Thumb opposition: fingertip-proximity signal + anchor expansion
 
@@ -2061,6 +2084,7 @@ matching robot fingers should curl in within ~50 ms.
 | Middle finger spins through the palm collision shell | Vestigial `middle_abad` hinge in the upstream OmniHand URDF was free-floating + unranged. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §1. | Should be fixed for you by the equality lock in `compose_x2_with_omnihand.py::LOCKED_PASSIVE_JOINTS`. If a future OmniHand revision adds a similar joint, append it to that tuple. |
 | Fingers jitter / wiggle constantly even with no operator input (`--sim-omnihand` mode) | Tiny URDF link inertias + soft mimic equality solver inject constraint forces with no joint damping to absorb. See [§8 OmniHand sim stability](#omnihand-sim-stability-armature--damping--locked-passives) §2. | Verify `_FINGER_ARMATURE` and `_FINGER_DAMPING` are non-zero in `compose_x2_with_omnihand.py`. The `mj_forward`-only kinematic renderer hides this — only `mj_step` paths (the SONIC bridge) expose it. |
 | `--sim-omnihand` runs but fingers never move with operator input | `pyzmq` missing in the bridge container; the OmniHand ZMQ SUB silently failed to bind. | `cd gear_sonic_deploy/docker_x2 && docker compose build` to bake the dependency in permanently. The bridge has a runtime `pip3 install pyzmq` fallback that should auto-recover; check the log for `[bridge] OmniHand ZMQ subscriber: pyzmq not present …` lines. |
+| Fingers refuse to close in `--robocasa-env` scenes but curl fine in bare sim (`--robocasa-env none`) | The X2's vestigial pre-OmniHand `wrist_roll_link` collision mesh — the legacy "closed fist" primitive shipped with the bare X2 model — physically blocks the OmniHand fingers from contacting anything inside the composed scene MJCF. The bare-sim path doesn't hit this because nothing is in reach of the fist shell; the moment a robocasa scene puts a table / cube / bowl into the workspace, the shell catches them first. | Rebuild the affected scene XML with the current `gear_sonic/scripts/build_x2_robocasa_scene_xml.py` — the `_disable_pre_omnihand_x2_fist_collision_mesh` helper zeroes `contype` / `conaffinity` on that mesh per side, and the post-compile verification asserts every OmniHand palm primitive still has collision. All three bundled scenes (`X2PickPlaceCube.xml`, `X2PickPlaceBowl.xml`, `X2PickPlaceApple.xml`) already ship with the disable. If you author a custom scene XML by hand, mirror the same flag flip on `*_wrist_roll_link` collision geoms. Full root-cause walk-through: [2026-05-13 robocasa finger-fix milestone §1](../user_guide/milestones/2026-05-13_robocasa_finger_fixes.md#1-disable-the-pre-omnihand-x2-fist-collision-mesh-in-scene-xmls). |
 
 ---
 

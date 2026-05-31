@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace agi_x2 {
@@ -51,7 +52,71 @@ bool TiltWatchdog::Update(double gravity_body_z)
 }
 
 // ---------------------------------------------------------------------------
-// ApplySafetyStack
+// PoseRefStarvationWatchdog
+// ---------------------------------------------------------------------------
+bool PoseRefStarvationWatchdog::Update(double now_s, double last_rx_monotonic_s)
+{
+  // No frame has ever arrived since the deploy connected. In the split-
+  // topology CONTROL path that's unsafe by construction -- the policy is
+  // running with the stand-pose default, but the operator wire is dark.
+  // Treat as infinitely stale.
+  if (last_rx_monotonic_s <= 0.0) {
+    latest_age_s_ = std::numeric_limits<double>::infinity();
+  } else {
+    latest_age_s_ = std::max(0.0, now_s - last_rx_monotonic_s);
+  }
+
+  if (tripped_) {
+    return false;  // already tripped; subsequent calls return false
+  }
+  if (latest_age_s_ >= stale_threshold_s_) {
+    tripped_ = true;
+    fresh_since_s_ = -1.0;
+    std::ostringstream os;
+    if (std::isinf(latest_age_s_)) {
+      os << "pose-ref starvation watchdog tripped: no frames received "
+         << "since deploy connected (threshold " << stale_threshold_s_
+         << " s)";
+    } else {
+      os << "pose-ref starvation watchdog tripped: age " << latest_age_s_
+         << " s >= threshold " << stale_threshold_s_ << " s";
+    }
+    reason_ = os.str();
+    return true;
+  }
+  return false;
+}
+
+bool PoseRefStarvationWatchdog::ReadyToResume(double now_s, double ref_age_s)
+{
+  // Update the latest_age_s_ from this call so x2_debug reflects the
+  // current age even when the deploy is in SAFE_IDLE and the per-tick
+  // Update() above isn't being called (we centralise stale checks here
+  // while in SAFE_IDLE).
+  latest_age_s_ = ref_age_s;
+  if (!tripped_) {
+    fresh_since_s_ = -1.0;  // not in starved mode; bookkeeping irrelevant
+    return false;
+  }
+  // Frames count as "fresh" while their age is comfortably under the trip
+  // threshold. We use the same threshold for both directions (no hysteresis)
+  // because the min-fresh window already enforces stability -- a flapping
+  // link can't satisfy ``min_fresh_window_s_`` seconds of continuous
+  // freshness if it keeps re-crossing the threshold.
+  const bool fresh_now = (ref_age_s < stale_threshold_s_);
+  if (!fresh_now) {
+    fresh_since_s_ = -1.0;  // freshness streak broken
+    return false;
+  }
+  if (fresh_since_s_ < 0.0) {
+    fresh_since_s_ = now_s;
+    return false;
+  }
+  return (now_s - fresh_since_s_) >= min_fresh_window_s_;
+}
+
+// ---------------------------------------------------------------------------
+// ApplySafetyStack -- full-control variant (preferred; takes per-DOF kp/kd)
 // ---------------------------------------------------------------------------
 SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
                              double current_gravity_body_z,
@@ -59,15 +124,18 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
                              TiltWatchdog& watchdog,
                              bool dry_run,
                              double now_s,
-                             double max_target_dev_rad)
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof,
+                             const std::array<double, NUM_DOFS>& kp_per_dof,
+                             const std::array<double, NUM_DOFS>& kd_per_dof)
 {
   SafeCommand cmd{};
 
-  // Default kp/kd come from the trained PD spec (codegen'd into policy
-  // parameters). Dry-run zeros these later; tilt-trip overrides them.
+  // Effective kp/kd: caller passes the already-scaled values (e.g.
+  // ``--kp-scale-ankle 1.5`` baked in upstream by BuildPdScalesPerDof).
+  // Dry-run zeros these later; tilt-trip overrides damping below.
   for (std::size_t i = 0; i < NUM_DOFS; ++i) {
-    cmd.stiffness_mj[i] = kps[i];
-    cmd.damping_mj[i]   = kds[i];
+    cmd.stiffness_mj[i] = kp_per_dof[i];
+    cmd.damping_mj[i]   = kd_per_dof[i];
   }
 
   // Tilt watchdog runs first so a freshly-tripped command goes to the safe
@@ -77,10 +145,11 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
     cmd.tilt_trip = true;
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
       cmd.target_pos_mj[i] = default_angles[i];
-      // Same kp as trained, but boost damping by 4x to gently slump back
-      // to default. The trained kd is critically damped for the "follow
-      // policy" use case; here we want to over-damp.
-      cmd.damping_mj[i] = kds[i] * 4.0;
+      // Same effective kp, but boost damping by 4x to gently slump back
+      // to default. kd_per_dof[i] already incorporates any operator kd
+      // scaling; the 4x is on top of that (the slump branch is the same
+      // factor regardless of trim).
+      cmd.damping_mj[i] = kd_per_dof[i] * 4.0;
     }
     cmd.ramp_alpha = 0.0;
     cmd.reason     = watchdog.Reason();
@@ -92,32 +161,37 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
     cmd.reason = "ok";
   }
 
-  // Optional per-joint hard clamp on |target - default|. Applied AFTER the
-  // ramp so a small max_target_dev_rad cleanly bounds the worst-case command
-  // even when the policy is fully phased in (alpha = 1). Skipped on a
-  // tilt-trip because that branch already pinned the target to default and
-  // adding a clamp on top would be a no-op. Non-positive value = disabled.
+  // Per-joint hard clamp on |target - default|, with PER-DOF thresholds.
+  // Applied AFTER the ramp so a small clamp cleanly bounds the worst-case
+  // command even when the policy is fully phased in (alpha = 1). Skipped
+  // on a tilt-trip because that branch already pinned the target to
+  // default and adding a clamp on top would be a no-op. An entry <= 0 in
+  // max_target_dev_per_dof disables the clamp on that specific joint.
   //
   // Rationale: a divergent policy (or an obs-construction bug that makes a
   // sane policy look divergent) can emit per-joint targets many radians from
-  // the standing pose. With kp ~ 100 Nm/rad on the legs, that becomes
+  // the standing pose. With kp ~ 99 Nm/rad on the legs, that becomes
   // hundreds of Nm of impulse the moment MC steps aside and the gains come
-  // back from zero. The clamp turns "policy can ask for anything" into
-  // "policy can ask for at most max_target_dev_rad away from the trained
-  // pose", which is the only safety property the C++ side can guarantee
-  // without trusting the policy.
-  if (!cmd.tilt_trip && max_target_dev_rad > 0.0) {
+  // back from zero. With kp ~ 14 Nm/rad on the arms, the same nominal
+  // deviation has 7x less torque, so arms can safely take 5x the angular
+  // travel that legs can. Per-DOF clamps let us express that ratio
+  // directly: legs/waist tight (e.g. 0.30 rad ~ 17 deg) for upright
+  // stability, arms wide (e.g. 1.50 rad ~ 86 deg) for reach-target
+  // following.
+  if (!cmd.tilt_trip) {
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+      const double clamp = max_target_dev_per_dof[i];
+      if (clamp <= 0.0) continue;
       const double delta = cmd.target_pos_mj[i] - default_angles[i];
-      const double clamped =
-          std::max(-max_target_dev_rad, std::min(max_target_dev_rad, delta));
+      const double clamped = std::max(-clamp, std::min(clamp, delta));
       cmd.target_pos_mj[i] = default_angles[i] + clamped;
     }
   }
 
   // Dry-run zeros the gains AFTER everything else, so the wiring (target
   // positions, joint name remap) is still exercised end-to-end while the
-  // motors do nothing.
+  // motors do nothing. Operator-supplied kp/kd scaling is honoured up to
+  // this point; dry-run is the unconditional kill.
   if (dry_run) {
     cmd.dry_run = true;
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
@@ -127,6 +201,48 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
   }
 
   return cmd;
+}
+
+// ---------------------------------------------------------------------------
+// ApplySafetyStack -- per-DOF clamp variant (uses trained kps/kds as-is)
+// ---------------------------------------------------------------------------
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             const std::array<double, NUM_DOFS>& max_target_dev_per_dof)
+{
+  // Forward to the full-control overload with the constexpr trained PD as
+  // the "effective" gains. Backward-compatible with callers that don't
+  // care about deployment-time PD bumps.
+  std::array<double, NUM_DOFS> kp_default{};
+  std::array<double, NUM_DOFS> kd_default{};
+  for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+    kp_default[i] = kps[i];
+    kd_default[i] = kds[i];
+  }
+  return ApplySafetyStack(policy_target_mj, current_gravity_body_z,
+                          ramp, watchdog, dry_run, now_s,
+                          max_target_dev_per_dof, kp_default, kd_default);
+}
+
+// ---------------------------------------------------------------------------
+// ApplySafetyStack -- scalar clamp variant (legacy thin wrapper)
+// ---------------------------------------------------------------------------
+SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_mj,
+                             double current_gravity_body_z,
+                             SoftStartRamp& ramp,
+                             TiltWatchdog& watchdog,
+                             bool dry_run,
+                             double now_s,
+                             double max_target_dev_rad)
+{
+  std::array<double, NUM_DOFS> per_dof{};
+  per_dof.fill(max_target_dev_rad);
+  return ApplySafetyStack(policy_target_mj, current_gravity_body_z,
+                          ramp, watchdog, dry_run, now_s, per_dof);
 }
 
 }  // namespace agi_x2

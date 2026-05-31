@@ -39,8 +39,13 @@ Keyboard (in-process mode, viewer must have focus):
     A / D           side_left/right_quarter_ft
     1 / 2 / q / Q   turn_left  15 / 30 / 45 / 90 deg
     3 / 4 / e / E   turn_right 15 / 30 / 45 / 90 deg
-    l / k / L       lean_fwd medium / small / large
+    l / k           lean_fwd medium / small (use the headless CLI for "large")
+    j / ;           lean_left_medium / lean_right_medium  (lateral, v6)
     , / .           torso_left / torso_right 30 deg
+    T               STATIC_HOLD at neutral (continuous waist debug)
+    i / o           hold pitch -2 / +2 deg
+    u / n           hold yaw   -5 / +5 deg
+    y / h           hold roll  -2 / +2 deg
     SPACE           idle (and pause / resume)
     R               reset to origin
     X / ESC         quit
@@ -99,11 +104,41 @@ def _build_glfw_keymap() -> dict[int, tuple[str, str]]:
         glfw.KEY_E: ("turn_right", "deg_45"),
         glfw.KEY_L: ("lean_fwd", "medium"),
         glfw.KEY_K: ("lean_fwd", "small"),
+        # Lateral lean (v6) -- GLFW key_callback can't see Shift here, so
+        # only the "medium" magnitude is bound. Use the headless planner
+        # CLI (gear_sonic/scripts/x2_heuristic_planner.py) for "large".
+        glfw.KEY_J: ("lean_left", "medium"),
+        glfw.KEY_SEMICOLON: ("lean_right", "medium"),
         glfw.KEY_COMMA: ("torso_left", "deg_30"),
         glfw.KEY_PERIOD: ("torso_right", "deg_30"),
         glfw.KEY_SPACE: ("idle", "default"),
     }
     return base
+
+
+# Per-keypress nudge step (degrees) for the continuous-hold debug keys.
+# Match the planner CLI defaults so the two surfaces feel identical.
+_HOLD_NUDGE_PITCH_DEG: float = 2.0
+_HOLD_NUDGE_ROLL_DEG: float = 2.0
+_HOLD_NUDGE_YAW_DEG: float = 5.0
+
+
+def _build_glfw_hold_nudge_map() -> dict[int, tuple[str, float]]:
+    """GLFW keycode -> (axis, signed_step_deg) for STATIC_HOLD nudges.
+
+    Mirrors the planner CLI's ``_HOLD_NUDGE_KEYS`` but substitutes
+    ``KEY_N`` for ``KEY_P`` because the viewer reserves ``P`` for the
+    pause toggle.
+    """
+    import glfw  # noqa: PLC0415 — viewer-only optional dep
+    return {
+        glfw.KEY_I: ("pitch", -_HOLD_NUDGE_PITCH_DEG),
+        glfw.KEY_O: ("pitch", +_HOLD_NUDGE_PITCH_DEG),
+        glfw.KEY_U: ("yaw", -_HOLD_NUDGE_YAW_DEG),
+        glfw.KEY_N: ("yaw", +_HOLD_NUDGE_YAW_DEG),
+        glfw.KEY_Y: ("roll", -_HOLD_NUDGE_ROLL_DEG),
+        glfw.KEY_H: ("roll", +_HOLD_NUDGE_ROLL_DEG),
+    }
 
 
 def _qpos_from_pose(
@@ -182,7 +217,30 @@ def run_in_process(
 
     paused = [False]
     keymap = _build_glfw_keymap() if enable_keyboard else {}
+    hold_nudge_map = _build_glfw_hold_nudge_map() if enable_keyboard else {}
+    # Local STATIC_HOLD target tracked by the viewer's nudge keys. Updated
+    # by KEY_T (reset to 0) and the nudge keys; re-emitted as a hold_torso
+    # command after every change so the planner's _HoldTracker slews to it.
+    hold_target: dict[str, float] = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0}
     last_cmd_label = ["—"]
+
+    def _emit_hold() -> None:
+        planner.enqueue(
+            LocomotionCommand(
+                intent="hold_torso",
+                magnitude="continuous",
+                source="kbd",
+                waist_pitch_deg=hold_target["pitch"],
+                waist_roll_deg=hold_target["roll"],
+                waist_yaw_deg=hold_target["yaw"],
+            )
+        )
+        last_cmd_label[0] = (
+            f"hold_torso pitch={hold_target['pitch']:+.1f} "
+            f"roll={hold_target['roll']:+.1f} "
+            f"yaw={hold_target['yaw']:+.1f}"
+        )
+        print(f"[viewer] -> {last_cmd_label[0]}")
 
     def key_callback(keycode: int) -> None:
         import glfw
@@ -196,9 +254,18 @@ def run_in_process(
             # toggle pause. Keep it simple: enqueue idle, never pause.
             planner.enqueue(LocomotionCommand("idle", "default", source="kbd"))
             last_cmd_label[0] = "idle default"
+            # Reset hold target so the next 'T' starts fresh.
+            hold_target.update(pitch=0.0, roll=0.0, yaw=0.0)
         elif keycode == glfw.KEY_P:
             paused[0] = not paused[0]
             print("[viewer] paused" if paused[0] else "[viewer] resumed")
+        elif keycode == glfw.KEY_T:
+            hold_target.update(pitch=0.0, roll=0.0, yaw=0.0)
+            _emit_hold()
+        elif keycode in hold_nudge_map:
+            axis, step = hold_nudge_map[keycode]
+            hold_target[axis] += step
+            _emit_hold()
         elif keycode in keymap:
             intent, mag = keymap[keycode]
             planner.enqueue(LocomotionCommand(intent, mag, source="kbd"))
@@ -270,17 +337,17 @@ def run_in_process(
 # ---------------------------------------------------------------------------
 
 
-def run_from_zmq(host: str, port: int, duration_s: float) -> int:
+def run_from_zmq(host: str, port: int, duration_s: float, topic: str = "pose") -> int:
     import mujoco
     import mujoco.viewer
     import zmq
 
     from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import unpack_message
 
-    print(f"[viewer] subscribing to tcp://{host}:{port} (topic='pose')")
+    print(f"[viewer] subscribing to tcp://{host}:{port} (topic={topic!r})")
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
-    sock.setsockopt_string(zmq.SUBSCRIBE, "pose")
+    sock.setsockopt_string(zmq.SUBSCRIBE, topic)
     sock.setsockopt(zmq.RCVTIMEO, 200)
     sock.connect(f"tcp://{host}:{port}")
     time.sleep(0.2)
@@ -323,7 +390,7 @@ def run_from_zmq(host: str, port: int, duration_s: float) -> int:
                     viewer.sync()
                     continue
                 try:
-                    decoded = unpack_message(raw, expected_topic="pose")
+                    decoded = unpack_message(raw, expected_topic=topic)
                 except ValueError as exc:
                     print(f"[viewer] decode error: {exc}")
                     continue
@@ -401,6 +468,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="HOST:PORT",
         help="Subscribe to a running planner instead of running in-process.",
     )
+    p.add_argument(
+        "--topic", default="pose",
+        choices=("pose", "body_pose"),
+        help=(
+            "ZMQ topic to subscribe to in --from-zmq mode. Use 'pose' (default) "
+            "for the heuristic planner's direct-to-deploy mode and the legacy "
+            "kplanner direct mode; use 'body_pose' for the new Phase 0 "
+            "recorder-merge mode and for the x2_kplanner.py daemon's "
+            "default publish topic."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -426,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             host = args.from_zmq
             port = 5556
-        return run_from_zmq(host, port, args.duration_s)
+        return run_from_zmq(host, port, args.duration_s, topic=args.topic)
 
     if not args.primitives.exists():
         print(

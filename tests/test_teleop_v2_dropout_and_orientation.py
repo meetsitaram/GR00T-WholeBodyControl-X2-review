@@ -616,8 +616,10 @@ def test_oppose_high_with_low_thumb_curl_drives_all_thumb_motors_via_oppose() ->
     """
     curls = _curl_array(thumb=0.1)
     # Disable hand-prior curl compensation so the exact lerp ratio
-    # is assertable (otherwise stretch_finger_curls maps thumb=0.1
-    # -> 0.0 since 0.1 sits in the deadzone).
+    # is assertable (otherwise stretch_finger_curls would shape
+    # thumb=0.1 through the active-zone curve and skew the
+    # comparison; the smooth-proportional default would map 0.1 to
+    # ~0.056 closure, the legacy bimodal would map it to 0.0).
     cmd = per_finger_grasp_command_from_curls_and_oppose(
         "left", curls, 1.0, apply_curl_compensation=False
     )
@@ -861,14 +863,19 @@ def test_stretch_finger_curls_deadzone_and_saturation() -> None:
     )
     np.testing.assert_allclose(cs_full, np.ones(5), atol=1e-12)
 
-    # Above full_threshold (e.g. group-fist value 0.92) -> still 1.
+    # Above full_threshold -> still 1. (Use ``min(full+0.02, 1.0)``
+    # so the test stays sensible whether the live default
+    # ``full_threshold`` is the smooth-proportional 0.95 or the
+    # legacy bimodal 0.40.)
+    over = min(full_thresh + 0.02, 1.0)
     cs_over = stretch_finger_curls(
-        np.full(5, 0.92),
+        np.full(5, over),
         deadzone=deadzone, full_threshold=full_thresh, gamma=gamma,
     )
     np.testing.assert_allclose(cs_over, np.ones(5), atol=1e-12)
 
-    # Power-curve interior.
+    # Power-curve interior. Midpoint of the active span maps to
+    # ``0.5**gamma`` regardless of where deadzone / full sit.
     midpoint = deadzone + 0.5 * span
     cs_mid = stretch_finger_curls(
         np.full(5, midpoint),
@@ -877,84 +884,307 @@ def test_stretch_finger_curls_deadzone_and_saturation() -> None:
     np.testing.assert_allclose(cs_mid, np.full(5, 0.5 ** gamma), atol=1e-12)
 
 
-def test_stretch_finger_curls_low_sensitivity_in_active_range() -> None:
-    """The per-finger defaults must suppress all "open hand + slight
-    movement" raw curls completely and saturate any "intentional
-    curl" raw value to the full motor-closed command. Tested with
-    the live :data:`DEFAULT_CURL_*_PER_FINGER` arrays.
+def test_stretch_finger_curls_default_is_smooth_proportional() -> None:
+    """Default per-finger params produce SMOOTH proportional shaping,
+    not bimodal. A 50 % raw curl produces ~50 % closure; mid-range
+    raw values produce mid-range outputs (no plateau-and-spike).
+
+    The previous bimodal defaults (``dz=0.35, full=0.40, gamma=5``)
+    silently composed on top of per-operator
+    :class:`HandRangeCalibration` and turned a calibrated
+    proportional teleop loop into a binary one (operator complaint
+    on 2026-05-13: "fingers either open or close, no smooth curling
+    in hand-tracking mode"). The new defaults
+    (``dz=0.05, full=0.95, gamma=1``) keep tiny rest-noise / saturation
+    cushions but otherwise pass curls through linearly. Bimodal
+    behaviour is still accessible by passing explicit per-finger
+    params (see :func:`test_stretch_finger_curls_bimodal_via_explicit_params`).
+    """
+    # Linear midpoints across the active range produce linear outputs
+    # (gamma=1, span 0.05..0.95 i.e. 0.90 wide).
+    for raw_val, expected in (
+        (0.05, 0.0),       # at deadzone -> 0
+        (0.275, 0.25),     # quarter way through active span
+        (0.50, 0.50),      # middle of active span
+        (0.725, 0.75),     # three-quarters through active span
+        (0.95, 1.0),       # at full_threshold -> 1
+    ):
+        out = stretch_finger_curls(np.full(5, raw_val))
+        np.testing.assert_allclose(
+            out, np.full(5, expected), atol=1e-12,
+            err_msg=(
+                f"smooth-default expected {expected:.3f} closure for "
+                f"raw={raw_val:.3f}; got {out}. If this changed the "
+                "compensation defaults probably regressed back to "
+                "bimodal -- see the long block-comment above "
+                "DEFAULT_CURL_DEADZONE_PER_FINGER."
+            ),
+        )
+
+    # Below the rest-noise deadzone -> exactly 0
+    out_rest = stretch_finger_curls(np.full(5, 0.04))
+    np.testing.assert_array_equal(out_rest, np.zeros(5))
+
+    # Above the saturation cushion -> exactly 1
+    out_sat = stretch_finger_curls(np.full(5, 0.96))
+    np.testing.assert_allclose(out_sat, np.ones(5), atol=1e-12)
+
+
+def test_default_compensation_no_bang_bang_with_default_calibration() -> None:
+    """End-to-end regression for the 2026-05-13 "bang-bang in
+    hand-tracking mode" report: with the per-operator
+    :class:`HandRangeCalibration` (the bundled
+    ``data/operator_calibrations/default.yaml`` ranges) AND
+    ``--apply-curl-compensation`` / ``--apply-oppose-compensation``
+    enabled, sweeping the operator's normalised finger curl from
+    0 to 1 must produce a strictly-monotone, near-linear sweep of
+    motor commands -- NOT a wide deadzone followed by an abrupt
+    saturation jump.
+
+    The user's symptom was "no robot finger movement until I curl
+    my hands to up to 55-60% range, and then even with a very
+    small curl inwards, the fingers close to full". That symptom
+    came from the OLD bimodal stretch defaults (``dz=0.35,
+    full=0.40, gamma=5``) composing on top of the normaliser. The
+    new smooth-proportional defaults (``dz=0.05, full=0.95,
+    gamma=1``) eliminate the dead zone and the saturation step.
+    """
+    # Per-finger range from the bundled default operator calibration
+    # (left hand). Captured 2026-05-10, ~2.6 k frames.
+    floor = np.array([0.198, 0.087, 0.093, 0.079, 0.097])
+    ceiling = np.array([0.993, 0.867, 0.884, 0.870, 0.846])
+    oppose_floor = 0.0
+    oppose_ceiling = 0.51
+
+    full_open = per_finger_grasp_command_from_curls_and_oppose(
+        "left", floor.copy(), oppose_floor,
+        apply_curl_compensation=True,
+        apply_oppose_compensation=True,
+        curl_floor=floor, curl_ceiling=ceiling,
+        oppose_floor=oppose_floor, oppose_ceiling=oppose_ceiling,
+    )
+    full_closed = per_finger_grasp_command_from_curls_and_oppose(
+        "left", ceiling.copy(), oppose_ceiling,
+        apply_curl_compensation=True,
+        apply_oppose_compensation=True,
+        curl_floor=floor, curl_ceiling=ceiling,
+        oppose_floor=oppose_floor, oppose_ceiling=oppose_ceiling,
+    )
+
+    # Sweep the operator's "normalised" curl in [0, 1] (linearly
+    # interpolated between the calibration floor and ceiling for
+    # every finger and the opposition signal). For each step, the
+    # commanded motor positions must lie strictly between the
+    # previous step and the full-closed end-points, AND the
+    # half-way step (frac=0.5) must land within ~10 % of the
+    # OPEN/CLOSED midpoint -- no plateau, no jump.
+    prev_cmd = full_open.copy()
+    half_cmd = None
+    for frac in (0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0):
+        raw_curls = floor + frac * (ceiling - floor)
+        raw_oppose = oppose_floor + frac * (oppose_ceiling - oppose_floor)
+        cmd = per_finger_grasp_command_from_curls_and_oppose(
+            "left", raw_curls, raw_oppose,
+            apply_curl_compensation=True,
+            apply_oppose_compensation=True,
+            curl_floor=floor, curl_ceiling=ceiling,
+            oppose_floor=oppose_floor, oppose_ceiling=oppose_ceiling,
+        )
+        # Each motor moves monotonically from OPEN toward CLOSED as
+        # frac increases. Check via the dot product of the increment
+        # against the OPEN -> CLOSED direction (positive on every
+        # step, no overshoot).
+        delta = cmd - prev_cmd
+        direction = full_closed - full_open
+        # All-zeros direction would mean the OPEN and CLOSED anchors
+        # coincide for that motor -- skip per-element check there.
+        for i in range(NUM_HAND_DOF_PER_SIDE):
+            if abs(direction[i]) < 1e-9:
+                continue
+            sign = np.sign(direction[i])
+            assert sign * delta[i] >= -1e-9, (
+                f"motor {i} regressed at frac={frac:.2f}: "
+                f"delta={delta[i]:+.6f} against direction={direction[i]:+.6f} "
+                f"(prev={prev_cmd[i]:.6f}, cmd={cmd[i]:.6f})"
+            )
+        prev_cmd = cmd
+        if abs(frac - 0.5) < 1e-9:
+            half_cmd = cmd
+
+    # Half-way operator curl produces ~half-way motor command on every
+    # finger motor. Allow +/- 12 % of the OPEN -> CLOSED span as
+    # tolerance (smooth defaults clip 5 % at each end, so a 0.5 raw
+    # curl really maps to (0.5 - 0.05) / 0.90 = 0.5 closure -- the
+    # tolerance is for the ~0 % rounding from the post-clip
+    # arithmetic and any small rounding from the lerp).
+    assert half_cmd is not None
+    span = full_closed - full_open
+    midpoint = full_open + 0.5 * span
+    rel = np.where(np.abs(span) > 1e-9, (half_cmd - full_open) / span, 0.5)
+    assert np.all(np.abs(rel - 0.5) < 0.12), (
+        f"half-way operator curl produced non-half-way motor command; "
+        f"per-motor closure ratio={rel.tolist()} (expected ~0.5 +/- 0.12). "
+        "If this regressed, the curl-compensation defaults probably "
+        "flipped back to bimodal -- see the long block-comment above "
+        "DEFAULT_CURL_DEADZONE_PER_FINGER."
+    )
+
+    # Sanity: full_closed actually differs from full_open on most
+    # motors (otherwise the monotonicity check above is vacuous).
+    assert np.sum(np.abs(full_closed - full_open) > 1e-3) >= 6
+
+
+def test_stretch_finger_curls_bimodal_via_explicit_params() -> None:
+    """Bimodal "intentional-curl detector" behaviour is still
+    available by passing the legacy per-finger deadzone /
+    full_threshold / gamma values explicitly. Documents that the
+    binary path the v3 tuner script
+    (``gear_sonic/scripts/tune_finger_curl_compensation.py``)
+    optimises for is opt-in, not the default.
 
     Empirical distribution of raw curls on the recorded teleop
-    data (gear_sonic/scripts/tune_finger_curl_compensation.py,
-    pooled across 4 v3 episodes, 7626 hand-mode frames):
+    data (pooled across 4 v3 episodes, 7626 hand-mode frames):
 
-      finger    p10    p50    p90       per-finger deadzone
+      finger    p10    p50    p90       legacy bimodal deadzone
       thumb     0.26   0.43   0.89      0.25
       index     0.11   0.26   0.84      0.35
       middle    0.11   0.28   0.87      0.35
       ring      0.09   0.28   0.85      0.35
       pinky     0.12   0.25   0.84      0.35
 
-    A "casual finger movement" that the user explicitly does NOT
-    want to register on the robot sits at raw <= 0.20 for ALL
-    fingers (including thumb). An "intentional curl" raw value
-    always reaches >= 0.45 across all fingers.
+    Under the bimodal params a "casual finger movement" (raw <= 0.20
+    for all fingers) is suppressed and an "intentional curl"
+    (raw >= 0.45) saturates to full closure.
     """
-    # raw <= 0.20 -> exactly 0 across all five fingers under
-    # per-finger defaults (thumb dz=0.25, fingers dz=0.35).
+    bimodal_dz = np.array([0.25, 0.35, 0.35, 0.35, 0.35])
+    bimodal_full = np.array([0.27, 0.40, 0.40, 0.40, 0.40])
+    bimodal_gamma = 5.0
+
+    # raw <= 0.20 -> exactly 0 across all five fingers under bimodal
+    # params (thumb dz=0.25, fingers dz=0.35).
     for raw_val in (0.05, 0.10, 0.15, 0.20):
-        out = stretch_finger_curls(np.full(5, raw_val))
+        out = stretch_finger_curls(
+            np.full(5, raw_val),
+            deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=bimodal_gamma,
+        )
         np.testing.assert_array_equal(
             out, np.zeros(5),
-            err_msg=f"raw={raw_val} must produce 0 closure; got {out}",
+            err_msg=f"raw={raw_val} must produce 0 closure under bimodal; got {out}",
         )
 
-    # raw >= 0.45 -> exactly 1 across all five fingers under
-    # per-finger defaults (thumb full=0.27, fingers full=0.40).
+    # raw >= 0.45 -> exactly 1 across all five fingers under bimodal
+    # params (thumb full=0.27, fingers full=0.40).
     for raw_val in (0.45, 0.50, 0.92, 1.00):
-        out = stretch_finger_curls(np.full(5, raw_val))
+        out = stretch_finger_curls(
+            np.full(5, raw_val),
+            deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=bimodal_gamma,
+        )
         np.testing.assert_allclose(
             out, np.ones(5), atol=1e-12,
-            err_msg=f"raw={raw_val} must saturate to 1; got {out}",
+            err_msg=f"raw={raw_val} must saturate to 1 under bimodal; got {out}",
         )
 
-    # Mid-deadzone values: thumb saturates at raw=0.30 (above its
-    # full=0.27) but the other four fingers stay at 0 (below their
-    # dz=0.35).
-    out = stretch_finger_curls(np.full(5, 0.30))
-    assert out[0] == 1.0, f"thumb at raw=0.30 must saturate; got {out[0]}"
+    # Mid-deadzone values under bimodal: thumb saturates at raw=0.30
+    # (above its full=0.27) but the other four fingers stay at 0
+    # (below their dz=0.35).
+    out = stretch_finger_curls(
+        np.full(5, 0.30),
+        deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=bimodal_gamma,
+    )
+    assert out[0] == 1.0, f"thumb at raw=0.30 must saturate (bimodal); got {out[0]}"
     np.testing.assert_array_equal(
         out[1:], np.zeros(4),
-        err_msg=f"non-thumb fingers at raw=0.30 must stay 0; got {out[1:]}",
+        err_msg=f"non-thumb fingers at raw=0.30 must stay 0 (bimodal); got {out[1:]}",
     )
 
 
-def test_stretch_finger_curls_isolated_quest3_max_saturates() -> None:
+def test_stretch_finger_curls_isolated_curl_via_explicit_bimodal() -> None:
     """Empirical: when the operator curls a single non-thumb finger
     in isolation, Quest 3's reported per-finger curl tops out at
-    ~0.50 in the wild teleop data (pooled p75 across the four
-    fingers is 0.70-0.76). The post-stretch curl for that finger
-    must therefore reach 1.0 by raw=0.50 -- otherwise the X2's
-    matching omnihand motors won't fully close on isolated-finger
-    gestures.
+    ~0.50 in the wild teleop data. Under the legacy bimodal params
+    that raw=0.50 saturated the post-stretch curl to 1.0 so the
+    X2's matching omnihand motors fully closed.
+
+    This is the use case the bimodal compensation was originally
+    designed for; with the new smooth-proportional defaults this
+    path is opt-in via explicit per-finger params (the smooth
+    default would otherwise pass raw=0.50 through as ~0.50 closure,
+    which is the desired behaviour for proportional teleop with a
+    calibrated :class:`HandRangeCalibration`).
     """
+    bimodal_dz = np.array([0.25, 0.35, 0.35, 0.35, 0.35])
+    bimodal_full = np.array([0.27, 0.40, 0.40, 0.40, 0.40])
+    bimodal_gamma = 5.0
+
     raw = np.array([0.10, 0.50, 0.10, 0.10, 0.10])  # only index curled
-    stretched = stretch_finger_curls(raw)
-    assert stretched[1] == 1.0, f"index at raw=0.50 must saturate; got {stretched[1]}"
+    stretched = stretch_finger_curls(
+        raw,
+        deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=bimodal_gamma,
+    )
+    assert stretched[1] == 1.0, f"index at raw=0.50 must saturate (bimodal); got {stretched[1]}"
     np.testing.assert_allclose(stretched[[0, 2, 3, 4]], np.zeros(4), atol=1e-12)
 
 
-def test_stretch_finger_curls_propagates_to_motor_command() -> None:
-    """End-to-end: with ``apply_curl_compensation=True`` an "isolated
-    index curl" raw signal (above the per-finger full_threshold) must
-    produce a motor command where index_pip / index_abad are at the
-    CLOSED anchor while every other motor stays at OPEN.
+def test_stretch_finger_curls_propagates_to_motor_command_smooth_default() -> None:
+    """End-to-end with the SMOOTH-PROPORTIONAL default compensation:
+    raw 0.50 on the index finger drives index_pip / index_abad to
+    ~50 % between OPEN and CLOSED, and a separate raw 1.0 on the
+    other fingers drives them all the way to CLOSED.
 
-    This explicitly opts into the stretch since the live default is
-    linear (``apply_curl_compensation=False``).
+    Replaces the old test that asserted bimodal saturation at
+    raw=0.50 with the new defaults (which would now bang the index
+    motors to 100 % even with the operator only half-curling).
     """
+    full_closed = per_finger_grasp_command_from_curls(
+        "left",
+        _curl_array(thumb=1.0, index=1.0, middle=1.0, ring=1.0, pinky=1.0),
+        apply_curl_compensation=False,
+    )
+    full_open = per_finger_grasp_command_from_curls(
+        "left", _curl_array(), apply_curl_compensation=False,
+    )
+
+    # Full close on every finger via compensation -> matches the
+    # un-compensated full-close command (every motor at CLOSED).
+    cmd_close = per_finger_grasp_command_from_curls(
+        "left",
+        _curl_array(thumb=1.0, index=1.0, middle=1.0, ring=1.0, pinky=1.0),
+        apply_curl_compensation=True,
+    )
+    np.testing.assert_allclose(cmd_close, full_closed, atol=1e-12)
+
+    # Half curl on every finger (raw=0.50) -> mid-way between OPEN
+    # and CLOSED on every motor (gamma=1, dz=0.05, full=0.95 so
+    # t=(0.50-0.05)/0.90 = 0.5).
+    cmd_mid = per_finger_grasp_command_from_curls(
+        "left",
+        _curl_array(thumb=0.5, index=0.5, middle=0.5, ring=0.5, pinky=0.5),
+        apply_curl_compensation=True,
+    )
+    expected_mid = 0.5 * (full_open + full_closed)
+    np.testing.assert_allclose(cmd_mid, expected_mid, atol=1e-12)
+
+
+def test_stretch_finger_curls_isolated_curl_motor_command_via_bimodal() -> None:
+    """Bimodal-via-explicit-params end-to-end: an "isolated index
+    curl" raw signal under the LEGACY bimodal per-finger params
+    drives index_pip / index_abad to CLOSED while every other motor
+    stays at OPEN. This is the path the original isolated-finger
+    detection use case wants -- now opt-in via explicit kwargs."""
+    bimodal_dz = np.array([0.25, 0.35, 0.35, 0.35, 0.35])
+    bimodal_full = np.array([0.27, 0.40, 0.40, 0.40, 0.40])
+    bimodal_gamma = 5.0
+
     raw = np.array([0.10, 0.50, 0.10, 0.10, 0.10])
+    stretched = stretch_finger_curls(
+        raw,
+        deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=bimodal_gamma,
+    )
+    # Feed the bimodal-stretched curls into the un-compensated
+    # motor mapper so we test the exact same downstream lerp as the
+    # old test did.
     cmd = per_finger_grasp_command_from_curls(
-        "left", raw, apply_curl_compensation=True
+        "left", stretched, apply_curl_compensation=False,
     )
     full_closed = per_finger_grasp_command_from_curls(
         "left",
@@ -962,7 +1192,7 @@ def test_stretch_finger_curls_propagates_to_motor_command() -> None:
         apply_curl_compensation=False,
     )
     full_open = per_finger_grasp_command_from_curls(
-        "left", _curl_array(), apply_curl_compensation=False
+        "left", _curl_array(), apply_curl_compensation=False,
     )
     np.testing.assert_allclose(cmd[3], full_closed[3], atol=1e-12)
     np.testing.assert_allclose(cmd[4], full_closed[4], atol=1e-12)
@@ -973,27 +1203,40 @@ def test_stretch_finger_curls_propagates_to_motor_command() -> None:
 def test_stretch_finger_curls_per_finger_arrays() -> None:
     """Per-finger ``deadzone`` / ``full_threshold`` / ``gamma``
     arrays apply different parameters to different fingers in the
-    same call. The default behaviour exercises this implicitly.
-    """
-    # Construct a raw input where each finger sits at its own
-    # deadzone boundary (per-finger defaults). All five must map
-    # to exactly 0.
-    dz = np.array([0.25, 0.35, 0.35, 0.35, 0.35])
-    raw_at_dz = dz.copy()
-    np.testing.assert_array_equal(stretch_finger_curls(raw_at_dz), np.zeros(5))
-
-    # Raw input where each finger sits exactly at its full_threshold
-    # -- all five must saturate to 1.
-    full = np.array([0.27, 0.40, 0.40, 0.40, 0.40])
-    np.testing.assert_allclose(
-        stretch_finger_curls(full), np.ones(5), atol=1e-12,
+    same call. Uses explicit per-finger params (not the smooth
+    proportional defaults) so the assertion target stays precise."""
+    # Each finger sits at its own deadzone boundary -- all five must
+    # map to exactly 0 under the bimodal per-finger params.
+    bimodal_dz = np.array([0.25, 0.35, 0.35, 0.35, 0.35])
+    bimodal_full = np.array([0.27, 0.40, 0.40, 0.40, 0.40])
+    raw_at_dz = bimodal_dz.copy()
+    np.testing.assert_array_equal(
+        stretch_finger_curls(
+            raw_at_dz,
+            deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=5.0,
+        ),
+        np.zeros(5),
     )
 
-    # Mix: thumb above its full_threshold, index below its deadzone,
-    # middle exactly at its full_threshold, ring inside its active
-    # range, pinky above. Expect saturate, 0, saturate, partial, saturate.
+    # Each finger at exactly its full_threshold -- all five saturate to 1.
+    np.testing.assert_allclose(
+        stretch_finger_curls(
+            bimodal_full,
+            deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=5.0,
+        ),
+        np.ones(5),
+        atol=1e-12,
+    )
+
+    # Mix under bimodal: thumb above its full_threshold, index below
+    # its deadzone, middle exactly at its full_threshold, ring inside
+    # its active range, pinky above. Expect saturate, 0, saturate,
+    # partial, saturate.
     raw = np.array([0.30, 0.20, 0.40, 0.375, 0.50])
-    out = stretch_finger_curls(raw)
+    out = stretch_finger_curls(
+        raw,
+        deadzone=bimodal_dz, full_threshold=bimodal_full, gamma=5.0,
+    )
     assert out[0] == 1.0  # thumb 0.30 > 0.27
     assert out[1] == 0.0  # index 0.20 < 0.35
     assert out[2] == 1.0  # middle 0.40 = full
@@ -1051,27 +1294,74 @@ def test_stretch_finger_curls_gamma_one_is_linear() -> None:
     )
 
 
-def test_stretch_thumb_oppose_suppresses_rest_bleed() -> None:
-    """The JS-side ``computeThumbOpposition`` reports ~0.05-0.25
-    even at relaxed-hand rest because the thumb tip naturally sits
-    a few cm from the index fingertip. ``stretch_thumb_oppose``
-    must suppress this bleed (output 0 below deadzone) and
-    saturate clear thumb-finger touches."""
-    # Below deadzone -> 0
-    for v in (0.0, 0.05, 0.10, 0.15, 0.20, 0.24):
+def test_stretch_thumb_oppose_default_is_smooth_proportional() -> None:
+    """Default ``stretch_thumb_oppose`` is now SMOOTH PROPORTIONAL
+    (``dz=0.05, full=0.95, gamma=1``) -- the recommended fix for
+    rest-bleed is now the per-operator ``oppose_floor`` /
+    ``oppose_ceiling`` affine remap in
+    :class:`HandRangeCalibration`, with this stretch supplying a
+    small noise-deadzone + saturation cushion only.
+
+    Bimodal rest-bleed suppression is still available by passing
+    explicit ``deadzone`` / ``full_threshold`` / ``gamma`` (see
+    :func:`test_stretch_thumb_oppose_bimodal_via_explicit_params`).
+    """
+    # Below the small rest-noise deadzone -> 0
+    for v in (0.0, 0.04):
         assert stretch_thumb_oppose(v) == 0.0, (
-            f"oppose={v} must produce 0 closure (rest-bleed); "
-            f"got {stretch_thumb_oppose(v)}"
+            f"oppose={v} must be at-or-below the smooth-default rest-noise "
+            f"deadzone; got {stretch_thumb_oppose(v)}"
         )
-    # At/above full_threshold -> 1
-    for v in (0.40, 0.50, 0.85, 0.95, 1.00):
+    # At/above the saturation cushion -> 1
+    for v in (0.96, 1.0):
         np.testing.assert_allclose(
             stretch_thumb_oppose(v), 1.0, atol=1e-12,
-            err_msg=f"oppose={v} must saturate to 1; got {stretch_thumb_oppose(v)}",
+            err_msg=(
+                f"oppose={v} must hit the smooth-default saturation cushion; "
+                f"got {stretch_thumb_oppose(v)}"
+            ),
+        )
+    # Mid-range produces mid-range output (no plateau-and-spike).
+    for raw, expected in (
+        (0.05, 0.0),
+        (0.275, 0.25),
+        (0.50, 0.50),
+        (0.725, 0.75),
+        (0.95, 1.0),
+    ):
+        np.testing.assert_allclose(
+            stretch_thumb_oppose(raw), expected, atol=1e-12,
+            err_msg=(
+                f"oppose={raw} must produce smooth proportional closure "
+                f"~{expected}; got {stretch_thumb_oppose(raw)}"
+            ),
         )
     # Out-of-range clamps gracefully
     assert stretch_thumb_oppose(-0.5) == 0.0
     assert stretch_thumb_oppose(1.5) == 1.0
+
+
+def test_stretch_thumb_oppose_bimodal_via_explicit_params() -> None:
+    """Bimodal rest-bleed-suppressing stretch (the legacy default)
+    is still available by passing explicit params."""
+    # Below explicit deadzone -> 0
+    for v in (0.0, 0.05, 0.10, 0.15, 0.20, 0.24):
+        out = stretch_thumb_oppose(
+            v, deadzone=0.25, full_threshold=0.40, gamma=3.0,
+        )
+        assert out == 0.0, (
+            f"oppose={v} below explicit dz=0.25 must produce 0 closure; got {out}"
+        )
+    # At/above explicit full_threshold -> 1
+    for v in (0.40, 0.50, 0.85, 0.95, 1.00):
+        np.testing.assert_allclose(
+            stretch_thumb_oppose(
+                v, deadzone=0.25, full_threshold=0.40, gamma=3.0,
+            ),
+            1.0,
+            atol=1e-12,
+            err_msg=f"oppose={v} above explicit full=0.40 must saturate; got",
+        )
 
 
 def test_stretch_thumb_oppose_validates_params() -> None:
@@ -1083,15 +1373,17 @@ def test_stretch_thumb_oppose_validates_params() -> None:
         stretch_thumb_oppose(0.5, gamma=0.0)
 
 
-def test_oppose_compensation_when_enabled_suppresses_rest_oppose() -> None:
-    """At a synthetic "relaxed bend" gesture (raw thumb=0.18,
-    oppose=0.10) the thumb_roll/abad motors must stay at OPEN when the
-    caller explicitly opts into ``apply_oppose_compensation=True``.
+def test_oppose_compensation_when_enabled_suppresses_rest_oppose_via_explicit_params() -> None:
+    """The opt-in opposition-compensation path can suppress
+    rest-bleed when the caller passes explicit
+    ``oppose_floor`` / ``oppose_ceiling`` (the per-operator
+    affine remap) -- this is the recommended way to absorb the
+    operator's resting opposition signal now that the
+    ``stretch_thumb_oppose`` defaults are smooth proportional.
 
-    The live default is linear (``apply_oppose_compensation=False``),
-    in which case oppose=0.10 leaks 10 % closure into both motors --
-    that is covered by :func:`test_oppose_compensation_can_be_disabled`.
-    This test only exercises the opt-in compensation path.
+    At a synthetic "relaxed bend" gesture (raw thumb=0.18,
+    oppose=0.10) with ``oppose_floor=0.10`` (the operator's rest
+    floor) the thumb_roll/abad motors must stay at OPEN.
     """
     curls = _curl_array(thumb=0.18)
     full_open = per_finger_grasp_command_from_curls(
@@ -1102,7 +1394,20 @@ def test_oppose_compensation_when_enabled_suppresses_rest_oppose() -> None:
         curls,
         0.10,
         apply_curl_compensation=True,
-        apply_oppose_compensation=True,
+        # Per-operator floors absorb both the thumb-curl rest band
+        # (~0.20 raw, see the typical Quest 3 thumb p05 in
+        # data/operator_calibrations/default.yaml) and the
+        # opposition rest band (~0.10 raw). Anything <= floor maps
+        # to 0 normalised, which then passes through the smooth-
+        # proportional stretch unchanged at 0. Crucially the thumb
+        # curl_floor must cover the operator's resting thumb signal,
+        # otherwise the residual curl bleeds into the
+        # ``max(oppose, thumb_flex)`` opposition-motor drive and
+        # the thumb motors leave OPEN.
+        curl_floor=np.array([0.20, 0.05, 0.05, 0.05, 0.05]),
+        curl_ceiling=np.array([0.95, 0.95, 0.95, 0.95, 0.95]),
+        oppose_floor=0.10,
+        oppose_ceiling=0.95,
     )
     np.testing.assert_allclose(cmd_with[0], full_open[0], atol=1e-12)
     np.testing.assert_allclose(cmd_with[1], full_open[1], atol=1e-12)

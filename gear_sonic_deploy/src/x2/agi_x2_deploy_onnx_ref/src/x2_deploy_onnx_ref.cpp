@@ -73,6 +73,10 @@
 #include "wrist_bypass.hpp"
 #include "zmq/zmq_debug_publisher.hpp"
 #include "zmq/zmq_pose_input_source.hpp"
+#include "zmq/zmq_resume_subscriber.hpp"
+
+#include <aimdk_msgs/srv/get_mc_action.hpp>
+#include <aimdk_msgs/msg/common_request.hpp>
 
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -88,6 +92,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -96,7 +101,75 @@
 #include <string>
 #include <thread>
 
+#include <unistd.h>  // ::write, STDERR_FILENO for async-signal-safe stderr
+
 namespace agi_x2 {
+
+// ────────────────────────────────────────────────────────────────────────────
+// Soft-shutdown signal handling (graceful Ctrl-C).
+//
+// File-scoped atomic flag set by our custom SIGINT/SIGTERM handler and polled
+// by OnControl. Must be lock-free + signal-safe; std::atomic<bool> on a
+// std::sig_atomic_t-compatible underlying type satisfies that on every
+// platform we target. The X2Deploy::OnControl tick (50 Hz) reads this and,
+// when set together with a non-empty --soft-shutdown-trigger-sentinel, takes
+// the RAMP_OUT → HOLD_FOR_MC path instead of letting rclcpp::shutdown() exit
+// the process immediately.
+//
+// The handler is installed AFTER rclcpp::init in main() so it overrides
+// rclcpp's default SIGINT handler. On the SECOND SIGINT within 5 s (or
+// 30 s into a hung RAMP_OUT), we fall back to rclcpp::shutdown() so the
+// operator always has a fast escape hatch.
+static std::atomic<bool>      g_soft_shutdown_requested{false};
+static std::atomic<int>       g_sigint_count{0};
+static std::atomic<long long> g_first_sigint_ns{0};
+
+// Async-signal-safe write helper. The cast-to-void trick does NOT suppress
+// glibc's warn_unused_result attribute on ::write, so we explicitly assign
+// to a sink variable and mark it volatile-discarded.
+[[gnu::always_inline]]
+static inline void SigSafeWriteStderr(const char* msg, std::size_t len)
+{
+  ssize_t written = ::write(STDERR_FILENO, msg, len);
+  (void)written;
+}
+
+extern "C" void SoftShutdownSignalHandler(int signum)
+{
+  using namespace std::chrono;
+  const long long now_ns = duration_cast<nanoseconds>(
+      steady_clock::now().time_since_epoch()).count();
+  const int count = g_sigint_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (count == 1) {
+    g_first_sigint_ns.store(now_ns, std::memory_order_release);
+    g_soft_shutdown_requested.store(true, std::memory_order_release);
+    // Async-signal-safe stderr message. write(2) is on the
+    // sig-safe list; iostream is not.
+    static const char kMsg1[] =
+        "\n[soft-shutdown] SIGINT/SIGTERM received -> requesting RAMP_OUT. "
+        "Press Ctrl-C again within 5 s to force immediate shutdown.\n";
+    SigSafeWriteStderr(kMsg1, sizeof(kMsg1) - 1);
+    return;
+  }
+  // Second signal: check if within the escape-hatch window.
+  const long long first_ns = g_first_sigint_ns.load(std::memory_order_acquire);
+  const long long dt_ns    = now_ns - first_ns;
+  if (dt_ns < 5LL * 1000 * 1000 * 1000) {
+    static const char kMsg2[] =
+        "\n[soft-shutdown] second SIGINT inside 5 s -> forcing rclcpp::shutdown(). "
+        "Bus will be silent until MC restarts.\n";
+    SigSafeWriteStderr(kMsg2, sizeof(kMsg2) - 1);
+  } else {
+    static const char kMsg3[] =
+        "\n[soft-shutdown] additional SIGINT -> forcing rclcpp::shutdown().\n";
+    SigSafeWriteStderr(kMsg3, sizeof(kMsg3) - 1);
+  }
+  // rclcpp::shutdown() is documented as signal-safe; this matches what
+  // rclcpp's own default handler does.
+  rclcpp::shutdown();
+  (void)signum;
+}
+
 
 // ---------------------------------------------------------------------------
 // CLI parsing (single-purpose; lightweight; no third-party deps)
@@ -118,8 +191,118 @@ struct CliArgs {
   // = disabled. See safety.hpp::ApplySafetyStack for rationale; intended for
   // first-powered-bring-up runs (e.g. 0.05 rad ~= 3 deg) so a divergent
   // policy or obs-construction bug cannot drive any joint more than this
-  // many radians from the trained standing pose.
+  // many radians from the trained standing pose. This is the GLOBAL value
+  // applied to every joint that doesn't have a per-group override below.
   double      max_target_dev    = -1.0;
+  // Per-group overrides for max_target_dev, indexed by MuJoCo joint group.
+  // -1 = inherit the global ``max_target_dev``; >0 = clamp this group at the
+  // given radian deviation. Designed for the case where one joint family
+  // can safely take more travel than another -- e.g. on X2 Ultra the legs
+  // run kp ~99 Nm/rad and the arms kp ~14 Nm/rad, so the same nominal
+  // |target - default| produces ~7x the torque on legs. Tight legs +
+  // wide arms is the natural setting for any teleop-driven session.
+  // Joint-group ranges (MuJoCo joint order, see policy_parameters.hpp::
+  // mujoco_joint_names):
+  //   leg   -> indices  0..11 (hip pitch/roll/yaw, knee, ankle pitch/roll, both sides)
+  //   waist -> indices 12..14 (yaw, pitch, roll)
+  //   arm   -> indices 15..28 (shoulder pitch/roll/yaw, elbow,
+  //                            wrist yaw/pitch/roll, both sides)
+  //   head  -> indices 29..30 (yaw, pitch)
+  double      max_target_dev_leg   = -1.0;
+  double      max_target_dev_waist = -1.0;
+  double      max_target_dev_arm   = -1.0;
+  double      max_target_dev_head  = -1.0;
+  // Per-group multiplicative trim on the trained PD spec (mirror of the
+  // ``--kp-scale-*`` / ``--kd-scale-*`` flags in ``eval_x2_mujoco.py``).
+  // The C++ deploy ships ``kps[]`` / ``kds[]`` as the BARE training values
+  // (codegen'd from IsaacLab via ``codegen_x2_policy_parameters.py``), but
+  // training used IsaacLab's IMPLICIT PD which integrates against the
+  // joint-space inertia + armature. MuJoCo (sim profile) and the real
+  // robot apply EXPLICIT ctrl-driven torque, so the same numerical KP
+  // produces a softer response at deploy time -- documented at length in
+  // ``gear_sonic/scripts/eval_x2_mujoco.py:155-200``. Fixed by bumping
+  // deployed PD per joint group, NOT by retraining.
+  //
+  // Defaults to 1.0 (no trim). The G16b-validated default for X2 Ultra
+  // is ``ankle=1.5`` (recovers ~+0.5 s mean survival on standing motions);
+  // the operator-observed real-robot torso wobble on nudge often clears
+  // up with ``waist=1.5`` on top of that (no Python sim equivalent --
+  // X2 Ultra real-robot inertia distribution differs from MJCF).
+  //
+  // Joint family (substring match on the joint name; mirrors Python
+  // ``_deployment_pd_scale``):
+  //   hip       -> contains "hip"
+  //   knee      -> contains "knee"
+  //   ankle     -> contains "ankle"
+  //   waist     -> contains "waist"
+  //   shoulder  -> contains "shoulder"
+  //   elbow     -> contains "elbow"
+  //   wrist     -> contains "wrist"
+  //   head      -> contains "head"
+  //
+  // Both global and per-group are MULTIPLICATIVE. Effective scale on a
+  // joint = global * group (group defaults to 1.0). Negative or zero
+  // values are rejected at parse time (cannot make a passive joint
+  // active by negating its kp).
+  double      kp_scale            = 1.0;
+  double      kp_scale_hip        = 1.0;
+  double      kp_scale_knee       = 1.0;
+  // Ankle is split into pitch vs roll (mirror of waist below). The
+  // legacy ``kp_scale_ankle`` alias multiplies BOTH subgroups so older
+  // YAMLs / scripts continue to work; effective scale on ankle_pitch
+  // becomes kp_scale_ankle * kp_scale_ankle_pitch. Both default to 1.0
+  // so alias-only behaviour is unchanged.
+  double      kp_scale_ankle        = 1.0;
+  double      kp_scale_ankle_pitch  = 1.0;
+  double      kp_scale_ankle_roll   = 1.0;
+  // Waist is split into yaw vs pitch vs roll (see PdScaleSpec below for
+  // why). Two layers of legacy alias are kept for backward compat:
+  //   ``kp_scale_waist``    -- applies to ALL three waist subgroups
+  //                            (predates any split; matches the very
+  //                            first single-knob YAMLs we shipped).
+  //   ``kp_scale_waist_pr`` -- applies to BOTH waist_pitch and
+  //                            waist_roll (predates the pitch/roll
+  //                            split; matches expressive.yaml and the
+  //                            pre-2026-05-30 walking_recovery.yaml).
+  // New presets should prefer the explicit ``kp_scale_waist_pitch``
+  // and ``kp_scale_waist_roll`` knobs below. Effective scale on a
+  // waist_pitch joint becomes
+  //   kp_scale_waist * kp_scale_waist_pr * kp_scale_waist_pitch
+  // which is identity (1*1*1) by default, so omitting the new knobs
+  // exactly reproduces the pre-split behaviour.
+  //
+  // Why split waist_pr further: the 2026-05-30 MC-vs-SONIC nudge scan
+  // showed pitch (sagittal lean) at +45% over MC and roll (lateral
+  // lean) at -72% under MC -- same trained PD, same actuator, but
+  // closed-loop response diverges by axis because the COM moves
+  // asymmetrically about the two axes (arms hang symmetric about
+  // pitch, swing the whole COM laterally about roll). A single
+  // waist_pr knob cannot close the lateral gap without breaking
+  // the sagittal axis. Splitting gives one knob per physical axis.
+  double      kp_scale_waist        = 1.0;
+  double      kp_scale_waist_yaw    = 1.0;
+  double      kp_scale_waist_pr     = 1.0;
+  double      kp_scale_waist_pitch  = 1.0;
+  double      kp_scale_waist_roll   = 1.0;
+  double      kp_scale_shoulder   = 1.0;
+  double      kp_scale_elbow      = 1.0;
+  double      kp_scale_wrist      = 1.0;
+  double      kp_scale_head       = 1.0;
+  double      kd_scale            = 1.0;
+  double      kd_scale_hip        = 1.0;
+  double      kd_scale_knee       = 1.0;
+  double      kd_scale_ankle        = 1.0;
+  double      kd_scale_ankle_pitch  = 1.0;
+  double      kd_scale_ankle_roll   = 1.0;
+  double      kd_scale_waist        = 1.0;
+  double      kd_scale_waist_yaw    = 1.0;
+  double      kd_scale_waist_pr     = 1.0;
+  double      kd_scale_waist_pitch  = 1.0;
+  double      kd_scale_waist_roll   = 1.0;
+  double      kd_scale_shoulder   = 1.0;
+  double      kd_scale_elbow      = 1.0;
+  double      kd_scale_wrist      = 1.0;
+  double      kd_scale_head       = 1.0;
   // Symmetric clamp on the raw ONNX action (action_il) BEFORE multiplying by
   // x2_action_scale. This mirrors IsaacLab's training-time clamp applied in
   // ManagerEnvWrapper.step (controlled by config ``action_clip_value`` in
@@ -156,6 +339,45 @@ struct CliArgs {
   // hz=8 -> alpha~=0.63 (~5 Hz effective bandwidth). 0 = disabled.
   // Documented under gear_sonic_deploy/configs/real_deploy_tuning/.
   double      target_lpf_hz     = 0.0;
+  // Per-group overrides for target_lpf_hz, mirroring the
+  // max_target_dev_{leg,waist,arm,head} pattern above. A negative value
+  // means "inherit the global ``target_lpf_hz``"; 0 = "disabled on this
+  // group regardless of global"; >0 = "use this cutoff on this group".
+  //
+  // Motivating diagnostic (Phase 1b waist torso-push A/B scan, 2026-05-30):
+  // SONIC's waist commanded target moves ~2x faster than MC's at numerically
+  // identical PD (waist_roll peak velocity 1.29 vs 0.59 rad/s, +118%) and
+  // overshoots its own command by an extra 25-64% in pos_p2p. Motor effort
+  // peaks at <=23 N*m on a 48 N*m motor (~50% headroom), so neither kd_scale
+  // bumping nor max_target_dev tightening is the right knob. The signal IS
+  // command bandwidth -- which a per-group LPF controls directly. Global
+  // LPF drops (8.0 -> 4.0) tried earlier hurt the legs because legs need
+  // high bandwidth for heel-strike correction; the waist doesn't.
+  //
+  // Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+  // mujoco_joint_names):
+  //   leg   -> indices  0..11 (hip+knee+ankle, both sides)
+  //   waist -> indices 12..14 (yaw, pitch, roll)
+  //   arm   -> indices 15..28 (shoulder+elbow+wrist, both sides)
+  //   head  -> indices 29..30 (yaw, pitch)
+  //
+  // Recommended values:
+  //   leg   : inherit global (8 Hz on walking_recovery.yaml). Going lower
+  //           reintroduces the heel-strike-correction lag we hit when we
+  //           tried global LPF=4 earlier.
+  //   waist : 2-3 Hz (1.3-1.9 Hz effective bandwidth). Sits just above the
+  //           observed 2.0-2.5 Hz waist_pitch/waist_roll resonance from the
+  //           Phase 1b oscillation scan, so the resonance content is
+  //           attenuated ~70-80% while slow operator-tracked motion still
+  //           passes.
+  //   arm   : inherit global, or 10-12 Hz (~6-7.5 Hz bandwidth) if teleop
+  //           feels sluggish under the global default.
+  //   head  : inherit global. No measured resonance worth treating
+  //           differently.
+  double      target_lpf_hz_leg   = -1.0;
+  double      target_lpf_hz_waist = -1.0;
+  double      target_lpf_hz_arm   = -1.0;
+  double      target_lpf_hz_head  = -1.0;
   int         intra_op_threads  = 1;
   // Optional topic overrides. Empty string -> use AimdkIo defaults
   // (which match the canonical names in the SDK `topics_and_services`
@@ -252,6 +474,26 @@ struct CliArgs {
   // Independent of start_trigger_sentinel; safe to use on its own.
   std::string ready_sentinel;
   // ────────────────────────────────────────────────────────────────────
+  // Soft-shutdown trigger (graceful Ctrl-C).
+  //
+  // Default flow without this flag is "Ctrl-C → rclcpp default SIGINT
+  // handler → rclcpp::shutdown() → executor.spin() returns → main()
+  // exits immediately". That bypasses RAMP_OUT / HOLD_FOR_MC entirely:
+  // the bus goes silent for the 1-2 s it takes MC to boot through
+  // PASSIVE_DEFAULT (zero torque), so the robot drops noticeably under
+  // gravity before MC reaches STAND_DEFAULT.
+  //
+  // With this flag, bash can request a graceful shutdown by touching
+  // soft_shutdown_trigger_sentinel BEFORE sending SIGTERM. In CONTROL
+  // state, deploy polls the file every OnControl tick (~50 Hz) and,
+  // when it appears, transitions to RAMP_OUT using the same code path
+  // that --max-duration uses. The full RAMP_OUT → HOLD_FOR_MC →
+  // exit-sentinel chain then runs as normal, so the robot stays under
+  // active torque through MC's PASSIVE_DEFAULT boot. Result: no
+  // zero-torque window, no drop.
+  // ────────────────────────────────────────────────────────────────────
+  std::string soft_shutdown_trigger_sentinel;
+  // ────────────────────────────────────────────────────────────────────
   // VLA / ZMQ input source (M2 acceptance gate).
   //
   // ``--input-type`` selects what drives the tokenizer's reference window:
@@ -274,6 +516,64 @@ struct CliArgs {
   std::string zmq_pose_topic    = "pose";
   int         zmq_debug_port    = 0;               // 0 = disabled
   std::string zmq_debug_topic   = "x2_debug";
+  // ────────────────────────────────────────────────────────────────────
+  // Pose-ref starvation watchdog (split-topology safety, --input-type=zmq).
+  //
+  // Active only when --input-type=zmq AND the deploy has reached CONTROL.
+  // Trips into the recoverable SAFE_IDLE state when the age of the most
+  // recent received pose frame exceeds ``pose_ref_stale_s`` seconds (= the
+  // operator-side stack is dead, wifi dropped, or the publisher froze).
+  // In SAFE_IDLE the deploy holds ``default_angles`` with 4x kd and does
+  // NOT run policy inference. Exiting SAFE_IDLE requires BOTH:
+  //   (a) fresh pose frames arriving for ``pose_ref_min_fresh_s`` seconds
+  //       (watchdog reports ReadyToResume() == true), AND
+  //   (b) an operator chord (A+B held 1 s on the Quest 3 left controller)
+  //       delivered via ZMQ pose_resume topic (see --zmq-resume-*).
+  // Both gates are required so a wifi flicker mid-task cannot silently
+  // re-engage CONTROL.
+  // ────────────────────────────────────────────────────────────────────
+  // Watchdog trip threshold (seconds). Pose-ref age >= this → trip.
+  // Default 0.5 s is comfortable for wifi: planner runs at 50 Hz (20 ms
+  // per frame), so a single dropped frame doesn't trip; sustained drops
+  // of ~25 frames do. Set <= 0 to disable the watchdog entirely
+  // (equivalent to --disable-pose-ref-watchdog; useful for benchmarks).
+  double      pose_ref_stale_s     = 0.5;
+  // After a trip, the wire must carry fresh frames for at least this many
+  // seconds continuously before ReadyToResume() returns true. Default
+  // 1.0 s is enough to confirm a stable link (50 fresh frames at 50 Hz).
+  // Pairs with the resume chord; both must hold to re-engage CONTROL.
+  double      pose_ref_min_fresh_s = 1.0;
+  // Hard-disable the pose-ref watchdog regardless of other flags. Keeps
+  // the legacy "ZmqPoseInputSource just holds the last good frame on
+  // starvation" behaviour for parity tests / benchmarks. NOT recommended
+  // for split-topology production runs -- a stale operator pose is the
+  // freeze-while-leaning failure mode that motivated this whole feature.
+  bool        disable_pose_ref_watchdog = false;
+  // ────────────────────────────────────────────────────────────────────
+  // Operator resume chord (companion to the starvation watchdog above).
+  //
+  // The deploy SUBs to a ``pose_resume`` topic on tcp://<host>:<port> and
+  // a single received message bumps an internal monotonic timestamp.
+  // The SAFE_IDLE exit logic gates on ``LatestFresh(0.5 s)`` AND the
+  // watchdog's ReadyToResume(), so the chord only takes effect when the
+  // operator side is currently healthy. See zmq_resume_subscriber.hpp.
+  // ────────────────────────────────────────────────────────────────────
+  std::string zmq_resume_host   = "localhost";
+  int         zmq_resume_port   = 5566;
+  std::string zmq_resume_topic  = "pose_resume";
+  // ────────────────────────────────────────────────────────────────────
+  // MC mode poller (Phase 5b observability).
+  //
+  // Polls the AimRT MC service ``/aimdk_5Fmsgs/srv/GetMcAction`` at this
+  // rate and surfaces the current ``McAction.value`` enum on x2_debug as
+  // an int (alongside body_q / dq / action). Pure observability: the
+  // deploy does not act on MC mode changes (the x2_motor_monitor.py
+  // daemon on PC2 owns the alert + JSONL persistence; this just gets
+  // the signal aligned to the policy tick clock for forensic
+  // cross-correlation). Set <= 0 to disable polling entirely.
+  // ────────────────────────────────────────────────────────────────────
+  double      mc_mode_poll_s    = 1.0;
+  std::string mc_mode_service   = "/aimdk_5Fmsgs/srv/GetMcAction";
   // ────────────────────────────────────────────────────────────────────
   // Wrist bypass (VR-teleop quality-of-life switch).
   //
@@ -319,6 +619,128 @@ void PrintUsage()
       << "                             Use 0.05 (~3 deg) for first powered runs\n"
       << "                             so a divergent policy cannot drive any joint\n"
       << "                             more than RAD away from the standing pose.\n"
+      << "                             Acts as the GLOBAL default for joints with no\n"
+      << "                             per-group override below.\n"
+      << "  --max-target-dev-leg RAD   per-group override (MJ joints 0..11 = both\n"
+      << "                             hips, knees, ankles). >0 wins over the global\n"
+      << "                             --max-target-dev for these joints; -1/omitted\n"
+      << "                             = inherit. Typical pairing: leg=0.30 (~17 deg),\n"
+      << "                             arm=1.50 (~86 deg). Legs need to stay tight\n"
+      << "                             because their kp ~99 Nm/rad; the same\n"
+      << "                             nominal travel produces ~7x the torque arms do.\n"
+      << "  --max-target-dev-waist RAD per-group override (MJ joints 12..14 = waist\n"
+      << "                             yaw/pitch/roll). Same semantics as --leg.\n"
+      << "  --max-target-dev-arm RAD   per-group override (MJ joints 15..28 = both\n"
+      << "                             shoulders, elbows, wrists). Set this loose\n"
+      << "                             (e.g. 1.50) for teleop where IK can drive\n"
+      << "                             the wrist far from default.\n"
+      << "  --max-target-dev-head RAD  per-group override (MJ joints 29..30 = head\n"
+      << "                             yaw, pitch). Same semantics as --leg.\n"
+      << "  --kp-scale FACTOR          multiplicative trim on the trained KP for ALL\n"
+      << "                             joints (default 1.0). The shipped kps[] is the\n"
+      << "                             raw IsaacLab training value; deploying it\n"
+      << "                             unchanged loses ~1.3-1.5x of effective loop\n"
+      << "                             gain because IsaacLab integrates PD implicitly\n"
+      << "                             against joint inertia + armature, while real\n"
+      << "                             X2 / MuJoCo apply explicit ctrl-driven torque.\n"
+      << "                             See gear_sonic/scripts/eval_x2_mujoco.py:155.\n"
+      << "                             Per-group scales below are ON TOP of this.\n"
+      << "  --kp-scale-hip FACTOR      per-family override (joint-name contains 'hip').\n"
+      << "  --kp-scale-knee FACTOR     per-family override (joint-name contains 'knee').\n"
+      << "  --kp-scale-ankle FACTOR    LEGACY ankle alias. Multiplies BOTH the\n"
+      << "                             ankle_pitch and ankle_roll subgroups (backward\n"
+      << "                             compat with the pre-split single-knob YAMLs).\n"
+      << "                             Prefer the split knobs below for new presets\n"
+      << "                             because MC uses ASYMMETRIC PD across ankle\n"
+      << "                             axes (pitch kp=40 kd=3.0, roll kp=30 kd=2.0).\n"
+      << "  --kp-scale-ankle-pitch FACTOR  ankle_pitch_joint ONLY. Trained kp=21.38;\n"
+      << "                             1.87 matches MC's 40 N*m/rad. The G16b-validated\n"
+      << "                             default for sagittal-plane recovery.\n"
+      << "  --kp-scale-ankle-roll FACTOR  ankle_roll_joint ONLY. Trained kp=21.38;\n"
+      << "                             1.40 matches MC's 30 N*m/rad (deliberately\n"
+      << "                             softer than pitch so frontal-plane disturbances\n"
+      << "                             absorb without snapping the foot sideways).\n"
+      << "  --kp-scale-waist FACTOR    LEGACY waist alias. Multiplies BOTH the waist_yaw\n"
+      << "                             and waist_pr subgroups (backward compat with the\n"
+      << "                             pre-split single-knob YAMLs). Prefer the split\n"
+      << "                             knobs below for new presets -- the trained kps[]\n"
+      << "                             differ 2.81x between waist_yaw (40 Nm/rad) and\n"
+      << "                             waist_pitch/roll (14.25 Nm/rad), so a single\n"
+      << "                             alias cannot match MC's uniform 40 Nm/rad\n"
+      << "                             without over-stiffening yaw.\n"
+      << "  --kp-scale-waist-yaw FACTOR  waist_yaw_joint ONLY. Trained kp=40.18\n"
+      << "                             (matches MC's 40 exactly), so the typical value\n"
+      << "                             is 1.00 -- bumping it is more likely to ring than\n"
+      << "                             to help.\n"
+      << "  --kp-scale-waist-pr FACTOR   LEGACY alias: applies to BOTH waist_pitch and\n"
+      << "                             waist_roll. Trained kp=14.25, MC uses 40, so\n"
+      << "                             2.81 matches MC exactly. Prefer the per-axis\n"
+      << "                             knobs below for new presets -- the 2026-05-30\n"
+      << "                             MC-vs-SONIC scan showed pitch and roll close\n"
+      << "                             the MC gap in opposite directions (+45% on\n"
+      << "                             pitch, -72% on roll), which the combined knob\n"
+      << "                             cannot express.\n"
+      << "  --kp-scale-waist-pitch FACTOR  waist_pitch_joint ONLY. Composes with the\n"
+      << "                             legacy --kp-scale-waist and --kp-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). Use\n"
+      << "                             this to tune sagittal-lean (fwd/back) stiffness\n"
+      << "                             independently of roll.\n"
+      << "  --kp-scale-waist-roll FACTOR  waist_roll_joint ONLY. Composes with the\n"
+      << "                             legacy --kp-scale-waist and --kp-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). Use\n"
+      << "                             this to tune lateral-lean (left/right)\n"
+      << "                             stiffness; closes the -72% lateral compliance\n"
+      << "                             gap vs MC that the combined waist_pr knob\n"
+      << "                             can't reach without breaking pitch.\n"
+      << "  --kp-scale-shoulder FACTOR per-family override (shoulders L/R).\n"
+      << "  --kp-scale-elbow FACTOR    per-family override (elbows L/R).\n"
+      << "  --kp-scale-wrist FACTOR    per-family override (wrists L/R yaw/pitch/roll).\n"
+      << "  --kp-scale-head FACTOR     per-family override (head yaw/pitch).\n"
+      << "  --kd-scale FACTOR          like --kp-scale but for damping (default 1.0).\n"
+      << "                             Watch the kp/kd ratio: bumping kp without kd\n"
+      << "                             reduces effective damping ratio and can ring.\n"
+      << "  --kd-scale-{hip,knee,ankle,waist,shoulder,elbow,wrist,head}\n"
+      << "                             per-family kd overrides; same group definitions\n"
+      << "                             as the kp variants above. The ankle and waist\n"
+      << "                             aliases multiply their split subgroups together\n"
+      << "                             (same backward-compat semantics as --kp-scale-*).\n"
+      << "  --kd-scale-ankle-pitch FACTOR  ankle_pitch_joint ONLY. MC publishes kd=3.0\n"
+      << "                             vs trained 0.907 -> 3.31 matches MC. Under-damped\n"
+      << "                             ankle_pitch is the usual cause of 'foot-feels-\n"
+      << "                             springy' on fwd/back nudges at the ankle.\n"
+      << "  --kd-scale-ankle-roll FACTOR  ankle_roll_joint ONLY. MC publishes kd=2.0\n"
+      << "                             vs trained 0.907 -> 2.20 matches MC. Should be\n"
+      << "                             LESS than the pitch knob for the same reason\n"
+      << "                             the KP is lower (frontal plane is intrinsically\n"
+      << "                             more rigid; less damping needed).\n"
+      << "  --kd-scale-waist-yaw FACTOR  waist_yaw_joint ONLY. MC publishes kd=8.0 vs\n"
+      << "                             trained 2.56 -> 3.13 matches MC. Trunk damping\n"
+      << "                             is critical for nudge rejection: bumping kd is\n"
+      << "                             usually safer than bumping kp.\n"
+      << "  --kd-scale-waist-pr FACTOR   LEGACY alias: applies to BOTH waist_pitch and\n"
+      << "                             waist_roll. MC publishes kd=5.0 vs trained\n"
+      << "                             0.907 -> 5.51 matches MC. Prefer the per-axis\n"
+      << "                             knobs below for new presets (see\n"
+      << "                             --kp-scale-waist-pr rationale).\n"
+      << "  --kd-scale-waist-pitch FACTOR  waist_pitch_joint ONLY. Composes with the\n"
+      << "                             legacy --kd-scale-waist and --kd-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). The\n"
+      << "                             sagittal-axis push response is the ONE waist\n"
+      << "                             metric where SONIC already exceeds MC (+45%\n"
+      << "                             stronger); don't bump this above MC-match\n"
+      << "                             without explicit fwd/back-nudge scan evidence.\n"
+      << "  --kd-scale-waist-roll FACTOR  waist_roll_joint ONLY. Composes with the\n"
+      << "                             legacy --kd-scale-waist and --kd-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). The\n"
+      << "                             lateral-axis push response under SONIC at the\n"
+      << "                             combined waist_pr knob sits at -72% of MC's\n"
+      << "                             resistance, AND the policy moves its commanded\n"
+      << "                             target with the disturbance (gait tracker),\n"
+      << "                             so the failure mode is not simply 'too soft'\n"
+      << "                             or 'too damped'. Direction of trim must be\n"
+      << "                             determined by a post-fix MC-vs-SONIC lateral\n"
+      << "                             nudge scan; do NOT prescribe an a priori\n"
+      << "                             value here without that data.\n"
       << "  --action-clip RAD          symmetric clip on the raw ONNX action\n"
       << "                             (action_il) BEFORE x2_action_scale (default\n"
       << "                             20.0, matches training-time\n"
@@ -341,6 +763,21 @@ void PrintUsage()
       << "                             to --obs-dump (raw target preserved) but it\n"
       << "                             changes what the bus sees, which would\n"
       << "                             diverge from eval_x2_mujoco.py's reference.\n"
+      << "                             Acts as the GLOBAL default for joints with\n"
+      << "                             no per-group override (see --target-lpf-hz-*).\n"
+      << "  --target-lpf-hz-leg HZ     Per-group override for legs (MJ joints 0..11\n"
+      << "                             = hip+knee+ankle, both sides). <0 = inherit\n"
+      << "                             global; 0 = disabled on this group; >0 = use\n"
+      << "                             this cutoff. Default <0 (= inherit).\n"
+      << "  --target-lpf-hz-waist HZ   Per-group override for the waist (MJ joints\n"
+      << "                             12..14 = yaw/pitch/roll). Recommended 2-3 Hz\n"
+      << "                             to kill the observed 2.0-2.5 Hz waist\n"
+      << "                             resonance under SONIC active walking.\n"
+      << "  --target-lpf-hz-arm HZ     Per-group override for the arms (MJ joints\n"
+      << "                             15..28). <0 = inherit global. Raise above\n"
+      << "                             global if teleop arm motion feels sluggish.\n"
+      << "  --target-lpf-hz-head HZ    Per-group override for the head (MJ joints\n"
+      << "                             29..30). <0 = inherit global.\n"
       << "  --log-dir PATH             write per-tick CSVs to PATH\n"
       << "  --intra-op-threads N       ONNX session threads (default 1)\n"
       << "  --imu-topic NAME           override IMU topic (default /aima/hal/imu/torso/state;\n"
@@ -401,6 +838,17 @@ void PrintUsage()
       << "                             detectors are armed and the safety gate can\n"
       << "                             be shown. Independent of start-trigger; safe\n"
       << "                             to use on its own.\n"
+      << "  --soft-shutdown-trigger-sentinel PATH\n"
+      << "                             Polled at 50 Hz in CONTROL state. When PATH\n"
+      << "                             appears, deploy transitions to RAMP_OUT (same\n"
+      << "                             code path as --max-duration) and follows the\n"
+      << "                             full RAMP_OUT -> HOLD_FOR_MC -> exit-sentinel\n"
+      << "                             handoff chain. Lets bash convert Ctrl-C into a\n"
+      << "                             graceful shutdown so the robot stays under\n"
+      << "                             torque through MC's PASSIVE_DEFAULT boot (no\n"
+      << "                             zero-torque drop). Empty = legacy behaviour\n"
+      << "                             (immediate exit on SIGINT, ~1-2 s drop while\n"
+      << "                             MC boots back to STAND_DEFAULT).\n"
       << "  --input-type TYPE          {motion_file,zmq} (default motion_file). When\n"
       << "                             'zmq', the tokenizer reference window is\n"
       << "                             driven by a ZMQ 'pose' topic publisher\n"
@@ -428,6 +876,46 @@ void PrintUsage()
       << "                             attractor masks the operator's hand pose;\n"
       << "                             keep 'off' for sim-to-real fidelity tests so\n"
       << "                             the policy's own commands reach every joint.\n"
+      << "  --pose-ref-stale-s SEC     Split-topology safety (--input-type=zmq).\n"
+      << "                             Pose-ref age (s) at which the deploy trips\n"
+      << "                             into SAFE_IDLE (legs locked, default angles,\n"
+      << "                             4x kd, no policy inference). Default 0.5 s\n"
+      << "                             (~25 dropped frames at 50 Hz). Set <=0 to\n"
+      << "                             disable (equivalent to --disable-pose-ref-\n"
+      << "                             watchdog). Pairs with --pose-ref-min-fresh-s\n"
+      << "                             and the resume chord for recovery.\n"
+      << "  --pose-ref-min-fresh-s SEC After a SAFE_IDLE trip, the wire must carry\n"
+      << "                             fresh frames for this many seconds continuously\n"
+      << "                             before ReadyToResume() flips true. Default 1.0.\n"
+      << "                             Prevents a flapping wifi link from oscillating\n"
+      << "                             in/out of SAFE_IDLE on each fresh frame.\n"
+      << "  --disable-pose-ref-watchdog Hard-disable the pose-ref watchdog regardless\n"
+      << "                             of other flags. Restores legacy 'hold last good\n"
+      << "                             frame on starvation' behaviour. Use only for\n"
+      << "                             parity tests / benchmarks; NOT recommended for\n"
+      << "                             split-topology production (the freeze-while-\n"
+      << "                             leaning failure mode is exactly what this\n"
+      << "                             watchdog catches).\n"
+      << "  --zmq-resume-host HOST     Operator chord PUB host (the laptop running\n"
+      << "                             quest3_manager_x2.py). Default 'localhost'.\n"
+      << "                             In split topology pass the laptop IP.\n"
+      << "  --zmq-resume-port PORT     Resume PUB port (default 5566).\n"
+      << "  --zmq-resume-topic TOPIC   Resume topic (default 'pose_resume'). The\n"
+      << "                             Quest 3 manager publishes a single multipart\n"
+      << "                             message [topic, ts_monotonic_ns_le_i64]\n"
+      << "                             when the operator holds A+B for 1 s on the\n"
+      << "                             left controller.\n"
+      << "  --mc-mode-poll-s SEC       Poll the MC GetMcAction service every SEC\n"
+      << "                             seconds in a background timer (default 1.0).\n"
+      << "                             Publishes the current McAction.value on\n"
+      << "                             x2_debug as mc_action_mode for forensic\n"
+      << "                             cross-correlation with policy/state. Set <=0\n"
+      << "                             to disable (e.g. for sim runs where MC isn't\n"
+      << "                             present). Pure observability -- the deploy\n"
+      << "                             never acts on the result; the motor monitor\n"
+      << "                             daemon owns the alerts + JSONL persistence.\n"
+      << "  --mc-mode-service NAME     Override the MC mode service name\n"
+      << "                             (default '/aimdk_5Fmsgs/srv/GetMcAction').\n"
       << "  --help, -h                 show this help\n";
 }
 
@@ -452,9 +940,47 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--tilt-cos")          a.tilt_cos          = std::stod(next("--tilt-cos"));
     else if (s == "--ramp-seconds")      a.ramp_seconds      = std::stod(next("--ramp-seconds"));
     else if (s == "--max-target-dev")    a.max_target_dev    = std::stod(next("--max-target-dev"));
+    else if (s == "--max-target-dev-leg")   a.max_target_dev_leg   = std::stod(next("--max-target-dev-leg"));
+    else if (s == "--max-target-dev-waist") a.max_target_dev_waist = std::stod(next("--max-target-dev-waist"));
+    else if (s == "--max-target-dev-arm")   a.max_target_dev_arm   = std::stod(next("--max-target-dev-arm"));
+    else if (s == "--max-target-dev-head")  a.max_target_dev_head  = std::stod(next("--max-target-dev-head"));
+    else if (s == "--kp-scale")             a.kp_scale          = std::stod(next("--kp-scale"));
+    else if (s == "--kp-scale-hip")         a.kp_scale_hip      = std::stod(next("--kp-scale-hip"));
+    else if (s == "--kp-scale-knee")        a.kp_scale_knee     = std::stod(next("--kp-scale-knee"));
+    else if (s == "--kp-scale-ankle")       a.kp_scale_ankle        = std::stod(next("--kp-scale-ankle"));
+    else if (s == "--kp-scale-ankle-pitch") a.kp_scale_ankle_pitch  = std::stod(next("--kp-scale-ankle-pitch"));
+    else if (s == "--kp-scale-ankle-roll")  a.kp_scale_ankle_roll   = std::stod(next("--kp-scale-ankle-roll"));
+    else if (s == "--kp-scale-waist")        a.kp_scale_waist        = std::stod(next("--kp-scale-waist"));
+    else if (s == "--kp-scale-waist-yaw")    a.kp_scale_waist_yaw    = std::stod(next("--kp-scale-waist-yaw"));
+    else if (s == "--kp-scale-waist-pr")     a.kp_scale_waist_pr     = std::stod(next("--kp-scale-waist-pr"));
+    else if (s == "--kp-scale-waist-pitch")  a.kp_scale_waist_pitch  = std::stod(next("--kp-scale-waist-pitch"));
+    else if (s == "--kp-scale-waist-roll")   a.kp_scale_waist_roll   = std::stod(next("--kp-scale-waist-roll"));
+    else if (s == "--kp-scale-shoulder")    a.kp_scale_shoulder   = std::stod(next("--kp-scale-shoulder"));
+    else if (s == "--kp-scale-elbow")       a.kp_scale_elbow    = std::stod(next("--kp-scale-elbow"));
+    else if (s == "--kp-scale-wrist")       a.kp_scale_wrist    = std::stod(next("--kp-scale-wrist"));
+    else if (s == "--kp-scale-head")        a.kp_scale_head     = std::stod(next("--kp-scale-head"));
+    else if (s == "--kd-scale")             a.kd_scale          = std::stod(next("--kd-scale"));
+    else if (s == "--kd-scale-hip")         a.kd_scale_hip      = std::stod(next("--kd-scale-hip"));
+    else if (s == "--kd-scale-knee")        a.kd_scale_knee     = std::stod(next("--kd-scale-knee"));
+    else if (s == "--kd-scale-ankle")       a.kd_scale_ankle        = std::stod(next("--kd-scale-ankle"));
+    else if (s == "--kd-scale-ankle-pitch") a.kd_scale_ankle_pitch  = std::stod(next("--kd-scale-ankle-pitch"));
+    else if (s == "--kd-scale-ankle-roll")  a.kd_scale_ankle_roll   = std::stod(next("--kd-scale-ankle-roll"));
+    else if (s == "--kd-scale-waist")        a.kd_scale_waist        = std::stod(next("--kd-scale-waist"));
+    else if (s == "--kd-scale-waist-yaw")    a.kd_scale_waist_yaw    = std::stod(next("--kd-scale-waist-yaw"));
+    else if (s == "--kd-scale-waist-pr")     a.kd_scale_waist_pr     = std::stod(next("--kd-scale-waist-pr"));
+    else if (s == "--kd-scale-waist-pitch")  a.kd_scale_waist_pitch  = std::stod(next("--kd-scale-waist-pitch"));
+    else if (s == "--kd-scale-waist-roll")   a.kd_scale_waist_roll   = std::stod(next("--kd-scale-waist-roll"));
+    else if (s == "--kd-scale-shoulder")    a.kd_scale_shoulder   = std::stod(next("--kd-scale-shoulder"));
+    else if (s == "--kd-scale-elbow")       a.kd_scale_elbow    = std::stod(next("--kd-scale-elbow"));
+    else if (s == "--kd-scale-wrist")       a.kd_scale_wrist    = std::stod(next("--kd-scale-wrist"));
+    else if (s == "--kd-scale-head")        a.kd_scale_head     = std::stod(next("--kd-scale-head"));
     else if (s == "--action-clip")       a.action_clip       = std::stod(next("--action-clip"));
     else if (s == "--return-seconds")    a.return_seconds    = std::stod(next("--return-seconds"));
     else if (s == "--target-lpf-hz")     a.target_lpf_hz     = std::stod(next("--target-lpf-hz"));
+    else if (s == "--target-lpf-hz-leg")   a.target_lpf_hz_leg   = std::stod(next("--target-lpf-hz-leg"));
+    else if (s == "--target-lpf-hz-waist") a.target_lpf_hz_waist = std::stod(next("--target-lpf-hz-waist"));
+    else if (s == "--target-lpf-hz-arm")   a.target_lpf_hz_arm   = std::stod(next("--target-lpf-hz-arm"));
+    else if (s == "--target-lpf-hz-head")  a.target_lpf_hz_head  = std::stod(next("--target-lpf-hz-head"));
     else if (s == "--intra-op-threads")  a.intra_op_threads  = std::stoi(next("--intra-op-threads"));
     else if (s == "--imu-topic")         a.imu_topic         = next("--imu-topic");
     else if (s == "--obs-dump")          a.obs_dump_path     = next("--obs-dump");
@@ -471,6 +997,8 @@ CliArgs ParseCli(int argc, char** argv)
       a.start_trigger_sentinel = next("--start-trigger-sentinel");
     else if (s == "--ready-sentinel")
       a.ready_sentinel = next("--ready-sentinel");
+    else if (s == "--soft-shutdown-trigger-sentinel")
+      a.soft_shutdown_trigger_sentinel = next("--soft-shutdown-trigger-sentinel");
     else if (s == "--input-type")
       a.input_type = next("--input-type");
     else if (s == "--zmq-pose-host")
@@ -490,6 +1018,22 @@ CliArgs ParseCli(int argc, char** argv)
       else throw std::runtime_error(
           "--wrist-bypass must be 'off' or 'ik', got: " + v);
     }
+    else if (s == "--pose-ref-stale-s")
+      a.pose_ref_stale_s = std::stod(next("--pose-ref-stale-s"));
+    else if (s == "--pose-ref-min-fresh-s")
+      a.pose_ref_min_fresh_s = std::stod(next("--pose-ref-min-fresh-s"));
+    else if (s == "--disable-pose-ref-watchdog")
+      a.disable_pose_ref_watchdog = true;
+    else if (s == "--zmq-resume-host")
+      a.zmq_resume_host = next("--zmq-resume-host");
+    else if (s == "--zmq-resume-port")
+      a.zmq_resume_port = std::stoi(next("--zmq-resume-port"));
+    else if (s == "--zmq-resume-topic")
+      a.zmq_resume_topic = next("--zmq-resume-topic");
+    else if (s == "--mc-mode-poll-s")
+      a.mc_mode_poll_s = std::stod(next("--mc-mode-poll-s"));
+    else if (s == "--mc-mode-service")
+      a.mc_mode_service = next("--mc-mode-service");
     else {
       throw std::runtime_error("unknown argument: " + s);
     }
@@ -506,7 +1050,255 @@ CliArgs ParseCli(int argc, char** argv)
         "--wrist-bypass=ik requires --input-type=zmq (no IK reference is "
         "available on the motion_file path; the bypass would be a no-op)");
   }
+
+  // Reject non-positive PD scales. Zero would silently disable a joint
+  // family (kp = 0 = passive), which is almost certainly an operator typo
+  // and would let the policy push the robot around with only damping in
+  // the loop. Negative values would invert the sign of the corrective
+  // torque, which is unrecoverable. Better to fail at parse time.
+  auto reject_nonpos = [](const char* flag, double v) {
+    if (v <= 0.0) {
+      throw std::runtime_error(std::string(flag) +
+                               " must be > 0 (got " + std::to_string(v) +
+                               "); use 1.0 for no trim");
+    }
+  };
+  reject_nonpos("--kp-scale",          a.kp_scale);
+  reject_nonpos("--kp-scale-hip",      a.kp_scale_hip);
+  reject_nonpos("--kp-scale-knee",     a.kp_scale_knee);
+  reject_nonpos("--kp-scale-ankle",       a.kp_scale_ankle);
+  reject_nonpos("--kp-scale-ankle-pitch", a.kp_scale_ankle_pitch);
+  reject_nonpos("--kp-scale-ankle-roll",  a.kp_scale_ankle_roll);
+  reject_nonpos("--kp-scale-waist",        a.kp_scale_waist);
+  reject_nonpos("--kp-scale-waist-yaw",    a.kp_scale_waist_yaw);
+  reject_nonpos("--kp-scale-waist-pr",     a.kp_scale_waist_pr);
+  reject_nonpos("--kp-scale-waist-pitch",  a.kp_scale_waist_pitch);
+  reject_nonpos("--kp-scale-waist-roll",   a.kp_scale_waist_roll);
+  reject_nonpos("--kp-scale-shoulder",  a.kp_scale_shoulder);
+  reject_nonpos("--kp-scale-elbow",    a.kp_scale_elbow);
+  reject_nonpos("--kp-scale-wrist",    a.kp_scale_wrist);
+  reject_nonpos("--kp-scale-head",     a.kp_scale_head);
+  reject_nonpos("--kd-scale",          a.kd_scale);
+  reject_nonpos("--kd-scale-hip",      a.kd_scale_hip);
+  reject_nonpos("--kd-scale-knee",     a.kd_scale_knee);
+  reject_nonpos("--kd-scale-ankle",       a.kd_scale_ankle);
+  reject_nonpos("--kd-scale-ankle-pitch", a.kd_scale_ankle_pitch);
+  reject_nonpos("--kd-scale-ankle-roll",  a.kd_scale_ankle_roll);
+  reject_nonpos("--kd-scale-waist",        a.kd_scale_waist);
+  reject_nonpos("--kd-scale-waist-yaw",    a.kd_scale_waist_yaw);
+  reject_nonpos("--kd-scale-waist-pr",     a.kd_scale_waist_pr);
+  reject_nonpos("--kd-scale-waist-pitch",  a.kd_scale_waist_pitch);
+  reject_nonpos("--kd-scale-waist-roll",   a.kd_scale_waist_roll);
+  reject_nonpos("--kd-scale-shoulder",  a.kd_scale_shoulder);
+  reject_nonpos("--kd-scale-elbow",    a.kd_scale_elbow);
+  reject_nonpos("--kd-scale-wrist",    a.kd_scale_wrist);
+  reject_nonpos("--kd-scale-head",     a.kd_scale_head);
+
   return a;
+}
+
+// ---------------------------------------------------------------------------
+// Per-DOF max_target_dev synthesizer.
+//
+// Maps the (global, leg, waist, arm, head) CLI scalars onto the 31-element
+// per-DOF array consumed by ApplySafetyStack. A per-group value <= 0 means
+// "inherit the global". The global itself can also be <= 0 (= disabled);
+// in that case any joint without a positive group override gets -1 in the
+// output array, which ApplySafetyStack interprets as "no clamp on this DOF".
+//
+// Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+// mujoco_joint_names):
+//   leg   -> indices  0..11
+//   waist -> indices 12..14
+//   arm   -> indices 15..28
+//   head  -> indices 29..30
+//
+// Free function (not a class member) so it's trivially testable in isolation
+// and visible to whoever's reading the safety wiring without having to step
+// inside X2Deploy.
+struct MaxTargetDevSpec {
+  double global;
+  double leg;
+  double waist;
+  double arm;
+  double head;
+};
+
+static std::array<double, NUM_DOFS>
+BuildMaxTargetDevPerDof(const MaxTargetDevSpec& s)
+{
+  std::array<double, NUM_DOFS> arr{};
+  arr.fill(s.global);
+  if (s.leg   > 0.0) for (std::size_t i = 0;  i <= 11; ++i) arr[i] = s.leg;
+  if (s.waist > 0.0) for (std::size_t i = 12; i <= 14; ++i) arr[i] = s.waist;
+  if (s.arm   > 0.0) for (std::size_t i = 15; i <= 28; ++i) arr[i] = s.arm;
+  if (s.head  > 0.0) for (std::size_t i = 29; i <= 30; ++i) arr[i] = s.head;
+  return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Per-DOF target_lpf alpha synthesizer.
+//
+// Mirrors BuildMaxTargetDevPerDof: maps the (global, leg, waist, arm, head)
+// CLI cutoff scalars onto a 31-element per-DOF EMA-alpha array consumed by
+// the OnControl hot loop. Convention for the input scalars (matches CliArgs
+// docs and --target-lpf-hz-* help):
+//   < 0  -> "inherit global"
+//   == 0 -> "disabled on this group" (no smoothing, output = raw target)
+//   > 0  -> "use this Hz cutoff on this group"
+//
+// The global itself follows the original target_lpf_hz convention: > 0
+// = enabled at that cutoff, otherwise disabled. This means a robot deployed
+// with the global at 0 (default) and only --target-lpf-hz-waist=3 will
+// smooth only the waist DOFs and leave every other DOF passthrough.
+//
+// alpha is the standard first-order EMA coefficient at the OnControl tick
+// rate ``dt`` (50 Hz, dt = 0.02 s): alpha = 1 - exp(-2*pi*hz*dt). alpha = 0
+// in the output array means "no smoothing on this DOF" (passthrough);
+// 0 < alpha < 1 means "EMA with this coefficient"; the hot path branches
+// on alpha == 0 to skip the EMA for unsmoothed DOFs cheaply.
+//
+// Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+// mujoco_joint_names):
+//   leg   -> indices  0..11
+//   waist -> indices 12..14
+//   arm   -> indices 15..28
+//   head  -> indices 29..30
+struct TargetLpfSpec {
+  double global;  // > 0 = enabled, otherwise disabled
+  double leg;     // < 0 inherit, == 0 disabled, > 0 = cutoff Hz
+  double waist;
+  double arm;
+  double head;
+  double dt;      // OnControl tick period in seconds (0.02 for 50 Hz)
+};
+
+static std::array<double, NUM_DOFS>
+BuildTargetLpfAlphaPerDof(const TargetLpfSpec& s)
+{
+  constexpr double pi = 3.14159265358979323846;
+  auto hz_to_alpha = [&](double hz) -> double {
+    if (hz <= 0.0) return 0.0;  // disabled or passthrough
+    return 1.0 - std::exp(-2.0 * pi * hz * s.dt);
+  };
+
+  // Step 1: fill with the global (or 0 if global is disabled).
+  const double alpha_global = hz_to_alpha(s.global > 0.0 ? s.global : 0.0);
+  std::array<double, NUM_DOFS> arr{};
+  arr.fill(alpha_global);
+
+  // Step 2: per-group overrides. Negative = inherit (do nothing here);
+  // zero or positive = explicit override (write into the slice). A zero
+  // override deliberately CLEARS the global on that group, which is the
+  // whole point of supporting a "disabled on this group" semantic
+  // independent of the global default.
+  auto apply = [&](double hz_group, std::size_t lo, std::size_t hi) {
+    if (hz_group < 0.0) return;  // inherit global
+    const double alpha_group = hz_to_alpha(hz_group);
+    for (std::size_t i = lo; i <= hi; ++i) arr[i] = alpha_group;
+  };
+  apply(s.leg,    0,  11);
+  apply(s.waist, 12,  14);
+  apply(s.arm,   15,  28);
+  apply(s.head,  29,  30);
+  return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Per-DOF PD-scale synthesizer.
+//
+// Mirrors ``gear_sonic/scripts/eval_x2_mujoco.py::_deployment_pd_scale``:
+// match each joint name against family substrings ("hip", "knee", "ankle",
+// "waist", "shoulder", "elbow", "wrist", "head") and use the matching
+// per-family scale (default 1.0). Then multiply by the global scale.
+//
+// The result is the FINAL effective PD that the safety stack will publish
+// on the bus. Positive only (validated at parse time). Used independently
+// for kp and kd via two ``PdScaleSpec`` instances.
+struct PdScaleSpec {
+  double global;
+  double hip;
+  double knee;
+  // Ankle is split into pitch vs roll because MC uses ASYMMETRIC PD on
+  // those subgroups (ankle_pitch kp=40 kd=3.0; ankle_roll kp=30 kd=2.0;
+  // 2026-05-15 scan). Trained kps are uniform (both 21.38) so a single
+  // ``ankle`` knob forces operator to pick "match pitch and over-stiffen
+  // roll" or "match roll and under-stiffen pitch". Split lets us hit
+  // both MC values exactly.
+  double ankle_pitch;
+  double ankle_roll;
+  // Waist is split THREE ways: yaw, pitch, roll. Two reasons stacked:
+  //
+  // (1) Trained kps for yaw vs pitch/roll differ 2.81x (waist_yaw
+  //     kp=40.18, waist_pitch/roll kp=14.25). MC publishes a uniform
+  //     kp=40 across all three (operator scan 2026-05-15:
+  //     mc_motor_scan_1778884089.jsonl), so matching MC requires
+  //     ~1.0x on waist_yaw and ~2.81x on waist_pitch/roll. A single
+  //     ``waist`` knob couldn't express that.
+  //
+  // (2) The 2026-05-30 MC-vs-SONIC torso-nudge scan showed pitch and
+  //     roll diverge in opposite directions from MC even at numerically
+  //     identical PD: pitch (sagittal lean) ran +45% STRONGER than MC
+  //     in push-resistance, while roll (lateral lean) ran -72% WEAKER.
+  //     The asymmetry comes from the load distribution (arms hang
+  //     symmetric about pitch, swing the whole COM laterally about
+  //     roll) AND from the policy being a gait-tracker that moves
+  //     WITH lateral disturbance. The waist_pr knob (which moved
+  //     pitch and roll together) couldn't close the lateral gap
+  //     without over-tightening pitch and re-introducing the
+  //     forward/back wobble we'd already tuned out.
+  //
+  // Splitting waist_pr -> waist_pitch + waist_roll gives one knob per
+  // physical axis, matching the ankle_pitch/ankle_roll split we
+  // already do.
+  double waist_yaw;
+  double waist_pitch;
+  double waist_roll;
+  double shoulder;
+  double elbow;
+  double wrist;
+  double head;
+};
+
+static double FamilyScaleForJointName(const PdScaleSpec& s,
+                                      const std::string& jname)
+{
+  // Order matters only for substrings that overlap. The waist split is
+  // checked subgroup-by-subgroup -- waist_yaw / waist_pitch /
+  // waist_roll are mutually exclusive on the X2 joint name list, so
+  // each falls into its own branch. All other families are pairwise
+  // disjoint, so iteration order doesn't matter for them.
+  if (jname.find("ankle")    != std::string::npos) {
+    // ankle_pitch_joint vs ankle_roll_joint (no "ankle_yaw" exists on
+    // X2). Identical structure to the waist split below.
+    if (jname.find("ankle_pitch") != std::string::npos) return s.ankle_pitch;
+    return s.ankle_roll;  // ankle_roll_joint (and any future ankle subgroup
+                          // not yet enumerated; defensive default)
+  }
+  if (jname.find("knee")     != std::string::npos) return s.knee;
+  if (jname.find("hip")      != std::string::npos) return s.hip;
+  if (jname.find("waist")    != std::string::npos) {
+    if (jname.find("waist_yaw")   != std::string::npos) return s.waist_yaw;
+    if (jname.find("waist_pitch") != std::string::npos) return s.waist_pitch;
+    return s.waist_roll;  // waist_roll_joint (defensive default for any
+                          // future waist subgroup name we haven't enumerated)
+  }
+  if (jname.find("shoulder") != std::string::npos) return s.shoulder;
+  if (jname.find("elbow")    != std::string::npos) return s.elbow;
+  if (jname.find("wrist")    != std::string::npos) return s.wrist;
+  if (jname.find("head")     != std::string::npos) return s.head;
+  return 1.0;  // Unknown family -> no trim. Defensive; should not happen
+               // for the codegen'd 31-joint X2 set.
+}
+
+static std::array<double, NUM_DOFS>
+BuildPdScalesPerDof(const PdScaleSpec& s)
+{
+  std::array<double, NUM_DOFS> arr{};
+  for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+    arr[i] = s.global * FamilyScaleForJointName(s, mujoco_joint_names[i]);
+  }
+  return arr;
 }
 
 // ---------------------------------------------------------------------------
@@ -555,16 +1347,48 @@ class X2Deploy {
     INIT,
     WAIT_FOR_CONTROL,
     CONTROL,
+    SAFE_IDLE,    // ← NEW: recoverable starvation hold (split-topology safety)
     RAMP_OUT,
     HOLD_FOR_MC,
     SAFE_HOLD,
   };
+
+  // ────────────────────────────────────────────────────────────────────
+  // SAFE_IDLE (Phase 2 of the split-topology safety plan).
+  //
+  // Reached from CONTROL when the pose-ref starvation watchdog trips
+  // (PoseRefStarvationWatchdog::Update returns true on the
+  // current age == now - LastReceivedMonotonicS()). In SAFE_IDLE:
+  //
+  //   * the writer keeps publishing at 500 Hz, latched to default_angles
+  //     with deploy-mode kp and 4x kd (matches the tilt-trip slump
+  //     branch), so the body stays under torque -- it doesn't go limp
+  //     like PASSIVE_DEFAULT would on MC. Operator can let go of the
+  //     gantry and the robot continues to hold the standing pose.
+  //   * the policy is NOT inferred (we skip the rest of the OnControl
+  //     fast path, including obs construction). The deploy is "alive
+  //     but coasting" -- minimal CPU + no commitment to whatever
+  //     stale pose the operator was last commanding.
+  //   * pose-ref freshness keeps being tracked. As soon as the wire
+  //     resumes and the watchdog's ReadyToResume() flips true AND an
+  //     operator chord arrives on the resume topic within the last
+  //     0.5 s, deploy re-enters CONTROL with ramp_alpha reset to 0
+  //     (so SoftStartRamp blends back from default to the live policy
+  //     output over --ramp-seconds; no torque shock).
+  //
+  // Unlike SAFE_HOLD (which is terminal -- deploy stays there until
+  // restart), SAFE_IDLE is explicitly recoverable. The dual-gate exit
+  // (fresh wire + operator chord) is a deliberate design choice: a wifi
+  // flicker on its own can never re-engage CONTROL silently, no matter
+  // how briefly the link recovers.
+  // ────────────────────────────────────────────────────────────────────
 
   X2Deploy(rclcpp::Node::SharedPtr node, const CliArgs& cli)
       : node_(node),
         cli_(cli),
         ramp_(cli.ramp_seconds),
         watchdog_(cli.tilt_cos),
+        pose_ref_watchdog_(cli.pose_ref_stale_s, cli.pose_ref_min_fresh_s),
         logger_(cli.log_dir.empty() ? std::string{} : cli.log_dir,
                 /*enabled=*/!cli.log_dir.empty())
   {
@@ -640,21 +1464,180 @@ class X2Deploy {
                 onnx_actor_->input_name().c_str(),
                 static_cast<long>(onnx_actor_->expected_obs_dim()));
 
+    // Synthesise the per-DOF max_target_dev array once from the CLI
+    // (global + per-group). Done after CLI parsing but before any
+    // OnControl tick can fire; the array is read-only thereafter.
+    max_target_dev_per_dof_ = BuildMaxTargetDevPerDof(MaxTargetDevSpec{
+        cli_.max_target_dev,
+        cli_.max_target_dev_leg,
+        cli_.max_target_dev_waist,
+        cli_.max_target_dev_arm,
+        cli_.max_target_dev_head});
+
+    // Synthesise the per-DOF effective PD by multiplying the constexpr
+    // trained kps[] / kds[] by the global+per-family scales. Done once
+    // here so the OnControl hot path is unaffected.
+    // Family aliases compose MULTIPLICATIVELY with their split-subgroup
+    // knobs, so ``--kp-scale-ankle 1.5`` alone still scales BOTH ankle
+    // subgroups by 1.5x (backward compat with the pre-split single-knob
+    // YAMLs); same for ``--kp-scale-waist``. Setting both an alias AND
+    // a subgroup value multiplies them, which is almost certainly an
+    // operator typo but we don't reject it -- the SAFETY warn log
+    // surfaces the final effective scale per subgroup so the operator
+    // can verify what landed.
+    // Waist subgroup composition: the legacy ``waist_pr`` alias is
+    // kept as a multiplier on BOTH pitch and roll for backward compat
+    // with pre-2026-05-30 walking_recovery.yaml / expressive.yaml.
+    // Effective scale on a waist_pitch joint becomes
+    //   waist (alias) * waist_pr (alias) * waist_pitch (split knob)
+    // and similarly for roll. All three default to 1.0, so the
+    // alias-only path (e.g. ``kd_scale_waist_pr: 5.51``) reproduces
+    // the pre-split behaviour bit-for-bit.
+    const auto kp_scales = BuildPdScalesPerDof(PdScaleSpec{
+        cli_.kp_scale,
+        cli_.kp_scale_hip,      cli_.kp_scale_knee,
+        cli_.kp_scale_ankle * cli_.kp_scale_ankle_pitch,
+        cli_.kp_scale_ankle * cli_.kp_scale_ankle_roll,
+        cli_.kp_scale_waist * cli_.kp_scale_waist_yaw,
+        cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_pitch,
+        cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_roll,
+        cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
+        cli_.kp_scale_wrist,    cli_.kp_scale_head});
+    const auto kd_scales = BuildPdScalesPerDof(PdScaleSpec{
+        cli_.kd_scale,
+        cli_.kd_scale_hip,      cli_.kd_scale_knee,
+        cli_.kd_scale_ankle * cli_.kd_scale_ankle_pitch,
+        cli_.kd_scale_ankle * cli_.kd_scale_ankle_roll,
+        cli_.kd_scale_waist * cli_.kd_scale_waist_yaw,
+        cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_pitch,
+        cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_roll,
+        cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
+        cli_.kd_scale_wrist,    cli_.kd_scale_head});
+    for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+      kps_scaled_[i] = kps[i] * kp_scales[i];
+      kds_scaled_[i] = kds[i] * kd_scales[i];
+    }
+
     // Loud-and-proud announcement of the safety knobs that materially affect
     // worst-case actuation. Operator should see these in the deploy log
     // before saying "go", so a missing --max-target-dev on a powered run is
-    // visible at a glance instead of buried in the help text.
-    if (cli_.max_target_dev > 0.0) {
+    // visible at a glance instead of buried in the help text. Per-group
+    // overrides are surfaced even when the global is disabled, so a
+    // partial-coverage configuration ("arm=1.50, leg=disabled") is hard
+    // to overlook.
+    constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
+    auto fmt_clamp = [&](double rad) {
+      char buf[64];
+      if (rad > 0.0) {
+        std::snprintf(buf, sizeof(buf), "%.3f rad (%.1f deg)", rad, rad * kRadToDeg);
+      } else {
+        std::snprintf(buf, sizeof(buf), "DISABLED");
+      }
+      return std::string(buf);
+    };
+    auto group_effective = [&](double group_val) {
+      return group_val > 0.0 ? group_val : cli_.max_target_dev;
+    };
+    if (cli_.max_target_dev > 0.0
+        || cli_.max_target_dev_leg > 0.0
+        || cli_.max_target_dev_waist > 0.0
+        || cli_.max_target_dev_arm > 0.0
+        || cli_.max_target_dev_head > 0.0) {
       RCLCPP_WARN(node_->get_logger(),
-                  "SAFETY: per-joint target clamp ENABLED at "
-                  "|target - default| <= %.3f rad (%.1f deg)",
-                  cli_.max_target_dev,
-                  cli_.max_target_dev * 180.0 / 3.14159265358979323846);
+                  "SAFETY: per-joint target clamp ENABLED. Effective per-group "
+                  "|target - default| limits: leg=%s, waist=%s, arm=%s, head=%s "
+                  "(global default --max-target-dev=%s; per-group overrides win when > 0)",
+                  fmt_clamp(group_effective(cli_.max_target_dev_leg)).c_str(),
+                  fmt_clamp(group_effective(cli_.max_target_dev_waist)).c_str(),
+                  fmt_clamp(group_effective(cli_.max_target_dev_arm)).c_str(),
+                  fmt_clamp(group_effective(cli_.max_target_dev_head)).c_str(),
+                  fmt_clamp(cli_.max_target_dev).c_str());
     } else {
       RCLCPP_WARN(node_->get_logger(),
                   "SAFETY: per-joint target clamp DISABLED "
-                  "(--max-target-dev not set). Policy can drive any joint "
-                  "to any value the ONNX session emits.");
+                  "(no --max-target-dev{,-leg,-waist,-arm,-head} set). "
+                  "Policy can drive any joint to any value the ONNX session emits.");
+    }
+
+    // Surface any non-unity PD trim so the operator can verify ankle=1.5,
+    // waist=1.5, etc. landed before saying "go". Suppressed entirely when
+    // every scale is exactly 1.0 (the default; unscaled trained PD).
+    auto any_non_unity = [](std::initializer_list<double> xs) {
+      for (double x : xs) if (x != 1.0) return true;
+      return false;
+    };
+    const bool kp_trimmed = any_non_unity({
+        cli_.kp_scale, cli_.kp_scale_hip, cli_.kp_scale_knee,
+        cli_.kp_scale_ankle, cli_.kp_scale_ankle_pitch, cli_.kp_scale_ankle_roll,
+        cli_.kp_scale_waist, cli_.kp_scale_waist_yaw, cli_.kp_scale_waist_pr,
+        cli_.kp_scale_waist_pitch, cli_.kp_scale_waist_roll,
+        cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
+        cli_.kp_scale_wrist, cli_.kp_scale_head});
+    const bool kd_trimmed = any_non_unity({
+        cli_.kd_scale, cli_.kd_scale_hip, cli_.kd_scale_knee,
+        cli_.kd_scale_ankle, cli_.kd_scale_ankle_pitch, cli_.kd_scale_ankle_roll,
+        cli_.kd_scale_waist, cli_.kd_scale_waist_yaw, cli_.kd_scale_waist_pr,
+        cli_.kd_scale_waist_pitch, cli_.kd_scale_waist_roll,
+        cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
+        cli_.kd_scale_wrist, cli_.kd_scale_head});
+    if (kp_trimmed || kd_trimmed) {
+      // Print effective per-subgroup scales (with alias folded in) so the
+      // operator doesn't have to multiply the alias by the subgroup knob
+      // in their head to know what landed. Also dump sample joints so
+      // the absolute Nm/rad value is visible at a glance for each
+      // wobble-axis joint family.
+      const double kp_eff_ankle_pitch = cli_.kp_scale_ankle * cli_.kp_scale_ankle_pitch;
+      const double kp_eff_ankle_roll  = cli_.kp_scale_ankle * cli_.kp_scale_ankle_roll;
+      const double kd_eff_ankle_pitch = cli_.kd_scale_ankle * cli_.kd_scale_ankle_pitch;
+      const double kd_eff_ankle_roll  = cli_.kd_scale_ankle * cli_.kd_scale_ankle_roll;
+      const double kp_eff_waist_yaw   = cli_.kp_scale_waist * cli_.kp_scale_waist_yaw;
+      // waist_pitch and waist_roll effective scales fold in both the
+      // legacy ``waist`` and ``waist_pr`` aliases as well as the new
+      // per-axis knobs, so what gets logged here is exactly what
+      // BuildPdScalesPerDof above feeds into BuildPdScalesPerDof.
+      const double kp_eff_waist_pitch = cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_pitch;
+      const double kp_eff_waist_roll  = cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_roll;
+      const double kd_eff_waist_yaw   = cli_.kd_scale_waist * cli_.kd_scale_waist_yaw;
+      const double kd_eff_waist_pitch = cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_pitch;
+      const double kd_eff_waist_roll  = cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_roll;
+      RCLCPP_WARN(node_->get_logger(),
+                  "SAFETY: deployment-time PD trim ENABLED. Effective gains = "
+                  "trained kps[]/kds[] * (global * family). KP scales: "
+                  "global=%.3f hip=%.3f knee=%.3f "
+                  "ankle_pitch=%.3f ankle_roll=%.3f "
+                  "waist_yaw=%.3f waist_pitch=%.3f waist_roll=%.3f "
+                  "shoulder=%.3f elbow=%.3f wrist=%.3f head=%.3f. "
+                  "KD scales: global=%.3f hip=%.3f knee=%.3f "
+                  "ankle_pitch=%.3f ankle_roll=%.3f "
+                  "waist_yaw=%.3f waist_pitch=%.3f waist_roll=%.3f "
+                  "shoulder=%.3f elbow=%.3f wrist=%.3f head=%.3f. "
+                  "Sample effective gains: "
+                  "ankle_pitch kp=%.3f kd=%.3f, ankle_roll kp=%.3f kd=%.3f, "
+                  "waist_yaw kp=%.3f kd=%.3f, waist_pitch kp=%.3f kd=%.3f, "
+                  "waist_roll kp=%.3f kd=%.3f.",
+                  cli_.kp_scale, cli_.kp_scale_hip, cli_.kp_scale_knee,
+                  kp_eff_ankle_pitch, kp_eff_ankle_roll,
+                  kp_eff_waist_yaw, kp_eff_waist_pitch, kp_eff_waist_roll,
+                  cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
+                  cli_.kp_scale_wrist, cli_.kp_scale_head,
+                  cli_.kd_scale, cli_.kd_scale_hip, cli_.kd_scale_knee,
+                  kd_eff_ankle_pitch, kd_eff_ankle_roll,
+                  kd_eff_waist_yaw, kd_eff_waist_pitch, kd_eff_waist_roll,
+                  cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
+                  cli_.kd_scale_wrist, cli_.kd_scale_head,
+                  kps_scaled_[4],  kds_scaled_[4],   // left_ankle_pitch
+                  kps_scaled_[5],  kds_scaled_[5],   // left_ankle_roll
+                  kps_scaled_[12], kds_scaled_[12],  // waist_yaw
+                  kps_scaled_[13], kds_scaled_[13], // waist_pitch
+                  kps_scaled_[14], kds_scaled_[14]); // waist_roll
+    } else {
+      RCLCPP_INFO(node_->get_logger(),
+                  "SAFETY: deployment-time PD trim DISABLED (all scales = 1.0). "
+                  "Using trained kps[]/kds[] from policy_parameters.hpp as-is. "
+                  "Note: IsaacLab's implicit PD makes the same numerical KP "
+                  "behave ~1.3-1.5x stiffer at training than at deploy; if you "
+                  "see torso wobble on nudge, try the MC-matched values shipped "
+                  "in configs/real_deploy_tuning/expressive.yaml.");
     }
 
     if (cli_.action_clip > 0.0) {
@@ -692,8 +1675,8 @@ class X2Deploy {
     // operator notices when the YAML is missing.
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
       stand_pose_target_[i]    = default_angles[i];
-      stand_pose_stiffness_[i] = kps[i];
-      stand_pose_damping_[i]   = kds[i];
+      stand_pose_stiffness_[i] = kps_scaled_[i];
+      stand_pose_damping_[i]   = kds_scaled_[i];
     }
     if (!cli_.stand_pose_path.empty()) {
       try {
@@ -765,6 +1748,24 @@ class X2Deploy {
                   "(touched on entering HOLD_FOR_MC).",
                   cli_.hold_for_mc_sentinel.c_str());
     }
+    if (!cli_.soft_shutdown_trigger_sentinel.empty()) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "HANDOFF: soft-shutdown trigger ENABLED -- polling '%s' "
+                  "in CONTROL state at 50 Hz. When bash touches this file "
+                  "(e.g. on Ctrl-C), deploy transitions to RAMP_OUT and "
+                  "follows the full RAMP_OUT -> HOLD_FOR_MC -> exit-"
+                  "sentinel chain. Robot stays under torque across the "
+                  "MC restart; no zero-torque drop.",
+                  cli_.soft_shutdown_trigger_sentinel.c_str());
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+                  "HANDOFF: soft-shutdown trigger DISABLED. Ctrl-C will "
+                  "exit immediately via rclcpp default SIGINT handler; "
+                  "bus will be silent for ~1-2 s while MC boots back "
+                  "through PASSIVE_DEFAULT (zero torque, robot drops "
+                  "under gravity). Pass --soft-shutdown-trigger-sentinel "
+                  "PATH to opt in to the graceful path.");
+    }
 
     // STANDBY support. If --start-trigger-sentinel is set, boot into
     // STANDBY (writer suppressed, no joint commands published) and wait
@@ -784,23 +1785,63 @@ class X2Deploy {
       std::remove(cli_.start_trigger_sentinel.c_str());
     }
 
-    // Compute the EMA coefficient now so OnControl can apply it without
-    // re-deriving every tick. dt is fixed at 1/50 s (the OnControl rate);
-    // alpha = 1 - exp(-2*pi*hz*dt) is the standard discrete first-order
-    // low-pass coefficient. hz<=0 -> alpha=0 (bypass).
-    if (cli_.target_lpf_hz > 0.0) {
-      const double dt = 1.0 / 50.0;
-      const double pi = 3.14159265358979323846;
-      target_lpf_alpha_ = 1.0 - std::exp(-2.0 * pi * cli_.target_lpf_hz * dt);
-      RCLCPP_WARN(node_->get_logger(),
-                  "REAL-DEPLOY: output target LPF ENABLED (--target-lpf-hz %.2f Hz, "
-                  "alpha=%.3f at 50 Hz OnControl). Bypassed in RAMP_OUT/SAFE_HOLD. "
-                  "Sim parity (eval_x2_mujoco.py) is preserved -- this filter "
-                  "lives strictly downstream of the policy and never affects "
-                  "--obs-dump output.",
-                  cli_.target_lpf_hz, target_lpf_alpha_);
-    } else {
-      target_lpf_alpha_ = 0.0;
+    // Compute the per-DOF EMA coefficient array now so OnControl can apply
+    // it without re-deriving every tick. dt is fixed at 1/50 s (the
+    // OnControl rate); alpha = 1 - exp(-2*pi*hz*dt) is the standard
+    // discrete first-order low-pass coefficient. Per-group overrides
+    // (--target-lpf-hz-{leg,waist,arm,head}) follow the max_target_dev
+    // semantics: <0 inherit global, ==0 disabled on that group, >0 use
+    // explicit cutoff. See BuildTargetLpfAlphaPerDof for the full table.
+    {
+      constexpr double kOnControlDt = 1.0 / 50.0;
+      const TargetLpfSpec spec{
+          cli_.target_lpf_hz,        // global
+          cli_.target_lpf_hz_leg,    // leg override (<0 = inherit)
+          cli_.target_lpf_hz_waist,  // waist override
+          cli_.target_lpf_hz_arm,    // arm override
+          cli_.target_lpf_hz_head,   // head override
+          kOnControlDt,
+      };
+      target_lpf_alpha_per_dof_ = BuildTargetLpfAlphaPerDof(spec);
+
+      // Cache the "anything active" flag so the OnControl hot loop can
+      // skip the entire EMA block when every DOF is in passthrough mode.
+      target_lpf_any_active_ = false;
+      for (double a : target_lpf_alpha_per_dof_) {
+        if (a > 0.0) {
+          target_lpf_any_active_ = true;
+          break;
+        }
+      }
+
+      // Pretty-print the effective Hz per group for the warm-up log, so an
+      // operator who's reading the deploy logs at startup can sanity-check
+      // what they shipped without having to re-derive alpha back into Hz.
+      auto group_eff_hz = [&](double override_hz) {
+        return override_hz < 0.0 ? std::max(spec.global, 0.0) : std::max(override_hz, 0.0);
+      };
+      const double hz_leg   = group_eff_hz(cli_.target_lpf_hz_leg);
+      const double hz_waist = group_eff_hz(cli_.target_lpf_hz_waist);
+      const double hz_arm   = group_eff_hz(cli_.target_lpf_hz_arm);
+      const double hz_head  = group_eff_hz(cli_.target_lpf_hz_head);
+
+      if (target_lpf_any_active_) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "REAL-DEPLOY: output target LPF ACTIVE on at least one group. "
+                    "Effective cutoffs (Hz) -- leg=%.2f waist=%.2f arm=%.2f head=%.2f "
+                    "(global=%.2f). Bypassed in RAMP_OUT/SAFE_HOLD. Sim parity "
+                    "(eval_x2_mujoco.py) preserved -- this filter is strictly "
+                    "downstream of the policy and never affects --obs-dump.",
+                    hz_leg, hz_waist, hz_arm, hz_head,
+                    std::max(cli_.target_lpf_hz, 0.0));
+      } else {
+        RCLCPP_INFO(node_->get_logger(),
+                    "REAL-DEPLOY: output target LPF DISABLED on every group "
+                    "(global=%.2f, leg=%.2f, waist=%.2f, arm=%.2f, head=%.2f Hz).",
+                    cli_.target_lpf_hz, cli_.target_lpf_hz_leg,
+                    cli_.target_lpf_hz_waist, cli_.target_lpf_hz_arm,
+                    cli_.target_lpf_hz_head);
+      }
     }
 
     // Initial safe command: PASSIVE (kp=0, kd=0) until any state arrives.
@@ -847,6 +1888,101 @@ class X2Deploy {
     // Optional autostart watchdog: flips WAIT->CONTROL after N seconds.
     if (cli_.autostart_seconds >= 0.0) {
       autostart_target_s_ = SteadyNow() + cli_.autostart_seconds;
+    }
+
+    // ─── Pose-ref starvation watchdog (split-topology safety) ──────────
+    // Active only on the ZMQ input path. Logging is loud-and-proud at
+    // startup so the operator can confirm the thresholds before saying
+    // "go". The actual per-tick Update() lives in OnControl below, so
+    // there is nothing else to wire here.
+    pose_ref_watchdog_active_ =
+        (cli_.input_type == "zmq")
+        && (cli_.pose_ref_stale_s > 0.0)
+        && (!cli_.disable_pose_ref_watchdog);
+    if (cli_.input_type == "zmq") {
+      if (pose_ref_watchdog_active_) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog ENABLED. CONTROL "
+                    "trips into SAFE_IDLE when pose-ref age >= %.3f s; "
+                    "exit requires fresh frames for >= %.3f s AND an "
+                    "operator resume chord. SAFE_IDLE holds default_angles "
+                    "with 4x kd (no policy inference).",
+                    cli_.pose_ref_stale_s, cli_.pose_ref_min_fresh_s);
+      } else if (cli_.disable_pose_ref_watchdog) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog DISABLED "
+                    "(--disable-pose-ref-watchdog). Legacy 'hold last good "
+                    "frame' behaviour active; freeze-while-leaning failure "
+                    "mode is possible if the operator wire stalls.");
+      } else {
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: pose-ref starvation watchdog DISABLED "
+                    "(--pose-ref-stale-s <= 0). Set --pose-ref-stale-s 0.5 "
+                    "for split-topology production.");
+      }
+    } else {
+      // motion_file path; watchdog doesn't apply.
+      RCLCPP_INFO(node_->get_logger(),
+                  "SAFETY: pose-ref starvation watchdog NOT applicable "
+                  "(--input-type=motion_file). Watchdog activates only "
+                  "on the ZMQ input path.");
+    }
+
+    // ─── Operator resume chord SUB (split-topology safety) ─────────────
+    // Bound only when the watchdog is active. The subscriber listens for
+    // a single multipart message on tcp://<zmq_resume_host>:<zmq_resume_port>
+    // topic <zmq_resume_topic>; the receipt itself (not the payload value)
+    // is what counts. Connect failures are warned-and-continued so a
+    // missing operator stack at deploy startup doesn't block the whole
+    // CONTROL path -- the watchdog will simply trip into SAFE_IDLE on
+    // the first starvation, and re-bind happens on every deploy restart.
+    if (pose_ref_watchdog_active_) {
+      try {
+        zmq_resume_sub_ = ZmqResumeSubscriber::Connect(
+            cli_.zmq_resume_host, cli_.zmq_resume_port, cli_.zmq_resume_topic);
+        RCLCPP_WARN(node_->get_logger(),
+                    "SAFETY: operator resume SUB bound to %s topic='%s'. "
+                    "SAFE_IDLE exit requires a resume frame within the "
+                    "last 0.5 s.",
+                    zmq_resume_sub_->Endpoint().c_str(),
+                    zmq_resume_sub_->Topic().c_str());
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "SAFETY: failed to bind operator resume SUB on "
+                     "tcp://%s:%d topic='%s': %s. SAFE_IDLE will be reachable "
+                     "but recovery requires deploy restart until this is "
+                     "fixed.",
+                     cli_.zmq_resume_host.c_str(), cli_.zmq_resume_port,
+                     cli_.zmq_resume_topic.c_str(), e.what());
+      }
+    }
+
+    // ─── MC mode poller (Phase 5b observability) ───────────────────────
+    // Async service client + a wall timer that fires every mc_mode_poll_s
+    // seconds. Each tick either: (a) starts a new async request if the
+    // previous one finished or never started, OR (b) reaps the pending
+    // future when it completes. mc_action_mode_ is the latest known
+    // McAction.value (= int enum, see McAction.msg). Published on
+    // x2_debug as ``mc_action_mode``. Pure observability -- the deploy
+    // never reads mc_action_mode_ to make control decisions.
+    if (cli_.mc_mode_poll_s > 0.0) {
+      mc_get_action_client_ =
+          node_->create_client<aimdk_msgs::srv::GetMcAction>(
+              cli_.mc_mode_service);
+      const auto period_ms = static_cast<int>(
+          std::lround(cli_.mc_mode_poll_s * 1000.0));
+      mc_mode_poll_timer_ = node_->create_wall_timer(
+          std::chrono::milliseconds(std::max(period_ms, 100)),
+          std::bind(&X2Deploy::OnMcModePoll, this));
+      RCLCPP_WARN(node_->get_logger(),
+                  "OBS: MC mode poller ENABLED at %.2f s on '%s'. "
+                  "Latest value published on x2_debug as mc_action_mode "
+                  "(-1 = unknown / service not yet seen).",
+                  cli_.mc_mode_poll_s, cli_.mc_mode_service.c_str());
+    } else {
+      RCLCPP_INFO(node_->get_logger(),
+                  "OBS: MC mode poller DISABLED (--mc-mode-poll-s <= 0). "
+                  "x2_debug mc_action_mode field will be -1 throughout.");
     }
   }
 
@@ -952,8 +2088,8 @@ class X2Deploy {
             std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
             for (std::size_t i = 0; i < NUM_DOFS; ++i) {
               latest_cmd_.target_pos_mj[i] = rs.joint_pos_mj[i];
-              latest_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
-              latest_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i];
+              latest_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps_scaled_[i];
+              latest_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds_scaled_[i];
             }
             latest_cmd_.reason = "wait_for_control_hold";
           } else {
@@ -1029,6 +2165,55 @@ class X2Deploy {
         // Stay here forever; writer publishes the latched safe command.
         return;
       }
+      case State::SAFE_IDLE: {
+        // Recoverable starvation hold (split-topology safety). Writer
+        // keeps publishing the latched safe_idle_cmd_ (default_angles
+        // + deploy-mode kp + 4x kd) at 500 Hz so the body stays under
+        // torque. We update the pose-ref age + ReadyToResume() every
+        // tick so x2_debug reflects the live state, then check whether
+        // BOTH gates (fresh wire AND recent operator chord) have closed
+        // -- if so, transition back to CONTROL with a fresh soft-start
+        // ramp and a reset starvation watchdog.
+        double age_s = std::numeric_limits<double>::infinity();
+        if (zmq_pose_source_ != nullptr) {
+          const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+          if (last_rx > 0.0) age_s = std::max(0.0, now - last_rx);
+        }
+        const bool ready_to_resume =
+            pose_ref_watchdog_.ReadyToResume(now, age_s);
+        const bool resume_chord_fresh =
+            (zmq_resume_sub_ != nullptr)
+            && zmq_resume_sub_->LatestFresh(now, /*window_s=*/0.5);
+        if (ready_to_resume && resume_chord_fresh) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "SAFE_IDLE -> CONTROL: resume chord received "
+                      "(latest %.3f s ago) AND pose-ref fresh for >= %.3f s "
+                      "(current age %.3f s). Re-engaging policy with a "
+                      "fresh soft-start ramp.",
+                      now - zmq_resume_sub_->LastReceivedMonotonicS(),
+                      cli_.pose_ref_min_fresh_s, age_s);
+          // Reset the soft-start ramp so the policy target blends back
+          // from default_angles over --ramp-seconds. The CONTROL state
+          // will pick up from the next tick exactly as if we'd just
+          // entered from WAIT_FOR_CONTROL.
+          ramp_.Reset();
+          pose_ref_watchdog_.ClearTrip();
+          safe_idle_entry_s_ = -1.0;
+          control_entry_s_   = now;
+          state_.store(State::CONTROL);
+        }
+        // Logger snapshot so the CSV captures SAFE_IDLE dwell explicitly
+        // (operators looking at tick.csv will see ramp_alpha=0 +
+        // reason="safe_idle" for the duration).
+        logger_.Log(now, rs.joint_pos_mj, rs.joint_vel_mj,
+                    rs.base_quat_wxyz, rs.base_ang_vel,
+                    last_action_il_, safe_idle_cmd_);
+        if (zmq_debug_pub_) {
+          PublishDebugFrame(now, rs, last_action_il_, safe_idle_cmd_,
+                            /*policy_time=*/now);
+        }
+        return;
+      }
       case State::RAMP_OUT: {
         // Soft-EXIT ramp: linearly interpolate target_pos from the snapshot
         // we took on entering RAMP_OUT (last policy command) toward MC's
@@ -1061,8 +2246,8 @@ class X2Deploy {
         for (std::size_t i = 0; i < NUM_DOFS; ++i) {
           sc.target_pos_mj[i] = (1.0 - alpha) * ramp_out_start_pos_[i]
                                 + alpha * stand_pose_target_[i];
-          sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
-          sc.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i];
+          sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps_scaled_[i];
+          sc.damping_mj[i]    = cli_.dry_run ? 0.0 : kds_scaled_[i];
         }
         sc.dry_run    = cli_.dry_run;
         sc.tilt_trip  = false;
@@ -1267,6 +2452,57 @@ class X2Deploy {
       case State::CONTROL: break;
     }
 
+    // Optional soft-shutdown trigger (graceful Ctrl-C path). Polled BEFORE
+    // the max-duration check and BEFORE the stale-state guard, for the
+    // same reason: a frozen-state robot must still respond to the
+    // operator's graceful-stop request. When EITHER the in-process flag
+    // (set by SoftShutdownSignalHandler on SIGINT) OR the on-disk sentinel
+    // (touched by the bash cleanup trap) trips, we take the exact same
+    // RAMP_OUT path that --max-duration would -- see the long-form comment
+    // below. Sentinel polling is the belt; in-process flag is the
+    // suspenders. We skip the file probe entirely when the flag wasn't
+    // provided (legacy callers pay zero cost; SoftShutdownSignalHandler is
+    // only installed when the CLI flag is set, so the in-process flag also
+    // stays false in legacy mode).
+    if (!cli_.soft_shutdown_trigger_sentinel.empty()) {
+      bool trigger = g_soft_shutdown_requested.load(std::memory_order_acquire);
+      if (!trigger) {
+        std::ifstream probe(cli_.soft_shutdown_trigger_sentinel);
+        if (probe.good()) trigger = true;
+      }
+      if (trigger) {
+        const bool via_signal =
+            g_soft_shutdown_requested.load(std::memory_order_acquire);
+        const char* src = via_signal ? "in-process SIGINT/SIGTERM"
+                                      : "on-disk sentinel";
+        if (cli_.return_seconds > 0.0) {
+          {
+            std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
+            ramp_out_start_pos_ = latest_cmd_.target_pos_mj;
+          }
+          ramp_out_entry_s_ = now;
+          state_.store(State::RAMP_OUT);
+          RCLCPP_WARN(node_->get_logger(),
+                      "Soft-shutdown requested (source: %s, sentinel='%s') "
+                      "-> RAMP_OUT (%.2fs return-to-stand) -> HOLD_FOR_MC. "
+                      "Robot stays under torque through MC's "
+                      "PASSIVE_DEFAULT boot.",
+                      src,
+                      cli_.soft_shutdown_trigger_sentinel.c_str(),
+                      cli_.return_seconds);
+        } else {
+          RCLCPP_WARN(node_->get_logger(),
+                      "Soft-shutdown requested (source: %s, sentinel='%s') "
+                      "-> shutting down immediately (--return-seconds "
+                      "disabled). Bus will be silent until MC restarts.",
+                      src,
+                      cli_.soft_shutdown_trigger_sentinel.c_str());
+          rclcpp::shutdown();
+        }
+        return;
+      }
+    }
+
     // Optional bounded-duration auto-shutdown. Triggered N seconds after we
     // entered CONTROL (control_entry_s_ is set in WAIT->CONTROL above). We
     // run this BEFORE the stale-state guard so a frozen robot still hits the
@@ -1301,6 +2537,50 @@ class X2Deploy {
         rclcpp::shutdown();
       }
       return;
+    }
+
+    // ---- Pose-ref starvation watchdog (split-topology safety) -------------
+    // Active only on the ZMQ input path. Trips CONTROL -> SAFE_IDLE the
+    // moment the wire goes stale. We measure age as
+    //   now - ZmqPoseInputSource::LastReceivedMonotonicS()
+    // (both in the same steady_clock seconds frame) and pass that to
+    // ``pose_ref_watchdog_.Update`` which is idempotent on repeat calls
+    // (latched until ClearTrip() in SAFE_IDLE). Has to run BEFORE the
+    // ``!fresh`` IMU guard below because a missing IMU sample is a
+    // legitimate "deploy is alive but doing nothing" condition; missing
+    // pose-ref frames are not, and SAFE_IDLE entry doesn't need a fresh
+    // IMU snapshot to latch its safe-hold target (default_angles is
+    // independent of body state).
+    if (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr) {
+      const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+      const bool trip_now  = pose_ref_watchdog_.Update(now, last_rx);
+      if (trip_now) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "CONTROL -> SAFE_IDLE: %s. Holding default_angles "
+                     "with 4x kd; awaiting operator resume chord on "
+                     "'%s' AND >= %.3f s of fresh pose frames.",
+                     pose_ref_watchdog_.Reason().c_str(),
+                     cli_.zmq_resume_topic.c_str(),
+                     cli_.pose_ref_min_fresh_s);
+        // Build the latched safe-idle command once.
+        for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+          safe_idle_cmd_.target_pos_mj[i] = default_angles[i];
+          safe_idle_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps_scaled_[i];
+          safe_idle_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds_scaled_[i] * 4.0;
+        }
+        safe_idle_cmd_.dry_run    = cli_.dry_run;
+        safe_idle_cmd_.tilt_trip  = false;
+        safe_idle_cmd_.ramp_alpha = 0.0;
+        safe_idle_cmd_.reason     = "safe_idle";
+        {
+          std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
+          latest_cmd_ = safe_idle_cmd_;
+        }
+        latest_cmd_ready_.store(true, std::memory_order_release);
+        safe_idle_entry_s_ = now;
+        state_.store(State::SAFE_IDLE);
+        return;
+      }
     }
 
     if (!fresh) {
@@ -1415,9 +2695,18 @@ class X2Deploy {
     }
 
     // ---- Safety stack ------------------------------------------------------
+    // Use the per-DOF clamp array synthesised in the constructor from
+    // --max-target-dev plus the --max-target-dev-{leg,waist,arm,head}
+    // overrides, so e.g. arms can take 1.50 rad while legs stay at 0.30
+    // rad on the same tick. Also pass the per-DOF effective PD (trained
+    // kps/kds * global+family --kp-scale/--kd-scale trims) so the safety
+    // stack publishes the deployment-bumped gains rather than the raw
+    // training PD. Both arrays are computed once at startup; the hot
+    // path is unchanged.
     SafeCommand sc = ApplySafetyStack(target_pos_mj, grav[2],
                                       ramp_, watchdog_, cli_.dry_run, now,
-                                      cli_.max_target_dev);
+                                      max_target_dev_per_dof_,
+                                      kps_scaled_, kds_scaled_);
 
     // ---- Output-side target LPF (real-deploy only; bypassed by default) ----
     // The EMA runs strictly AFTER the safety stack, so:
@@ -1429,7 +2718,7 @@ class X2Deploy {
     //     is identical with or without --target-lpf-hz set;
     //   * RAMP_OUT and SAFE_HOLD bypass: those states already produce a
     //     deliberately-shaped trajectory we don't want to attenuate.
-    if (target_lpf_alpha_ > 0.0
+    if (target_lpf_any_active_
         && state_.load() == State::CONTROL
         && !sc.tilt_trip) {
       if (!target_lpf_initialized_) {
@@ -1438,10 +2727,18 @@ class X2Deploy {
         target_lpf_state_ = sc.target_pos_mj;
         target_lpf_initialized_ = true;
       } else {
-        const double a = target_lpf_alpha_;
+        // Per-DOF EMA. alpha == 0 means "passthrough on this joint" -- we
+        // still write the raw target into target_lpf_state_ so that if a
+        // per-group LPF is toggled on later (not currently supported, but
+        // cheap to keep correct) the state isn't stale.
         for (std::size_t i = 0; i < NUM_DOFS; ++i) {
-          target_lpf_state_[i] =
-              a * sc.target_pos_mj[i] + (1.0 - a) * target_lpf_state_[i];
+          const double a = target_lpf_alpha_per_dof_[i];
+          if (a > 0.0) {
+            target_lpf_state_[i] =
+                a * sc.target_pos_mj[i] + (1.0 - a) * target_lpf_state_[i];
+          } else {
+            target_lpf_state_[i] = sc.target_pos_mj[i];
+          }
         }
         sc.target_pos_mj = target_lpf_state_;
       }
@@ -1478,16 +2775,23 @@ class X2Deploy {
 
     // ---- Periodic status ---------------------------------------------------
     if (++control_tick_ % 50 == 0) {
+      const int32_t mode_now = mc_action_mode_.load(std::memory_order_acquire);
+      const double  pose_ref_age =
+          (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr)
+              ? pose_ref_watchdog_.LatestAgeS()
+              : -1.0;
       RCLCPP_INFO(node_->get_logger(),
                   "CONTROL tick=%lu policy_t=%.2fs alpha=%.2f grav_z=%+.2f "
                   "act_clip_ticks=%lu max_pre_clip=%.2f "
-                  "wrist_bypass_ticks=%lu wrist_bypass_max_dev_rad=%.3f",
+                  "wrist_bypass_ticks=%lu wrist_bypass_max_dev_rad=%.3f "
+                  "pose_ref_age=%.3fs mc_mode=%d",
                   static_cast<unsigned long>(control_tick_),
                   policy_time, sc.ramp_alpha, grav[2],
                   static_cast<unsigned long>(action_clip_tick_count_),
                   action_clip_max_pre_clip_,
                   static_cast<unsigned long>(wrist_bypass_tick_count_),
-                  wrist_bypass_max_delta_);
+                  wrist_bypass_max_delta_,
+                  pose_ref_age, static_cast<int>(mode_now));
     }
   }
 
@@ -1505,6 +2809,9 @@ class X2Deploy {
       // commands would make the firmware see a dual-publisher fight.
       return;
     }
+    // SAFE_IDLE, SAFE_HOLD, RAMP_OUT, HOLD_FOR_MC, CONTROL all publish.
+    // SAFE_IDLE in particular MUST keep the writer alive at 500 Hz so the
+    // body stays under torque while the operator wire is dark.
     // Skip publishing until OnControl (or RAMP_OUT/SAFE_HOLD) has latched
     // a real command. Without this guard, the first ~15 ms after WAIT ->
     // CONTROL would publish a default-zero command (kp=0, kd=0, target=0),
@@ -1532,8 +2839,8 @@ class X2Deploy {
     SafeCommand sc;
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
       sc.target_pos_mj[i] = default_angles[i];
-      sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
-      sc.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i] * 4.0;
+      sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps_scaled_[i];
+      sc.damping_mj[i]    = cli_.dry_run ? 0.0 : kds_scaled_[i] * 4.0;
     }
     sc.dry_run    = cli_.dry_run;
     sc.tilt_trip  = false;
@@ -1545,6 +2852,55 @@ class X2Deploy {
     }
     latest_cmd_ready_.store(true, std::memory_order_release);
     state_.store(State::SAFE_HOLD);
+  }
+
+  // ─── MC mode poller (Phase 5b observability) ────────────────────────
+  // Fires every cli_.mc_mode_poll_s seconds. Strictly best-effort: if MC's
+  // service isn't up yet (or the call times out), we silently leave
+  // mc_action_mode_ at its previous value (-1 if never seen). The deploy
+  // never makes control decisions based on this value; it is only
+  // surfaced on x2_debug for forensic alignment with deploy CSVs +
+  // motor_monitor.jsonl (Phase 5).
+  void OnMcModePoll()
+  {
+    if (!mc_get_action_client_) return;
+    if (!mc_get_action_client_->service_is_ready()) {
+      // MC service hasn't come up yet (or went away). Keep the previous
+      // value; the periodic deploy status line will show -1 until it
+      // does. We deliberately do NOT spam-log here -- the operator can
+      // tail x2_debug or the motor_monitor JSONL for real-time visibility.
+      return;
+    }
+    // Drain any prior async future. The async path is single-shot per
+    // tick; if a request from the previous tick is still in flight we
+    // skip this tick (the rclcpp executor will eventually deliver it).
+    if (mc_mode_request_in_flight_) {
+      if (mc_mode_pending_future_.valid()
+          && mc_mode_pending_future_.wait_for(std::chrono::seconds(0))
+                 == std::future_status::ready) {
+        try {
+          auto resp = mc_mode_pending_future_.get();
+          if (resp) {
+            mc_action_mode_.store(resp->info.current_action.value,
+                                  std::memory_order_release);
+            mc_action_status_.store(resp->info.status.value,
+                                    std::memory_order_release);
+          }
+        } catch (const std::exception& e) {
+          RCLCPP_DEBUG(node_->get_logger(),
+                       "OBS: MC mode poll future threw: %s", e.what());
+        }
+        mc_mode_request_in_flight_ = false;
+      } else {
+        // Still pending; skip issuing a duplicate.
+        return;
+      }
+    }
+    auto req = std::make_shared<aimdk_msgs::srv::GetMcAction::Request>();
+    req->request = aimdk_msgs::msg::CommonRequest();
+    req->request.header.stamp = node_->now();
+    mc_mode_pending_future_ = mc_get_action_client_->async_send_request(req).future.share();
+    mc_mode_request_in_flight_ = true;
   }
 
   // ─── HOLD_FOR_MC support ────────────────────────────────────────────
@@ -1677,7 +3033,56 @@ class X2Deploy {
 
   SoftStartRamp                     ramp_;
   TiltWatchdog                      watchdog_;
+  // Split-topology pose-ref starvation watchdog. Active only when
+  // ``pose_ref_watchdog_active_`` is true (set in the ctor from CLI).
+  // OnControl checks it on every CONTROL tick using the age computed
+  // from the ZmqPoseInputSource's monotonic last-recv timestamp; a trip
+  // transitions CONTROL -> SAFE_IDLE and latches a default-pose hold
+  // with 4x kd. Exit (back to CONTROL) requires both ReadyToResume()
+  // and a recent operator chord on ``zmq_resume_sub_``.
+  PoseRefStarvationWatchdog         pose_ref_watchdog_;
+  bool                              pose_ref_watchdog_active_ = false;
+  // Operator-side resume chord SUB. Constructed when the pose-ref
+  // watchdog is active. Holds its own background thread + ZMQ socket;
+  // tears down cleanly in the destructor via std::unique_ptr.
+  std::unique_ptr<ZmqResumeSubscriber> zmq_resume_sub_;
+  // Most recent SAFE_IDLE entry time (steady_clock seconds). Used by
+  // the periodic status line and the x2_debug ``in_safe_idle`` ms
+  // counter. -1 = never been in SAFE_IDLE (or already exited).
+  double                            safe_idle_entry_s_ = -1.0;
+  // Latched SafeCommand that the writer keeps publishing while in
+  // SAFE_IDLE. Built once at entry to avoid recomputing default_angles
+  // + 4x kd on every 500 Hz tick.
+  SafeCommand                       safe_idle_cmd_;
+
+  // MC mode poller (Phase 5b observability). Background timer fires
+  // every cli_.mc_mode_poll_s seconds; mc_action_mode_ holds the latest
+  // McAction.value enum (-1 = unknown). Published on x2_debug.
+  rclcpp::Client<aimdk_msgs::srv::GetMcAction>::SharedPtr
+                                    mc_get_action_client_;
+  rclcpp::TimerBase::SharedPtr      mc_mode_poll_timer_;
+  std::shared_future<
+      aimdk_msgs::srv::GetMcAction::Response::SharedPtr>
+                                    mc_mode_pending_future_;
+  bool                              mc_mode_request_in_flight_ = false;
+  std::atomic<int32_t>              mc_action_mode_{-1};
+  std::atomic<int32_t>              mc_action_status_{-1};
+
   DeployLogger                      logger_;
+
+  // Per-DOF max_target_dev clamp synthesised once from the global +
+  // per-group CLI scalars. Indexed in MuJoCo joint order. Entry <= 0 ->
+  // no clamp on that joint. See BuildMaxTargetDevPerDof above.
+  std::array<double, NUM_DOFS>      max_target_dev_per_dof_{};
+
+  // Effective per-DOF PD synthesised once from kps[] / kds[] (constexpr
+  // training values from policy_parameters.hpp) multiplied by the
+  // global+per-family --kp-scale / --kd-scale CLI trims. These ARE the
+  // gains the safety stack will publish on the bus -- the scaling is
+  // applied at startup, not per-tick, so the runtime cost is one
+  // multiply per joint at boot. Indexed in MuJoCo joint order.
+  std::array<double, NUM_DOFS>      kps_scaled_{};
+  std::array<double, NUM_DOFS>      kds_scaled_{};
 
   rclcpp::TimerBase::SharedPtr      control_timer_;
   rclcpp::TimerBase::SharedPtr      writer_timer_;
@@ -1750,14 +3155,20 @@ class X2Deploy {
   rclcpp::Subscription<aimdk_msgs::msg::JointCommandArray>::SharedPtr
       mc_takeover_waist_sub_;
 
-  // Output-side target LPF state. target_lpf_alpha_ is computed once in
-  // Run() from cli_.target_lpf_hz at the OnControl rate (50 Hz). When alpha
-  // is zero the filter is fully bypassed -- no math, no allocations, and
-  // the published target is the unmodified safety-clamped policy output.
+  // Output-side target LPF state. target_lpf_alpha_per_dof_ is computed
+  // once in Run() from (cli_.target_lpf_hz, cli_.target_lpf_hz_{leg,waist,
+  // arm,head}) at the OnControl rate (50 Hz) by BuildTargetLpfAlphaPerDof,
+  // which encodes the per-group inherit/disable/explicit semantics. A slot
+  // with alpha == 0 is in passthrough mode -- the OnControl hot path
+  // branches on that and skips the EMA math entirely, so disabling the LPF
+  // on a group truly costs nothing. ``target_lpf_any_active_`` is the
+  // logical OR over the array; when it's false the whole filter block is
+  // skipped (zero per-DOF cost on the historical default cli config).
   // target_lpf_initialized_ is reset implicitly by being default-false at
   // node startup; we also re-seed on the FIRST CONTROL tick (see OnControl)
   // so post-RAMP_OUT/SAFE_HOLD restarts (if we ever support them) behave.
-  double                            target_lpf_alpha_         = 0.0;
+  std::array<double, NUM_DOFS>      target_lpf_alpha_per_dof_{};
+  bool                              target_lpf_any_active_    = false;
   bool                              target_lpf_initialized_   = false;
   std::array<double, NUM_DOFS>      target_lpf_state_{};
 
@@ -1842,8 +3253,41 @@ class X2Deploy {
     std::uint8_t dry_run   = sc.dry_run   ? 1 : 0;
     double ramp_alpha = sc.ramp_alpha;
 
+    // ─── v5 split-topology / forensic fields ───────────────────────────
+    // Computed once per tick so the dump_x2_debug.py consumer (and the
+    // x2_motor_monitor sidecar) can correlate the policy clock with
+    // operator-side stack health.
+    double  pose_ref_age_s = -1.0;  // sentinel: no ZMQ source / no frames
+    if (pose_ref_watchdog_active_ && zmq_pose_source_ != nullptr) {
+      const double last_rx = zmq_pose_source_->LastReceivedMonotonicS();
+      if (last_rx > 0.0) {
+        pose_ref_age_s = std::max(0.0, now - last_rx);
+      } else {
+        // Watchdog active but no frame yet: report a large finite age
+        // (NOT +inf, which decodes awkwardly on the Python side). 1e9
+        // is "obviously starved" without breaking JSON encoders.
+        pose_ref_age_s = 1.0e9;
+      }
+    }
+    std::uint8_t in_safe_idle =
+        (state_.load() == State::SAFE_IDLE) ? 1 : 0;
+    std::uint8_t pose_ref_starved =
+        (pose_ref_watchdog_active_ && pose_ref_watchdog_.Tripped()) ? 1 : 0;
+    // Resume chord telemetry: age in seconds since most recent press
+    // (sentinel -1 = no press / no SUB). Operator can correlate visible
+    // SAFE_IDLE entries with chord receipt timing.
+    double  resume_age_s = -1.0;
+    int64_t resume_total = 0;
+    if (zmq_resume_sub_) {
+      const double last_press = zmq_resume_sub_->LastReceivedMonotonicS();
+      if (last_press > 0.0) resume_age_s = std::max(0.0, now - last_press);
+      resume_total = static_cast<int64_t>(zmq_resume_sub_->total_received());
+    }
+    int32_t mc_action_mode   = mc_action_mode_.load(std::memory_order_acquire);
+    int32_t mc_action_status = mc_action_status_.load(std::memory_order_acquire);
+
     std::vector<PackedField> fields;
-    fields.reserve(13);
+    fields.reserve(21);
     fields.push_back({"control_tick",   "i64", {1},                     &tick_i64,            sizeof(int64_t)});
     fields.push_back({"ros_timestamp",  "f64", {1},                     &now_f64,             sizeof(double)});
     fields.push_back({"policy_time",    "f64", {1},                     &policy_time_f64,     sizeof(double)});
@@ -1858,11 +3302,22 @@ class X2Deploy {
     fields.push_back({"ramp_alpha",     "f64", {1},                     &ramp_alpha,          sizeof(double)});
     fields.push_back({"tilt_trip",      "u8",  {1},                     &tilt_trip,           sizeof(std::uint8_t)});
 
-    // Note: dry_run is intentionally LAST so dump_x2_debug.py can detect
-    // an old protocol version (without dry_run) by short-message-length.
-    fields.push_back({"dry_run",        "u8",  {1},                     &dry_run,             sizeof(std::uint8_t)});
+    // dry_run was previously LAST in the v4 protocol. v5 keeps it BEFORE
+    // the new fields so the protocol number reflects the schema and old
+    // dump_x2_debug.py consumers either upgrade or short-read cleanly at
+    // the dry_run boundary (the message length tells them which protocol
+    // version landed).
+    fields.push_back({"dry_run",         "u8",  {1}, &dry_run,         sizeof(std::uint8_t)});
+    // v5 forensic fields (Phase 2 + 5b).
+    fields.push_back({"pose_ref_age_s",  "f64", {1}, &pose_ref_age_s,  sizeof(double)});
+    fields.push_back({"pose_ref_starved","u8",  {1}, &pose_ref_starved,sizeof(std::uint8_t)});
+    fields.push_back({"in_safe_idle",    "u8",  {1}, &in_safe_idle,    sizeof(std::uint8_t)});
+    fields.push_back({"resume_age_s",    "f64", {1}, &resume_age_s,    sizeof(double)});
+    fields.push_back({"resume_total",    "i64", {1}, &resume_total,    sizeof(int64_t)});
+    fields.push_back({"mc_action_mode",  "i32", {1}, &mc_action_mode,  sizeof(int32_t)});
+    fields.push_back({"mc_action_status","i32", {1}, &mc_action_status,sizeof(int32_t)});
 
-    if (zmq_debug_pub_->Publish(fields, /*version=*/4, /*count=*/1)) {
+    if (zmq_debug_pub_->Publish(fields, /*version=*/5, /*count=*/1)) {
       ++zmq_debug_frames_published_;
     }
   }
@@ -1948,6 +3403,26 @@ int main(int argc, char** argv)
     PrintUsage();
     rclcpp::shutdown();
     return 2;
+  }
+
+  // Install our soft-shutdown SIGINT/SIGTERM handler IFF the operator opted
+  // in via --soft-shutdown-trigger-sentinel. Doing so overrides rclcpp's
+  // default handler (which calls rclcpp::shutdown() and lets main() return,
+  // bypassing RAMP_OUT/HOLD_FOR_MC entirely). When the flag is empty we
+  // leave rclcpp's default in place so legacy behaviour is bit-exact.
+  // SoftShutdownSignalHandler is async-signal-safe (atomic flag + write(2));
+  // it sets g_soft_shutdown_requested, which OnControl polls on the next
+  // 50 Hz tick (<= 20 ms latency) and uses to enter RAMP_OUT.
+  if (!cli.soft_shutdown_trigger_sentinel.empty()) {
+    struct sigaction sa{};
+    sa.sa_handler = SoftShutdownSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  // do not interrupt blocking syscalls (e.g. ZMQ recv)
+    if (sigaction(SIGINT,  &sa, nullptr) != 0
+        || sigaction(SIGTERM, &sa, nullptr) != 0) {
+      std::cerr << "[soft-shutdown] sigaction install failed (errno=" << errno
+                << "): falling back to rclcpp default SIGINT handler.\n";
+    }
   }
 
   auto node = rclcpp::Node::make_shared("x2_deploy_onnx_ref");

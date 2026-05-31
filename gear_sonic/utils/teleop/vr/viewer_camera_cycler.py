@@ -4,11 +4,20 @@ Why this exists
 ---------------
 
 The deploy's MuJoCo viewer (a Python ``mujoco.viewer.launch_passive``
-window) cycles through its fixed cameras on the ``Tab`` key. The
-operator wears the Quest 3 headset and can't reach the workstation
-keyboard, so we let them tap the right thumbstick (in
-:mod:`quest3_manager_x2`) and synthesise a ``Tab`` keypress targeted
+window) cycles to the next fixed camera on the ``]`` key (and the
+previous on ``[``); ``Esc`` returns to the free camera. The operator
+wears the Quest 3 headset and can't reach the workstation keyboard,
+so we let them tap the LEFT thumbstick click (in
+:mod:`quest3_manager_x2`) and synthesise a ``]`` keypress targeted
 at the viewer window via ``xdotool``.
+
+We initially used ``Tab`` because the cheatsheet on hand at the time
+said "Tab cycles cameras", but ``Tab`` actually toggles the viewer's
+left UI panel and does not change the active camera at all. The
+correct keysym is ``bracketright`` -- verified live on
+mujoco==3.5.0's ``launch_passive`` and consistent with the official
+docs (https://mujoco.readthedocs.io/en/2.3.6/programming/visualization.html
+and the ``mjpython`` viewer source).
 
 This is intentionally an MVP. The "right" architecture is documented
 in the ``TODO`` comment on :class:`ViewerCameraCycler` -- a single
@@ -22,8 +31,8 @@ Until that lands, this module:
 * Locates the viewer window once on first use (cached for the
   lifetime of the process; window IDs are stable as long as the
   viewer isn't restarted).
-* Sends a single ``Tab`` keystroke per :meth:`cycle` call, with a
-  short cooldown so a noisy thumbstick doesn't fire ten Tabs and
+* Sends a single ``]`` keystroke per :meth:`cycle` call, with a
+  short cooldown so a noisy thumbstick doesn't fire ten cycles and
   blow past the camera the operator wanted.
 * Logs cleanly on every failure mode (missing ``xdotool``, no
   ``DISPLAY``, no MuJoCo window found) so the operator can diagnose
@@ -44,14 +53,22 @@ log = logging.getLogger(__name__)
 
 
 class ViewerCameraCycler:
-    """Send Tab to the deploy MuJoCo viewer to cycle its fixed cameras.
+    """Send ``]`` to the deploy MuJoCo viewer to cycle its fixed cameras.
 
     Thread-safe (all public methods take a lock); cheap to instantiate
     even when xdotool / DISPLAY are unavailable -- the failure surfaces
     on the first :meth:`cycle` call as a one-shot WARN log line. The
     manager constructs one of these unconditionally and binds it to a
-    Quest 3 button; runtime conditions decide whether the Tab actually
-    goes anywhere.
+    Quest 3 button; runtime conditions decide whether the keystroke
+    actually goes anywhere.
+
+    The configurable :attr:`CYCLE_KEYSYM` is the X11 keysym name xdotool
+    expects (``bracketright`` for ``]``); change it to ``bracketleft``
+    if you'd rather cycle backwards through cameras, or to ``Escape``
+    to snap back to the free camera. ``Tab`` is NOT a valid choice --
+    in mujoco's passive viewer Tab toggles the left UI panel and does
+    not change cameras at all (we wasted some time on that one in v7.1
+    -- preserved here as a regression breadcrumb).
 
     TODO(unified-vr-input-topic): Replace this entire xdotool path with
     a proper ZMQ ``vr_input`` topic published by the manager. Any
@@ -62,12 +79,32 @@ class ViewerCameraCycler:
     for the user-facing rationale.
     """
 
+    # X11 keysym name passed to ``xdotool key``. ``bracketright`` is the
+    # X server's name for ``]`` -- the next-fixed-camera key in
+    # mujoco.viewer.launch_passive (verified on mujoco==3.5.0; matches
+    # the upstream visualization docs). Use ``bracketleft`` to cycle
+    # backwards if your demo setup wants that direction. NEVER set this
+    # to ``Tab`` -- Tab toggles the viewer's left UI panel and does
+    # NOT change cameras (this was the v7.1 bug fixed at deploy time).
+    CYCLE_KEYSYM: str = "bracketright"
+
     # How long to wait after a successful cycle before honouring the
     # next press. Stick clicks tend to come in pairs because the
     # gamepad polling loop sees the press for a couple of frames; a
     # 250 ms cooldown collapses those into one Tab without making the
     # operator wait a noticeable beat.
     DEFAULT_COOLDOWN_S: float = 0.25
+
+    # Re-emit each one-shot failure WARN every ``WARN_REEMIT_PERIOD_S``
+    # seconds while the failure persists. Without this, a long session
+    # that started with the deploy viewer down (e.g. the operator hit
+    # the click button before the deploy was up) goes silent forever
+    # afterwards even if the situation eventually changes. With
+    # periodic re-emission the operator gets a fresh log line every
+    # ~30 s telling them exactly which precondition is still missing,
+    # so they don't have to read the source to understand why nothing
+    # happens. Set to 0 to fully suppress re-emission (one-shot only).
+    WARN_REEMIT_PERIOD_S: float = 30.0
 
     # Window classes we always exclude from the candidate list. GNOME's
     # mutter compositor wraps every X11 client in a ``mutter-x11-frames``
@@ -92,11 +129,17 @@ class ViewerCameraCycler:
         self._lock = threading.Lock()
         self._cached_wid: Optional[str] = None
         self._last_cycle_t: float = 0.0
-        # One-shot log gates so we don't spam the manager's foreground
-        # log on every press when something is misconfigured.
-        self._warned_no_xdotool = False
-        self._warned_no_display = False
-        self._warned_no_window = False
+        # Per-failure-mode timestamps of the last warning we emitted
+        # for that mode. ``cycle()`` re-emits the WARN whenever
+        # (now - timestamp) >= WARN_REEMIT_PERIOD_S so a long session
+        # that started in a bad state (deploy viewer down at first
+        # press, xdotool not installed, etc.) gets a periodic
+        # reminder instead of going permanently silent after the
+        # first warn. ``0.0`` means "never warned"; the first press
+        # always logs.
+        self._last_warn_t_no_xdotool: float = 0.0
+        self._last_warn_t_no_display: float = 0.0
+        self._last_warn_t_no_window: float = 0.0
 
     def cycle(self) -> bool:
         """Send a single Tab keystroke to the deploy viewer.
@@ -111,41 +154,44 @@ class ViewerCameraCycler:
                 return False
 
             if shutil.which("xdotool") is None:
-                if not self._warned_no_xdotool:
+                if self._should_reemit(self._last_warn_t_no_xdotool, now):
                     log.warning(
                         "[viewer-cycler] xdotool not installed; install "
                         "with `sudo apt install xdotool` to enable "
-                        "right-stick-click camera cycling. Press is a "
+                        "left-stick-click camera cycling. Press is a "
                         "no-op until then."
                     )
-                    self._warned_no_xdotool = True
+                    self._last_warn_t_no_xdotool = now
                 return False
 
             if not os.environ.get("DISPLAY"):
-                if not self._warned_no_display:
+                if self._should_reemit(self._last_warn_t_no_display, now):
                     log.warning(
                         "[viewer-cycler] no DISPLAY env var; this is "
                         "expected on headless runs (--no-sim-viewer). "
                         "Camera cycling will be a no-op."
                     )
-                    self._warned_no_display = True
+                    self._last_warn_t_no_display = now
                 return False
 
             wid = self._cached_wid or self._locate_window()
             if wid is None:
-                if not self._warned_no_window:
+                if self._should_reemit(self._last_warn_t_no_window, now):
                     log.warning(
-                        "[viewer-cycler] no window matching %r found "
-                        "via xdotool. Is the deploy MuJoCo viewer up? "
-                        "Re-run the planner stack with viewer enabled "
-                        "(default) and click the deploy window once.",
+                        "[viewer-cycler] no window matching classname=%r "
+                        "or name=%r found via xdotool. Is the deploy "
+                        "MuJoCo viewer up? Re-run the planner stack "
+                        "with viewer enabled (default) and click the "
+                        "deploy window once. (DISPLAY=%s)",
+                        self._classname,
                         self._pattern,
+                        os.environ.get("DISPLAY", "(unset)"),
                     )
-                    self._warned_no_window = True
+                    self._last_warn_t_no_window = now
                 return False
             self._cached_wid = wid
 
-            ok = self._send_tab(wid)
+            ok = self._send_camera_cycle_key(wid)
             if ok:
                 self._last_cycle_t = now
             return ok
@@ -159,7 +205,21 @@ class ViewerCameraCycler:
         """
         with self._lock:
             self._cached_wid = None
-            self._warned_no_window = False
+            self._last_warn_t_no_window = 0.0
+
+    def _should_reemit(self, last_warn_t: float, now: float) -> bool:
+        """True if we should log this WARN now.
+
+        Returns True on the first emission (``last_warn_t == 0.0``) and
+        every ``WARN_REEMIT_PERIOD_S`` seconds thereafter while the
+        failure persists. Returns False if re-emission is disabled
+        (period <= 0) and we've already warned once.
+        """
+        if last_warn_t == 0.0:
+            return True
+        if self.WARN_REEMIT_PERIOD_S <= 0.0:
+            return False
+        return (now - last_warn_t) >= self.WARN_REEMIT_PERIOD_S
 
     # -- internals ---------------------------------------------------
 
@@ -292,11 +352,19 @@ class ViewerCameraCycler:
                 source, wids, wids[0],
             )
 
-    def _send_tab(self, wid: str) -> bool:
-        """Synthesize a Tab keypress on the cached window."""
+    def _send_camera_cycle_key(self, wid: str) -> bool:
+        """Synthesize the configured camera-cycle keypress on ``wid``.
+
+        Uses :attr:`CYCLE_KEYSYM` (defaults to ``bracketright`` -- the
+        ``]`` key, which advances to the next fixed camera in the
+        passive viewer). The instance attribute can be overridden for
+        cycling the other direction (``bracketleft``) or snapping back
+        to the free camera (``Escape``); see the class docstring for
+        the rationale of why this is parameterised.
+        """
         try:
             res = subprocess.run(
-                ["xdotool", "key", "--window", wid, "Tab"],
+                ["xdotool", "key", "--window", wid, self.CYCLE_KEYSYM],
                 capture_output=True, text=True, timeout=2.0,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
@@ -312,9 +380,122 @@ class ViewerCameraCycler:
                 res.returncode, res.stderr.strip(),
             )
             self._cached_wid = None
-            self._warned_no_window = False
+            self._last_warn_t_no_window = 0.0
             return False
         return True
 
 
 __all__ = ["ViewerCameraCycler"]
+
+
+def _diag_main(argv: Optional[list[str]] = None) -> int:
+    """Standalone CLI: invoke cycle() once and print a verbose diagnosis.
+
+    Run as:
+
+        python -m gear_sonic.utils.teleop.vr.viewer_camera_cycler
+
+    or via :mod:`gear_sonic.scripts.diag_viewer_camera_cycler`. Designed
+    for debugging the xdotool path without putting the VR headset on
+    -- if this prints "OK: cycled", the headset L-stick click should
+    work too. If it prints anything else, the failure is in the
+    xdotool / window / DISPLAY layer rather than the headset / WebXR
+    / manager-edge-detection layer.
+
+    Exit codes:
+      * 0 -- cycle succeeded (camera-cycle key dispatched; viewer
+        should have rotated to the next fixed camera; verify
+        visually).
+      * 1 -- cycle returned False (see WARN line just above for the
+        specific reason: missing xdotool, no DISPLAY, no MuJoCo
+        window found, or per-WID class lookup failures). Confirms
+        the problem is host-side / X11-side, NOT manager-side.
+      * 2 -- argument parsing failed.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Invoke ViewerCameraCycler.cycle() once and print whether "
+            "it succeeded. Use to diagnose the xdotool path independent "
+            "of the VR headset / WebXR client."
+        ),
+    )
+    parser.add_argument(
+        "--pattern", default="MuJoCo",
+        help="Window title substring (xdotool search --name). Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--classname", default="MuJoCo",
+        help="Window WM_CLASS (xdotool search --classname). Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1,
+        help="Number of cycle() calls (with cooldown sleeps between). Default: %(default)d.",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable INFO logging from the cycler (lists multiple matches, etc.).",
+    )
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code) if exc.code is not None else 2
+
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    cycler = ViewerCameraCycler(
+        window_search_pattern=args.pattern,
+        window_class_name=args.classname,
+    )
+
+    # Print a quick environment summary so the operator doesn't have
+    # to read the source to know what the cycler will see. This is
+    # the most common cause of "I ran the diag and it said no window
+    # found": DISPLAY=:0 when the deploy is on :1, or vice versa.
+    print("=== viewer-cycler diagnosis ===")
+    print(f"  DISPLAY        : {os.environ.get('DISPLAY', '(unset)')}")
+    print(f"  XAUTHORITY     : {os.environ.get('XAUTHORITY', '(unset)')}")
+    print(f"  xdotool path   : {shutil.which('xdotool') or '(NOT FOUND)'}")
+    print(f"  search pattern : name={args.pattern!r} classname={args.classname!r}")
+    print(f"  cycle keysym   : {cycler.CYCLE_KEYSYM!r} (next-fixed-camera in mujoco viewer)")
+    print(f"  cooldown_s     : {cycler._cooldown_s}")
+    print(f"  repeat         : {args.repeat}")
+    print()
+
+    overall_ok = True
+    for i in range(args.repeat):
+        ok = cycler.cycle()
+        print(
+            f"  cycle #{i + 1}: "
+            f"{'OK (' + cycler.CYCLE_KEYSYM + ' dispatched)' if ok else 'no-op (see WARN above)'}"
+        )
+        overall_ok = overall_ok and ok
+        if i + 1 < args.repeat:
+            time.sleep(cycler._cooldown_s + 0.05)
+
+    print()
+    if overall_ok:
+        print(
+            "RESULT: keystroke dispatched successfully on every call. "
+            "Look at the deploy MuJoCo viewer -- it should have rotated "
+            "through {} cameras. If not, the keysym ({}) doesn't bind "
+            "to camera-cycle in this build of mujoco.viewer; try "
+            "another via --classname / inspecting MuJoCo source.".format(
+                args.repeat, cycler.CYCLE_KEYSYM,
+            )
+        )
+        return 0
+    print(
+        "RESULT: cycler returned False on at least one call. The xdotool "
+        "path is the problem -- the headset/WebXR side is fine. Read the "
+        "WARN line above for the specific failure mode."
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_diag_main())

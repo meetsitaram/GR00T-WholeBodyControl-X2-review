@@ -108,6 +108,20 @@ ZmqPoseInputSource::~ZmqPoseInputSource()
 }
 
 // ---------------------------------------------------------------------------
+// LastReceivedMonotonicS -- pose-ref starvation watchdog hook
+// ---------------------------------------------------------------------------
+double ZmqPoseInputSource::LastReceivedMonotonicS() const
+{
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  // No frame has ever arrived (sentinel = time_point::min()).
+  if (latest_recv_.time_since_epoch().count() ==
+      std::chrono::steady_clock::time_point::min().time_since_epoch().count()) {
+    return -1.0;
+  }
+  return std::chrono::duration<double>(latest_recv_.time_since_epoch()).count();
+}
+
+// ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
 

@@ -166,7 +166,23 @@ The `disable_hand_collisions` knob is the one critical fork point:
   primitives live so the bridge's broad-phase considers
   finger-vs-cube and finger-vs-bowl pairs. Without this the
   subtask-grasp signal stays at 0 forever even when the operator is
-  obviously squeezing the cube.
+  obviously squeezing the cube. To stop the OmniHand collision
+  primitives from pinning the fingers half-open against each other or
+  against the palm, every hand collision geom is re-classed via
+  `_filter_hand_self_collisions` to
+  `(contype=2, conaffinity=1)`. The MuJoCo contact rule
+  `(c1 & a2) || (c2 & a1)` then evaluates to:
+
+  | Pair | Result |
+  |------|--------|
+  | Hand vs cube / bowl / table / floor / X2 body (default `1, 1`) | **contact ✓** |
+  | Hand vs hand (`2, 1` × `2, 1`) | filtered (palm-vs-finger AND finger-vs-finger) |
+
+  Touchable scene geoms keep their default `(1, 1)` -- no scene-side
+  patching is required for new tasks. (See
+  `X2_INTEGRATION_NOTES.md` → "Hand self-collision filter" for the
+  full bitmask derivation, the X2 wrist-mesh discriminator that
+  preserves the X2 collision model, and the regression test set.)
 
 ### Step 2 — wrap as a robosuite robot inside the gr00trobocasa fork
 
@@ -196,9 +212,18 @@ declares:
   build offline and don't pull in a multi-GB texture set.
 * `LMTabletopFixedBase` — base env that pins the X2's floating base
   via a fixed frame, so the SONIC policy doesn't need to learn to
-  walk while we're focused on upper-body manipulation.
+  walk while we're focused on upper-body manipulation. Exposes a
+  `_build_mujoco_objects()` hook so subclasses that need real-mesh
+  free-joint props (e.g. the apple) can extend the merge list before
+  `super()._load_model()` runs.
 * `X2PickPlaceCube` — pick a red cube, drop it into a blue bowl.
 * `X2PickPlaceBowl` — pick a blue bowl, place it on a green target zone.
+* `X2PickPlaceApple` — real-mesh sibling of `X2PickPlaceCube`. Loads
+  the upstream `apple_0` MJCFObject (textured visual mesh + 5-fragment
+  convex-decomposition collision shell) instead of a primitive box.
+  Same bowl, table, and per-episode placement ranges as the cube
+  variant so episodes from both scenes can be co-trained on the same
+  VLA backbone without renormalising rewards.
 
 Two version-bump tweaks were also applied:
 
@@ -217,9 +242,16 @@ For runtime we don't load the live robocasa env in the deploy. Instead,
 1. Composes X2 + OmniHand (with `disable_hand_collisions=False`).
 2. Spins up a transient robocasa env, scrapes the table + cube + bowl
    bodies (and assets) from its compiled XML.
-3. Bakes the `rgbd_head_front` head camera and two close-up
-   `obj_left` / `obj_right` workspace cameras (target-body cameras
-   that track the manipulable object).
+3. Bakes the `rgbd_head_front` head camera, two close-up
+   `obj_left` / `obj_right` workspace cameras (`mode="targetbody"`,
+   each tracking the env's manipulable object), and one wide-angle
+   world-fixed witness camera `front_cam` (`mode="fixed"`, 120°
+   vertical FoV, sat at `(0.9144, 0, 1.10)` looking back along world
+   `-x`). All three workspace cameras live in the
+   `_WORKSPACE_CAMERAS` tuple in
+   `build_x2_robocasa_scene_xml.py`; per-camera `mode` + optional
+   `xyaxes` controls whether the camera tracks an object or stays
+   pinned to the launch framing.
 4. Absolutizes every `<mesh file="…">` path so the result is a
    single self-contained XML.
 5. Writes `<env>.xml` plus a `<env>.json` sidecar listing freejoints,
@@ -228,10 +260,11 @@ For runtime we don't load the live robocasa env in the deploy. Instead,
    initial poses.
 
 The bundled outputs live at
-`gear_sonic/data/assets/robocasa_scenes/X2PickPlaceCube.{xml,json}` and
-`X2PickPlaceBowl.{xml,json}`. **Both the bridge and the recorder load
-the same XML**; that is what keeps qpos addresses, body IDs, and
-freejoint layouts byte-identical across processes.
+`gear_sonic/data/assets/robocasa_scenes/X2PickPlaceCube.{xml,json}`,
+`X2PickPlaceBowl.{xml,json}`, and `X2PickPlaceApple.{xml,json}`.
+**Both the bridge and the recorder load the same XML**; that is what
+keeps qpos addresses, body IDs, and freejoint layouts byte-identical
+across processes.
 
 ```
    gr00trobocasa env class                 compose_x2_with_omnihand
@@ -506,6 +539,13 @@ keeps the ladder monotonic.
   serialization, phased reward monotonicity, scene XML invariants.
 * `tests/test_x2_camera_plumbing.py` — verifies `rgbd_head_front` +
   `obj_left` / `obj_right` cameras land in the built scene XML.
+* `tests/test_record_x2_dataset_schema.py::test_front_cam_baked_into_robocasa_scene_xmls`
+  — locks down the world-fixed `front_cam` (120° FoV, fixed pose,
+  3 ft / chest-height) across all three bundled robocasa scene XMLs;
+  paired with `test_front_cam_include_adds_video_feature` /
+  `test_front_cam_default_off_keeps_legacy_schema` /
+  `test_front_cam_resolver_default_in_record_cli` for the recorder
+  feature schema + CLI default.
 * `tests/test_x2_lerobot_exporter.py` — schema / column-name lock-down
   for the LeRobot v2.1 writer.
 
@@ -542,10 +582,14 @@ keeps the ladder monotonic.
   [X2 heuristic locomotion planner](x2_heuristic_planner.md) is wired
   through `record_x2_dataset.py` (planned but not implemented).
 
-* **Two scenes shipped.** `X2PickPlaceCube` and `X2PickPlaceBowl`.
-  The full RoboCasa365 kitchen library (2,500+ scenes, 365 tasks) is
-  not auto-imported; each new scene is a 3-file change documented in
+* **Three scenes shipped.** `X2PickPlaceCube`, `X2PickPlaceBowl`, and
+  `X2PickPlaceApple`. The full RoboCasa365 kitchen library (2,500+
+  scenes, 365 tasks) is not auto-imported; each new scene is a 3-file
+  change documented in
   [`X2_INTEGRATION_NOTES.md`](../../../decoupled_wbc/dexmg/gr00trobocasa/X2_INTEGRATION_NOTES.md#adding-a-new-scene).
+  Apple is the first real-mesh manipulable in the bundle (the other
+  two use synthesised primitives) — use it as the template when
+  importing more upstream `MJCFObject` assets.
 
 ---
 

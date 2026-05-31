@@ -63,8 +63,22 @@ def _deg_list_to_rad(lst: list[float]) -> list[float]:
 
 
 HAND_GRASP_OPEN_LEFT_DEG: list[float] = [
-    0.0,    # thumb_roll  (range -50..+10)
-    10.0,   # thumb_abad  (range   0..+100)
+    # thumb_roll / thumb_abad OPEN anchors biased into a natural
+    # rest pose (2026-05-13). The previous values (0°, 10°) put the
+    # thumb perpendicular to the palm at rest -- visually "thumb
+    # sticking out to the side", uncanny on the kitchen-task viewer.
+    # The new values bias the resting thumb so it sits ~halfway
+    # across the palm, parallel to the middle finger and well clear
+    # of the index. CLOSED anchors are UNCHANGED so we do NOT push
+    # any motor closer to its hardware hardstop -- the only effect
+    # is that the OPEN -> CLOSED span shrinks for these two motors
+    # (thumb_abad 70° -> 45°, thumb_roll 40° -> 28°). Operators
+    # perceive more thumb-toward-palm motion at half-drive because
+    # the rest pose is already biased that way. Iterate visually
+    # in the MuJoCo viewer if these need further tuning. See the
+    # mirrored values in HAND_GRASP_OPEN_RIGHT_DEG.
+    -12.0,  # thumb_roll  (range -50..+10, was 0; pad rolled inward)
+    35.0,   # thumb_abad  (range   0..+100, was 10; thumb partway across palm)
     -5.0,   # thumb_mcp   (range -49..   0)
     0.0,    # index_abad  (range   0..+12)
     5.0,    # index_pip   (range   0..+90)
@@ -111,8 +125,10 @@ HAND_GRASP_CLOSED_LEFT_DEG: list[float] = [
 ]
 
 HAND_GRASP_OPEN_RIGHT_DEG: list[float] = [
-    0.0,    # thumb_roll  (range -10..+50)
-    -10.0,  # thumb_abad  (range -100..  0)
+    # See note on HAND_GRASP_OPEN_LEFT_DEG -- mirrored here for the
+    # right hand so the resting thumb pose is symmetric.
+    12.0,   # thumb_roll  (range -10..+50, was 0; pad rolled inward)
+    -35.0,  # thumb_abad  (range -100..0, was -10; thumb partway across palm)
     5.0,    # thumb_mcp   (range   0..+49)
     0.0,    # index_abad  (range -12..   0)
     5.0,    # index_pip
@@ -276,23 +292,55 @@ FINGER_CURL_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky
 #
 # Quest 3's XRHand estimator still has a strong "fingers move
 # together" prior: isolated fingers often report well below 1.0 even
-# when the operator intends a full close. Operators experience this
-# as "the robot's fingers don't fully close when I curl just one
-# finger". **Optional** compensation applies a piecewise stretch on
-# the raw curl signal (enable with ``apply_curl_compensation=True``):
+# when the operator intends a full close. **Optional** compensation
+# applies a piecewise gain on the raw curl signal (enable with
+# ``apply_curl_compensation=True``).
 #
-#   * Below DEADZONE (0.25): output 0
-#   * Above FULL_THRESHOLD (0.28): output 1.0
-#   * Power-curve ease-in in between (gamma = 3.0)
+# Default compensation is **smooth proportional**, NOT bimodal
+# (2026-05-13 retune). Concretely the defaults below are
+# ``deadzone=0.05, full_threshold=0.95, gamma=1`` for every finger
+# and the thumb-opposition signal:
 #
-# These defaults are NOT hand-picked -- they were chosen by
-# sweeping (deadzone, full_threshold, gamma) per finger over a
-# grid and picking the combination that maximised the bimodality
-# of the post-stretch motor-command distribution on real recorded
-# teleop data, pooled across 4 v3 debug episodes (7626 hand-mode
-# frames total). See gear_sonic/scripts/tune_finger_curl_compensation.py.
+#   * Below DEADZONE (0.05): output 0   -- only filters rest-noise
+#     jitter on the raw curl channel.
+#   * Above FULL_THRESHOLD (0.95): output 1 -- small saturation
+#     cushion so the operator doesn't have to hit the literal Quest
+#     max to drive the robot to CLOSED.
+#   * Linear in between (``gamma = 1``) so half-way curl produces
+#     half-way closure.
 #
-# Empirical raw-curl distribution per finger:
+# Why it changed (history matters for anyone reading the tuner
+# script's older output):
+#
+# The previous defaults (``thumb dz=0.25 full=0.27 gamma=5``;
+# ``finger dz=0.35 full=0.40 gamma=5``; oppose ``dz=0.25 full=0.40
+# gamma=3``) were tuned by maximising bimodality of the post-
+# compensation motor-command distribution on the v3 debug episodes
+# (see gear_sonic/scripts/tune_finger_curl_compensation.py). That
+# job was "decide whether the operator intends to curl this finger
+# or not" -- i.e. a binary classifier. With those defaults a
+# half-pulled curl produced either 0 % or 100 % closure with a tiny
+# ramp window in between; operators describe this as "fingers are
+# bang-bang -- they only either open or close, no smooth curling"
+# (cf. the dexterous-grasp regression on 2026-05-13). For the
+# teleop / dataset-recording use case where the operator already
+# has per-finger ``hand_range`` calibration (``floor`` / ``ceiling``
+# affine remap, see :func:`normalize_finger_curls` and
+# :class:`HandRangeCalibration` in operator_calibration.py), the
+# bimodal stretch then composes ON TOP of the proportional
+# normalisation and silently destroys it.
+#
+# Smooth proportional gives the operator continuous control of the
+# closure depth: a 50 % normalised curl produces ~50 % robot-finger
+# closure regardless of which finger. Bimodal detection is still
+# accessible by passing explicit per-finger params -- e.g.
+# ``stretch_finger_curls(c, deadzone=0.35, full_threshold=0.40,
+# gamma=5)`` recovers the old behaviour exactly. The tuner script
+# also still emits its bimodal-tuned numbers for callers who want
+# them.
+#
+# Empirical raw-curl distribution per finger (kept here for the
+# tuner script and for anyone re-tuning later):
 #
 #   finger      p10    p25    p50    p75    p90
 #   thumb     0.26   0.31   0.43   0.72   0.89
@@ -301,53 +349,27 @@ FINGER_CURL_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky
 #   ring      0.09   0.15   0.28   0.75   0.85
 #   pinky     0.12   0.15   0.25   0.73   0.84
 #
-# The thumb's rest distribution is shifted ~0.10-0.15 higher than
-# the four fingers because (a) Quest3's MAX_CURL_ANGLE.thumb = 90 deg
-# vs MAX_CURL_ANGLE.fingers = 180 deg amplifies small thumb bends,
-# and (b) anatomically the thumb at "open hand" rest already has
-# moderate MCP flexion (~30 deg). So a single global deadzone is
-# either too tight for the thumb (passes resting thumb noise as
-# closure) or too loose for the fingers (misses moderate
-# intentional curls). Per-finger params solve both.
-#
-# Selected per-finger parameters (single global gamma=5 is fine):
-#
-#   thumb:                 dz=0.25, full=0.27, gamma=5  (98% bimodal)
-#   index/middle/ring/pinky: dz=0.35, full=0.40, gamma=5  (99% bimodal)
-#
-# Response curve interpretation (via the per-finger gates):
-#   thumb raw  in [0.00, 0.25]  ->  output = 0
-#   thumb raw  in (0.25, 0.27)  ->  output = (t)**5 (tiny ramp)
-#   thumb raw  in [0.27, 1.00]  ->  output = 1
-#   finger raw in [0.00, 0.35]  ->  output = 0
-#   finger raw in (0.35, 0.40)  ->  output = (t)**5 (tiny ramp)
-#   finger raw in [0.40, 1.00]  ->  output = 1
-#
-# Cost: dynamic range above each finger's full_threshold is
-# collapsed -- a partial fist of any kind produces the same motor
-# command as a full fist. In practice operators care about the
-# full-open and full-closed end-points; intermediate values are
-# mostly lost to Quest 3's hand-prior coupling already (pairwise
-# finger-curl correlations of +0.99-+1.00 between
-# index/middle/ring/pinky). Pass ``apply_curl_compensation=True``
-# (and tune :func:`stretch_finger_curls` kwargs) when you want that
-# behaviour; leave it at the default ``False`` for proportional,
-# full-span tracking.
-#
-# Backwards-compat scalar defaults: when callers pass a single
-# float, the global value is used for all five fingers. The
-# scalar defaults below are the per-finger fallback that
-# corresponds to the thumb (the most permissive of the two
-# settings) so that legacy code that doesn't differentiate
-# between fingers still gets reasonable behaviour.
-DEFAULT_CURL_DEADZONE: float = 0.25
-DEFAULT_CURL_FULL_THRESHOLD: float = 0.28
-DEFAULT_CURL_GAMMA: float = 5.0
+# The thumb's rest distribution sits ~0.10-0.15 higher than the
+# four fingers because (a) Quest3's ``MAX_CURL_ANGLE.thumb = 90 deg``
+# vs ``MAX_CURL_ANGLE.fingers = 180 deg`` amplifies small thumb
+# bends, and (b) anatomically the thumb at "open hand" rest already
+# has moderate MCP flexion. The per-operator
+# :class:`HandRangeCalibration` (loaded from the operator
+# calibration YAML) absorbs both of those biases via per-finger
+# (floor, ceiling) and is the recommended fix for the resting
+# offset -- the smooth defaults below are the proportional shaping
+# that runs on TOP of (or instead of) that affine remap.
+DEFAULT_CURL_DEADZONE: float = 0.05
+DEFAULT_CURL_FULL_THRESHOLD: float = 0.95
+DEFAULT_CURL_GAMMA: float = 1.0
 
 # Per-finger parameter arrays (5 elements: thumb, index, middle, ring, pinky).
-DEFAULT_CURL_DEADZONE_PER_FINGER: tuple[float, ...] = (0.25, 0.35, 0.35, 0.35, 0.35)
-DEFAULT_CURL_FULL_THRESHOLD_PER_FINGER: tuple[float, ...] = (0.27, 0.40, 0.40, 0.40, 0.40)
-DEFAULT_CURL_GAMMA_PER_FINGER: tuple[float, ...] = (5.0, 5.0, 5.0, 5.0, 5.0)
+# Same smooth proportional values across all five fingers; per-finger
+# arrays remain in the API surface so callers (or a future tuner) can
+# differentiate between the thumb and the other four fingers if needed.
+DEFAULT_CURL_DEADZONE_PER_FINGER: tuple[float, ...] = (0.05, 0.05, 0.05, 0.05, 0.05)
+DEFAULT_CURL_FULL_THRESHOLD_PER_FINGER: tuple[float, ...] = (0.95, 0.95, 0.95, 0.95, 0.95)
+DEFAULT_CURL_GAMMA_PER_FINGER: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0)
 
 # Live defaults: linear map headset curl → motor lerp ratio (full robot range).
 DEFAULT_APPLY_CURL_COMPENSATION: bool = False
@@ -370,21 +392,28 @@ DEFAULT_APPLY_OPPOSE_COMPENSATION: bool = False
 # sits ~3-4 cm from the index fingertip and the palm width is
 # ~8-9 cm, so d_norm ~ 0.35-0.45 and the JS-side signal drifts
 # around 0.05-0.25 even though the operator's intent is "no
-# opposition". Without a stretch this produces 5-25 % spurious
-# closure on thumb_roll / thumb_abad at rest, which the operator
-# perceives as "the robot's thumb starts moving by itself".
+# opposition". The recommended fix for that resting bias is the
+# per-operator :class:`HandRangeCalibration.oppose_floor` /
+# ``oppose_ceiling`` affine remap (see
+# :func:`normalize_thumb_oppose`), which absorbs the operator's
+# actual rest distribution and saturation point.
 #
-# We apply the same piecewise-power-curve stretch as for finger
-# curls. Empirically the JS signal saturates near 1.0 for any
-# clear thumb-finger touch (d_norm < 0.10), and rest-bleed sits
-# below ~0.25, so a conservative deadzone of 0.25 with a tight
-# active zone gives near-binary opposition behaviour matching the
-# rest of the pipeline. By default live teleop uses linear opposition
-# (``apply_oppose_compensation=False``); set ``True`` to use this
-# curve.
-DEFAULT_OPPOSE_DEADZONE: float = 0.25
-DEFAULT_OPPOSE_FULL_THRESHOLD: float = 0.40
-DEFAULT_OPPOSE_GAMMA: float = 3.0
+# This module's ``stretch_thumb_oppose`` curve is the OPTIONAL
+# shaping that composes on top of (or instead of) that
+# normalisation -- analogous to ``stretch_finger_curls`` for the
+# per-finger channel. Defaults are the same smooth proportional
+# values: ``deadzone=0.05, full_threshold=0.95, gamma=1`` (linear
+# in the active zone, with a small rest-noise gate at the bottom
+# and a small saturation cushion at the top). The previous bimodal
+# defaults (``dz=0.25, full=0.40, gamma=3``) collapsed any partial
+# opposition into either 0 or 1, which made operators describe the
+# behaviour as "thumb is bang-bang" once the per-operator
+# ``oppose_*`` calibration was already absorbing the rest bias.
+# Pass explicit ``deadzone`` / ``full_threshold`` / ``gamma`` if
+# you want the bimodal behaviour back.
+DEFAULT_OPPOSE_DEADZONE: float = 0.05
+DEFAULT_OPPOSE_FULL_THRESHOLD: float = 0.95
+DEFAULT_OPPOSE_GAMMA: float = 1.0
 
 
 def _broadcast_5(name: str, val: float | tuple[float, ...] | list[float] | np.ndarray) -> np.ndarray:

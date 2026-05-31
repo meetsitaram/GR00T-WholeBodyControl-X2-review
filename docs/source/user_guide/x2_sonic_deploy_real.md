@@ -15,6 +15,22 @@ Companion documents:
 - [`x2_deployment_code.md`](../references/x2_deployment_code.md) — reference
   for the deploy package's architecture, CLI, observation/action contract,
   and ROS 2 topics.
+- [`x2_split_deploy_pc2.md`](../references/x2_split_deploy_pc2.md) — the
+  **recommended** Topology B variant: deploy + hand bridge + motor monitor
+  run as long-running tmux sessions on PC2 (so the policy keeps running
+  even if the laptop's WiFi blinks), the laptop runs only the operator-
+  side stack, and the deploy's new `SAFE_IDLE` state + manual A+B resume
+  chord on the Quest 3 form the freeze-recovery contract. See also
+  [`pc2_jetson_bringup.md`](../getting_started/pc2_jetson_bringup.md) for the
+  one-time PC2 setup.
+- [`x2_motor_monitoring.md`](../references/x2_motor_monitoring.md) — the
+  forensic motor-state JSONL the new `x2_motor_monitor.py` daemon
+  writes on PC2 (and forwards to the laptop's manager sidecar).
+- [`x2_pd_tuning_with_mc_scan.md`](x2_pd_tuning_with_mc_scan.md) —
+  procedure for picking the deployment-time PD scale knobs and per-group
+  target clamps used by `--tuning-config`. Includes the
+  `x2_scan_mc_motors.sh` MC-scan helper, the nudge-test loop, and how
+  to read the per-joint oscillation summary.
 
 The deploy package itself is `gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/`.
 
