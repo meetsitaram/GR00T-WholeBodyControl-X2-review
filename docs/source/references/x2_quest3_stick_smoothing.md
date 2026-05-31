@@ -278,8 +278,39 @@ on startup; absence of that line means the env var path didn't fire (typo, etc.)
    The `vr_raw` row in the sweep output is now the actual on-robot baseline-with-filter. It should match the recommended config's `vel_z` p99 (~3.1 m/s²) within ±0.5 m/s²; if it doesn't, the StickFilter wiring isn't engaging — check the manager log for the `[stick-filter] enabled` line.
 4. **Subjective check**: forward-with-twist maneuver (t=60-70 in the script). The lurching should be gone; the gait should look like a smoother continuous walk under twist.
 
+## Companion: publisher-side reference-step smoother (lower-body click fix)
+
+`StickFilter` shapes the velocity intent on the *input* side (raw stick → smoothed stick → `intent_to_velocity` → 4-D velocity → kplanner). A separate fault lives on the *output* side: when the planner's 31-DoF reference pose itself jumps between two consecutive 20 ms ticks — e.g. operator pushes the stick and the kplanner replaces its frozen `default_angles` reference with the live neural buffer pose, or releases the stick and snaps back the other way — the deploy's high lower-body kp (hip/knee ~99 Nm/rad, ankle ~21 Nm/rad after the 2026-05 stability bump) turns that step into a torque step, and the real drivetrain absorbs it as an audible click (backlash + bearing snap; MuJoCo doesn't model it, so sim is silent).
+
+[`_ReferenceStepSmoother`](../../../gear_sonic/scripts/x2_kplanner.py) sits at the publisher and handles that side. Knobs (wrapper env vars in `gear_sonic/scripts/run_x2_quest3_planner_stack.sh`):
+
+| Env var | CLI | Default | What it controls |
+| ------- | --- | ------- | ---------------- |
+| `KPLANNER_REF_SMOOTHER_MS` | `--ref-smoother-ms` | `300` | Halfcos ramp duration in ms |
+| `KPLANNER_REF_SMOOTHER_TRIGGER_RAD` | `--ref-smoother-trigger-rad` | `0.05` | Per-tick lower-body reference delta (rad) that arms a ramp |
+| `KPLANNER_REF_SMOOTHER_SHAPE` | `--ref-smoother-shape` | `halfcos` | `halfcos` (C¹ at both endpoints; default), `linear` (A/B only), `off` (passthrough revert) |
+| `KPLANNER_REF_SMOOTHER_JOINTS` | `--ref-smoother-joints` | `lower_body` | `lower_body` (legs 0-11 + waist 12-14), `legs_only` (0-11), `all` (debug) |
+
+Two design properties matter for understanding the layering:
+
+- **Step-detection driven, not FSM-driven.** The smoother watches per-tick reference deltas on the wire — it does not import `PlannerState` or hook the `IDLE_LOOP ↔ PLAYING` edge. Operator stick push, stick release, future mode flips, future MC-handoff piping through the same publisher all generate the same on-wire signature (a multi-degree step on a leg or waist channel), so the same code path handles them uniformly without follow-up work.
+- **Manipulation-safety mask.** The default `lower_body` preset blends MJ indices `[0..14]` only. Arms `[15..28]` and head `[29..30]` are byte-equivalent passthrough during a ramp; fingers / OmniHand commands are on a separate command path and were never in this stream regardless. The unit test `test_upper_body_passthrough_default` pins that invariant.
+
+The two smoothers compose without interaction:
+
+```
+sticks --[StickFilter]--> velocity_intent --[kplanner FSM + neural]--> 31-DoF q --[_ReferenceStepSmoother]--> body_pose wire
+        (input shaping;                                                            (output shaping;
+         per-channel LPF + slew + optional release tau)                             halfcos ramp on detected reference steps)
+```
+
+`StickFilter` reduces the upstream cause (acceleration outside the training band); `_ReferenceStepSmoother` reduces a downstream symptom (audible torque step when the reference itself snaps). Tuning them separately is fine; each one is reversible via a single env var (`QUEST3_STICK_LPF_TAU=0` for the input filter, `KPLANNER_REF_SMOOTHER_SHAPE=off` for the output smoother).
+
+Unit tests live in [`tests/test_x2_kplanner_reference_smoother.py`](../../../tests/test_x2_kplanner_reference_smoother.py) (24 cases covering the halfcos math, step-detection threshold, joint-mask invariants, one-shot semantics, reset, and a numerical torque-step-reduction check that pins the analytic `2T/(π·dt)` ratio).
+
 ## Follow-ups (deferred)
 
+- **Port `_ReferenceStepSmoother` to the C++ deploy (SAFE_IDLE recovery clicks).** The Python kplanner-side smoother kills clicks for every transition that originates at the kplanner publisher — stick push, stick release, future mode flips, future MC-handoff piping. It does **NOT** see deploy-internal state transitions. The most operationally relevant one today is `CONTROL ↔ SAFE_IDLE` on the deploy side ([`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp`](../../../gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/x2_deploy_onnx_ref.cpp)): when the operator↔PC2 WiFi has a stale window, the pose-ref-age watchdog trips `CONTROL → SAFE_IDLE`, the deploy snaps `target_pos_mj` to `default_angles` with `kd × 4`, and then snaps back to the live tracked pose on `SAFE_IDLE → CONTROL` once the freshness window recovers. On weak WiFi this happens multiple times in a session and each transition is an audible click on the lower body (operator-reported 2026-05-31, the same session that validated the Python smoother). The Python smoother cannot see this because the deploy *ignores* the kplanner reference while in SAFE_IDLE and publishes its own hold — the step lives entirely inside the C++ binary. The follow-up is to port the same algorithm to C++ at a single insertion point in `OnControl()` just after `ApplySafetyStack()`, mirroring the four CLI knobs and the `lower_body` default mask. Same algorithm, same defaults, same passthrough invariant on arms/head/fingers. Plumb via the deploy launch script's existing CLI surface (e.g. `--ref-smoother-ms`) and matching env var on `deploy_x2.sh`. Tracked as a separate PR because it requires a deploy binary rebuild + PC2 push + real-robot A/B; the Python change ships independently.
 - **`Quest3Replayer` + `--quest3-replay-from`** — a getter-compatible replacement for `Quest3Reader` that drives the manager from a recorded JSONL, no headset. Would enable repeated `(τ, slew)` sweeps through the full manager+kplanner+SONIC+MuJoCo stack offline. Not needed for the current tuning because the analyzer's offline pipeline (replay → filter → `intent_to_velocity` → metrics) already captures the relevant per-channel dynamics. Worth picking up if a future tuning iteration needs full-stack physics in the loop.
 - **(B) live PKL-replay wire capture via `x2_pkl_command_source` + `record_planner_cmd_jsonl.py`** — the analyzer currently reads Flavor B from the same per-frame derivation as Flavor A. A live wire capture (`x2_pkl_command_source --pkl ... | record_planner_cmd_jsonl.py`) would confirm that the kplanner's actual on-wire intent matches the offline-computed Flavor B byte-for-byte. Useful regression check; not strictly required for tuning since the kplanner's `intent_to_velocity` short-circuits on `target_velocity` (i.e., the PKL source ships the same numbers the analyzer extracts offline).
 - **Per-channel tuning** — current defaults apply the same `τ` uniformly across `fwd / side / yaw`. The analyzer already shows lateral and yaw are well under the PKL band even unfiltered, so per-channel `τ` could reduce lag on those without changing the forward fix. Easy to add (`StickFilterConfig` already carries per-channel fields; only the CLI plumbing needs splitting).

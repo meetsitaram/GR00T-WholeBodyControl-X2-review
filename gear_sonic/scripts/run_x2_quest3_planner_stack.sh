@@ -421,6 +421,47 @@ KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S:-}"
 # more aggressive lift-off, or ``=0`` to revert to the legacy raw
 # proportional behaviour and accept the sub-0.3 m/s hip-wiggle.
 KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS:-}"
+# Reference-step smoother knobs (publisher-side, step-detection driven).
+# The smoother watches per-tick deltas on the lower-body joint reference
+# (legs + waist by default; arms / head / fingers untouched so
+# manipulation tasks driven by the same body_pose stream are unaffected)
+# and arms a half-cosine ramp whenever the delta exceeds the trigger.
+# Eliminates the audible motor click on stick push and release reported
+# on real hardware 2026-05-31 (drivetrain backlash absorbing the torque
+# step that high lower-body kp turns the reference step into; MuJoCo has
+# no backlash so the symptom is silent in sim).
+#
+# Step-detection-driven (NOT FSM-driven): fires on any source of
+# reference step -- stick push, stick release, future mode flips, future
+# MC-handoff piping -- without needing to know which.
+#
+# KPLANNER_REF_SMOOTHER_MS: ramp duration in milliseconds. Default empty
+# -> daemon default 300 ms (~natural period of the leg PD loop at
+# deployed kp). Tune down to 150-200 ms if the ramp feels sluggish; up
+# to 500 ms if residual clicks remain. Set 0 to disable entirely
+# (passthrough).
+KPLANNER_REF_SMOOTHER_MS="${KPLANNER_REF_SMOOTHER_MS:-}"
+# KPLANNER_REF_SMOOTHER_TRIGGER_RAD: per-tick reference delta (rad) on
+# any blended-channel joint that arms the ramp. Default empty -> daemon
+# default 0.05 rad ~= 3 deg. Cleanly separates the multi-degree jumps a
+# stick push/release creates from the per-tick neural-buffer motion
+# under steady walking. Set 0 to make every non-zero delta a candidate
+# (debug only; will fire ramps continuously during smooth walking).
+KPLANNER_REF_SMOOTHER_TRIGGER_RAD="${KPLANNER_REF_SMOOTHER_TRIGGER_RAD:-}"
+# KPLANNER_REF_SMOOTHER_SHAPE: halfcos | linear | off. Default empty ->
+# daemon default 'halfcos' (C^1 smooth at both ramp endpoints; the
+# piano-work proven shape). 'linear' is for A/B; 'off' is the
+# single-flag revert (byte-equivalent passthrough).
+KPLANNER_REF_SMOOTHER_SHAPE="${KPLANNER_REF_SMOOTHER_SHAPE:-}"
+# KPLANNER_REF_SMOOTHER_JOINTS: lower_body | legs_only | all. Default
+# empty -> daemon default 'lower_body' (legs 0-11 + waist 12-14).
+# 'lower_body' is intentionally chosen to leave arms (15-28) and head
+# (29-30) BYTE-EQUIVALENT to today's publisher output so manipulation
+# tasks (Quest 3 hand IK, future bimanual reach) are unaffected by the
+# ramp. 'legs_only' skips waist for max waist-twist responsiveness;
+# 'all' blends all 31 DoFs (debug A/B). Fingers are on a separate
+# command path and are never in this stream regardless of preset.
+KPLANNER_REF_SMOOTHER_JOINTS="${KPLANNER_REF_SMOOTHER_JOINTS:-}"
 
 # --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
@@ -612,6 +653,10 @@ while [[ $# -gt 0 ]]; do
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
         --kplanner-continuous-forward-min-mps) KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="$2"; shift 2 ;;
+        --kplanner-ref-smoother-ms) KPLANNER_REF_SMOOTHER_MS="$2"; shift 2 ;;
+        --kplanner-ref-smoother-trigger-rad) KPLANNER_REF_SMOOTHER_TRIGGER_RAD="$2"; shift 2 ;;
+        --kplanner-ref-smoother-shape) KPLANNER_REF_SMOOTHER_SHAPE="$2"; shift 2 ;;
+        --kplanner-ref-smoother-joints) KPLANNER_REF_SMOOTHER_JOINTS="$2"; shift 2 ;;
         --quest3-continuous-yaw-max) QUEST3_CONTINUOUS_YAW_MAX="$2"; shift 2 ;;
         --loco-decoupled-arms) LOCO_DECOUPLED_ARMS="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
@@ -1916,6 +1961,18 @@ else
     fi
     if [[ -n "${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS}" ]]; then
         PLANNER_ARGS+=(--continuous-forward-min-mps "${KPLANNER_CONTINUOUS_FORWARD_MIN_MPS}")
+    fi
+    if [[ -n "${KPLANNER_REF_SMOOTHER_MS}" ]]; then
+        PLANNER_ARGS+=(--ref-smoother-ms "${KPLANNER_REF_SMOOTHER_MS}")
+    fi
+    if [[ -n "${KPLANNER_REF_SMOOTHER_TRIGGER_RAD}" ]]; then
+        PLANNER_ARGS+=(--ref-smoother-trigger-rad "${KPLANNER_REF_SMOOTHER_TRIGGER_RAD}")
+    fi
+    if [[ -n "${KPLANNER_REF_SMOOTHER_SHAPE}" ]]; then
+        PLANNER_ARGS+=(--ref-smoother-shape "${KPLANNER_REF_SMOOTHER_SHAPE}")
+    fi
+    if [[ -n "${KPLANNER_REF_SMOOTHER_JOINTS}" ]]; then
+        PLANNER_ARGS+=(--ref-smoother-joints "${KPLANNER_REF_SMOOTHER_JOINTS}")
     fi
     if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
         PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")
