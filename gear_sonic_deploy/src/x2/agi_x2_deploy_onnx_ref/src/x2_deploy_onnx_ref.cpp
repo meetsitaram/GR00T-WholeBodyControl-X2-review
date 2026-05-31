@@ -255,16 +255,35 @@ struct CliArgs {
   double      kp_scale_ankle        = 1.0;
   double      kp_scale_ankle_pitch  = 1.0;
   double      kp_scale_ankle_roll   = 1.0;
-  // Waist is split into yaw vs pitch/roll (see PdScaleSpec above for
-  // why). The legacy ``kp_scale_waist`` knob is kept as a MULTIPLICATIVE
-  // alias that applies to BOTH waist subgroups, so existing scripts /
-  // YAMLs that set ``--kp-scale-waist 1.5`` keep working unchanged
-  // (effective scale on a waist_pitch joint becomes
-  // kp_scale_waist * kp_scale_waist_pr; both default to 1.0 so the
-  // alias-only path matches the pre-split behaviour exactly).
-  double      kp_scale_waist      = 1.0;
-  double      kp_scale_waist_yaw  = 1.0;
-  double      kp_scale_waist_pr   = 1.0;
+  // Waist is split into yaw vs pitch vs roll (see PdScaleSpec below for
+  // why). Two layers of legacy alias are kept for backward compat:
+  //   ``kp_scale_waist``    -- applies to ALL three waist subgroups
+  //                            (predates any split; matches the very
+  //                            first single-knob YAMLs we shipped).
+  //   ``kp_scale_waist_pr`` -- applies to BOTH waist_pitch and
+  //                            waist_roll (predates the pitch/roll
+  //                            split; matches expressive.yaml and the
+  //                            pre-2026-05-30 walking_recovery.yaml).
+  // New presets should prefer the explicit ``kp_scale_waist_pitch``
+  // and ``kp_scale_waist_roll`` knobs below. Effective scale on a
+  // waist_pitch joint becomes
+  //   kp_scale_waist * kp_scale_waist_pr * kp_scale_waist_pitch
+  // which is identity (1*1*1) by default, so omitting the new knobs
+  // exactly reproduces the pre-split behaviour.
+  //
+  // Why split waist_pr further: the 2026-05-30 MC-vs-SONIC nudge scan
+  // showed pitch (sagittal lean) at +45% over MC and roll (lateral
+  // lean) at -72% under MC -- same trained PD, same actuator, but
+  // closed-loop response diverges by axis because the COM moves
+  // asymmetrically about the two axes (arms hang symmetric about
+  // pitch, swing the whole COM laterally about roll). A single
+  // waist_pr knob cannot close the lateral gap without breaking
+  // the sagittal axis. Splitting gives one knob per physical axis.
+  double      kp_scale_waist        = 1.0;
+  double      kp_scale_waist_yaw    = 1.0;
+  double      kp_scale_waist_pr     = 1.0;
+  double      kp_scale_waist_pitch  = 1.0;
+  double      kp_scale_waist_roll   = 1.0;
   double      kp_scale_shoulder   = 1.0;
   double      kp_scale_elbow      = 1.0;
   double      kp_scale_wrist      = 1.0;
@@ -278,6 +297,8 @@ struct CliArgs {
   double      kd_scale_waist        = 1.0;
   double      kd_scale_waist_yaw    = 1.0;
   double      kd_scale_waist_pr     = 1.0;
+  double      kd_scale_waist_pitch  = 1.0;
+  double      kd_scale_waist_roll   = 1.0;
   double      kd_scale_shoulder   = 1.0;
   double      kd_scale_elbow      = 1.0;
   double      kd_scale_wrist      = 1.0;
@@ -318,6 +339,45 @@ struct CliArgs {
   // hz=8 -> alpha~=0.63 (~5 Hz effective bandwidth). 0 = disabled.
   // Documented under gear_sonic_deploy/configs/real_deploy_tuning/.
   double      target_lpf_hz     = 0.0;
+  // Per-group overrides for target_lpf_hz, mirroring the
+  // max_target_dev_{leg,waist,arm,head} pattern above. A negative value
+  // means "inherit the global ``target_lpf_hz``"; 0 = "disabled on this
+  // group regardless of global"; >0 = "use this cutoff on this group".
+  //
+  // Motivating diagnostic (Phase 1b waist torso-push A/B scan, 2026-05-30):
+  // SONIC's waist commanded target moves ~2x faster than MC's at numerically
+  // identical PD (waist_roll peak velocity 1.29 vs 0.59 rad/s, +118%) and
+  // overshoots its own command by an extra 25-64% in pos_p2p. Motor effort
+  // peaks at <=23 N*m on a 48 N*m motor (~50% headroom), so neither kd_scale
+  // bumping nor max_target_dev tightening is the right knob. The signal IS
+  // command bandwidth -- which a per-group LPF controls directly. Global
+  // LPF drops (8.0 -> 4.0) tried earlier hurt the legs because legs need
+  // high bandwidth for heel-strike correction; the waist doesn't.
+  //
+  // Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+  // mujoco_joint_names):
+  //   leg   -> indices  0..11 (hip+knee+ankle, both sides)
+  //   waist -> indices 12..14 (yaw, pitch, roll)
+  //   arm   -> indices 15..28 (shoulder+elbow+wrist, both sides)
+  //   head  -> indices 29..30 (yaw, pitch)
+  //
+  // Recommended values:
+  //   leg   : inherit global (8 Hz on walking_recovery.yaml). Going lower
+  //           reintroduces the heel-strike-correction lag we hit when we
+  //           tried global LPF=4 earlier.
+  //   waist : 2-3 Hz (1.3-1.9 Hz effective bandwidth). Sits just above the
+  //           observed 2.0-2.5 Hz waist_pitch/waist_roll resonance from the
+  //           Phase 1b oscillation scan, so the resonance content is
+  //           attenuated ~70-80% while slow operator-tracked motion still
+  //           passes.
+  //   arm   : inherit global, or 10-12 Hz (~6-7.5 Hz bandwidth) if teleop
+  //           feels sluggish under the global default.
+  //   head  : inherit global. No measured resonance worth treating
+  //           differently.
+  double      target_lpf_hz_leg   = -1.0;
+  double      target_lpf_hz_waist = -1.0;
+  double      target_lpf_hz_arm   = -1.0;
+  double      target_lpf_hz_head  = -1.0;
   int         intra_op_threads  = 1;
   // Optional topic overrides. Empty string -> use AimdkIo defaults
   // (which match the canonical names in the SDK `topics_and_services`
@@ -612,11 +672,26 @@ void PrintUsage()
       << "                             (matches MC's 40 exactly), so the typical value\n"
       << "                             is 1.00 -- bumping it is more likely to ring than\n"
       << "                             to help.\n"
-      << "  --kp-scale-waist-pr FACTOR   waist_pitch_joint + waist_roll_joint. Trained\n"
-      << "                             kp=14.25, MC uses 40, so 2.81 matches MC exactly\n"
-      << "                             and is the recommended value if you're chasing\n"
-      << "                             forward/back nudge wobble. See\n"
-      << "                             configs/real_deploy_tuning/expressive.yaml.\n"
+      << "  --kp-scale-waist-pr FACTOR   LEGACY alias: applies to BOTH waist_pitch and\n"
+      << "                             waist_roll. Trained kp=14.25, MC uses 40, so\n"
+      << "                             2.81 matches MC exactly. Prefer the per-axis\n"
+      << "                             knobs below for new presets -- the 2026-05-30\n"
+      << "                             MC-vs-SONIC scan showed pitch and roll close\n"
+      << "                             the MC gap in opposite directions (+45% on\n"
+      << "                             pitch, -72% on roll), which the combined knob\n"
+      << "                             cannot express.\n"
+      << "  --kp-scale-waist-pitch FACTOR  waist_pitch_joint ONLY. Composes with the\n"
+      << "                             legacy --kp-scale-waist and --kp-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). Use\n"
+      << "                             this to tune sagittal-lean (fwd/back) stiffness\n"
+      << "                             independently of roll.\n"
+      << "  --kp-scale-waist-roll FACTOR  waist_roll_joint ONLY. Composes with the\n"
+      << "                             legacy --kp-scale-waist and --kp-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). Use\n"
+      << "                             this to tune lateral-lean (left/right)\n"
+      << "                             stiffness; closes the -72% lateral compliance\n"
+      << "                             gap vs MC that the combined waist_pr knob\n"
+      << "                             can't reach without breaking pitch.\n"
       << "  --kp-scale-shoulder FACTOR per-family override (shoulders L/R).\n"
       << "  --kp-scale-elbow FACTOR    per-family override (elbows L/R).\n"
       << "  --kp-scale-wrist FACTOR    per-family override (wrists L/R yaw/pitch/roll).\n"
@@ -642,10 +717,30 @@ void PrintUsage()
       << "                             trained 2.56 -> 3.13 matches MC. Trunk damping\n"
       << "                             is critical for nudge rejection: bumping kd is\n"
       << "                             usually safer than bumping kp.\n"
-      << "  --kd-scale-waist-pr FACTOR   waist_pitch_joint + waist_roll_joint. MC\n"
-      << "                             publishes kd=5.0 vs trained 0.907 -> 5.51 matches\n"
-      << "                             MC. This is the SINGLE biggest knob for closing\n"
-      << "                             the forward/back nudge gap on the real robot.\n"
+      << "  --kd-scale-waist-pr FACTOR   LEGACY alias: applies to BOTH waist_pitch and\n"
+      << "                             waist_roll. MC publishes kd=5.0 vs trained\n"
+      << "                             0.907 -> 5.51 matches MC. Prefer the per-axis\n"
+      << "                             knobs below for new presets (see\n"
+      << "                             --kp-scale-waist-pr rationale).\n"
+      << "  --kd-scale-waist-pitch FACTOR  waist_pitch_joint ONLY. Composes with the\n"
+      << "                             legacy --kd-scale-waist and --kd-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). The\n"
+      << "                             sagittal-axis push response is the ONE waist\n"
+      << "                             metric where SONIC already exceeds MC (+45%\n"
+      << "                             stronger); don't bump this above MC-match\n"
+      << "                             without explicit fwd/back-nudge scan evidence.\n"
+      << "  --kd-scale-waist-roll FACTOR  waist_roll_joint ONLY. Composes with the\n"
+      << "                             legacy --kd-scale-waist and --kd-scale-waist-pr\n"
+      << "                             multiplicatively (default 1.0 = inherit). The\n"
+      << "                             lateral-axis push response under SONIC at the\n"
+      << "                             combined waist_pr knob sits at -72% of MC's\n"
+      << "                             resistance, AND the policy moves its commanded\n"
+      << "                             target with the disturbance (gait tracker),\n"
+      << "                             so the failure mode is not simply 'too soft'\n"
+      << "                             or 'too damped'. Direction of trim must be\n"
+      << "                             determined by a post-fix MC-vs-SONIC lateral\n"
+      << "                             nudge scan; do NOT prescribe an a priori\n"
+      << "                             value here without that data.\n"
       << "  --action-clip RAD          symmetric clip on the raw ONNX action\n"
       << "                             (action_il) BEFORE x2_action_scale (default\n"
       << "                             20.0, matches training-time\n"
@@ -668,6 +763,21 @@ void PrintUsage()
       << "                             to --obs-dump (raw target preserved) but it\n"
       << "                             changes what the bus sees, which would\n"
       << "                             diverge from eval_x2_mujoco.py's reference.\n"
+      << "                             Acts as the GLOBAL default for joints with\n"
+      << "                             no per-group override (see --target-lpf-hz-*).\n"
+      << "  --target-lpf-hz-leg HZ     Per-group override for legs (MJ joints 0..11\n"
+      << "                             = hip+knee+ankle, both sides). <0 = inherit\n"
+      << "                             global; 0 = disabled on this group; >0 = use\n"
+      << "                             this cutoff. Default <0 (= inherit).\n"
+      << "  --target-lpf-hz-waist HZ   Per-group override for the waist (MJ joints\n"
+      << "                             12..14 = yaw/pitch/roll). Recommended 2-3 Hz\n"
+      << "                             to kill the observed 2.0-2.5 Hz waist\n"
+      << "                             resonance under SONIC active walking.\n"
+      << "  --target-lpf-hz-arm HZ     Per-group override for the arms (MJ joints\n"
+      << "                             15..28). <0 = inherit global. Raise above\n"
+      << "                             global if teleop arm motion feels sluggish.\n"
+      << "  --target-lpf-hz-head HZ    Per-group override for the head (MJ joints\n"
+      << "                             29..30). <0 = inherit global.\n"
       << "  --log-dir PATH             write per-tick CSVs to PATH\n"
       << "  --intra-op-threads N       ONNX session threads (default 1)\n"
       << "  --imu-topic NAME           override IMU topic (default /aima/hal/imu/torso/state;\n"
@@ -840,9 +950,11 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--kp-scale-ankle")       a.kp_scale_ankle        = std::stod(next("--kp-scale-ankle"));
     else if (s == "--kp-scale-ankle-pitch") a.kp_scale_ankle_pitch  = std::stod(next("--kp-scale-ankle-pitch"));
     else if (s == "--kp-scale-ankle-roll")  a.kp_scale_ankle_roll   = std::stod(next("--kp-scale-ankle-roll"));
-    else if (s == "--kp-scale-waist")       a.kp_scale_waist        = std::stod(next("--kp-scale-waist"));
-    else if (s == "--kp-scale-waist-yaw")   a.kp_scale_waist_yaw  = std::stod(next("--kp-scale-waist-yaw"));
-    else if (s == "--kp-scale-waist-pr")    a.kp_scale_waist_pr   = std::stod(next("--kp-scale-waist-pr"));
+    else if (s == "--kp-scale-waist")        a.kp_scale_waist        = std::stod(next("--kp-scale-waist"));
+    else if (s == "--kp-scale-waist-yaw")    a.kp_scale_waist_yaw    = std::stod(next("--kp-scale-waist-yaw"));
+    else if (s == "--kp-scale-waist-pr")     a.kp_scale_waist_pr     = std::stod(next("--kp-scale-waist-pr"));
+    else if (s == "--kp-scale-waist-pitch")  a.kp_scale_waist_pitch  = std::stod(next("--kp-scale-waist-pitch"));
+    else if (s == "--kp-scale-waist-roll")   a.kp_scale_waist_roll   = std::stod(next("--kp-scale-waist-roll"));
     else if (s == "--kp-scale-shoulder")    a.kp_scale_shoulder   = std::stod(next("--kp-scale-shoulder"));
     else if (s == "--kp-scale-elbow")       a.kp_scale_elbow    = std::stod(next("--kp-scale-elbow"));
     else if (s == "--kp-scale-wrist")       a.kp_scale_wrist    = std::stod(next("--kp-scale-wrist"));
@@ -853,9 +965,11 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--kd-scale-ankle")       a.kd_scale_ankle        = std::stod(next("--kd-scale-ankle"));
     else if (s == "--kd-scale-ankle-pitch") a.kd_scale_ankle_pitch  = std::stod(next("--kd-scale-ankle-pitch"));
     else if (s == "--kd-scale-ankle-roll")  a.kd_scale_ankle_roll   = std::stod(next("--kd-scale-ankle-roll"));
-    else if (s == "--kd-scale-waist")       a.kd_scale_waist        = std::stod(next("--kd-scale-waist"));
-    else if (s == "--kd-scale-waist-yaw")   a.kd_scale_waist_yaw  = std::stod(next("--kd-scale-waist-yaw"));
-    else if (s == "--kd-scale-waist-pr")    a.kd_scale_waist_pr   = std::stod(next("--kd-scale-waist-pr"));
+    else if (s == "--kd-scale-waist")        a.kd_scale_waist        = std::stod(next("--kd-scale-waist"));
+    else if (s == "--kd-scale-waist-yaw")    a.kd_scale_waist_yaw    = std::stod(next("--kd-scale-waist-yaw"));
+    else if (s == "--kd-scale-waist-pr")     a.kd_scale_waist_pr     = std::stod(next("--kd-scale-waist-pr"));
+    else if (s == "--kd-scale-waist-pitch")  a.kd_scale_waist_pitch  = std::stod(next("--kd-scale-waist-pitch"));
+    else if (s == "--kd-scale-waist-roll")   a.kd_scale_waist_roll   = std::stod(next("--kd-scale-waist-roll"));
     else if (s == "--kd-scale-shoulder")    a.kd_scale_shoulder   = std::stod(next("--kd-scale-shoulder"));
     else if (s == "--kd-scale-elbow")       a.kd_scale_elbow    = std::stod(next("--kd-scale-elbow"));
     else if (s == "--kd-scale-wrist")       a.kd_scale_wrist    = std::stod(next("--kd-scale-wrist"));
@@ -863,6 +977,10 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--action-clip")       a.action_clip       = std::stod(next("--action-clip"));
     else if (s == "--return-seconds")    a.return_seconds    = std::stod(next("--return-seconds"));
     else if (s == "--target-lpf-hz")     a.target_lpf_hz     = std::stod(next("--target-lpf-hz"));
+    else if (s == "--target-lpf-hz-leg")   a.target_lpf_hz_leg   = std::stod(next("--target-lpf-hz-leg"));
+    else if (s == "--target-lpf-hz-waist") a.target_lpf_hz_waist = std::stod(next("--target-lpf-hz-waist"));
+    else if (s == "--target-lpf-hz-arm")   a.target_lpf_hz_arm   = std::stod(next("--target-lpf-hz-arm"));
+    else if (s == "--target-lpf-hz-head")  a.target_lpf_hz_head  = std::stod(next("--target-lpf-hz-head"));
     else if (s == "--intra-op-threads")  a.intra_op_threads  = std::stoi(next("--intra-op-threads"));
     else if (s == "--imu-topic")         a.imu_topic         = next("--imu-topic");
     else if (s == "--obs-dump")          a.obs_dump_path     = next("--obs-dump");
@@ -951,9 +1069,11 @@ CliArgs ParseCli(int argc, char** argv)
   reject_nonpos("--kp-scale-ankle",       a.kp_scale_ankle);
   reject_nonpos("--kp-scale-ankle-pitch", a.kp_scale_ankle_pitch);
   reject_nonpos("--kp-scale-ankle-roll",  a.kp_scale_ankle_roll);
-  reject_nonpos("--kp-scale-waist",       a.kp_scale_waist);
-  reject_nonpos("--kp-scale-waist-yaw", a.kp_scale_waist_yaw);
-  reject_nonpos("--kp-scale-waist-pr",  a.kp_scale_waist_pr);
+  reject_nonpos("--kp-scale-waist",        a.kp_scale_waist);
+  reject_nonpos("--kp-scale-waist-yaw",    a.kp_scale_waist_yaw);
+  reject_nonpos("--kp-scale-waist-pr",     a.kp_scale_waist_pr);
+  reject_nonpos("--kp-scale-waist-pitch",  a.kp_scale_waist_pitch);
+  reject_nonpos("--kp-scale-waist-roll",   a.kp_scale_waist_roll);
   reject_nonpos("--kp-scale-shoulder",  a.kp_scale_shoulder);
   reject_nonpos("--kp-scale-elbow",    a.kp_scale_elbow);
   reject_nonpos("--kp-scale-wrist",    a.kp_scale_wrist);
@@ -964,9 +1084,11 @@ CliArgs ParseCli(int argc, char** argv)
   reject_nonpos("--kd-scale-ankle",       a.kd_scale_ankle);
   reject_nonpos("--kd-scale-ankle-pitch", a.kd_scale_ankle_pitch);
   reject_nonpos("--kd-scale-ankle-roll",  a.kd_scale_ankle_roll);
-  reject_nonpos("--kd-scale-waist",       a.kd_scale_waist);
-  reject_nonpos("--kd-scale-waist-yaw", a.kd_scale_waist_yaw);
-  reject_nonpos("--kd-scale-waist-pr",  a.kd_scale_waist_pr);
+  reject_nonpos("--kd-scale-waist",        a.kd_scale_waist);
+  reject_nonpos("--kd-scale-waist-yaw",    a.kd_scale_waist_yaw);
+  reject_nonpos("--kd-scale-waist-pr",     a.kd_scale_waist_pr);
+  reject_nonpos("--kd-scale-waist-pitch",  a.kd_scale_waist_pitch);
+  reject_nonpos("--kd-scale-waist-roll",   a.kd_scale_waist_roll);
   reject_nonpos("--kd-scale-shoulder",  a.kd_scale_shoulder);
   reject_nonpos("--kd-scale-elbow",    a.kd_scale_elbow);
   reject_nonpos("--kd-scale-wrist",    a.kd_scale_wrist);
@@ -1015,6 +1137,74 @@ BuildMaxTargetDevPerDof(const MaxTargetDevSpec& s)
 }
 
 // ---------------------------------------------------------------------------
+// Per-DOF target_lpf alpha synthesizer.
+//
+// Mirrors BuildMaxTargetDevPerDof: maps the (global, leg, waist, arm, head)
+// CLI cutoff scalars onto a 31-element per-DOF EMA-alpha array consumed by
+// the OnControl hot loop. Convention for the input scalars (matches CliArgs
+// docs and --target-lpf-hz-* help):
+//   < 0  -> "inherit global"
+//   == 0 -> "disabled on this group" (no smoothing, output = raw target)
+//   > 0  -> "use this Hz cutoff on this group"
+//
+// The global itself follows the original target_lpf_hz convention: > 0
+// = enabled at that cutoff, otherwise disabled. This means a robot deployed
+// with the global at 0 (default) and only --target-lpf-hz-waist=3 will
+// smooth only the waist DOFs and leave every other DOF passthrough.
+//
+// alpha is the standard first-order EMA coefficient at the OnControl tick
+// rate ``dt`` (50 Hz, dt = 0.02 s): alpha = 1 - exp(-2*pi*hz*dt). alpha = 0
+// in the output array means "no smoothing on this DOF" (passthrough);
+// 0 < alpha < 1 means "EMA with this coefficient"; the hot path branches
+// on alpha == 0 to skip the EMA for unsmoothed DOFs cheaply.
+//
+// Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+// mujoco_joint_names):
+//   leg   -> indices  0..11
+//   waist -> indices 12..14
+//   arm   -> indices 15..28
+//   head  -> indices 29..30
+struct TargetLpfSpec {
+  double global;  // > 0 = enabled, otherwise disabled
+  double leg;     // < 0 inherit, == 0 disabled, > 0 = cutoff Hz
+  double waist;
+  double arm;
+  double head;
+  double dt;      // OnControl tick period in seconds (0.02 for 50 Hz)
+};
+
+static std::array<double, NUM_DOFS>
+BuildTargetLpfAlphaPerDof(const TargetLpfSpec& s)
+{
+  constexpr double pi = 3.14159265358979323846;
+  auto hz_to_alpha = [&](double hz) -> double {
+    if (hz <= 0.0) return 0.0;  // disabled or passthrough
+    return 1.0 - std::exp(-2.0 * pi * hz * s.dt);
+  };
+
+  // Step 1: fill with the global (or 0 if global is disabled).
+  const double alpha_global = hz_to_alpha(s.global > 0.0 ? s.global : 0.0);
+  std::array<double, NUM_DOFS> arr{};
+  arr.fill(alpha_global);
+
+  // Step 2: per-group overrides. Negative = inherit (do nothing here);
+  // zero or positive = explicit override (write into the slice). A zero
+  // override deliberately CLEARS the global on that group, which is the
+  // whole point of supporting a "disabled on this group" semantic
+  // independent of the global default.
+  auto apply = [&](double hz_group, std::size_t lo, std::size_t hi) {
+    if (hz_group < 0.0) return;  // inherit global
+    const double alpha_group = hz_to_alpha(hz_group);
+    for (std::size_t i = lo; i <= hi; ++i) arr[i] = alpha_group;
+  };
+  apply(s.leg,    0,  11);
+  apply(s.waist, 12,  14);
+  apply(s.arm,   15,  28);
+  apply(s.head,  29,  30);
+  return arr;
+}
+
+// ---------------------------------------------------------------------------
 // Per-DOF PD-scale synthesizer.
 //
 // Mirrors ``gear_sonic/scripts/eval_x2_mujoco.py::_deployment_pd_scale``:
@@ -1037,16 +1227,33 @@ struct PdScaleSpec {
   // both MC values exactly.
   double ankle_pitch;
   double ankle_roll;
-  // Waist is split into yaw vs pitch/roll because the trained kps for
-  // those subgroups differ substantially (waist_yaw kp=40.18, waist_pr
-  // kp=14.25 -- a 2.81x gap). On the real X2, MC publishes a uniform
-  // kp=40 across ALL three waist joints (operator scan
-  // 2026-05-15:mc_motor_scan_1778884089.jsonl), so matching MC requires
-  // ~1.0x on waist_yaw and ~2.81x on waist_pr. A single ``waist`` knob
-  // could not express that pattern -- it would either over-stiffen
-  // waist_yaw or under-stiffen waist_pr. Split fixes that.
+  // Waist is split THREE ways: yaw, pitch, roll. Two reasons stacked:
+  //
+  // (1) Trained kps for yaw vs pitch/roll differ 2.81x (waist_yaw
+  //     kp=40.18, waist_pitch/roll kp=14.25). MC publishes a uniform
+  //     kp=40 across all three (operator scan 2026-05-15:
+  //     mc_motor_scan_1778884089.jsonl), so matching MC requires
+  //     ~1.0x on waist_yaw and ~2.81x on waist_pitch/roll. A single
+  //     ``waist`` knob couldn't express that.
+  //
+  // (2) The 2026-05-30 MC-vs-SONIC torso-nudge scan showed pitch and
+  //     roll diverge in opposite directions from MC even at numerically
+  //     identical PD: pitch (sagittal lean) ran +45% STRONGER than MC
+  //     in push-resistance, while roll (lateral lean) ran -72% WEAKER.
+  //     The asymmetry comes from the load distribution (arms hang
+  //     symmetric about pitch, swing the whole COM laterally about
+  //     roll) AND from the policy being a gait-tracker that moves
+  //     WITH lateral disturbance. The waist_pr knob (which moved
+  //     pitch and roll together) couldn't close the lateral gap
+  //     without over-tightening pitch and re-introducing the
+  //     forward/back wobble we'd already tuned out.
+  //
+  // Splitting waist_pr -> waist_pitch + waist_roll gives one knob per
+  // physical axis, matching the ankle_pitch/ankle_roll split we
+  // already do.
   double waist_yaw;
-  double waist_pr;
+  double waist_pitch;
+  double waist_roll;
   double shoulder;
   double elbow;
   double wrist;
@@ -1057,11 +1264,10 @@ static double FamilyScaleForJointName(const PdScaleSpec& s,
                                       const std::string& jname)
 {
   // Order matters only for substrings that overlap. The waist split is
-  // checked first inside the "waist" branch -- "waist_yaw_joint" needs
-  // to route to s.waist_yaw, everything else under "waist" (which is
-  // waist_pitch_joint + waist_roll_joint on the X2) routes to
-  // s.waist_pr. All other families are pairwise disjoint on the X2
-  // joint name list, so iteration order doesn't matter for them.
+  // checked subgroup-by-subgroup -- waist_yaw / waist_pitch /
+  // waist_roll are mutually exclusive on the X2 joint name list, so
+  // each falls into its own branch. All other families are pairwise
+  // disjoint, so iteration order doesn't matter for them.
   if (jname.find("ankle")    != std::string::npos) {
     // ankle_pitch_joint vs ankle_roll_joint (no "ankle_yaw" exists on
     // X2). Identical structure to the waist split below.
@@ -1072,8 +1278,10 @@ static double FamilyScaleForJointName(const PdScaleSpec& s,
   if (jname.find("knee")     != std::string::npos) return s.knee;
   if (jname.find("hip")      != std::string::npos) return s.hip;
   if (jname.find("waist")    != std::string::npos) {
-    if (jname.find("waist_yaw") != std::string::npos) return s.waist_yaw;
-    return s.waist_pr;  // waist_pitch_joint and waist_roll_joint
+    if (jname.find("waist_yaw")   != std::string::npos) return s.waist_yaw;
+    if (jname.find("waist_pitch") != std::string::npos) return s.waist_pitch;
+    return s.waist_roll;  // waist_roll_joint (defensive default for any
+                          // future waist subgroup name we haven't enumerated)
   }
   if (jname.find("shoulder") != std::string::npos) return s.shoulder;
   if (jname.find("elbow")    != std::string::npos) return s.elbow;
@@ -1277,13 +1485,22 @@ class X2Deploy {
     // operator typo but we don't reject it -- the SAFETY warn log
     // surfaces the final effective scale per subgroup so the operator
     // can verify what landed.
+    // Waist subgroup composition: the legacy ``waist_pr`` alias is
+    // kept as a multiplier on BOTH pitch and roll for backward compat
+    // with pre-2026-05-30 walking_recovery.yaml / expressive.yaml.
+    // Effective scale on a waist_pitch joint becomes
+    //   waist (alias) * waist_pr (alias) * waist_pitch (split knob)
+    // and similarly for roll. All three default to 1.0, so the
+    // alias-only path (e.g. ``kd_scale_waist_pr: 5.51``) reproduces
+    // the pre-split behaviour bit-for-bit.
     const auto kp_scales = BuildPdScalesPerDof(PdScaleSpec{
         cli_.kp_scale,
         cli_.kp_scale_hip,      cli_.kp_scale_knee,
         cli_.kp_scale_ankle * cli_.kp_scale_ankle_pitch,
         cli_.kp_scale_ankle * cli_.kp_scale_ankle_roll,
         cli_.kp_scale_waist * cli_.kp_scale_waist_yaw,
-        cli_.kp_scale_waist * cli_.kp_scale_waist_pr,
+        cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_pitch,
+        cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_roll,
         cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
         cli_.kp_scale_wrist,    cli_.kp_scale_head});
     const auto kd_scales = BuildPdScalesPerDof(PdScaleSpec{
@@ -1292,7 +1509,8 @@ class X2Deploy {
         cli_.kd_scale_ankle * cli_.kd_scale_ankle_pitch,
         cli_.kd_scale_ankle * cli_.kd_scale_ankle_roll,
         cli_.kd_scale_waist * cli_.kd_scale_waist_yaw,
-        cli_.kd_scale_waist * cli_.kd_scale_waist_pr,
+        cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_pitch,
+        cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_roll,
         cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
         cli_.kd_scale_wrist,    cli_.kd_scale_head});
     for (std::size_t i = 0; i < NUM_DOFS; ++i) {
@@ -1352,12 +1570,14 @@ class X2Deploy {
         cli_.kp_scale, cli_.kp_scale_hip, cli_.kp_scale_knee,
         cli_.kp_scale_ankle, cli_.kp_scale_ankle_pitch, cli_.kp_scale_ankle_roll,
         cli_.kp_scale_waist, cli_.kp_scale_waist_yaw, cli_.kp_scale_waist_pr,
+        cli_.kp_scale_waist_pitch, cli_.kp_scale_waist_roll,
         cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
         cli_.kp_scale_wrist, cli_.kp_scale_head});
     const bool kd_trimmed = any_non_unity({
         cli_.kd_scale, cli_.kd_scale_hip, cli_.kd_scale_knee,
         cli_.kd_scale_ankle, cli_.kd_scale_ankle_pitch, cli_.kd_scale_ankle_roll,
         cli_.kd_scale_waist, cli_.kd_scale_waist_yaw, cli_.kd_scale_waist_pr,
+        cli_.kd_scale_waist_pitch, cli_.kd_scale_waist_roll,
         cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
         cli_.kd_scale_wrist, cli_.kd_scale_head});
     if (kp_trimmed || kd_trimmed) {
@@ -1371,37 +1591,45 @@ class X2Deploy {
       const double kd_eff_ankle_pitch = cli_.kd_scale_ankle * cli_.kd_scale_ankle_pitch;
       const double kd_eff_ankle_roll  = cli_.kd_scale_ankle * cli_.kd_scale_ankle_roll;
       const double kp_eff_waist_yaw   = cli_.kp_scale_waist * cli_.kp_scale_waist_yaw;
-      const double kp_eff_waist_pr    = cli_.kp_scale_waist * cli_.kp_scale_waist_pr;
+      // waist_pitch and waist_roll effective scales fold in both the
+      // legacy ``waist`` and ``waist_pr`` aliases as well as the new
+      // per-axis knobs, so what gets logged here is exactly what
+      // BuildPdScalesPerDof above feeds into BuildPdScalesPerDof.
+      const double kp_eff_waist_pitch = cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_pitch;
+      const double kp_eff_waist_roll  = cli_.kp_scale_waist * cli_.kp_scale_waist_pr * cli_.kp_scale_waist_roll;
       const double kd_eff_waist_yaw   = cli_.kd_scale_waist * cli_.kd_scale_waist_yaw;
-      const double kd_eff_waist_pr    = cli_.kd_scale_waist * cli_.kd_scale_waist_pr;
+      const double kd_eff_waist_pitch = cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_pitch;
+      const double kd_eff_waist_roll  = cli_.kd_scale_waist * cli_.kd_scale_waist_pr * cli_.kd_scale_waist_roll;
       RCLCPP_WARN(node_->get_logger(),
                   "SAFETY: deployment-time PD trim ENABLED. Effective gains = "
                   "trained kps[]/kds[] * (global * family). KP scales: "
                   "global=%.3f hip=%.3f knee=%.3f "
                   "ankle_pitch=%.3f ankle_roll=%.3f "
-                  "waist_yaw=%.3f waist_pr=%.3f "
+                  "waist_yaw=%.3f waist_pitch=%.3f waist_roll=%.3f "
                   "shoulder=%.3f elbow=%.3f wrist=%.3f head=%.3f. "
                   "KD scales: global=%.3f hip=%.3f knee=%.3f "
                   "ankle_pitch=%.3f ankle_roll=%.3f "
-                  "waist_yaw=%.3f waist_pr=%.3f "
+                  "waist_yaw=%.3f waist_pitch=%.3f waist_roll=%.3f "
                   "shoulder=%.3f elbow=%.3f wrist=%.3f head=%.3f. "
                   "Sample effective gains: "
                   "ankle_pitch kp=%.3f kd=%.3f, ankle_roll kp=%.3f kd=%.3f, "
-                  "waist_yaw kp=%.3f kd=%.3f, waist_pitch kp=%.3f kd=%.3f.",
+                  "waist_yaw kp=%.3f kd=%.3f, waist_pitch kp=%.3f kd=%.3f, "
+                  "waist_roll kp=%.3f kd=%.3f.",
                   cli_.kp_scale, cli_.kp_scale_hip, cli_.kp_scale_knee,
                   kp_eff_ankle_pitch, kp_eff_ankle_roll,
-                  kp_eff_waist_yaw, kp_eff_waist_pr,
+                  kp_eff_waist_yaw, kp_eff_waist_pitch, kp_eff_waist_roll,
                   cli_.kp_scale_shoulder, cli_.kp_scale_elbow,
                   cli_.kp_scale_wrist, cli_.kp_scale_head,
                   cli_.kd_scale, cli_.kd_scale_hip, cli_.kd_scale_knee,
                   kd_eff_ankle_pitch, kd_eff_ankle_roll,
-                  kd_eff_waist_yaw, kd_eff_waist_pr,
+                  kd_eff_waist_yaw, kd_eff_waist_pitch, kd_eff_waist_roll,
                   cli_.kd_scale_shoulder, cli_.kd_scale_elbow,
                   cli_.kd_scale_wrist, cli_.kd_scale_head,
                   kps_scaled_[4],  kds_scaled_[4],   // left_ankle_pitch
                   kps_scaled_[5],  kds_scaled_[5],   // left_ankle_roll
                   kps_scaled_[12], kds_scaled_[12],  // waist_yaw
-                  kps_scaled_[13], kds_scaled_[13]); // waist_pitch
+                  kps_scaled_[13], kds_scaled_[13], // waist_pitch
+                  kps_scaled_[14], kds_scaled_[14]); // waist_roll
     } else {
       RCLCPP_INFO(node_->get_logger(),
                   "SAFETY: deployment-time PD trim DISABLED (all scales = 1.0). "
@@ -1557,23 +1785,63 @@ class X2Deploy {
       std::remove(cli_.start_trigger_sentinel.c_str());
     }
 
-    // Compute the EMA coefficient now so OnControl can apply it without
-    // re-deriving every tick. dt is fixed at 1/50 s (the OnControl rate);
-    // alpha = 1 - exp(-2*pi*hz*dt) is the standard discrete first-order
-    // low-pass coefficient. hz<=0 -> alpha=0 (bypass).
-    if (cli_.target_lpf_hz > 0.0) {
-      const double dt = 1.0 / 50.0;
-      const double pi = 3.14159265358979323846;
-      target_lpf_alpha_ = 1.0 - std::exp(-2.0 * pi * cli_.target_lpf_hz * dt);
-      RCLCPP_WARN(node_->get_logger(),
-                  "REAL-DEPLOY: output target LPF ENABLED (--target-lpf-hz %.2f Hz, "
-                  "alpha=%.3f at 50 Hz OnControl). Bypassed in RAMP_OUT/SAFE_HOLD. "
-                  "Sim parity (eval_x2_mujoco.py) is preserved -- this filter "
-                  "lives strictly downstream of the policy and never affects "
-                  "--obs-dump output.",
-                  cli_.target_lpf_hz, target_lpf_alpha_);
-    } else {
-      target_lpf_alpha_ = 0.0;
+    // Compute the per-DOF EMA coefficient array now so OnControl can apply
+    // it without re-deriving every tick. dt is fixed at 1/50 s (the
+    // OnControl rate); alpha = 1 - exp(-2*pi*hz*dt) is the standard
+    // discrete first-order low-pass coefficient. Per-group overrides
+    // (--target-lpf-hz-{leg,waist,arm,head}) follow the max_target_dev
+    // semantics: <0 inherit global, ==0 disabled on that group, >0 use
+    // explicit cutoff. See BuildTargetLpfAlphaPerDof for the full table.
+    {
+      constexpr double kOnControlDt = 1.0 / 50.0;
+      const TargetLpfSpec spec{
+          cli_.target_lpf_hz,        // global
+          cli_.target_lpf_hz_leg,    // leg override (<0 = inherit)
+          cli_.target_lpf_hz_waist,  // waist override
+          cli_.target_lpf_hz_arm,    // arm override
+          cli_.target_lpf_hz_head,   // head override
+          kOnControlDt,
+      };
+      target_lpf_alpha_per_dof_ = BuildTargetLpfAlphaPerDof(spec);
+
+      // Cache the "anything active" flag so the OnControl hot loop can
+      // skip the entire EMA block when every DOF is in passthrough mode.
+      target_lpf_any_active_ = false;
+      for (double a : target_lpf_alpha_per_dof_) {
+        if (a > 0.0) {
+          target_lpf_any_active_ = true;
+          break;
+        }
+      }
+
+      // Pretty-print the effective Hz per group for the warm-up log, so an
+      // operator who's reading the deploy logs at startup can sanity-check
+      // what they shipped without having to re-derive alpha back into Hz.
+      auto group_eff_hz = [&](double override_hz) {
+        return override_hz < 0.0 ? std::max(spec.global, 0.0) : std::max(override_hz, 0.0);
+      };
+      const double hz_leg   = group_eff_hz(cli_.target_lpf_hz_leg);
+      const double hz_waist = group_eff_hz(cli_.target_lpf_hz_waist);
+      const double hz_arm   = group_eff_hz(cli_.target_lpf_hz_arm);
+      const double hz_head  = group_eff_hz(cli_.target_lpf_hz_head);
+
+      if (target_lpf_any_active_) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "REAL-DEPLOY: output target LPF ACTIVE on at least one group. "
+                    "Effective cutoffs (Hz) -- leg=%.2f waist=%.2f arm=%.2f head=%.2f "
+                    "(global=%.2f). Bypassed in RAMP_OUT/SAFE_HOLD. Sim parity "
+                    "(eval_x2_mujoco.py) preserved -- this filter is strictly "
+                    "downstream of the policy and never affects --obs-dump.",
+                    hz_leg, hz_waist, hz_arm, hz_head,
+                    std::max(cli_.target_lpf_hz, 0.0));
+      } else {
+        RCLCPP_INFO(node_->get_logger(),
+                    "REAL-DEPLOY: output target LPF DISABLED on every group "
+                    "(global=%.2f, leg=%.2f, waist=%.2f, arm=%.2f, head=%.2f Hz).",
+                    cli_.target_lpf_hz, cli_.target_lpf_hz_leg,
+                    cli_.target_lpf_hz_waist, cli_.target_lpf_hz_arm,
+                    cli_.target_lpf_hz_head);
+      }
     }
 
     // Initial safe command: PASSIVE (kp=0, kd=0) until any state arrives.
@@ -2450,7 +2718,7 @@ class X2Deploy {
     //     is identical with or without --target-lpf-hz set;
     //   * RAMP_OUT and SAFE_HOLD bypass: those states already produce a
     //     deliberately-shaped trajectory we don't want to attenuate.
-    if (target_lpf_alpha_ > 0.0
+    if (target_lpf_any_active_
         && state_.load() == State::CONTROL
         && !sc.tilt_trip) {
       if (!target_lpf_initialized_) {
@@ -2459,10 +2727,18 @@ class X2Deploy {
         target_lpf_state_ = sc.target_pos_mj;
         target_lpf_initialized_ = true;
       } else {
-        const double a = target_lpf_alpha_;
+        // Per-DOF EMA. alpha == 0 means "passthrough on this joint" -- we
+        // still write the raw target into target_lpf_state_ so that if a
+        // per-group LPF is toggled on later (not currently supported, but
+        // cheap to keep correct) the state isn't stale.
         for (std::size_t i = 0; i < NUM_DOFS; ++i) {
-          target_lpf_state_[i] =
-              a * sc.target_pos_mj[i] + (1.0 - a) * target_lpf_state_[i];
+          const double a = target_lpf_alpha_per_dof_[i];
+          if (a > 0.0) {
+            target_lpf_state_[i] =
+                a * sc.target_pos_mj[i] + (1.0 - a) * target_lpf_state_[i];
+          } else {
+            target_lpf_state_[i] = sc.target_pos_mj[i];
+          }
         }
         sc.target_pos_mj = target_lpf_state_;
       }
@@ -2879,14 +3155,20 @@ class X2Deploy {
   rclcpp::Subscription<aimdk_msgs::msg::JointCommandArray>::SharedPtr
       mc_takeover_waist_sub_;
 
-  // Output-side target LPF state. target_lpf_alpha_ is computed once in
-  // Run() from cli_.target_lpf_hz at the OnControl rate (50 Hz). When alpha
-  // is zero the filter is fully bypassed -- no math, no allocations, and
-  // the published target is the unmodified safety-clamped policy output.
+  // Output-side target LPF state. target_lpf_alpha_per_dof_ is computed
+  // once in Run() from (cli_.target_lpf_hz, cli_.target_lpf_hz_{leg,waist,
+  // arm,head}) at the OnControl rate (50 Hz) by BuildTargetLpfAlphaPerDof,
+  // which encodes the per-group inherit/disable/explicit semantics. A slot
+  // with alpha == 0 is in passthrough mode -- the OnControl hot path
+  // branches on that and skips the EMA math entirely, so disabling the LPF
+  // on a group truly costs nothing. ``target_lpf_any_active_`` is the
+  // logical OR over the array; when it's false the whole filter block is
+  // skipped (zero per-DOF cost on the historical default cli config).
   // target_lpf_initialized_ is reset implicitly by being default-false at
   // node startup; we also re-seed on the FIRST CONTROL tick (see OnControl)
   // so post-RAMP_OUT/SAFE_HOLD restarts (if we ever support them) behave.
-  double                            target_lpf_alpha_         = 0.0;
+  std::array<double, NUM_DOFS>      target_lpf_alpha_per_dof_{};
+  bool                              target_lpf_any_active_    = false;
   bool                              target_lpf_initialized_   = false;
   std::array<double, NUM_DOFS>      target_lpf_state_{};
 

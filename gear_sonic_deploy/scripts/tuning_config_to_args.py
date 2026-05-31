@@ -90,8 +90,10 @@ KEY_TO_FLAG: dict[str, tuple[str, Callable[[Any], str], Callable[[str, Any], Non
     "kp_scale_ankle_pitch": ("--kp-scale-ankle-pitch", _fmt_float, _check_pos),
     "kp_scale_ankle_roll":  ("--kp-scale-ankle-roll",  _fmt_float, _check_pos),
     "kp_scale_waist":       ("--kp-scale-waist",       _fmt_float, _check_pos),
-    "kp_scale_waist_yaw": ("--kp-scale-waist-yaw", _fmt_float, _check_pos),
-    "kp_scale_waist_pr":  ("--kp-scale-waist-pr",  _fmt_float, _check_pos),
+    "kp_scale_waist_yaw":   ("--kp-scale-waist-yaw",   _fmt_float, _check_pos),
+    "kp_scale_waist_pr":    ("--kp-scale-waist-pr",    _fmt_float, _check_pos),
+    "kp_scale_waist_pitch": ("--kp-scale-waist-pitch", _fmt_float, _check_pos),
+    "kp_scale_waist_roll":  ("--kp-scale-waist-roll",  _fmt_float, _check_pos),
     "kp_scale_shoulder":  ("--kp-scale-shoulder",  _fmt_float, _check_pos),
     "kp_scale_elbow":    ("--kp-scale-elbow",    _fmt_float, _check_pos),
     "kp_scale_wrist":    ("--kp-scale-wrist",    _fmt_float, _check_pos),
@@ -103,15 +105,29 @@ KEY_TO_FLAG: dict[str, tuple[str, Callable[[Any], str], Callable[[str, Any], Non
     "kd_scale_ankle_pitch": ("--kd-scale-ankle-pitch", _fmt_float, _check_pos),
     "kd_scale_ankle_roll":  ("--kd-scale-ankle-roll",  _fmt_float, _check_pos),
     "kd_scale_waist":       ("--kd-scale-waist",       _fmt_float, _check_pos),
-    "kd_scale_waist_yaw": ("--kd-scale-waist-yaw", _fmt_float, _check_pos),
-    "kd_scale_waist_pr":  ("--kd-scale-waist-pr",  _fmt_float, _check_pos),
+    "kd_scale_waist_yaw":   ("--kd-scale-waist-yaw",   _fmt_float, _check_pos),
+    "kd_scale_waist_pr":    ("--kd-scale-waist-pr",    _fmt_float, _check_pos),
+    "kd_scale_waist_pitch": ("--kd-scale-waist-pitch", _fmt_float, _check_pos),
+    "kd_scale_waist_roll":  ("--kd-scale-waist-roll",  _fmt_float, _check_pos),
     "kd_scale_shoulder":  ("--kd-scale-shoulder",  _fmt_float, _check_pos),
     "kd_scale_elbow":    ("--kd-scale-elbow",    _fmt_float, _check_pos),
     "kd_scale_wrist":    ("--kd-scale-wrist",    _fmt_float, _check_pos),
     "kd_scale_head":     ("--kd-scale-head",     _fmt_float, _check_pos),
     # New post-policy filters (parity-safe by construction; see C++ comment
     # next to CliArgs::target_lpf_hz for why this is dump-invisible).
-    "target_lpf_hz":   ("--target-lpf-hz",    _fmt_float, _check_nonneg),
+    # ``target_lpf_hz`` is the global default; the four per-group keys
+    # below override the global on their slice with the same
+    # inherit/disable/explicit convention as max_target_dev_*:
+    #   negative / null -> inherit global
+    #   0.0             -> disabled on this group (passthrough)
+    #   > 0.0           -> use this Hz cutoff on this group
+    # Negatives ARE legal here (sentinel for "inherit"), which is why these
+    # rows skip ``_check_nonneg``; the C++ binary handles the sentinel.
+    "target_lpf_hz":       ("--target-lpf-hz",       _fmt_float, _check_nonneg),
+    "target_lpf_hz_leg":   ("--target-lpf-hz-leg",   _fmt_float, None),
+    "target_lpf_hz_waist": ("--target-lpf-hz-waist", _fmt_float, None),
+    "target_lpf_hz_arm":   ("--target-lpf-hz-arm",   _fmt_float, None),
+    "target_lpf_hz_head":  ("--target-lpf-hz-head",  _fmt_float, None),
 }
 
 

@@ -107,17 +107,36 @@ kp_scale_knee:     1.0
 kp_scale_ankle:        1.5   # LEGACY alias; G16b-validated single-knob default
 kp_scale_ankle_pitch:  1.0   # ankle_pitch only; 1.87 matches MC's 40 N*m/rad
 kp_scale_ankle_roll:   1.0   # ankle_roll only; 1.40 matches MC's 30 N*m/rad
-# Waist has THREE knobs because the trained kps differ 2.81x between
-# waist_yaw (40 N*m/rad) and waist_pitch/roll (14.25 N*m/rad), but MC
-# uses a uniform 40 N*m/rad across all three. Matching MC therefore
-# requires waist_yaw=1.0 and waist_pr=2.81. The legacy ``kp_scale_waist``
-# is kept as a multiplicative alias (applies to BOTH subgroups) so
-# existing presets keep working unchanged; new presets should set the
-# split knobs directly. Both default to 1.0; effective scale on a waist
-# joint = kp_scale_waist * kp_scale_waist_{yaw,pr}.
-kp_scale_waist:    1.0   # LEGACY alias (applies to both waist_yaw + waist_pr)
-kp_scale_waist_yaw: 1.0  # waist_yaw_joint only; trained kp=40 matches MC
-kp_scale_waist_pr:  1.0  # waist_pitch_joint + waist_roll_joint; 2.81 matches MC
+# Waist has FIVE knobs (two layers of legacy alias + three explicit
+# subgroups). The 2.81x trained-kp gap between waist_yaw (40 N*m/rad)
+# and waist_pitch/roll (14.25 N*m/rad) drives the yaw vs pr split,
+# and the 2026-05-30 MC-vs-SONIC torso-nudge scan drives the further
+# split of waist_pr into per-axis pitch and roll knobs: closed-loop
+# response on the two axes diverges in opposite directions (pitch
+# +45% over MC's resistance, roll -72% under MC) at identical PD
+# because the COM moves asymmetrically about the two axes. Splitting
+# gives one knob per physical axis.
+#
+# Effective scale on a waist joint =
+#   kp_scale_waist * kp_scale_waist_{yaw, pr * {pitch, roll}}
+# All five default to 1.0, so existing presets that only set
+# kp_scale_waist_pr keep working bit-for-bit. New presets should
+# prefer the explicit kp_scale_waist_pitch / kp_scale_waist_roll
+# knobs (and same for kd).
+kp_scale_waist:       1.0   # LEGACY alias (applies to ALL three subgroups)
+kp_scale_waist_yaw:   1.0   # waist_yaw_joint only; trained kp=40 matches MC
+kp_scale_waist_pr:    1.0   # LEGACY alias (applies to BOTH waist_pitch and
+                            # waist_roll); 2.81 matches MC. Prefer the per-
+                            # axis knobs below for new presets.
+kp_scale_waist_pitch: 1.0   # waist_pitch_joint only (sagittal lean). Composes
+                            # with waist + waist_pr above. SONIC sits at +45%
+                            # over MC's pitch resistance at MC-match PD, so
+                            # this is rarely the knob that needs lifting.
+kp_scale_waist_roll:  1.0   # waist_roll_joint only (lateral lean). Composes
+                            # with waist + waist_pr above. Lateral compliance
+                            # at MC-match PD is -72% of MC; tune direction
+                            # via a post-fix MC-vs-SONIC lateral nudge scan,
+                            # do NOT prescribe a starting value sight-unseen.
 kp_scale_shoulder: 1.0
 kp_scale_elbow:    1.0
 kp_scale_wrist:    1.0
@@ -130,10 +149,21 @@ kd_scale_ankle_pitch:  1.0   # MC kd=3.0 vs trained 0.907 -> 3.31 matches MC.
                              # Bump this if forward/back ankle nudges feel
                              # "springy" / under-damped.
 kd_scale_ankle_roll:   1.0   # MC kd=2.0 vs trained 0.907 -> 2.20 matches MC
-kd_scale_waist:        1.0   # LEGACY alias (applies to both waist_yaw + waist_pr)
+kd_scale_waist:        1.0   # LEGACY alias (applies to ALL three waist subgroups)
 kd_scale_waist_yaw:    1.0   # MC kd=8.0 vs trained 2.56 -> 3.13 matches MC
-kd_scale_waist_pr:     1.0   # MC kd=5.0 vs trained 0.907 -> 5.51 matches MC.
-                             # Biggest single knob for fwd/back trunk nudge wobble.
+kd_scale_waist_pr:     1.0   # LEGACY alias (applies to BOTH waist_pitch + roll).
+                             # MC kd=5.0 vs trained 0.907 -> 5.51 matches MC.
+                             # Prefer the per-axis knobs below for new presets.
+kd_scale_waist_pitch:  1.0   # waist_pitch_joint only. SONIC's sagittal push
+                             # response is already +45% stronger than MC at
+                             # MC-match PD; don't bump this above 1.0 without
+                             # explicit fwd/back-nudge scan evidence.
+kd_scale_waist_roll:   1.0   # waist_roll_joint only. SONIC's lateral push
+                             # response is -72% of MC at MC-match PD AND the
+                             # policy moves its commanded target with the
+                             # disturbance (gait tracker), so direction of
+                             # trim must come from a post-fix lateral nudge
+                             # scan rather than an a priori value.
 kd_scale_shoulder:     1.0
 kd_scale_elbow:    1.0
 kd_scale_wrist:    1.0
@@ -147,10 +177,39 @@ kd_scale_head:     1.0
 # off, and sim parity is preserved by the wrapper's hard refusal to load
 # tuning configs in sim mode. RAMP_OUT and SAFE_HOLD bypass.
 #
+# ``target_lpf_hz`` is the GLOBAL default for joints with no per-group
+# override below. Per-group keys (``target_lpf_hz_{leg,waist,arm,head}``)
+# override the global on their slice -- they let you trade SONIC's policy
+# bandwidth differently for the legs (which need wide bandwidth for
+# heel-strike correction) vs. the waist (which sees ~2 Hz resonance under
+# active walking and benefits from a tighter cutoff).
+#
+# Per-group convention (mirrors max_target_dev_*):
+#   null / omitted / negative -> inherit ``target_lpf_hz``
+#   0.0                       -> disabled on this group (= passthrough)
+#   > 0.0                     -> use this cutoff on this group
+#
 # Recommended values (50 Hz OnControl rate):
 #   0.0 (or null)  -> disabled. Default.
-#   8.0           -> ~5 Hz effective bandwidth. Tames leg/waist jitter
-#                    without visibly delaying arm gestures.
-#   5.0           -> ~3 Hz. More aggressive smoothing; arms may feel slow.
-#   12.0          -> ~7.5 Hz. Light touch; preserves snappier motions.
-target_lpf_hz: 0.0
+#   8.0            -> ~5 Hz effective bandwidth. Tames leg jitter without
+#                     visibly delaying arm gestures.
+#   5.0            -> ~3 Hz. More aggressive smoothing; arms may feel slow.
+#   12.0           -> ~7.5 Hz. Light touch; preserves snappier motions.
+#   target_lpf_hz_waist=2-3 -> recommended fix for the 2.0-2.5 Hz waist
+#                              resonance observed in the Phase 1b torso
+#                              push A/B scan (2026-05-30) under SONIC. Sits
+#                              just above the resonance so it's attenuated
+#                              ~70-80% while slow operator-tracked motion
+#                              still passes.
+#
+# Group ranges (MuJoCo joint order, see policy_parameters.hpp::
+# mujoco_joint_names):
+#   target_lpf_hz_leg   -> indices  0..11 (hip+knee+ankle, both sides)
+#   target_lpf_hz_waist -> indices 12..14 (yaw, pitch, roll)
+#   target_lpf_hz_arm   -> indices 15..28 (shoulder+elbow+wrist, both sides)
+#   target_lpf_hz_head  -> indices 29..30 (yaw, pitch)
+target_lpf_hz:       0.0
+target_lpf_hz_leg:   null   # inherit target_lpf_hz
+target_lpf_hz_waist: null   # set to 2-3 to suppress active-walking waist wobble
+target_lpf_hz_arm:   null
+target_lpf_hz_head:  null
