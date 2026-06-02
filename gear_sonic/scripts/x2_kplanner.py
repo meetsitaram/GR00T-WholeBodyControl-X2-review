@@ -735,6 +735,10 @@ def _qpos_to_stream_frame(
         bin_name=bin_name,
         frame_index=frame_index,
         seam_blend=False,
+        # Carry the actual MuJoCo qpos[2] through to the wire so the
+        # kinematic viewer + PKL recorder can reconstruct world-frame
+        # pelvis height instead of pelvis-pinning at DEFAULT_PELVIS_Z_M.
+        root_z_world=float(root_xyz[2]),
     )
 
 
@@ -2516,6 +2520,7 @@ def run(
                         bin_name=anchor_frame.bin_name,
                         frame_index=warm_idx,
                         seam_blend=False,
+                        root_z_world=float(current_root_z),
                     )
                     publisher.publish(anchor_frame_idx)
                     next_tick += period_s
@@ -2549,6 +2554,7 @@ def run(
                 published root pose for every future slot."""
                 xyzw = _idle_root_xyzw()
                 xy = current_root_xy.astype(np.float64).copy()
+                z_world = float(current_root_z)
                 return [
                     StreamFrame(
                         joint_pos_mj=anchor_frame.joint_pos_mj,
@@ -2559,6 +2565,7 @@ def run(
                         bin_name="kplanner_idle_future",
                         frame_index=start_idx + step_ticks * (k + 1),
                         seam_blend=False,
+                        root_z_world=z_world,
                     )
                     for k in range(num_future)
                 ]
@@ -2733,6 +2740,7 @@ def run(
                         bin_name="kplanner_idle",
                         frame_index=global_tick,
                         seam_blend=False,
+                        root_z_world=float(current_root_z),
                     )
                     future_frames = _build_idle_future(global_tick)
                 else:
@@ -2831,6 +2839,7 @@ def run(
                     bin_name=cur_frame.bin_name,
                     frame_index=cur_frame.frame_index,
                     seam_blend=cur_frame.seam_blend,
+                    root_z_world=cur_frame.root_z_world,
                 )
 
                 publisher.publish(cur_frame, future_frames=future_frames, future_dt_s=0.1)

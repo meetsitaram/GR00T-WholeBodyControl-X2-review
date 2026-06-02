@@ -28,9 +28,13 @@ Examples (from the repo root):
     .venv/bin/python -m gear_sonic.scripts.view_x2_planner_mujoco \\
         --from-zmq 127.0.0.1:5556
 
-In ZMQ-subscribe mode the viewer doesn't get world XY (the deploy doesn't
-need it), so the robot is anchored at the origin and you only see body
-articulation + heading. In-process mode shows full world translation.
+In ZMQ-subscribe mode the viewer auto-detects ``root_xy_world`` (2,) and
+``root_z_world`` (1,) on the wire (planner + recorder emit them on every
+tick post-2026-06) and renders full world-frame pelvis translation. If
+the publisher is older and omits those keys, the viewer falls back to
+the legacy pelvis-pinned-at-origin behaviour and only shows body
+articulation + heading. In-process mode always shows full world
+translation.
 
 Keyboard (in-process mode, viewer must have focus):
     w / b           walk / back-step
@@ -397,18 +401,37 @@ def run_from_zmq(host: str, port: int, duration_s: float, topic: str = "pose") -
                 fields = decoded.fields
                 if "joint_pos_mj" not in fields or "root_quat_xyzw" not in fields:
                     continue
+                # Auto-detect world-frame root fields. Post-2026-06 the
+                # planner + recorder include ``root_xy_world`` (2,) and
+                # ``root_z_world`` (1,) on every body_pose / pose tick,
+                # which lets the kinematic viewer track actual pelvis
+                # translation instead of pinning at the origin. Older
+                # publishers omit the keys -> we fall back to None
+                # (legacy pelvis-pinned behaviour).
+                if "root_xy_world" in fields and "root_z_world" in fields:
+                    rxy = np.asarray(fields["root_xy_world"]).reshape(-1)
+                    rz = np.asarray(fields["root_z_world"]).reshape(-1)
+                    if rxy.shape == (2,) and rz.shape == (1,):
+                        root_xyz = np.array(
+                            [float(rxy[0]), float(rxy[1]), float(rz[0])],
+                            dtype=np.float64,
+                        )
+                    else:
+                        root_xyz = None
+                else:
+                    root_xyz = None
                 if n_received == 0:
                     print(
                         f"[viewer] first frame received "
-                        f"(version={decoded.version}, fields={list(fields)})"
+                        f"(version={decoded.version}, "
+                        f"world-root={'yes' if root_xyz is not None else 'no (pelvis pinned)'}, "
+                        f"fields={list(fields)})"
                     )
-                # ZMQ subscribe mode: the wire format doesn't carry world XY,
-                # so anchor at origin and only show body articulation + heading.
                 _qpos_from_pose(
                     mj_data.qpos,
                     fields["joint_pos_mj"],
                     fields["root_quat_xyzw"],
-                    None,
+                    root_xyz,
                 )
                 mj_data.qvel[:] = 0.0
                 mujoco.mj_forward(mj_model, mj_data)

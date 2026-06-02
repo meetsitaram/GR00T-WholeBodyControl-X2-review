@@ -368,6 +368,16 @@ class StreamFrame:
     bin_name: str  # current primitive bin
     frame_index: int  # global tick (0-based)
     seam_blend: bool  # True when this frame came from a blend window
+    # World-frame pelvis height in metres. Populated by callers that
+    # integrate it (the neural kplanner integrates this every tick;
+    # see ``current_root_z`` in gear_sonic/scripts/x2_kplanner.py).
+    # The heuristic planner leaves this at the default because its
+    # primitive PKLs don't shift pelvis height meaningfully. The
+    # publisher serialises this alongside ``root_xy_world`` so
+    # subscribers that need full world-frame root (kinematic viewer,
+    # motion-lib PKL recorder) can reconstruct ``qpos[0:3]`` without
+    # a separate sidecar.
+    root_z_world: float = DEFAULT_PELVIS_Z_M
 
 
 @dataclass
@@ -1082,6 +1092,15 @@ def build_pose_payload(
         "left_hand_joints": np.zeros(hand_dof, dtype=np.float32),
         "right_hand_joints": np.zeros(hand_dof, dtype=np.float32),
         "frame_index": np.array([frame.frame_index], dtype=np.int64),
+        # World-frame pelvis pose. Additive over the legacy v4 payload:
+        # the C++ deploy and the LeRobot recorder iterate header.fields
+        # and ignore keys they don't recognise (see
+        # zmq_packed_message_decoder.unpack_message), so this is wire-safe
+        # against not-yet-rebuilt subscribers. New subscribers (kinematic
+        # viewer, motion-lib PKL recorder) consume these to reconstruct
+        # qpos[0:3] without a separate sidecar topic.
+        "root_xy_world": frame.root_xy_world.astype(np.float32),
+        "root_z_world": np.array([float(frame.root_z_world)], dtype=np.float32),
     }
     if future_frames:
         n_future = len(future_frames)

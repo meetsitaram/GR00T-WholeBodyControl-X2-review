@@ -61,6 +61,27 @@ plus the v4 future window `joint_pos_mj_future` / `root_quat_xyzw_future`
 recorder + deploy do not know which planner is upstream and do not need
 to.
 
+Post-2026-06 the payload also carries two additive **world-frame root**
+fields:
+
+| Field            | Shape | Dtype     | Meaning                                            |
+| ---------------- | ----- | --------- | -------------------------------------------------- |
+| `root_xy_world`  | (2,)  | `float32` | Pelvis XY in the global frame (metres).            |
+| `root_z_world`   | (1,)  | `float32` | Pelvis Z in the global frame (metres).             |
+
+The kplanner integrates these every tick (see `current_root_xy` /
+`current_root_z` in `gear_sonic/scripts/x2_kplanner.py`). The C++
+deploy iterates the wire header and ignores keys it doesn't recognise
+(`unpack_message` in `zmq_packed_message_decoder.py`), so the additions
+are **wire-safe**: a not-yet-rebuilt deploy continues to consume only
+the legacy fields. New subscribers that DO need the full world-frame
+root — the kinematic MuJoCo viewer (`view_x2_planner_mujoco
+--from-zmq`) and the Phase 2 motion-lib PKL recorder — read these
+fields to reconstruct `qpos[0:3]` without a separate sidecar topic.
+The `x2_dataset_recorder` passes these fields through verbatim on its
+merged `pose` stream too, so subscribers downstream of the recorder
+see the same world-root contract.
+
 ## Components
 
 ### 1. `NeuralPlannerCore` (robot-agnostic)

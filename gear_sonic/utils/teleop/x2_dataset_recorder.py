@@ -523,6 +523,15 @@ class _SubscribeModeState:
         # makes the policy "step in place" -- legs animate but the
         # body never gets a forward-thrust ref).
         self._root_quat_xyzw: Optional[np.ndarray] = None
+        # Wire-format world-frame pelvis position (post-2026-06 publisher).
+        # Optional; older planners omit these fields. When present the
+        # recorder forwards them on the merged ``pose`` stream so the
+        # kinematic viewer (and downstream PKL recorder in Phase 2) can
+        # reconstruct full ``qpos[0:3]`` instead of pelvis-pinning at the
+        # origin. The C++ deploy ignores these keys (consumes joints +
+        # root_quat only), so plumbing them through is wire-safe.
+        self._root_xy_world: Optional[np.ndarray] = None
+        self._root_z_world: Optional[float] = None
         self._joint_pos_mj_future: Optional[np.ndarray] = None
         self._root_quat_xyzw_future: Optional[np.ndarray] = None
         self._joint_vel_mj_future: Optional[np.ndarray] = None
@@ -546,6 +555,8 @@ class _SubscribeModeState:
         q_mj: np.ndarray,
         *,
         root_quat_xyzw: Optional[np.ndarray] = None,
+        root_xy_world: Optional[np.ndarray] = None,
+        root_z_world: Optional[float] = None,
         joint_pos_mj_future: Optional[np.ndarray] = None,
         root_quat_xyzw_future: Optional[np.ndarray] = None,
         joint_vel_mj_future: Optional[np.ndarray] = None,
@@ -566,6 +577,12 @@ class _SubscribeModeState:
             self._body_pose_q_mj = q_mj.copy()
             self._root_quat_xyzw = (
                 None if root_quat_xyzw is None else root_quat_xyzw.copy()
+            )
+            self._root_xy_world = (
+                None if root_xy_world is None else root_xy_world.copy()
+            )
+            self._root_z_world = (
+                None if root_z_world is None else float(root_z_world)
             )
             self._joint_pos_mj_future = (
                 None if joint_pos_mj_future is None
@@ -665,6 +682,11 @@ class _SubscribeModeState:
                     None if self._root_quat_xyzw is None
                     else self._root_quat_xyzw.copy()
                 ),
+                "root_xy_world": (
+                    None if self._root_xy_world is None
+                    else self._root_xy_world.copy()
+                ),
+                "root_z_world": self._root_z_world,
                 "joint_pos_mj_future": (
                     None if self._joint_pos_mj_future is None
                     else self._joint_pos_mj_future.copy()
@@ -840,6 +862,22 @@ def _handle_body_pose_msg(
         if rq.shape == (4,):
             root_quat = rq
 
+    # World-frame pelvis XY/Z (post-2026-06 publisher; see
+    # build_pose_payload in state_machine.py). The kinematic viewer and
+    # the Phase 2 PKL recorder both need these to reconstruct full
+    # qpos[0:3]; older publishers omit the keys and the merged stream
+    # then falls back to pelvis-pinned at origin (the previous behaviour).
+    root_xy_world_arr: Optional[np.ndarray] = None
+    if "root_xy_world" in fields:
+        rxy = np.asarray(fields["root_xy_world"], dtype=np.float32).reshape(-1)
+        if rxy.shape == (2,):
+            root_xy_world_arr = rxy
+    root_z_world_val: Optional[float] = None
+    if "root_z_world" in fields:
+        rz = np.asarray(fields["root_z_world"], dtype=np.float32).reshape(-1)
+        if rz.shape == (1,):
+            root_z_world_val = float(rz[0])
+
     wire_mt: Optional[np.ndarray] = None
     if "motion_token" in fields:
         mt = np.asarray(fields["motion_token"], dtype=np.float32).reshape(-1)
@@ -895,6 +933,8 @@ def _handle_body_pose_msg(
         state.update_body_pose(
             q,
             root_quat_xyzw=root_quat,
+            root_xy_world=root_xy_world_arr,
+            root_z_world=root_z_world_val,
             joint_pos_mj_future=jpos_future_arr,
             root_quat_xyzw_future=rot_future_arr,
             joint_vel_mj_future=jvel_future_arr,
@@ -904,7 +944,11 @@ def _handle_body_pose_msg(
         )
     else:
         state.update_body_pose(
-            q, root_quat_xyzw=root_quat, wire_motion_token=wire_mt,
+            q,
+            root_quat_xyzw=root_quat,
+            root_xy_world=root_xy_world_arr,
+            root_z_world=root_z_world_val,
+            wire_motion_token=wire_mt,
         )
 
 
@@ -2317,6 +2361,8 @@ class X2DatasetRecorder:
                     right_hand_q=right_hand_q,
                     tick=tick,
                     root_quat_xyzw=snap["root_quat_xyzw"],
+                    root_xy_world=snap.get("root_xy_world"),
+                    root_z_world=snap.get("root_z_world"),
                     joint_pos_mj_future=jpos_future_overlaid,
                     root_quat_xyzw_future=rot_future_planner,
                     frame_index_future=fidx_future_planner,
@@ -2696,6 +2742,8 @@ class X2DatasetRecorder:
         right_hand_q: np.ndarray,
         tick: int,
         root_quat_xyzw: Optional[np.ndarray] = None,
+        root_xy_world: Optional[np.ndarray] = None,
+        root_z_world: Optional[float] = None,
         joint_pos_mj_future: Optional[np.ndarray] = None,
         root_quat_xyzw_future: Optional[np.ndarray] = None,
         frame_index_future: Optional[np.ndarray] = None,
@@ -2725,6 +2773,21 @@ class X2DatasetRecorder:
             "right_hand_joints": right_hand_q.astype(np.float32),
             "frame_index": np.array([tick], dtype=np.int64),
         }
+
+        # Pass through world-frame root pose when the upstream planner
+        # publisher provides it (post-2026-06). The C++ deploy ignores
+        # these keys; the kinematic viewer + Phase 2 PKL recorder use
+        # them to render and store actual locomotion translation. Older
+        # planners omit them and the merged stream simply falls back to
+        # the pelvis-pinned legacy behaviour, which is wire-safe.
+        if root_xy_world is not None:
+            rxy = np.asarray(root_xy_world, dtype=np.float32).reshape(-1)
+            if rxy.shape == (2,):
+                payload["root_xy_world"] = rxy
+        if root_z_world is not None:
+            payload["root_z_world"] = np.array(
+                [float(root_z_world)], dtype=np.float32
+            )
 
         if (
             joint_pos_mj_future is not None
