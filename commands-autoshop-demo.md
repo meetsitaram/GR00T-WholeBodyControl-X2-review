@@ -6,12 +6,12 @@ or
 
 ### start sonic on PC2 : Robogym Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
-    --pc2-host 192.168.86.30 --laptop-host 192.168.86.22 \
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
     --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml
 
 ### stop sonic
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.30
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
 
 ### start sonic on PC2 : Express Auto Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
@@ -281,11 +281,15 @@ Notes:
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
     --duration 0 \
-    --remote-deploy ${PC2_HOST:-10.0.1.41}
+    --pc2-host ${PC2_HOST:-10.0.1.41}
 ```
 
-`--remote-deploy` takes PC2's IP from the laptop's perspective (same
-value you passed `--pc2-host` to the daemon script).
+`--pc2-host` takes PC2's IP from the laptop's perspective (same value you
+passed `--pc2-host` to the daemon script). It implies `--no-deploy`,
+wires the recorder / manager split-topology SUBs, and stands up the
+`x2_debug -> robot_pose` bridge (so the kplanner pose-feedback sees
+measured yaw on the very first published frame). The older
+`--remote-deploy HOST` is kept as a legacy alias.
 
 ### terminal 3 -- (optional) follow-tail PC2 logs
 

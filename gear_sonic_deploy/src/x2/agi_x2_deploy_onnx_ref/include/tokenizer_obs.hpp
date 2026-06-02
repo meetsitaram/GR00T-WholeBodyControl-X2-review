@@ -60,6 +60,7 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace agi_x2 {
@@ -78,12 +79,34 @@ static_assert(TOK_CMD_FLAT_DIM + TOK_ORI_FLAT_DIM == TOK_DIM,
  * @param current_time seconds since CONTROL state entry (matches Sample(t)
  *                     contract used elsewhere in the deploy)
  * @param base_quat_wxyz current robot torso orientation, MuJoCo / IMU convention
+ * @param override_ref_quat_xyzw OPTIONAL bootstrap-safe substitute for the
+ *                     reference frame's root quat. When provided, every
+ *                     future frame sampled from ``ref`` has its
+ *                     ``root_quat_xyzw`` replaced by this value BEFORE the
+ *                     ``rel = inv(cur) * ref`` rotation diff is computed.
+ *                     Passing ``base_quat_xyzw`` (i.e. the current measured
+ *                     orientation) here yields ``rel = identity`` for all
+ *                     10 future slots, which collapses the 6-D ori block
+ *                     to a constant. The deploy hands this in when the
+ *                     ZMQ pose-ref input source has never received a
+ *                     real frame (LastReceivedMonotonicS() < 0): without
+ *                     it, the ``ZmqPoseInputSource::Connect()`` bootstrap
+ *                     pre-fill of ``root_quat_xyzw = (0,0,0,1)`` becomes
+ *                     a fixed world-+X reference and the policy actively
+ *                     twists the body back to spawn heading on every
+ *                     tick (the "robot recovers to a fixed world
+ *                     orientation" symptom). Default ``std::nullopt``
+ *                     preserves pre-fix behaviour for the unit tests
+ *                     and any caller that already has a fresh reference.
  * @return float vector of length TOK_DIM, ready to feed the ONNX session
  *         alongside the 990-D proprioception.
  */
-std::vector<float> BuildTokenizerObs(const ReferenceMotion& ref,
-                                     double current_time,
-                                     const std::array<double, 4>& base_quat_wxyz);
+std::vector<float> BuildTokenizerObs(
+    const ReferenceMotion& ref,
+    double current_time,
+    const std::array<double, 4>& base_quat_wxyz,
+    const std::optional<std::array<double, 4>>& override_ref_quat_xyzw
+        = std::nullopt);
 
 }  // namespace agi_x2
 

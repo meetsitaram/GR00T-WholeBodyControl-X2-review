@@ -461,6 +461,91 @@ def test_reseed_returns_buffer_uninitialized_when_frames_none():
 
 
 # ---------------------------------------------------------------------------
+# scope='none' short-circuit
+# ---------------------------------------------------------------------------
+
+
+def test_reseed_scope_none_short_circuits_without_touching_buffer():
+    """scope='none' must return 'disabled' immediately and leave the
+    planner's neural buffer byte-identical.
+
+    This is the real-robot path: the x2_debug bridge has no position
+    sensor (xy=z=0), so the launcher pins scope=none and lets the
+    yaw-only refreshes (IDLE_LOOP, IDLE->PLAYING, startup) carry the
+    snap-back protection alone. The PLAYING-side reseed must NOT mutate
+    the model's context buffer in that mode -- if it ever did, the model
+    would see (0,0,0) position history every tick and walk/turn would
+    regress.
+    """
+    buf = _make_buf(num_frames=32, marker_value=7.0)
+    buf_before = buf.clone()
+
+    core = _FakePlannerCore(buf, current_frame_idx=10)
+    deque = collections.deque(maxlen=8)
+    lock = threading.Lock()
+    now = time.monotonic()
+    # Stack the deque with fresh, valid observations -- even with
+    # plenty of data the short-circuit must fire BEFORE the lock is
+    # taken (no insufficient/stale fallback path leaking through).
+    for k in range(_NUM_FT * 2):
+        deque.append(_make_obs(now - 0.005 * k, x=1.0, y=2.0, z=0.85))
+
+    reason = _reseed_root_from_observations(
+        core, deque, lock, max_age_s=1.0,
+        scope="none",
+    )
+
+    assert reason == "disabled", (
+        f"scope='none' must return the literal 'disabled' sentinel so "
+        f"reseed_stats['skipped_disabled'] accounting works; got: {reason!r}"
+    )
+    assert torch.equal(buf, buf_before), (
+        "scope='none' must leave the planner buffer untouched, byte-for-byte"
+    )
+
+
+def test_reseed_scope_none_short_circuits_even_without_observations():
+    """The short-circuit must fire BEFORE the pose_deque length check.
+
+    Confirms scope='none' returns 'disabled' (not 'insufficient_obs')
+    even when the deque is empty or smaller than NUM_FT. Important on
+    boot when pose_deque hasn't filled yet -- we want predictable
+    'disabled' accounting from tick 1, not a transient 'insufficient'.
+    """
+    buf = _make_buf(num_frames=32, marker_value=11.0)
+    buf_before = buf.clone()
+    core = _FakePlannerCore(buf, current_frame_idx=5)
+    deque = collections.deque(maxlen=8)
+    lock = threading.Lock()
+
+    reason = _reseed_root_from_observations(
+        core, deque, lock, max_age_s=1.0,
+        scope="none",
+    )
+
+    assert reason == "disabled"
+    assert torch.equal(buf, buf_before)
+
+
+def test_reseed_scope_none_short_circuits_with_uninitialized_buffer():
+    """The short-circuit must fire BEFORE the frames-None check too.
+
+    Same rationale: predictable accounting from boot, even when the
+    planner_core hasn't called reset() yet (frames['mujoco_qpos']=None).
+    """
+    core = _FakePlannerCore(buf=None, current_frame_idx=0)
+    deque = collections.deque(maxlen=8)
+    lock = threading.Lock()
+
+    reason = _reseed_root_from_observations(
+        core, deque, lock, max_age_s=1.0,
+        scope="none",
+    )
+
+    assert reason == "disabled"
+
+
+# ---------------------------------------------------------------------------
 # Smoke test the PoseObservation dataclass shape contract. Keeps the
 # wire-format spec discoverable from the tests file even if the
 # dataclass moves.

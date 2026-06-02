@@ -64,6 +64,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw  # noqa: E402
 from gear_sonic.utils.planner.state_machine import (  # noqa: E402
     LocomotionCommand,
     OUTPUT_FPS,
@@ -887,6 +888,41 @@ class PoseObservation:
     pelvis_qpos_wxyz: np.ndarray  # shape (7,)
 
 
+def _yaw_only_wxyz_from_pelvis(pelvis_qpos_wxyz: np.ndarray) -> np.ndarray:
+    """Extract world-frame yaw from a pelvis ``(x,y,z, qw,qx,qy,qz)`` row
+    and return ``R_z(yaw)`` packed as ``(qw, qx, qy, qz)``.
+
+    Used by the publish loop's IDLE_LOOP branch to re-anchor the
+    persisted reference yaw (``current_root_wxyz``) on every tick from
+    the latest ``robot_pose`` observation. Pitch + roll are dropped on
+    purpose so a transient leg lean (e.g. fall-recovery) doesn't bleed
+    into the published reference and confuse SONIC's upright-reference
+    training distribution.
+
+    Yaw extraction goes through :func:`yaw_of_quat_xyzw` so the
+    convention (lowercase ``"zyx"`` extrinsic, range ``(-pi, pi]``)
+    matches every other yaw-touching site in the stack -- the gesture
+    session yaw rebase, the recorder's snap quat, and the kplanner's
+    own state-machine logging. A custom closed-form would silently
+    drift from that convention under non-trivial pitch/roll.
+    """
+    qpos = np.asarray(pelvis_qpos_wxyz, dtype=np.float64).reshape(-1)
+    if qpos.shape[0] < 7:
+        raise ValueError(
+            f"pelvis_qpos_wxyz must be >= 7 long (got {qpos.shape[0]})"
+        )
+    quat_xyzw = np.array(
+        [qpos[4], qpos[5], qpos[6], qpos[3]],
+        dtype=np.float64,
+    )
+    yaw = yaw_of_quat_xyzw(quat_xyzw)
+    half = 0.5 * yaw
+    return np.array(
+        [math.cos(half), 0.0, 0.0, math.sin(half)],
+        dtype=np.float32,
+    )
+
+
 def _pose_feedback_thread(
     pose_deque: "collections.deque[PoseObservation]",
     pose_lock: threading.Lock,
@@ -947,7 +983,23 @@ def _pose_feedback_thread(
 
 _RESEED_SCOPE_FULL_ROOT = "full_root"
 _RESEED_SCOPE_QUAT_ONLY = "quat_only"
-_VALID_RESEED_SCOPES = (_RESEED_SCOPE_FULL_ROOT, _RESEED_SCOPE_QUAT_ONLY)
+# ``none`` -> reseed disabled entirely (PLAYING side). Use this on real
+# robot where the pose source is the IMU-only x2_debug bridge (no
+# position measurement): ``full_root`` would overwrite the planner's
+# xy/z history with zeros every replan tick (catastrophic instability),
+# and ``quat_only`` would anchor the model's yaw integration to the
+# lagging measured yaw, causing commanded turns to under-rotate (the
+# model can never get more than one replan-tick ahead of the robot).
+# With ``none`` the planner integrates yaw open-loop during PLAYING --
+# snap-back protection still comes from the IDLE_LOOP yaw refresh and
+# the new IDLE -> PLAYING transition seed (both yaw-only, both writing
+# to ``current_root_wxyz`` only, never to the model's neural buffer).
+_RESEED_SCOPE_NONE = "none"
+_VALID_RESEED_SCOPES = (
+    _RESEED_SCOPE_FULL_ROOT,
+    _RESEED_SCOPE_QUAT_ONLY,
+    _RESEED_SCOPE_NONE,
+)
 
 
 def _reseed_root_from_observations(
@@ -988,6 +1040,15 @@ def _reseed_root_from_observations(
 
     Returns ``None`` on success, or a short skip-reason string.
     """
+    # Short-circuit ``none`` BEFORE any planner_core / pose_deque access
+    # so the call is cheap (a single string compare per replan tick) and
+    # the disabled state is observable in reseed_stats without taking
+    # the pose_lock. ``"disabled"`` is the canonical skip-reason; the
+    # caller maps non-{insufficient,stale,buffer_uninit} reasons into
+    # ``skipped_other`` for log accounting.
+    if scope == _RESEED_SCOPE_NONE:
+        return "disabled"
+
     import torch
 
     buf = planner_core.frames.get("mujoco_qpos")
@@ -1826,6 +1887,7 @@ def _planner_worker(
         "skipped_insufficient": 0,
         "skipped_stale": 0,
         "skipped_buffer_uninit": 0,
+        "skipped_disabled": 0,
         "skipped_other": 0,
     }
     stats_log_every = 50
@@ -1896,18 +1958,22 @@ def _planner_worker(
                 reseed_stats["skipped_stale"] += 1
             elif reason.startswith("buffer_uninit"):
                 reseed_stats["skipped_buffer_uninit"] += 1
+            elif reason == "disabled":
+                reseed_stats["skipped_disabled"] += 1
             else:
                 reseed_stats["skipped_other"] += 1
             total = sum(reseed_stats.values())
             if total > 0 and total % stats_log_every == 0:
                 log.info(
                     "reseed stats: total=%d applied=%d "
-                    "insufficient=%d stale=%d buf_uninit=%d other=%d",
+                    "insufficient=%d stale=%d buf_uninit=%d "
+                    "disabled=%d other=%d",
                     total,
                     reseed_stats["applied"],
                     reseed_stats["skipped_insufficient"],
                     reseed_stats["skipped_stale"],
                     reseed_stats["skipped_buffer_uninit"],
+                    reseed_stats["skipped_disabled"],
                     reseed_stats["skipped_other"],
                 )
 
@@ -2350,6 +2416,82 @@ def run(
 
     try:
         with PidFile(pid_file):
+            # ---- One-shot startup yaw seed from pose-feedback.
+            #
+            # The IDLE_LOOP yaw refresh (added 2026-06-01) only kicks in
+            # once the main publish loop reaches its IDLE branch, but
+            # the quiet-stand warmup runs FIRST and publishes
+            # ``warmup_quiet_stand_s * OUTPUT_FPS`` frames at the
+            # un-seeded root (= warmup_qpos[3:7] = identity quat / world
+            # +X). The deploy treats the very first one of those as its
+            # ``ZmqPoseInputSource`` bootstrap reference and the policy
+            # twists the body to match -- this is the "VR planner stack
+            # turns me back to default orientation as soon as I start
+            # it" symptom on real robot.
+            #
+            # Fix: before publishing anything, block up to ~1s waiting
+            # for a measured robot pose to land in the SUB queue, then
+            # seed ``current_root_xy/z/wxyz`` from it. On sim runs the
+            # MuJoCo bridge supplies robot_pose immediately; on real
+            # robot the x2_debug -> robot_pose bridge (see
+            # gear_sonic_deploy/scripts/x2_debug_to_robot_pose_bridge.py)
+            # publishes within a few wifi RTTs. If neither is available
+            # within the timeout we fall back to the warmup_qpos default
+            # silently -- the IDLE_LOOP refresh will still correct it
+            # eventually, and the C++ bootstrap fix protects against the
+            # never-receive-a-frame case.
+            if pose_deque is not None and pose_lock is not None:
+                seed_timeout_s = 1.0
+                seed_poll_s = 0.02
+                seed_deadline = time.monotonic() + seed_timeout_s
+                seeded = False
+                while time.monotonic() < seed_deadline and not stop_event.is_set():
+                    latest_seed_obs: Optional[PoseObservation] = None
+                    with pose_lock:
+                        if pose_deque:
+                            latest_seed_obs = pose_deque[-1]
+                    if latest_seed_obs is not None:
+                        age_s = max(
+                            0.0, time.monotonic() - latest_seed_obs.t_mono
+                        )
+                        if age_s <= float(pose_feedback_max_age_s):
+                            # Yaw-only update. xy/z are NOT updated:
+                            # the real-robot bridge publishes those as
+                            # zeros (no IMU position measurement) and
+                            # the warmup_qpos defaults (xy=0, z=hip_h
+                            # from the PKL) are correct for both sim and
+                            # real anyway. Matches the IDLE_LOOP refresh
+                            # behaviour further down -- yaw is the only
+                            # field that needs starvation-protection.
+                            try:
+                                current_root_wxyz = _yaw_only_wxyz_from_pelvis(
+                                    latest_seed_obs.pelvis_qpos_wxyz
+                                ).astype(np.float32)
+                                log.info(
+                                    "startup yaw seed: pose-feedback age=%.3fs, "
+                                    "current_root_wxyz=%s (yaw-only re-projection "
+                                    "of measured pelvis; xy/z left at warmup defaults)",
+                                    age_s, current_root_wxyz.tolist(),
+                                )
+                                seeded = True
+                                break
+                            except (ValueError, TypeError) as exc:
+                                log.warning(
+                                    "startup yaw seed: rejected sample (%s); "
+                                    "continuing to poll", exc,
+                                )
+                    time.sleep(seed_poll_s)
+                if not seeded:
+                    log.warning(
+                        "startup yaw seed: TIMEOUT after %.2fs; falling back to "
+                        "warmup_qpos[3:7]=%s. Quiet-stand warmup will publish "
+                        "this stale reference; IDLE_LOOP refresh will correct "
+                        "it once a measured pose lands. If you see snap-back, "
+                        "check that the x2_debug -> robot_pose bridge is up "
+                        "(--with-x2-debug-bridge on the planner stack launcher).",
+                        seed_timeout_s, current_root_wxyz.tolist(),
+                    )
+
             # ---- Optional quiet-stand warmup (publishes the frozen anchor qpos)
             warmup_n = (
                 int(round(max(0.0, warmup_quiet_stand_s) * OUTPUT_FPS))
@@ -2452,6 +2594,57 @@ def run(
                 )
                 if desired_state != current_planner_state:
                     if desired_state == PlannerState.PLAYING:
+                        # One-shot yaw refresh on IDLE -> PLAYING entry.
+                        # The IDLE_LOOP branch below refreshes
+                        # ``current_root_wxyz`` every tick while idle,
+                        # so when the operator releases the stick after
+                        # a gesture (the common workflow) the warm seed
+                        # is already measured-aligned. But if the
+                        # operator HOLDS the stick through a gesture --
+                        # so the kplanner stays in PLAYING the whole
+                        # time and gesture playback inside the recorder
+                        # silently moves the robot to a new heading --
+                        # there's no IDLE tick to refresh, and the
+                        # next ``_build_warm_qpos()`` would seed the
+                        # neural buffer at a stale model-integrated
+                        # yaw. Snap-back symptom on PLAYING resume.
+                        # Refresh here as a belt-and-braces measure;
+                        # cost is one yaw extraction per state
+                        # transition (~rare), and we never block more
+                        # than the existing pose_feedback_max_age_s
+                        # gate would allow.
+                        if pose_deque is not None and pose_lock is not None:
+                            latest_entry_obs: Optional[PoseObservation] = None
+                            with pose_lock:
+                                if pose_deque:
+                                    latest_entry_obs = pose_deque[-1]
+                            if latest_entry_obs is not None:
+                                age_s = (
+                                    time.monotonic() - latest_entry_obs.t_mono
+                                )
+                                if age_s <= float(pose_feedback_max_age_s):
+                                    try:
+                                        prev_wxyz = current_root_wxyz.copy()
+                                        current_root_wxyz = (
+                                            _yaw_only_wxyz_from_pelvis(
+                                                latest_entry_obs.pelvis_qpos_wxyz
+                                            ).astype(np.float32)
+                                        )
+                                        if not np.allclose(prev_wxyz, current_root_wxyz, atol=1e-4):
+                                            log.info(
+                                                "IDLE -> PLAYING yaw refresh: "
+                                                "pose-feedback age=%.3fs, "
+                                                "prev=%s -> measured=%s",
+                                                age_s,
+                                                prev_wxyz.tolist(),
+                                                current_root_wxyz.tolist(),
+                                            )
+                                    except (ValueError, TypeError) as exc:
+                                        log.debug(
+                                            "IDLE -> PLAYING yaw refresh "
+                                            "skipped: %s", exc,
+                                        )
+
                         # Seed the ring buffer with default_angles at
                         # the ROBOT'S CURRENT integrated root frame
                         # (not at world origin / identity quat). This
@@ -2486,10 +2679,49 @@ def run(
 
                 # ---- Build the published frame.
                 if current_planner_state == PlannerState.IDLE_LOOP:
+                    # Yaw-only resync from robot_pose feedback before we
+                    # publish. Without this, ``current_root_wxyz`` is
+                    # only ever updated by the model's own predictions
+                    # (PLAYING branch below), so anything that moves
+                    # the real robot off-yaw while the operator's stick
+                    # is centred -- fall recovery, slip, push, or a
+                    # recorder-side gesture override (sit_down /
+                    # stand_up that turns the body) -- leaves us
+                    # publishing a stale absolute yaw target. The C++
+                    # tokenizer feeds the SONIC policy
+                    # ``rel = inv(measured) * reference`` (see
+                    # gear_sonic_deploy/src/x2/.../tokenizer_obs.cpp:114),
+                    # so a stale reference causes the policy to twist
+                    # the body back to the old heading -- the "robot
+                    # always tries to recover to the same world
+                    # orientation" symptom. Refreshing here closes that
+                    # loop for the idle path while PLAYING continues
+                    # to publish model-predicted yaw verbatim (so
+                    # commanded turns still execute as intended).
+                    if pose_deque is not None and pose_lock is not None:
+                        latest_obs: Optional[PoseObservation] = None
+                        with pose_lock:
+                            if pose_deque:
+                                latest_obs = pose_deque[-1]
+                        if latest_obs is not None:
+                            age_s = time.monotonic() - latest_obs.t_mono
+                            if age_s <= float(pose_feedback_max_age_s):
+                                try:
+                                    current_root_wxyz = _yaw_only_wxyz_from_pelvis(
+                                        latest_obs.pelvis_qpos_wxyz
+                                    )
+                                except (ValueError, TypeError) as exc:
+                                    log.debug(
+                                        "yaw refresh skipped: %s "
+                                        "(continuing with stale current_root_wxyz)",
+                                        exc,
+                                    )
+
                     # Frozen-anchor branch: emit default_angles joints
                     # at the LAST integrated world root pose. Joint
                     # angles snap to anchor (default_angles); root XY
                     # and yaw carry over from the prior PLAYING session
+                    # (or from the latest pose_deque refresh above)
                     # so a release-after-turn doesn't trigger a SONIC
                     # yaw-correction back toward identity.
                     cur_frame = StreamFrame(
@@ -2828,13 +3060,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(_VALID_RESEED_SCOPES),
         default=_RESEED_SCOPE_FULL_ROOT,
         help=(
-            "Which root channels the reseed rewrites. 'full_root' (default) "
-            "overwrites xyz + quat (4 root rows, 7 floats each). 'quat_only' "
-            "overwrites just the quaternion -- preserves the planner's "
-            "internal-model xy overshoot (which empirically helps the policy "
-            "track forward motion) while still anchoring heading to observed "
-            "reality. Use 'quat_only' when forward tracking regresses under "
-            "'full_root'."
+            "Which root channels the PLAYING-side reseed rewrites every "
+            "replan tick. 'full_root' (default) overwrites xyz + quat -- "
+            "best for sim, where the MuJoCo bridge supplies full "
+            "ground-truth qpos. 'quat_only' overwrites just the quaternion "
+            "-- preserves the planner's internal-model xy overshoot (which "
+            "helps the policy track forward motion) while still anchoring "
+            "heading to observed reality; use this with a pose source that "
+            "has VALID xy/z but you want quat anchoring only. 'none' "
+            "disables the PLAYING reseed entirely -- pose_deque still "
+            "feeds the IDLE_LOOP yaw refresh and the IDLE -> PLAYING "
+            "transition seed (both yaw-only, both writing to "
+            "current_root_wxyz only), but the model's neural buffer is "
+            "left untouched during PLAYING. REQUIRED on real robot with "
+            "the IMU-only x2_debug bridge: 'full_root' would teleport the "
+            "planner's xy history to zero every tick, and 'quat_only' "
+            "would anchor yaw integration to the lagging measured yaw "
+            "(commanded turns under-rotate)."
         ),
     )
     p.add_argument(

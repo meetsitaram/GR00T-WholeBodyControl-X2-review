@@ -4,9 +4,11 @@
 
 namespace agi_x2 {
 
-std::vector<float> BuildTokenizerObs(const ReferenceMotion& ref,
-                                     double current_time,
-                                     const std::array<double, 4>& base_quat_wxyz)
+std::vector<float> BuildTokenizerObs(
+    const ReferenceMotion& ref,
+    double current_time,
+    const std::array<double, 4>& base_quat_wxyz,
+    const std::optional<std::array<double, 4>>& override_ref_quat_xyzw)
 {
   std::vector<float> out;
   out.reserve(TOK_DIM);
@@ -111,7 +113,19 @@ std::vector<float> BuildTokenizerObs(const ReferenceMotion& ref,
       jvel_frames[k][il] = static_cast<float>(frame.joint_vel_mj[mj]);
     }
 
-    const auto rel_xyzw = quat_mul_xyzw(cur_quat_inv_xyzw, frame.root_quat_xyzw);
+    // Bootstrap-safe reference quat. The caller passes
+    // ``override_ref_quat_xyzw = base_quat_xyzw`` when the input source
+    // has never received a real pose-ref frame, so the 10 ori rows
+    // collapse to identity (rel = inv(cur) * cur) and the policy
+    // stops trying to twist the body back to the C++ bootstrap's
+    // ``root_quat_xyzw = (0, 0, 0, 1)`` (world +X) pre-fill that
+    // would otherwise leak through here. See header docstring for
+    // the full failure-mode story.
+    const auto& ref_quat_xyzw =
+        override_ref_quat_xyzw.has_value()
+            ? *override_ref_quat_xyzw
+            : frame.root_quat_xyzw;
+    const auto rel_xyzw = quat_mul_xyzw(cur_quat_inv_xyzw, ref_quat_xyzw);
     const auto rot6     = rot6d_from_quat_xyzw(rel_xyzw);
     for (std::size_t i = 0; i < 6; ++i) {
       ori_frames[k][i] = static_cast<float>(rot6[i]);

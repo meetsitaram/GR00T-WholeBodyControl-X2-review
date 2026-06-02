@@ -66,6 +66,18 @@
 #                                   # 2.0=more deadzone-feel. Tunes the
 #                                   # Quest3 L-stick analog response without
 #                                   # changing the peak velocity.
+#       [--no-pose-feedback | --with-pose-feedback]
+#       [--pose-feedback-host H] [--pose-feedback-port P]
+#       [--pose-feedback-topic T] [--pose-feedback-max-age-s S]
+#                                   # Default ON: kplanner SUBs robot_pose
+#                                   # from the bridge (127.0.0.1:5570) and
+#                                   # re-anchors current_root_wxyz from
+#                                   # measured pelvis yaw every IDLE tick.
+#                                   # Stops SONIC from twisting the body
+#                                   # back to a stale yaw after fall
+#                                   # recovery or sit/stand gesture
+#                                   # sequences. Pass --no-pose-feedback to
+#                                   # revert to open-loop diagnostic mode.
 #       [--pose-ref-watchdog {auto,on,off}]
 #                                   # auto (default): off in local sim,
 #                                   # on for --remote-deploy / --no-deploy.
@@ -80,8 +92,9 @@
 #       [--vla-bridge MODEL_DIR --vla-prompt STR
 #        [--vla-device DEV] [--vla-rate FLOAT] [--vla-inference-period-s S]
 #        [--vla-python PATH] [--vla-max-target-dev RAD] [--vla-target-lpf-hz HZ]]
+#       [--pc2-host HOST]    # recommended one-arg split-topology
 #       [--remote-deploy HOST [--resume-pub-port PORT]
-#                              [--motor-monitor-port PORT]]
+#                              [--motor-monitor-port PORT]]   # legacy alias
 #
 # Defaults to --teleop-only (no dataset writes). Pass --with-record
 # (along with --output-dir and --task) to capture a LeRobot v2.1
@@ -263,6 +276,13 @@ BODY_POSE_TOPIC="body_pose"
 # binds when --sim-mjcf points at a robocasa scene XML.
 SCENE_STATE_PORT=5559   # deploy bridge PUB -> recorder SUB (per-tick obj qpos)
 SCENE_RESET_PORT=5560   # recorder PUB -> deploy bridge SUB (re-randomise objs)
+# Gesture playback (live PKL takeover): recorder SUB.binds, transient
+# play_gesture script PUB.connects. See
+# gear_sonic/utils/teleop/gesture_session.py and the
+# "Play a gesture mid-VR-session" section in clip_motion_commands.md.
+GESTURE_CMD_PORT=5568   # play_gesture PUB -> recorder SUB
+GESTURE_CMD_TOPIC="gesture_cmd"
+GESTURE_CATALOG="${REPO_ROOT}/gear_sonic/data/motions/gestures/gestures_v1.yaml"
 
 # --------------------------------------------------------------------------
 # CLI defaults
@@ -464,6 +484,63 @@ KPLANNER_REF_SMOOTHER_SHAPE="${KPLANNER_REF_SMOOTHER_SHAPE:-}"
 KPLANNER_REF_SMOOTHER_JOINTS="${KPLANNER_REF_SMOOTHER_JOINTS:-}"
 
 # --------------------------------------------------------------------------
+# Closed-loop pose feedback (default ON). The kplanner subscribes to the
+# sim bridge's robot_pose:5570 PUB (real-robot bridge publishes the same
+# topic on the deploy side) and uses the latest pelvis quat to re-anchor
+# its IDLE_LOOP-published ``current_root_wxyz`` every tick. Without this
+# the kplanner publishes whatever yaw it last persisted from a PLAYING
+# segment, and SONIC's policy actively twists the real robot back to
+# that stale heading -- visible as
+#   * "robot snaps back after fall recovery"
+#   * "robot rotates back to the original direction after a sit+stand
+#      gesture sequence"
+# See gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/src/tokenizer_obs.cpp
+# (rel = inv(measured) * reference) for why the published yaw is what
+# the policy drives toward.
+#
+# Pass --no-pose-feedback to opt back into open-loop (regression /
+# diagnostic baseline). MAX_AGE_S guards against a frozen bridge:
+# observations older than this are ignored on each tick, falling back
+# to the previously-persisted yaw.
+WITH_POSE_FEEDBACK="${WITH_POSE_FEEDBACK:-1}"
+POSE_FEEDBACK_HOST="${POSE_FEEDBACK_HOST:-127.0.0.1}"
+POSE_FEEDBACK_PORT="${POSE_FEEDBACK_PORT:-5570}"
+POSE_FEEDBACK_TOPIC="${POSE_FEEDBACK_TOPIC:-robot_pose}"
+POSE_FEEDBACK_MAX_AGE_S="${POSE_FEEDBACK_MAX_AGE_S:-0.5}"
+
+# --------------------------------------------------------------------------
+# x2_debug -> robot_pose bridge (real-robot only by default). On the real
+# robot, the laptop has NO native ``robot_pose`` publisher -- that topic is
+# only emitted by ``x2_mujoco_ros_bridge.py`` in sim. Without a republisher
+# the kplanner pose-feedback SUB above is a no-op and ``current_root_wxyz``
+# stays pinned at its R_z(0) warmup default. The first frame the kplanner
+# publishes then hands the C++ deploy an identity-yaw reference and the
+# policy actively twists the body back to world +X (the
+# "robot turns back to default orientation as soon as I start the VR
+# planner stack" symptom).
+#
+# The bridge SUBs the deploy's ``x2_debug:5557`` PUB over the network
+# (PC2 -> laptop), extracts the IMU ``base_quat`` field, and re-PUBs it as
+# JSON ``robot_pose`` on ``localhost:5570`` -- identical wire format to the
+# MuJoCo bridge so the kplanner consumes both the same way. Auto-enabled
+# whenever the stack is launched in --no-deploy mode (split-topology /
+# remote deploy), since that's the only configuration where the symptom
+# applies; sim runs have the MuJoCo bridge supplying robot_pose directly.
+# Pass --x2-debug-bridge-host to override, --no-x2-debug-bridge to opt out.
+WITH_X2_DEBUG_BRIDGE="${WITH_X2_DEBUG_BRIDGE:-auto}"
+# Deliberately NOT defaulting from any ambient PC2_HOST env-var: a
+# stale shell export silently pointing the bridge at the wrong robot
+# is the kind of failure mode that's easy to miss in a banner and
+# catastrophic on real hardware (kplanner happily seeds yaw from
+# whatever IMU answers and then twists the live robot toward a
+# different machine's heading). Make the host explicit per-invocation:
+# pass --x2-debug-bridge-host, --remote-deploy, or --no-x2-debug-bridge.
+X2_DEBUG_BRIDGE_HOST=""
+X2_DEBUG_BRIDGE_PORT="${X2_DEBUG_BRIDGE_PORT:-5557}"
+X2_DEBUG_BRIDGE_TOPIC="${X2_DEBUG_BRIDGE_TOPIC:-x2_debug}"
+X2_DEBUG_BRIDGE_RATE_CAP_HZ="${X2_DEBUG_BRIDGE_RATE_CAP_HZ:-200.0}"
+
+# --------------------------------------------------------------------------
 # Split-topology / remote-deploy mode. When --remote-deploy HOST is set
 # we treat the laptop as the operator-side stack ONLY (manager + planner
 # + recorder); the C++ deploy + hand bridge + motor monitor are assumed
@@ -492,6 +569,32 @@ RESUME_PUB_PORT=5566
 MOTOR_MONITOR_PORT=5567
 RESUME_PUB_TOPIC="pose_resume"
 MOTOR_MONITOR_TOPIC="motor_monitor"
+
+# --------------------------------------------------------------------------
+# Canonical "where is the X2 robot" flag. One arg, everything else
+# implied. Specifically, setting --pc2-host HOST is equivalent to:
+#   * --no-deploy               (the deploy is on HOST, not laptop)
+#   * --remote-deploy HOST      (recorder x2_debug SUB redirect, manager
+#                               motor_monitor SUB, manager resume PUB)
+#   * --x2-debug-bridge-host HOST  (kplanner pose-feedback bridge)
+# unless those flags were already passed explicitly (in which case the
+# explicit value wins -- useful for the rare case where the bridge needs
+# to talk to a different host than the deploy, e.g. multi-robot test
+# rigs). The older flags remain accepted so commands.md /
+# gesture_commands.md / sample_commands.md don't break, but --pc2-host
+# is the recommended path going forward and matches the
+# x2_pc2_daemons.sh / pc2_bringup.sh vocabulary.
+#
+# Deliberately NOT defaulted from any ambient ${PC2_HOST} env-var: a
+# stale shell export silently pointing the planner stack at the wrong
+# robot is the kind of failure mode that's easy to miss in a banner and
+# catastrophic on real hardware (kplanner happily seeds yaw from
+# whatever IMU answers and then twists the live robot toward a
+# different machine's heading). Make the host explicit per-invocation
+# even though x2_pc2_daemons.sh does inherit from the env -- the
+# planner stack actively drives the robot whereas the daemons script
+# is purely an ssh wrapper, so a mismatch here has a much higher cost.
+PC2_HOST=""
 
 # --------------------------------------------------------------------------
 # VLA closed-loop mode (NEW). When --vla-bridge MODEL_DIR is passed,
@@ -657,6 +760,18 @@ while [[ $# -gt 0 ]]; do
         --kplanner-ref-smoother-trigger-rad) KPLANNER_REF_SMOOTHER_TRIGGER_RAD="$2"; shift 2 ;;
         --kplanner-ref-smoother-shape) KPLANNER_REF_SMOOTHER_SHAPE="$2"; shift 2 ;;
         --kplanner-ref-smoother-joints) KPLANNER_REF_SMOOTHER_JOINTS="$2"; shift 2 ;;
+        --no-pose-feedback) WITH_POSE_FEEDBACK=0; shift ;;
+        --with-pose-feedback) WITH_POSE_FEEDBACK=1; shift ;;
+        --pose-feedback-host) POSE_FEEDBACK_HOST="$2"; WITH_POSE_FEEDBACK=1; shift 2 ;;
+        --pose-feedback-port) POSE_FEEDBACK_PORT="$2"; WITH_POSE_FEEDBACK=1; shift 2 ;;
+        --pose-feedback-topic) POSE_FEEDBACK_TOPIC="$2"; WITH_POSE_FEEDBACK=1; shift 2 ;;
+        --pose-feedback-max-age-s) POSE_FEEDBACK_MAX_AGE_S="$2"; WITH_POSE_FEEDBACK=1; shift 2 ;;
+        --no-x2-debug-bridge) WITH_X2_DEBUG_BRIDGE=0; shift ;;
+        --with-x2-debug-bridge) WITH_X2_DEBUG_BRIDGE=1; shift ;;
+        --x2-debug-bridge-host) X2_DEBUG_BRIDGE_HOST="$2"; WITH_X2_DEBUG_BRIDGE=1; shift 2 ;;
+        --x2-debug-bridge-port) X2_DEBUG_BRIDGE_PORT="$2"; WITH_X2_DEBUG_BRIDGE=1; shift 2 ;;
+        --x2-debug-bridge-topic) X2_DEBUG_BRIDGE_TOPIC="$2"; WITH_X2_DEBUG_BRIDGE=1; shift 2 ;;
+        --x2-debug-bridge-rate-cap-hz) X2_DEBUG_BRIDGE_RATE_CAP_HZ="$2"; WITH_X2_DEBUG_BRIDGE=1; shift 2 ;;
         --quest3-continuous-yaw-max) QUEST3_CONTINUOUS_YAW_MAX="$2"; shift 2 ;;
         --loco-decoupled-arms) LOCO_DECOUPLED_ARMS="$2"; shift 2 ;;
         --pose-ref-watchdog) POSE_REF_WATCHDOG="$2"; shift 2 ;;
@@ -686,6 +801,7 @@ while [[ $# -gt 0 ]]; do
         --vla-target-lpf-hz) VLA_TARGET_LPF_HZ="$2"; VLA_DEPLOY_FILTERS=1; shift 2 ;;
         --vla-deploy-filters) VLA_DEPLOY_FILTERS=1; shift ;;
         --vla-no-policy) VLA_NO_POLICY=1; shift ;;
+        --pc2-host) PC2_HOST="$2"; shift 2 ;;
         --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
         --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
         --motor-monitor-port) MOTOR_MONITOR_PORT="$2"; shift 2 ;;
@@ -731,6 +847,27 @@ if [[ "${PLANNER_KIND}" == "kplanner" ]]; then
     SIM_RSI_PKL="${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_kplanner_rsi_anchor.pkl"
 fi
 
+# --pc2-host fan-out. One arg, three internal vars: REMOTE_DEPLOY_HOST
+# (recorder/manager split-topology wiring), X2_DEBUG_BRIDGE_HOST
+# (kplanner pose-feedback bridge), and the implicit --no-deploy below.
+# Explicit overrides win, so an operator who genuinely needs to point
+# the bridge at a different host than the deploy can still do that with
+# --x2-debug-bridge-host on top of --pc2-host. A mismatch between
+# --pc2-host and --remote-deploy is almost certainly a typo and we
+# bail out loudly rather than silently honour one and drop the other.
+if [[ -n "${PC2_HOST}" ]]; then
+    if [[ -n "${REMOTE_DEPLOY_HOST}" && "${REMOTE_DEPLOY_HOST}" != "${PC2_HOST}" ]]; then
+        echo "ERROR: --pc2-host '${PC2_HOST}' contradicts --remote-deploy '${REMOTE_DEPLOY_HOST}'." >&2
+        echo "       Pass one or make them match." >&2
+        exit 1
+    fi
+    REMOTE_DEPLOY_HOST="${PC2_HOST}"
+    if [[ -z "${X2_DEBUG_BRIDGE_HOST}" ]]; then
+        X2_DEBUG_BRIDGE_HOST="${PC2_HOST}"
+        WITH_X2_DEBUG_BRIDGE=1
+    fi
+fi
+
 # Remote-deploy gating. Keep this BEFORE the --validate-only short-
 # circuit so the operator can sanity-check the resolved banner with
 # both --remote-deploy and --validate-only set together.
@@ -749,6 +886,65 @@ if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
         # Operator passed --remote-deploy without explicit --no-deploy --
         # quietly imply it.
         WITH_DEPLOY=0
+    fi
+fi
+
+# An explicit --x2-debug-bridge-host means "the deploy is on that other
+# host and I want its IMU yaw piped to my kplanner" -- which is exactly
+# the split-topology case. Imply --no-deploy the same way --remote-deploy
+# does, so the operator doesn't need to remember to pass both. Note we
+# do NOT auto-populate REMOTE_DEPLOY_HOST: that flag wires additional
+# split-topology surfaces (recorder x2_debug SUB redirect, manager
+# motor_monitor SUB, etc.) and should stay opt-in.
+if [[ -n "${X2_DEBUG_BRIDGE_HOST}" && "${WITH_DEPLOY}" -eq 1 ]]; then
+    WITH_DEPLOY=0
+fi
+
+# Resolve --x2-debug-bridge=auto. We need it whenever the deploy is NOT
+# running locally on the laptop -- in those cases nothing else publishes
+# robot_pose:5570 and the kplanner pose-feedback would be a no-op
+# without the bridge. Sim runs (WITH_DEPLOY=1) get robot_pose from the
+# MuJoCo bridge directly so the x2_debug bridge is redundant.
+#
+# Host resolution: explicit --x2-debug-bridge-host wins; else inherit
+# from --remote-deploy HOST when provided; else error out (we can't
+# guess where PC2 is and silently leaving the bridge off would put us
+# right back in the snap-back symptom).
+case "${WITH_X2_DEBUG_BRIDGE}" in
+    auto)
+        if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
+            WITH_X2_DEBUG_BRIDGE=0
+        else
+            WITH_X2_DEBUG_BRIDGE=1
+        fi
+        ;;
+    0|1) ;;
+    *)
+        echo "ERROR: --with/--no-x2-debug-bridge must be 0|1 (got '${WITH_X2_DEBUG_BRIDGE}')" >&2
+        exit 1
+        ;;
+esac
+if [[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 && -z "${X2_DEBUG_BRIDGE_HOST}" ]]; then
+    if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
+        X2_DEBUG_BRIDGE_HOST="${REMOTE_DEPLOY_HOST}"
+    else
+        echo "ERROR: x2_debug bridge is ON (split-topology) but no host was" >&2
+        echo "       given on the command line. Pass one of:" >&2
+        echo "         --pc2-host <PC2_IP>             # recommended (one-arg)" >&2
+        echo "         --x2-debug-bridge-host <PC2_IP> # bridge-only override" >&2
+        echo "         --remote-deploy <PC2_IP>        # legacy alias" >&2
+        echo "         --no-x2-debug-bridge            # opt out" >&2
+        echo "" >&2
+        echo "       The bridge host is required per-invocation by design --" >&2
+        echo "       silently inheriting it from an ambient env-var risks" >&2
+        echo "       pointing the kplanner's pose-feedback at the wrong" >&2
+        echo "       robot and yawing the live one toward that other" >&2
+        echo "       machine's heading. Opting out with --no-x2-debug-bridge" >&2
+        echo "       leaves the kplanner pose-feedback as a no-op (the C++" >&2
+        echo "       bootstrap fallback still protects against starvation" >&2
+        echo "       snap-back, but kplanner startup may publish a stale" >&2
+        echo "       R_z(0) reference for the first few ticks)." >&2
+        exit 1
     fi
 fi
 
@@ -1030,6 +1226,7 @@ RECORDER_PID=""
 RECORDER_PGID=""
 VLA_BRIDGE_PID=""
 VLA_BRIDGE_PGID=""
+X2_DEBUG_BRIDGE_PID=""
 
 cleanup_children() {
     log "shutting down children (reverse spawn order)..."
@@ -1040,6 +1237,9 @@ cleanup_children() {
     fi
     kill_pid_quiet "${MANAGER_PID}"  "manager"
     kill_pid_quiet "${PLANNER_PID}"  "planner"
+    # x2_debug -> robot_pose bridge: stateless republisher, single
+    # SIGTERM is fine.
+    kill_pid_quiet "${X2_DEBUG_BRIDGE_PID}" "x2_debug_bridge"
     # VLA bridge runs in its own session (setsid) so we can SIGINT the
     # whole process group -- the bridge spawns helper threads that
     # render videos / write MP4s / etc, and a clean SIGINT lets them
@@ -1618,7 +1818,9 @@ ${C_GREEN}┌──────────────────────�
   planner demo     : ${PLANNER_DEMO:-(none -- planner sits in IDLE_LOOP at startup, awaits VR planner_cmd)}
   finger comp      : curl=$([[ "${APPLY_CURL_COMP}" -eq 1 ]] && echo on || echo off)  oppose=$([[ "${APPLY_OPPOSE_COMP}" -eq 1 ]] && echo on || echo off)$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)" || echo "  (pass --apply-{curl,oppose}-compensation to enable)")
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
+  pc2 host         : $([[ -n "${PC2_HOST}" ]] && echo "${PC2_HOST}  (single-arg fan-out: drives the two split-topology lines below)" || echo "(not set; using --remote-deploy/--x2-debug-bridge-host directly)")
   remote-deploy    : $([[ -n "${REMOTE_DEPLOY_HOST}" ]] && echo "ON  -> ${REMOTE_DEPLOY_HOST} (recorder x2_debug SUB redirected; manager resume PUB :${RESUME_PUB_PORT}; manager motor_monitor SUB tcp://${REMOTE_DEPLOY_HOST}:${MOTOR_MONITOR_PORT})" || echo "off")
+  x2_debug bridge  : $([[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 ]] && echo "ON  -> SUB tcp://${X2_DEBUG_BRIDGE_HOST}:${X2_DEBUG_BRIDGE_PORT}@${X2_DEBUG_BRIDGE_TOPIC} -> PUB tcp://127.0.0.1:${POSE_FEEDBACK_PORT}@${POSE_FEEDBACK_TOPIC} (rate-cap ${X2_DEBUG_BRIDGE_RATE_CAP_HZ}Hz; feeds kplanner pose-feedback so first frame doesn't twist back to world +X)" || echo "off (sim run or --no-x2-debug-bridge; kplanner pose-feedback may be a no-op)")
   pose-ref watchdog: ${POSE_REF_WATCHDOG_RESOLVED} (cli=${POSE_REF_WATCHDOG}; off=--disable-pose-ref-watchdog forwarded to deploy; on=C++ default 0.5 s SAFE_IDLE trip)
   ONNX model       : ${SIM_MODEL}
   motion_token     : $([[ -n "${SONIC_CHECKPOINT}" ]] && echo "ON  (${SONIC_CHECKPOINT}, ${SONIC_TOKENIZER_DEVICE})" || echo "DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)")
@@ -1845,6 +2047,46 @@ else
     fi
 fi
 
+# --------------------------------------------------------------------------
+# Step 1.5 — x2_debug -> robot_pose bridge (split-topology only).
+#
+# Must come BEFORE the planner so by the time x2_kplanner.py opens its
+# pose-feedback SUB the bridge is already publishing on
+# tcp://127.0.0.1:${POSE_FEEDBACK_PORT}. Without this, the kplanner
+# pose-feedback path is a no-op on real robot (no robot_pose publisher
+# on the laptop), ``current_root_wxyz`` stays at its R_z(0) warmup
+# default, and the first frame the kplanner publishes hands the deploy
+# a stale identity-yaw reference -- which the policy faithfully twists
+# back to. See the WITH_X2_DEBUG_BRIDGE comment block up top.
+# --------------------------------------------------------------------------
+if [[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 ]]; then
+    X2_DEBUG_BRIDGE_LOG="${LOG_DIR}/x2_debug_bridge.log"
+    log "Step 1.5/4 — spawning x2_debug -> robot_pose bridge"
+    log "  upstream  SUB tcp://${X2_DEBUG_BRIDGE_HOST}:${X2_DEBUG_BRIDGE_PORT} topic=${X2_DEBUG_BRIDGE_TOPIC}"
+    log "  downstream PUB tcp://127.0.0.1:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC}"
+    log "  log -> ${X2_DEBUG_BRIDGE_LOG}"
+    "${PYTHON}" -u -m gear_sonic_deploy.scripts.x2_debug_to_robot_pose_bridge \
+        --x2-debug-host "${X2_DEBUG_BRIDGE_HOST}" \
+        --x2-debug-port "${X2_DEBUG_BRIDGE_PORT}" \
+        --x2-debug-topic "${X2_DEBUG_BRIDGE_TOPIC}" \
+        --robot-pose-bind '*' \
+        --robot-pose-port "${POSE_FEEDBACK_PORT}" \
+        --rate-cap-hz "${X2_DEBUG_BRIDGE_RATE_CAP_HZ}" \
+        >"${X2_DEBUG_BRIDGE_LOG}" 2>&1 &
+    X2_DEBUG_BRIDGE_PID=$!
+    log "  bridge spawned (pid=${X2_DEBUG_BRIDGE_PID}); not blocking on" \
+        "first frame -- kplanner pose-feedback has its own max-age gate" \
+        "and the bridge will catch up within ~5ms once a wifi packet arrives"
+    sleep 0.3
+    if ! kill -0 "${X2_DEBUG_BRIDGE_PID}" 2>/dev/null; then
+        log "ERROR: x2_debug bridge died on startup; tail of log:"
+        tail -n 40 "${X2_DEBUG_BRIDGE_LOG}" | sed 's/^/  /'
+        exit 1
+    fi
+else
+    log "Step 1.5/4 — x2_debug -> robot_pose bridge SKIPPED (sim run or --no-x2-debug-bridge)."
+fi
+
 if [[ "${VLA_MODE}" -eq 0 ]]; then
 
 # --------------------------------------------------------------------------
@@ -1976,6 +2218,58 @@ else
     fi
     if [[ -n "${KPLANNER_STICK_SHAPE_EXP}" ]]; then
         PLANNER_ARGS+=(--stick-shape-exp "${KPLANNER_STICK_SHAPE_EXP}")
+    fi
+    if [[ "${WITH_POSE_FEEDBACK}" -eq 1 ]]; then
+        # Closed-loop yaw refresh: kplanner's IDLE_LOOP branch reads the
+        # latest robot_pose pelvis quat each tick and overwrites the
+        # persisted ``current_root_wxyz`` with R_z(measured_yaw) so SONIC
+        # stops twisting the body back to a stale heading after fall
+        # recovery / gesture overrides. See the "Closed-loop pose
+        # feedback" comment near the defaults section for context.
+        PLANNER_ARGS+=(
+            --pose-feedback-host "${POSE_FEEDBACK_HOST}"
+            --pose-feedback-port "${POSE_FEEDBACK_PORT}"
+            --pose-feedback-topic "${POSE_FEEDBACK_TOPIC}"
+            --pose-feedback-max-age-s "${POSE_FEEDBACK_MAX_AGE_S}"
+        )
+        # Reseed-scope hygiene. ``full_root`` (the kplanner default)
+        # overwrites slots [0:7] of the planner's context buffer (xyz +
+        # quat) with each reseed sample. That's correct in sim where the
+        # MuJoCo bridge supplies ground-truth qpos, but BOTH ``full_root``
+        # and the seemingly-safer ``quat_only`` cause regressions on the
+        # real-robot x2_debug bridge:
+        #
+        #   * ``full_root``  -- bridge has no position sensor and
+        #                       publishes xy=z=0, so the planner's xy
+        #                       history gets teleported to the origin
+        #                       every reseed tick -> catastrophic
+        #                       instability during walk / turn.
+        #   * ``quat_only`` -- model integrates yaw open-loop and the
+        #                       physical robot lags the reference
+        #                       (inertia / tracking dynamics); pinning
+        #                       the planner's neural-buffer quat to the
+        #                       lagging measured yaw means the planner
+        #                       can never get more than one replan-tick
+        #                       ahead of the robot, and commanded turns
+        #                       under-rotate.
+        #   * ``none``      -- PLAYING reseed disabled entirely. The
+        #                       model integrates open-loop during
+        #                       PLAYING (turns work as commanded). The
+        #                       pose_deque still feeds the IDLE_LOOP
+        #                       yaw refresh, the startup yaw seed, and
+        #                       the IDLE -> PLAYING transition seed --
+        #                       all yaw-only writes to current_root_wxyz
+        #                       only, no neural-buffer mutation. Net:
+        #                       snap-back protection without the
+        #                       PLAYING-side correctness penalty.
+        if [[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 ]]; then
+            PLANNER_ARGS+=(--pose-reseed-scope none)
+            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=none -- IMU-only bridge; snap-back guarded by IDLE_LOOP + IDLE->PLAYING + startup yaw refreshes)"
+        else
+            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=full_root -- MuJoCo bridge has ground-truth xy/z)"
+        fi
+    else
+        log "  closed-loop pose feedback: DISABLED (--no-pose-feedback); kplanner will publish stale yaw refs"
     fi
 
     log "Step 2/4 — spawning x2_kplanner -> ${PLANNER_LOG}"
@@ -2266,6 +2560,10 @@ RECORDER_ARGS=(
     --sub-host "${RECORDER_DEBUG_SUB_HOST}"
     --sub-port "${DEBUG_PORT}"
     --sub-topic "${DEBUG_TOPIC}"
+    --gesture-cmd-host '*'
+    --gesture-cmd-port "${GESTURE_CMD_PORT}"
+    --gesture-cmd-topic "${GESTURE_CMD_TOPIC}"
+    --gesture-catalog "${GESTURE_CATALOG}"
     --rate "${RATE}"
 )
 if [[ "${WITH_RECORD}" -eq 1 ]]; then
@@ -2518,6 +2816,10 @@ if [[ "${VLA_MODE}" -eq 1 ]]; then
         --sub-host localhost
         --sub-port "${DEBUG_PORT}"
         --sub-topic "${DEBUG_TOPIC}"
+        --gesture-cmd-host '*'
+        --gesture-cmd-port "${GESTURE_CMD_PORT}"
+        --gesture-cmd-topic "${GESTURE_CMD_TOPIC}"
+        --gesture-catalog "${GESTURE_CATALOG}"
         --rate "${RATE}"
         --teleop-only
     )

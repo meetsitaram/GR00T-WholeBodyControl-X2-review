@@ -1,0 +1,57 @@
+# Live-trigger gesture catalog for the Quest3 planner stack.
+# Loaded once at recorder startup; `play_gesture <name>` resolves
+# names against this file. Per-entry schema mirrors the offline
+# stitching playlists at gear_sonic/data/motions/playlists/.
+#
+# Add a new gesture by appending a row below, restart the recorder.
+# Each `source` path is resolved relative to the repo root.
+name: x2_ultra_gestures_v1
+gestures:
+  - name: sit_stand_sit_A538
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A538_M_19s_43s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: sit_stand_sit_A540
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A540_M_23s_38s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: sit_stand_sit_A541
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A541_25s_49s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: sit_stand_sit_A541_M
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A541_M_25s_49s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: sit_stand_sit_A538_M_004
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_004__A538_M_22s_44s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  # Two halves of sit_stand_sit_A540 with an indefinite hold in between.
+  # The source clip is stand -> sit (frames 0..113), seated plateau
+  # (frames 113..405), then sit -> stand (frames 405..449). We trim
+  # the plateau so the recorder's hold_after sustains the seated pose
+  # rather than replaying it.
+  - name: sit_down_A540
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A540_M_23s_38s.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: 140
+    hold_after: true   # recorder republishes last frame until stop / new play
+
+  - name: stand_up_A540
+    source: gear_sonic/data/motions/x2_ultra_sit_stand_sit_003__A540_M_23s_38s.pkl
+    motion_key: null
+    start_frame: 390
+    n_frames: null
+    # hold_after omitted -> default false -> auto-handback to kplanner

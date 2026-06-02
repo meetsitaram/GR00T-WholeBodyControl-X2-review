@@ -2604,8 +2604,40 @@ class X2Deploy {
     prop_buf_.Append(rs.base_ang_vel, jpos_rel_il, jvel_il, last_action_il_, grav);
 
     // 3. Tokenizer reference window.
+    //
+    // Bootstrap-safe override: when the ZMQ pose-ref input source has
+    // never received a real frame, ``ZmqPoseInputSource::Connect()``
+    // pre-fills ``latest_frame_.root_quat_xyzw`` with the identity quat
+    // (zmq_pose_input_source.cpp:81-82). Without intervention, the
+    // tokenizer's ``rel = inv(measured) * R_identity`` then turns into
+    // an actively-driven yaw error and the policy twists the body
+    // back to world +X every tick -- the symptom captured in terminal
+    // logs as `pose_ref_age=-1.000s mc_mode=0` while the robot
+    // visibly rotates back to its spawn heading after every nudge.
+    //
+    // The fix is local: when we know LastReceivedMonotonicS() < 0
+    // (the sentinel for "never received"), pass the CURRENT measured
+    // quat in as the reference quat for every future-window slot.
+    // The tokenizer then computes ``rel = inv(measured) * measured =
+    // identity`` and the policy holds whatever orientation the body
+    // is in. Once a real pose-ref frame lands, this branch becomes
+    // a no-op and the planner / proxy reference takes over as
+    // intended.
+    //
+    // Joint targets continue to come from the reference (default_angles
+    // for the bootstrap default; whatever the planner sends after);
+    // only the orientation channel is rebased. Doing this here rather
+    // than mutating ZmqPoseInputSource keeps the input-source contract
+    // ("Sample() returns latest_frame_") byte-identical for every
+    // other consumer (debug, recorder, eval).
     const double policy_time = now - control_entry_s_;
-    const auto tok_obs = BuildTokenizerObs(*ref_motion_, policy_time, rs.base_quat_wxyz);
+    std::optional<std::array<double, 4>> tok_ref_override;
+    if (zmq_pose_source_ != nullptr &&
+        zmq_pose_source_->LastReceivedMonotonicS() < 0.0) {
+      tok_ref_override = wxyz_to_xyzw(rs.base_quat_wxyz);
+    }
+    const auto tok_obs = BuildTokenizerObs(
+        *ref_motion_, policy_time, rs.base_quat_wxyz, tok_ref_override);
     const auto prop    = prop_buf_.GetFlat();
 
     // ---- Inference ---------------------------------------------------------
