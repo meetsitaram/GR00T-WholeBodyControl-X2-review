@@ -2480,6 +2480,40 @@ if [[ -n "${QUEST3_STICK_RETURN_TAU}" ]]; then
     log "  StickFilter release tau: ${QUEST3_STICK_RETURN_TAU} s"
 fi
 
+# --- VR wrist orientation offset (operator-side, "controller mount
+# calibration" stop-gap until vr_operator_calibrate is re-run) -------
+# Three floats per side: roll pitch yaw in DEGREES, intrinsic XYZ
+# Tait-Bryan, applied in the operator's wrist-local frame BEFORE the
+# calibration alignment. Defaults empty -> no flag passed -> manager's
+# (0, 0, 0) default -> today's behaviour. Pass space-separated values
+# via env var, e.g.:
+#     QUEST3_LEFT_WRIST_OFFSET_RPY_DEG="0 0 -30"  ./run_*.sh
+# rotates the LEFT operator-wrist quat by -30deg about the wrist normal
+# axis (yaw) before the calibration applies, compensating a left
+# controller mounted ~30deg outward on the operator's cuff.
+QUEST3_LEFT_WRIST_OFFSET_RPY_DEG="${QUEST3_LEFT_WRIST_OFFSET_RPY_DEG:-}"
+QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG="${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG:-}"
+if [[ -n "${QUEST3_LEFT_WRIST_OFFSET_RPY_DEG}" ]]; then
+    # shellcheck disable=SC2206  # intentional word splitting for nargs=3
+    _LEFT_RPY=( ${QUEST3_LEFT_WRIST_OFFSET_RPY_DEG} )
+    if [[ "${#_LEFT_RPY[@]}" -ne 3 ]]; then
+        err "QUEST3_LEFT_WRIST_OFFSET_RPY_DEG must be 3 floats (roll pitch yaw, deg); got: '${QUEST3_LEFT_WRIST_OFFSET_RPY_DEG}'"
+        exit 2
+    fi
+    MANAGER_ARGS+=(--left-wrist-offset-rpy-deg "${_LEFT_RPY[@]}")
+    log "  LEFT wrist op-quat offset: rpy_deg=(${_LEFT_RPY[0]}, ${_LEFT_RPY[1]}, ${_LEFT_RPY[2]})"
+fi
+if [[ -n "${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG}" ]]; then
+    # shellcheck disable=SC2206
+    _RIGHT_RPY=( ${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG} )
+    if [[ "${#_RIGHT_RPY[@]}" -ne 3 ]]; then
+        err "QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG must be 3 floats (roll pitch yaw, deg); got: '${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG}'"
+        exit 2
+    fi
+    MANAGER_ARGS+=(--right-wrist-offset-rpy-deg "${_RIGHT_RPY[@]}")
+    log "  RIGHT wrist op-quat offset: rpy_deg=(${_RIGHT_RPY[0]}, ${_RIGHT_RPY[1]}, ${_RIGHT_RPY[2]})"
+fi
+
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
 MANAGER_PID=$!

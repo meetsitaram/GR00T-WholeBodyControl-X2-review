@@ -371,6 +371,20 @@ class ManagerConfig:
     apply_oppose_compensation: bool = False
     enable_finger_filter: bool = True
 
+    # VR wrist quat offset (operator-side, applied in head-yaw frame
+    # BEFORE the calibration alignment). Stop-gap "controller mount
+    # calibration" knob: when one of the controllers is mounted at a
+    # fixed rotation on the operator's wrist (e.g. left controller cuff
+    # twisted ~30deg outward), this rotates the reported op-wrist quat
+    # by the inverse of the mount alignment so the calibration sees a
+    # corrected operator quat. Re-run ``vr_operator_calibrate.py`` to
+    # drop these back to zero. Tuple is ``(roll, pitch, yaw)`` in
+    # degrees, intrinsic XYZ Tait-Bryan; see ``VRArmTeleopCalibrated``
+    # docstring for the axis convention. Defaults to no offset on
+    # either side -- existing setups stay bit-exact.
+    left_wrist_op_quat_offset_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    right_wrist_op_quat_offset_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
     # Sidecar
     sidecar_log_path: Optional[Path] = None
     """If set, append one JSONL line per emitted ``planner_cmd`` to this
@@ -537,6 +551,12 @@ class Quest3ManagerX2:
             hand_input_mode=cfg.hand_input_mode,
             apply_curl_compensation=cfg.apply_curl_compensation,
             apply_oppose_compensation=cfg.apply_oppose_compensation,
+            left_wrist_op_quat_offset_rpy_deg=tuple(
+                cfg.left_wrist_op_quat_offset_rpy_deg
+            ),
+            right_wrist_op_quat_offset_rpy_deg=tuple(
+                cfg.right_wrist_op_quat_offset_rpy_deg
+            ),
         )
         self._intent = IntentDecoder(
             stick_deadzone=cfg.intent_stick_deadzone,
@@ -2106,6 +2126,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply-curl-compensation", action="store_true")
     p.add_argument("--apply-oppose-compensation", action="store_true")
     p.add_argument("--no-finger-filter", action="store_true")
+    # VR wrist orientation offsets -- stop-gap until the operator
+    # re-runs vr_operator_calibrate.py. Three floats (roll, pitch, yaw)
+    # in DEGREES, intrinsic XYZ Tait-Bryan, applied in the operator's
+    # wrist-local frame BEFORE the calibration alignment (so the IK
+    # sees a corrected operator quat). Convention reminder:
+    #   roll  = pronation / supination (twist about forearm long axis)
+    #   pitch = flex / extend
+    #   yaw   = ulnar / radial deviation
+    # Defaults to (0, 0, 0) on both sides == no-op == today's behaviour.
+    p.add_argument(
+        "--left-wrist-offset-rpy-deg",
+        dest="left_wrist_offset_rpy_deg",
+        type=float, nargs=3, metavar=("ROLL", "PITCH", "YAW"),
+        default=(0.0, 0.0, 0.0),
+        help="Operator-side wrist quat offset for the LEFT controller "
+             "(degrees, intrinsic XYZ in the operator's wrist-local "
+             "frame). Stop-gap fix for a controller mount misalignment; "
+             "rerun vr_operator_calibrate.py to drop this back to zero. "
+             "Only takes effect when --ik-rotation-weight > 0. Example: "
+             "'--left-wrist-offset-rpy-deg 0 0 -30' compensates a left "
+             "controller that sits ~30deg outward (yaw) on the cuff.",
+    )
+    p.add_argument(
+        "--right-wrist-offset-rpy-deg",
+        dest="right_wrist_offset_rpy_deg",
+        type=float, nargs=3, metavar=("ROLL", "PITCH", "YAW"),
+        default=(0.0, 0.0, 0.0),
+        help="Operator-side wrist quat offset for the RIGHT controller "
+             "(see --left-wrist-offset-rpy-deg for axis convention).",
+    )
 
     # Sidecar
     p.add_argument(
@@ -2335,6 +2385,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         apply_curl_compensation=args.apply_curl_compensation,
         apply_oppose_compensation=args.apply_oppose_compensation,
         enable_finger_filter=not args.no_finger_filter,
+        left_wrist_op_quat_offset_rpy_deg=tuple(
+            float(v) for v in args.left_wrist_offset_rpy_deg
+        ),
+        right_wrist_op_quat_offset_rpy_deg=tuple(
+            float(v) for v in args.right_wrist_offset_rpy_deg
+        ),
         sidecar_log_path=args.sidecar_log,
         quest3_raw_log_path=args.quest3_record_to,
         recorder_enabled=args.recorder_enabled,
