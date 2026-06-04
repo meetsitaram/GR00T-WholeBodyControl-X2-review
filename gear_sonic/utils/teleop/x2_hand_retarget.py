@@ -64,21 +64,24 @@ def _deg_list_to_rad(lst: list[float]) -> list[float]:
 
 HAND_GRASP_OPEN_LEFT_DEG: list[float] = [
     # thumb_roll / thumb_abad OPEN anchors biased into a natural
-    # rest pose (2026-05-13). The previous values (0°, 10°) put the
-    # thumb perpendicular to the palm at rest -- visually "thumb
-    # sticking out to the side", uncanny on the kitchen-task viewer.
-    # The new values bias the resting thumb so it sits ~halfway
-    # across the palm, parallel to the middle finger and well clear
-    # of the index. CLOSED anchors are UNCHANGED so we do NOT push
-    # any motor closer to its hardware hardstop -- the only effect
-    # is that the OPEN -> CLOSED span shrinks for these two motors
-    # (thumb_abad 70° -> 45°, thumb_roll 40° -> 28°). Operators
-    # perceive more thumb-toward-palm motion at half-drive because
-    # the rest pose is already biased that way. Iterate visually
-    # in the MuJoCo viewer if these need further tuning. See the
-    # mirrored values in HAND_GRASP_OPEN_RIGHT_DEG.
+    # rest pose. History: original upstream values (0°, 10°) put the
+    # thumb perpendicular to the palm at rest -- "thumb sticking out
+    # to the side", uncanny on the kitchen-task viewer. Bumped to
+    # (-12°, 35°) on 2026-05-13 to sit ~halfway across the palm.
+    # Bumped again to (-12°, 55°) on 2026-06-03 because operators
+    # reported the thumb still wasn't reaching "parallel to the
+    # middle finger" mid-curl in controller mode -- pushing
+    # thumb_abad from 35 % to 55 % of hardware travel positions the
+    # thumb pad near mid-palm at full open so the open->closed lerp
+    # sweeps it through proper opposition for any trigger ratio.
+    # CLOSED anchors are UNCHANGED so we do NOT push any motor
+    # closer to its hardware hardstop -- the only effect is the
+    # OPEN -> CLOSED span shrinks for thumb_abad (now 25° travel
+    # instead of 45°) and thumb_roll (unchanged at 28°). Iterate
+    # visually in the MuJoCo viewer if these need further tuning.
+    # See the mirrored values in HAND_GRASP_OPEN_RIGHT_DEG.
     -12.0,  # thumb_roll  (range -50..+10, was 0; pad rolled inward)
-    35.0,   # thumb_abad  (range   0..+100, was 10; thumb partway across palm)
+    55.0,   # thumb_abad  (range   0..+100, was 35; thumb ~mid-palm, parallel to middle finger)
     -5.0,   # thumb_mcp   (range -49..   0)
     0.0,    # index_abad  (range   0..+12)
     5.0,    # index_pip   (range   0..+90)
@@ -128,7 +131,7 @@ HAND_GRASP_OPEN_RIGHT_DEG: list[float] = [
     # See note on HAND_GRASP_OPEN_LEFT_DEG -- mirrored here for the
     # right hand so the resting thumb pose is symmetric.
     12.0,   # thumb_roll  (range -10..+50, was 0; pad rolled inward)
-    -35.0,  # thumb_abad  (range -100..0, was -10; thumb partway across palm)
+    -55.0,  # thumb_abad  (range -100..0, was -35; thumb ~mid-palm, parallel to middle finger)
     5.0,    # thumb_mcp   (range   0..+49)
     0.0,    # index_abad  (range -12..   0)
     5.0,    # index_pip
