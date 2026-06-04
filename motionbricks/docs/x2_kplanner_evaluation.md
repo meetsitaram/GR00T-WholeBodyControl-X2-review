@@ -473,6 +473,16 @@ codebase as an opt-in capability for future use cases (e.g. coarse
 re-localization after a deploy reset) and as a regression target so
 the negative result stays measurable.
 
+**Wrapper default (2026-06):** ``run_x2_quest3_planner_stack.sh`` now
+passes ``--pose-reseed-scope=none`` on **both** the sim and real paths.
+Previously it only set ``none`` for the x2_debug bridge path; the sim
+path silently fell through to the daemon default ``full_root`` and
+matched row C / row D of the table above (sluggish forward, weak turn
+response). Operators who want the old behaviour can set
+``KPLANNER_POSE_RESEED_SCOPE=full_root`` for an A/B run, or pass
+``--no-pose-feedback`` / ``WITH_POSE_FEEDBACK=0`` to bypass the SUB
+entirely (the bigger-hammer baseline).
+
 #### Hip-height (channel 3) OOD bug (2026-05-30)
 
 While porting the "config A" recipe to the Quest 3 stack the

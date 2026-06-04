@@ -190,12 +190,42 @@ with deploys that don't know about the new state.
 > pins `STATIC_HOLD(latched)`) still fires; it is now best understood
 > as a *no-jump seed* — the planner enters ARM_MAN at exactly the
 > pre-flip pose, and the operator's R-stick continues to slew it from
-> there. The lateral-lean (roll) modifier was simultaneously removed
-> from the operator vocabulary: v7.0 used "A held + R-stick X → roll",
-> but A and the R-stick share the operator's right thumb on the same
-> controller and the modifier was unreachable mid-lean. The wire
-> format still carries `waist_roll_deg` for scripted demos and future
-> VLA outputs; the operator path always emits 0 there.
+> there. v7.2 removed the "A held + R-stick X → roll" modifier
+> because A and the R-stick share the operator's right thumb on
+> the same controller and the modifier was unreachable mid-lean.
+> v7.4 (below) re-introduces continuous roll on the **L-stick X
+> axis** in ARM_MANIPULATION only.
+
+> **Operator note (v7.4: bidirectional pitch + ARM_MAN L-stick squat /
+> roll)** — the operator vocabulary was widened in three ways:
+>
+> 1. **Bidirectional pitch.** The R-stick Y axis now decodes to
+>    signed `waist_pitch_deg` so backward push (`ry < 0`) leans the
+>    body backward (`pitch_deg < 0`). Pre-v7.4 the negative side was
+>    clamped to 0. `make_waist_pose_frame()` already supported
+>    signed pitch, so the heuristic `STATIC_HOLD` path picks this up
+>    with no further changes.
+> 2. **ARM_MAN L-stick decoding.** In ARM_MANIPULATION the L-stick
+>    decodes as **roll (`lx`) + continuous hip height (`ly`, squat /
+>    stand)**. The roll target rides the existing `STATIC_HOLD` path
+>    via `make_waist_pose_frame(roll_deg=...)`. The hip-height
+>    target rides on a new optional wire field (`hip_height_m`)
+>    consumed only by the kplanner; the heuristic planner **ignores**
+>    `hip_height_m` because its `STATIC_HOLD` path produces a frozen-
+>    feet pose at `DEFAULT_PELVIS_Z_M` and has no continuous height
+>    surface. Operators wanting squat / stand under the heuristic
+>    backend should use the discrete `crouch_medium` primitive.
+> 3. **Dominance cones.** The decoder gates pitch on `|ry| >=
+>    pitch_dominance_ratio * |rx|` (yaw-priority cone, R-stick) and
+>    height on `|ly| >= height_dominance_ratio * |lx|` (roll-priority
+>    cone, L-stick). 0.4 default; lets the operator twist while
+>    leaning slightly but blocks accidental lean / squat from a
+>    yaw-or-roll-intent stick wobble.
+>
+> The wire format additions are backward-compatible: v7.3 payloads
+> (no `hip_height_m` field) still parse, and the heuristic planner
+> drops the field at deserialization. The kplanner's continuous
+> waist hold path is documented in [`x2_kplanner.md`](x2_kplanner.md).
 
 ### Why some families are alias-collapsed
 
@@ -511,7 +541,10 @@ External command sources (any combination, behind one `queue.Queue`):
   the v7 optional `waist_pitch_deg`, `waist_roll_deg`, `waist_yaw_deg`
   floats — only meaningful when `intent == "hold_torso"` (see
   [v7: continuous waist hold](#v7-continuous-waist-hold-static_hold)).
-  Missing fields default to 0, so legacy publishers stay wire-compatible.
+  v7.4 also adds an optional `hip_height_m` float (kplanner only —
+  the heuristic planner ignores the field). Missing fields default
+  to 0 (or `None` for `hip_height_m`), so legacy publishers stay
+  wire-compatible.
 
   Example payloads:
 
@@ -519,6 +552,9 @@ External command sources (any combination, behind one `queue.Queue`):
   {"intent": "walk", "magnitude": "forward"}
   {"intent": "hold_torso", "magnitude": "continuous",
    "waist_pitch_deg": 12.0, "waist_roll_deg": 0.0, "waist_yaw_deg": 25.0}
+  {"intent": "hold_torso", "magnitude": "continuous",
+   "waist_pitch_deg": 0.0, "waist_roll_deg": 6.0, "waist_yaw_deg": 0.0,
+   "hip_height_m": 0.62}
   {"intent": "idle", "magnitude": "default"}
   ```
 

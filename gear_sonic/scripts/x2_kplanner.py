@@ -66,13 +66,26 @@ if str(_REPO_ROOT) not in sys.path:
 
 from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw  # noqa: E402
 from gear_sonic.utils.planner.state_machine import (  # noqa: E402
+    HOLD_HIP_PITCH_SHARE,
+    HOLD_HIP_YAW_SHARE,
+    HOLD_ANKLE_PITCH_SHARE,
+    HOLD_ANKLE_ROLL_SHARE,
+    HOLD_SLEW_DPS,
+    HOLD_TORSO_INTENT,
     LocomotionCommand,
     OUTPUT_FPS,
     PlannerState,
     StreamFrame,
+    _HoldTracker,
     build_pose_payload,
     commands_from_yaml,
 )
+from gear_sonic.utils.planner.constants import (  # noqa: E402
+    WAIST_PITCH_IDX,
+    WAIST_ROLL_IDX,
+    WAIST_YAW_IDX,
+)
+from gear_sonic.utils.planner.x2_recipes import make_waist_pose_frame  # noqa: E402
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message  # noqa: E402
 
 
@@ -514,6 +527,27 @@ def intent_to_velocity(cmd: LocomotionCommand) -> tuple[float, float, float, flo
             cmd.stick_fwd, cmd.stick_side, cmd.stick_yaw,
         )
         return _apply_continuous_runtime_scales(result)
+    if cmd.intent == HOLD_TORSO_INTENT:
+        # ``hold_torso`` keeps the velocity intent at idle (no walking,
+        # no turning) so the SONIC policy plants the feet, but honours
+        # any operator-supplied hip-height override on channel-3 of
+        # the velocity tuple. ``cmd.hip_height_m is None`` -> no
+        # override -> fall through to ``_IDLE_INTENT`` -> kplanner
+        # default hip height (0.687m). When a finite value is
+        # present, substitute it into the channel-3 slot. The waist
+        # angles (pitch / roll / yaw) are NOT consumed here -- they
+        # ride on a separate kinematic-overlay path applied to the
+        # published frame after intent_to_velocity returns; see
+        # ``_apply_waist_overlay`` in the publish loop. Without that
+        # split the kplanner could not express the "lean while
+        # squatting" combo the operator can drive with both sticks.
+        yaw_idle, vx_idle, vz_idle, hip_idle = _IDLE_INTENT
+        hip_h = (
+            float(cmd.hip_height_m)
+            if cmd.hip_height_m is not None
+            else float(hip_idle)
+        )
+        return (float(yaw_idle), float(vx_idle), float(vz_idle), hip_h)
     result = _resolve_velocity(cmd.intent, cmd.magnitude)
     if result == _IDLE_INTENT and cmd.intent != "idle":
         log.debug("intent %s,%s has no velocity mapping; idling",
@@ -800,14 +834,27 @@ def _zmq_command_thread(
                 stick_fwd  = float(payload.get("stick_fwd",  0.0))
                 stick_side = float(payload.get("stick_side", 0.0))
                 stick_yaw  = float(payload.get("stick_yaw",  0.0))
-                # ``hold_torso`` (continuous waist target) passes through
-                # but the kplanner's dispatcher idles on it (no upper-body
-                # bins). We still parse the waist fields so future kplanner
-                # extensions can consume them without changing the wire
-                # format.
+                # ``hold_torso`` (continuous waist target) is consumed
+                # by the kplanner's waist-overlay path (v7.4): the
+                # tracker walks ``current_*_deg`` toward these targets
+                # at HOLD_SLEW_DPS each tick and the publish loop adds
+                # the deltas to the waist DOFs of the kplanner's
+                # output frame. ``hip_height_m`` is an optional
+                # absolute hip-height override (metres) consumed by
+                # ``intent_to_velocity``: when present and the intent
+                # is ``hold_torso`` it substitutes channel-3 of the
+                # 4-D velocity intent so the operator's L-stick Y
+                # squat / stand drives the model's continuous height
+                # target. Missing field -> None -> kplanner default.
                 waist_pitch_deg = float(payload.get("waist_pitch_deg", 0.0))
                 waist_roll_deg  = float(payload.get("waist_roll_deg",  0.0))
                 waist_yaw_deg   = float(payload.get("waist_yaw_deg",   0.0))
+                hip_height_raw  = payload.get("hip_height_m", None)
+                hip_height_m: Optional[float] = (
+                    float(hip_height_raw)
+                    if hip_height_raw is not None
+                    else None
+                )
                 # Optional raw 4-D velocity passthrough used by
                 # ``x2_pkl_command_source`` for replaying recorded motion
                 # clips through the planner -> deploy chain without the
@@ -852,6 +899,7 @@ def _zmq_command_thread(
                     stick_side=stick_side,
                     stick_yaw=stick_yaw,
                     direct_velocity=direct_velocity,
+                    hip_height_m=hip_height_m,
                 )
             )
     finally:
@@ -2360,6 +2408,34 @@ def run(
     global_tick = 0
     last_intent_log: tuple[float, float, float, float] = _IDLE_INTENT
 
+    # ---- Continuous waist overlay (kplanner-side, v7.4).
+    #
+    # The neural model's intent space is a 4-D velocity vector
+    # (yaw_rate, vel_x, vel_z, hip_h); it has no "command the body to
+    # lean +15 deg" channel. Pre-v7.4 the manager could publish
+    # ``hold_torso`` commands with non-zero waist_pitch / roll / yaw,
+    # but the kplanner silently ignored them and the operator's stick
+    # produced no waist motion.
+    #
+    # v7.4 closes that gap by maintaining a small slew-rate-limited
+    # tracker (mirrors the heuristic planner's STATIC_HOLD path) and
+    # adding a kinematic OVERLAY to the published joint vector each
+    # tick: we add (target_pitch, target_roll, target_yaw) deltas to
+    # the three waist joint slots in cur_frame.joint_pos_mj after the
+    # neural model has produced its frame. This is intentionally
+    # "pure waist" (no hip / ankle counter-balance shares) so the
+    # overlay does NOT fight the model's leg motion when the
+    # operator leans WHILE walking. The hip-share counter-balance the
+    # heuristic planner uses is appropriate only for a feet-planted
+    # static stand pose; during walking we want to leave the legs
+    # entirely to the model.
+    #
+    # The tracker advances at OUTPUT_FPS (50 Hz) using HOLD_SLEW_DPS
+    # (60 deg/s) -- same parameters as the heuristic STATIC_HOLD path,
+    # so the operator-feel matches across planner backends.
+    waist_tracker: _HoldTracker = _HoldTracker()
+    last_waist_target_log: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
     # Always-available frozen-anchor StreamFrame, shared by the warmup
     # ticks below AND the IDLE_LOOP branch of the main publish loop.
     # Built once from warmup_qpos so all three paths emit a bit-identical
@@ -2589,6 +2665,32 @@ def run(
                             target,
                         )
                         last_intent_log = target
+                    # Waist-overlay target update. Honour every
+                    # ``hold_torso`` command (continuous waist intent
+                    # from the operator's R-stick / ARM_MAN L-stick);
+                    # everything else implicitly resets the waist to
+                    # neutral so a discrete ``walk / fwd_step / turn_*``
+                    # command relaxes the lean cleanly. The tracker's
+                    # slew limit handles the cross-tick smoothness;
+                    # there's no need to debounce here because the
+                    # decoder already throttles publishing.
+                    if latest_cmd.intent == HOLD_TORSO_INTENT:
+                        new_waist_target = (
+                            float(latest_cmd.waist_pitch_deg),
+                            float(latest_cmd.waist_roll_deg),
+                            float(latest_cmd.waist_yaw_deg),
+                        )
+                    else:
+                        new_waist_target = (0.0, 0.0, 0.0)
+                    waist_tracker.set_target(*new_waist_target)
+                    if new_waist_target != last_waist_target_log:
+                        log.info(
+                            "waist overlay target updated (%s, %s) -> "
+                            "pitch=%.1f roll=%.1f yaw=%.1f deg",
+                            latest_cmd.intent, latest_cmd.magnitude,
+                            *new_waist_target,
+                        )
+                        last_waist_target_log = new_waist_target
 
                 # ---- Resolve high-level state from current intent.
                 # IDLE_LOOP <-> PLAYING transitions are edge-triggered
@@ -2811,6 +2913,81 @@ def run(
                         )
                         for k in range(num_future)
                     ]
+
+                # ---- Waist overlay (v7.4, kplanner-side STATIC_HOLD analogue).
+                # Step the tracker so ``current_*`` walks toward the
+                # operator-commanded target at HOLD_SLEW_DPS (60 deg/s),
+                # then add the (current_pitch, current_roll, current_yaw)
+                # deltas onto the published waist joint slots. We
+                # operate on a copy of joint_pos_mj because the IDLE
+                # branch shares ``anchor_frame.joint_pos_mj`` across
+                # ticks; mutating it in place would compound the
+                # overlay across consecutive idle ticks.
+                #
+                # PLAYING branch: only the 3 waist DOFs are touched so
+                # the kplanner's leg / arm motion is preserved
+                # byte-identical. IDLE_LOOP branch: same; the static
+                # stand pose's hip / ankle joints stay at default. We
+                # intentionally DO NOT apply the heuristic planner's
+                # hip / ankle counter-balance shares here -- those make
+                # sense for a feet-planted lean but would visually
+                # fight the kplanner's stride during locomotion.
+                # Operators wanting the "natural deadlift hinge" feel
+                # can fall back to ``--planner heuristic`` for static
+                # work; the kplanner trades that bit of ergonomic
+                # realism for a unified walk + lean experience.
+                waist_tracker.step(dt_s=period_s)
+                if (
+                    waist_tracker.current_pitch_deg != 0.0
+                    or waist_tracker.current_roll_deg != 0.0
+                    or waist_tracker.current_yaw_deg != 0.0
+                ):
+                    overlay_q = cur_frame.joint_pos_mj.copy()
+                    overlay_q[WAIST_PITCH_IDX] += float(
+                        np.deg2rad(waist_tracker.current_pitch_deg)
+                    )
+                    overlay_q[WAIST_ROLL_IDX] += float(
+                        np.deg2rad(waist_tracker.current_roll_deg)
+                    )
+                    overlay_q[WAIST_YAW_IDX] += float(
+                        np.deg2rad(waist_tracker.current_yaw_deg)
+                    )
+                    cur_frame = StreamFrame(
+                        joint_pos_mj=overlay_q.astype(np.float32, copy=False),
+                        root_quat_xyzw=cur_frame.root_quat_xyzw,
+                        root_xy_world=cur_frame.root_xy_world,
+                        yaw_world_deg=cur_frame.yaw_world_deg,
+                        state=cur_frame.state,
+                        bin_name=cur_frame.bin_name,
+                        frame_index=cur_frame.frame_index,
+                        seam_blend=cur_frame.seam_blend,
+                        root_z_world=cur_frame.root_z_world,
+                    )
+                    if future_frames:
+                        overlaid_futures: list[StreamFrame] = []
+                        for ff in future_frames:
+                            fq = ff.joint_pos_mj.copy()
+                            fq[WAIST_PITCH_IDX] += float(
+                                np.deg2rad(waist_tracker.current_pitch_deg)
+                            )
+                            fq[WAIST_ROLL_IDX] += float(
+                                np.deg2rad(waist_tracker.current_roll_deg)
+                            )
+                            fq[WAIST_YAW_IDX] += float(
+                                np.deg2rad(waist_tracker.current_yaw_deg)
+                            )
+                            overlaid_futures.append(StreamFrame(
+                                joint_pos_mj=fq.astype(np.float32, copy=False),
+                                root_quat_xyzw=ff.root_quat_xyzw,
+                                root_xy_world=ff.root_xy_world,
+                                yaw_world_deg=ff.yaw_world_deg,
+                                state=ff.state,
+                                bin_name=ff.bin_name,
+                                frame_index=ff.frame_index,
+                                seam_blend=ff.seam_blend,
+                                root_z_world=ff.root_z_world,
+                            ))
+                        future_frames = overlaid_futures
 
                 # ---- Reference-step smoother (publisher output, step-driven).
                 # Applied at a single point AFTER both IDLE / PLAYING

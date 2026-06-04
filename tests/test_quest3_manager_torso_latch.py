@@ -130,15 +130,16 @@ def test_locomotion_to_arm_man_with_neutral_waist_latches_zero_pose(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(0.0, 0.0, 0.0),
+        live_waist_target=(0.0, 0.0, 0.0, None),
     )
 
-    assert manager._latched_waist == (0.0, 0.0, 0.0)
+    assert manager._latched_waist == (0.0, 0.0, 0.0, None)
     hold_cmds = [c for c in cmds if c.intent == "hold_torso"]
     assert len(hold_cmds) == 1
     h = hold_cmds[0]
     assert h.magnitude == "continuous"
     assert (h.waist_pitch_deg, h.waist_roll_deg, h.waist_yaw_deg) == (0.0, 0.0, 0.0)
+    assert h.hip_height_m is None
     # No torso_locked cue for neutral pose -- only the standard mode prompt.
     keys = [m.get("key") for m in sent if m.get("_type") == "play_audio"]
     assert "mode_torso_locked" not in keys
@@ -157,10 +158,10 @@ def test_locomotion_to_arm_man_with_nonneutral_waist_latches_and_cues(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(15.0, -5.0, 30.0),
+        live_waist_target=(15.0, -5.0, 30.0, None),
     )
 
-    assert manager._latched_waist == (15.0, -5.0, 30.0)
+    assert manager._latched_waist == (15.0, -5.0, 30.0, None)
     hold_cmds = [c for c in cmds if c.intent == "hold_torso"]
     assert len(hold_cmds) == 1
     h = hold_cmds[0]
@@ -171,12 +172,36 @@ def test_locomotion_to_arm_man_with_nonneutral_waist_latches_and_cues(manager):
     assert "mode_arm_manipulation" in keys
 
 
+def test_locomotion_to_arm_man_with_squat_height_latches_hip(manager):
+    """v7.4: latched 4-tuple carries hip_height_m so the squat target
+    survives the LOCO -> ARM_MAN flip."""
+    cmds = _capture_planner_cmds(manager)
+    _capture_audio(manager)
+
+    transition = ModeTransition(
+        previous=StreamMode.LOCOMOTION,
+        current=StreamMode.ARM_MANIPULATION,
+    )
+    manager._on_mode_transition(
+        transition,
+        vr_pose=np.zeros(9, dtype=np.float32),
+        tick=0,
+        live_waist_target=(0.0, 5.0, 0.0, 0.62),
+    )
+
+    assert manager._latched_waist == (0.0, 5.0, 0.0, 0.62)
+    hold_cmds = [c for c in cmds if c.intent == "hold_torso"]
+    assert len(hold_cmds) == 1
+    h = hold_cmds[0]
+    assert h.hip_height_m == pytest.approx(0.62)
+
+
 def test_arm_man_to_locomotion_clears_latch_and_emits_idle(manager):
     cmds = _capture_planner_cmds(manager)
     _capture_audio(manager)
 
     # Pretend we're already latched.
-    manager._latched_waist = (10.0, 0.0, 20.0)
+    manager._latched_waist = (10.0, 0.0, 20.0, None)
 
     transition = ModeTransition(
         previous=StreamMode.ARM_MANIPULATION,
@@ -186,7 +211,7 @@ def test_arm_man_to_locomotion_clears_latch_and_emits_idle(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(0.0, 0.0, 0.0),
+        live_waist_target=(0.0, 0.0, 0.0, None),
     )
 
     assert manager._latched_waist is None
@@ -198,7 +223,7 @@ def test_active_to_off_clears_latch(manager):
     cmds = _capture_planner_cmds(manager)
     _capture_audio(manager)
 
-    manager._latched_waist = (8.0, 2.0, 5.0)
+    manager._latched_waist = (8.0, 2.0, 5.0, None)
     transition = ModeTransition(
         previous=StreamMode.ARM_MANIPULATION,
         current=StreamMode.OFF,
@@ -225,7 +250,7 @@ def test_off_to_locomotion_does_not_publish_hold_torso(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(0.0, 0.0, 0.0),
+        live_waist_target=(0.0, 0.0, 0.0, None),
     )
     hold_cmds = [c for c in cmds if c.intent == "hold_torso"]
     assert hold_cmds == []
@@ -243,10 +268,10 @@ def test_toggle_waist_freeze_on_captures_live_target(manager):
     assert manager._waist_frozen is False
     assert manager._latched_waist is None
 
-    manager._toggle_waist_freeze((10.0, -2.5, 18.0))
+    manager._toggle_waist_freeze((10.0, -2.5, 18.0, None))
 
     assert manager._waist_frozen is True
-    assert manager._latched_waist == (10.0, -2.5, 18.0)
+    assert manager._latched_waist == (10.0, -2.5, 18.0, None)
     keys = [m.get("key") for m in sent if m.get("_type") == "play_audio"]
     assert "torso_frozen" in keys
 
@@ -254,9 +279,9 @@ def test_toggle_waist_freeze_on_captures_live_target(manager):
 def test_toggle_waist_freeze_off_clears_latch(manager):
     sent = _capture_audio(manager)
     manager._waist_frozen = True
-    manager._latched_waist = (12.0, 0.0, 0.0)
+    manager._latched_waist = (12.0, 0.0, 0.0, None)
 
-    manager._toggle_waist_freeze((0.0, 0.0, 0.0))
+    manager._toggle_waist_freeze((0.0, 0.0, 0.0, None))
 
     assert manager._waist_frozen is False
     assert manager._latched_waist is None
@@ -267,11 +292,20 @@ def test_toggle_waist_freeze_off_clears_latch(manager):
 def test_toggle_waist_freeze_round_trip(manager):
     """Two clicks cancel out -- back to the starting state."""
     _capture_audio(manager)
-    manager._toggle_waist_freeze((5.0, 0.0, 0.0))
+    manager._toggle_waist_freeze((5.0, 0.0, 0.0, None))
     assert manager._waist_frozen is True
-    manager._toggle_waist_freeze((0.0, 0.0, 0.0))
+    manager._toggle_waist_freeze((0.0, 0.0, 0.0, None))
     assert manager._waist_frozen is False
     assert manager._latched_waist is None
+
+
+def test_toggle_waist_freeze_captures_height(manager):
+    """v7.4: hip_height_m is captured into the latched 4-tuple so the
+    R-click freeze pins squat / stand alongside lean / twist."""
+    _capture_audio(manager)
+    manager._toggle_waist_freeze((10.0, 0.0, 5.0, 0.65))
+    assert manager._waist_frozen is True
+    assert manager._latched_waist == (10.0, 0.0, 5.0, 0.65)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +321,7 @@ def test_loco_to_arm_with_active_freeze_uses_latched_pose(manager):
     _capture_audio(manager)
 
     manager._waist_frozen = True
-    manager._latched_waist = (15.0, -3.0, 25.0)
+    manager._latched_waist = (15.0, -3.0, 25.0, None)
 
     transition = ModeTransition(
         previous=StreamMode.LOCOMOTION,
@@ -297,14 +331,14 @@ def test_loco_to_arm_with_active_freeze_uses_latched_pose(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(2.0, 0.0, 5.0),  # different from the frozen pose
+        live_waist_target=(2.0, 0.0, 5.0, None),  # different from the frozen pose
     )
 
     hold_cmds = [c for c in cmds if c.intent == "hold_torso"]
     assert len(hold_cmds) == 1
     h = hold_cmds[0]
     assert (h.waist_pitch_deg, h.waist_roll_deg, h.waist_yaw_deg) == (15.0, -3.0, 25.0)
-    assert manager._latched_waist == (15.0, -3.0, 25.0)
+    assert manager._latched_waist == (15.0, -3.0, 25.0, None)
     assert manager._waist_frozen is True
 
 
@@ -316,7 +350,7 @@ def test_arm_to_loco_with_active_freeze_keeps_hold(manager):
     _capture_audio(manager)
 
     manager._waist_frozen = True
-    manager._latched_waist = (12.0, 0.0, 20.0)
+    manager._latched_waist = (12.0, 0.0, 20.0, None)
 
     transition = ModeTransition(
         previous=StreamMode.ARM_MANIPULATION,
@@ -326,7 +360,7 @@ def test_arm_to_loco_with_active_freeze_keeps_hold(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(0.0, 0.0, 0.0),
+        live_waist_target=(0.0, 0.0, 0.0, None),
     )
 
     idle_cmds = [c for c in cmds if c.intent == "idle"]
@@ -335,7 +369,7 @@ def test_arm_to_loco_with_active_freeze_keeps_hold(manager):
         f"got {idle_cmds}"
     )
     assert manager._waist_frozen is True
-    assert manager._latched_waist == (12.0, 0.0, 20.0)
+    assert manager._latched_waist == (12.0, 0.0, 20.0, None)
 
 
 def test_arm_to_loco_without_freeze_releases_as_today(manager):
@@ -345,7 +379,7 @@ def test_arm_to_loco_without_freeze_releases_as_today(manager):
     _capture_audio(manager)
 
     manager._waist_frozen = False
-    manager._latched_waist = (8.0, 0.0, 15.0)  # left over from B-latch entry
+    manager._latched_waist = (8.0, 0.0, 15.0, None)  # left over from B-latch entry
 
     transition = ModeTransition(
         previous=StreamMode.ARM_MANIPULATION,
@@ -355,7 +389,7 @@ def test_arm_to_loco_without_freeze_releases_as_today(manager):
         transition,
         vr_pose=np.zeros(9, dtype=np.float32),
         tick=0,
-        live_waist_target=(0.0, 0.0, 0.0),
+        live_waist_target=(0.0, 0.0, 0.0, None),
     )
 
     assert manager._latched_waist is None
@@ -368,7 +402,7 @@ def test_off_transition_clears_freeze(manager):
     _capture_audio(manager)
 
     manager._waist_frozen = True
-    manager._latched_waist = (10.0, 0.0, 0.0)
+    manager._latched_waist = (10.0, 0.0, 0.0, None)
 
     transition = ModeTransition(
         previous=StreamMode.LOCOMOTION,

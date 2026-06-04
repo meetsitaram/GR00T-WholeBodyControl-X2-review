@@ -69,7 +69,7 @@ flowchart LR
     subgraph Mgr["quest3_manager_x2 (single Python process)"]
         Q3R["Quest3Reader<br/>(WS + HTTPS<br/>background threads)"]
         IK["Retargeter<br/>(IK + finger map)"]
-        ID["IntentDecoder<br/>(L stick + R stick + B/A/X/Y<br/>v7: R stick continuous waist hold<br/>v7.1: R-click toggles waist freeze;<br/>L-click cycles deploy camera)"]
+        ID["IntentDecoder<br/>(L stick + R stick + B/A/X/Y<br/>v7: R stick continuous waist hold<br/>v7.1: R-click toggles waist freeze;<br/>L-click cycles deploy camera<br/>v7.4: R-stick bidirectional pitch + yaw-priority cone;<br/>L-stick (ARM_MAN only) -> roll + continuous hip-height squat/stand)"]
         VCC["ViewerCameraCycler<br/>(xdotool)"]
     end
 
@@ -166,7 +166,7 @@ sequenceDiagram
 
     H->>M: WS JSON {pose, hand_curls, oppose, buttons, sticks}
     M->>M: IK retarget (arms) + finger map (hands)
-    M->>M: IntentDecoder (L stick + R stick + buttons -> LocomotionCmd<br/>v7: R stick -> hold_torso(pitch,roll,yaw); B-press latches in ARM_MAN)
+    M->>M: IntentDecoder (L stick + R stick + buttons -> LocomotionCmd<br/>v7: R stick -> hold_torso(pitch,roll,yaw); B-press latches in ARM_MAN<br/>v7.4: R-stick pitch is signed; ARM_MAN L-stick -> hold_torso(roll,hip_height_m))
 
     par To planner
         M->>P: 5563 planner_cmd<br/>{intent, magnitude}
@@ -219,7 +219,7 @@ lines 141-153 — bumping any of them requires updating every consumer.
 |------|-------|-----------|------|------|---------|
 | **5556** | `pose` | recorder PUB → C++ deploy SUB **and** bridge OmniHand SUB | packed | 50 Hz | `joint_pos_mj` (f32, 31), `root_quat_xyzw` (f32, 4), `motion_token` (f32, 64), `left_hand_joints` / `right_hand_joints` (f32, 10), `frame_index` (i64), optional `joint_pos_mj_future` (f32, 9×31), `root_quat_xyzw_future` (f32, 9×4), `joint_vel_mj_future` (f32, 9×31), `frame_index_future` (i64, 9), `future_dt_s` (f32) |
 | **5557** | `x2_debug` | C++ deploy PUB → recorder SUB | packed | 50 Hz | `control_tick` (i64), `ros_timestamp` / `policy_time` (f64), `base_quat` (f64, 4), `base_ang_vel` (f64, 3), `body_q` / `body_dq` / `last_action` (f64, 31), `left_hand_q` / `right_hand_q` (f64, 10), `hand_frame_idx` (i64), `ramp_alpha` (f64), `tilt_trip` / `dry_run` (u8) |
-| **5563** | `planner_cmd` | manager PUB → planner SUB | multipart `[topic, json]` | edge-triggered (intent change) + idle keep-alives | `{"intent": str, "magnitude": str}`, plus optional v7 `waist_pitch_deg`, `waist_roll_deg`, `waist_yaw_deg` floats when `intent == "hold_torso"` (continuous waist hold; see [`x2_heuristic_planner.md`](x2_heuristic_planner.md#v7-continuous-waist-hold-static_hold)) |
+| **5563** | `planner_cmd` | manager PUB → planner SUB | multipart `[topic, json]` | edge-triggered (intent change) + idle keep-alives | `{"intent": str, "magnitude": str}`, plus optional v7 `waist_pitch_deg`, `waist_roll_deg`, `waist_yaw_deg` floats when `intent == "hold_torso"` (continuous waist hold; see [`x2_heuristic_planner.md`](x2_heuristic_planner.md#v7-continuous-waist-hold-static_hold)) and an optional v7.4 `hip_height_m` float (continuous hip-height target — kplanner only; the heuristic planner ignores the field and synthesizes a frozen-feet pose at `DEFAULT_PELVIS_Z_M`) |
 | **5564** | `arm_targets`, `hand_finger_cmd`, `stream_mode`, `recorder_cmd` (multiplexed on **one** PUB socket) | manager PUB → recorder SUB | multipart `[topic, msgpack/json]` | 50 Hz (arm/hand/mode); edge-triggered (recorder_cmd) | `arm_targets`: 14 floats (left_q ‖ right_q). `hand_finger_cmd`: `{left_hand_q[10], right_hand_q[10]}`. `stream_mode`: `{mode: "OFF"|"LOCOMOTION"|"ARM_MANIPULATION"}`. `recorder_cmd`: `{op: "start"|"save"|"discard"|"estop", tick: int}` |
 | **5565** | `body_pose` | planner PUB → recorder SUB | packed | 50 Hz | Same packed schema as `pose` (planner builds the future window via `state_machine.build_pose_payload`) |
 

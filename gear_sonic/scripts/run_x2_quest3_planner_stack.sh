@@ -396,10 +396,15 @@ KPLANNER_DEVICE="cuda"
 KPLANNER_REPLAN_THRESHOLD_FRAMES="2"
 
 # Runtime velocity tuning passed straight through to ``x2_kplanner.py``.
-# Default empty -> let the daemon use its own defaults (yaw-lock on at
-# 0.05 rad/s, all direction scales 1.0). Override via wrapper flags or
-# environment variables when the operator wants to compensate for the
-# model's L/R asymmetry or quell yaw drift more / less aggressively.
+# Default empty -> let the daemon use its own defaults (yaw-lock OFF
+# == epsilon 0.0 rad/s; all direction scales 1.0). Set
+# KPLANNER_YAW_LOCK_EPSILON=0.05 to enable the legacy yaw-pin behaviour
+# (pin commanded yaw to the persisted root quat whenever |yaw_rate| <
+# 0.05 rad/s; useful when the model has yaw drift in forward-only walks
+# but warning: it can also stop the robot from turning at all if set
+# higher than the operator's stick yaw rate). Override via wrapper
+# flags or environment variables when compensating for the model's L/R
+# asymmetry or quelling yaw drift more / less aggressively.
 KPLANNER_YAW_LOCK_EPSILON="${KPLANNER_YAW_LOCK_EPSILON:-}"
 KPLANNER_TURN_LEFT_SCALE="${KPLANNER_TURN_LEFT_SCALE:-}"
 KPLANNER_TURN_RIGHT_SCALE="${KPLANNER_TURN_RIGHT_SCALE:-}"
@@ -1821,6 +1826,7 @@ ${C_GREEN}┌──────────────────────�
   pc2 host         : $([[ -n "${PC2_HOST}" ]] && echo "${PC2_HOST}  (single-arg fan-out: drives the two split-topology lines below)" || echo "(not set; using --remote-deploy/--x2-debug-bridge-host directly)")
   remote-deploy    : $([[ -n "${REMOTE_DEPLOY_HOST}" ]] && echo "ON  -> ${REMOTE_DEPLOY_HOST} (recorder x2_debug SUB redirected; manager resume PUB :${RESUME_PUB_PORT}; manager motor_monitor SUB tcp://${REMOTE_DEPLOY_HOST}:${MOTOR_MONITOR_PORT})" || echo "off")
   x2_debug bridge  : $([[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 ]] && echo "ON  -> SUB tcp://${X2_DEBUG_BRIDGE_HOST}:${X2_DEBUG_BRIDGE_PORT}@${X2_DEBUG_BRIDGE_TOPIC} -> PUB tcp://127.0.0.1:${POSE_FEEDBACK_PORT}@${POSE_FEEDBACK_TOPIC} (rate-cap ${X2_DEBUG_BRIDGE_RATE_CAP_HZ}Hz; feeds kplanner pose-feedback so first frame doesn't twist back to world +X)" || echo "off (sim run or --no-x2-debug-bridge; kplanner pose-feedback may be a no-op)")
+  pose-feedback    : $([[ "${WITH_POSE_FEEDBACK}" -eq 1 ]] && echo "ON  scope=${KPLANNER_POSE_RESEED_SCOPE:-none} (PLAYING reseed=$([[ "${KPLANNER_POSE_RESEED_SCOPE:-none}" == "none" ]] && echo "off, integrates open-loop" || echo "${KPLANNER_POSE_RESEED_SCOPE:-none}") -- IDLE yaw refresh still runs for snap-back protection)" || echo "OFF (--no-pose-feedback; kplanner publishes stale yaw refs but is fully open-loop)")
   pose-ref watchdog: ${POSE_REF_WATCHDOG_RESOLVED} (cli=${POSE_REF_WATCHDOG}; off=--disable-pose-ref-watchdog forwarded to deploy; on=C++ default 0.5 s SAFE_IDLE trip)
   ONNX model       : ${SIM_MODEL}
   motion_token     : $([[ -n "${SONIC_CHECKPOINT}" ]] && echo "ON  (${SONIC_CHECKPOINT}, ${SONIC_TOKENIZER_DEVICE})" || echo "DISABLED (action.motion_token = zeros; dataset will NOT be VLA-trainable)")
@@ -2234,16 +2240,24 @@ else
         )
         # Reseed-scope hygiene. ``full_root`` (the kplanner default)
         # overwrites slots [0:7] of the planner's context buffer (xyz +
-        # quat) with each reseed sample. That's correct in sim where the
-        # MuJoCo bridge supplies ground-truth qpos, but BOTH ``full_root``
-        # and the seemingly-safer ``quat_only`` cause regressions on the
-        # real-robot x2_debug bridge:
+        # quat) with each reseed sample. Every scope other than
+        # ``none`` regresses something in this stack:
         #
-        #   * ``full_root``  -- bridge has no position sensor and
-        #                       publishes xy=z=0, so the planner's xy
-        #                       history gets teleported to the origin
-        #                       every reseed tick -> catastrophic
-        #                       instability during walk / turn.
+        #   * ``full_root``  -- on the real-robot x2_debug bridge the
+        #                       publisher has no position sensor and
+        #                       sends xy=z=0, teleporting the planner's
+        #                       xy history to the origin every reseed
+        #                       tick -> catastrophic instability during
+        #                       walk / turn. AND on the local-sim path
+        #                       the MuJoCo bridge's qpos is the
+        #                       SONIC-tracked pose, which lags the
+        #                       planner reference; feeding that lagged
+        #                       pose back as "ground truth" each replan
+        #                       collapses the planner's commanded motion
+        #                       into the lag (operator-verified 2026-06:
+        #                       robot crawls / barely turns on full
+        #                       stick vs. responsive when the reseed is
+        #                       off).
         #   * ``quat_only`` -- model integrates yaw open-loop and the
         #                       physical robot lags the reference
         #                       (inertia / tracking dynamics); pinning
@@ -2262,11 +2276,18 @@ else
         #                       only, no neural-buffer mutation. Net:
         #                       snap-back protection without the
         #                       PLAYING-side correctness penalty.
+        #
+        # Conclusion: ``scope=none`` is the right default for every path
+        # we currently ship (real-bridge AND local-sim). Override with
+        # ``KPLANNER_POSE_RESEED_SCOPE=full_root`` if you're A/B testing
+        # against the old behaviour.
+        POSE_RESEED_SCOPE_DEFAULT="none"
+        POSE_RESEED_SCOPE="${KPLANNER_POSE_RESEED_SCOPE:-${POSE_RESEED_SCOPE_DEFAULT}}"
+        PLANNER_ARGS+=(--pose-reseed-scope "${POSE_RESEED_SCOPE}")
         if [[ "${WITH_X2_DEBUG_BRIDGE}" -eq 1 ]]; then
-            PLANNER_ARGS+=(--pose-reseed-scope none)
-            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=none -- IMU-only bridge; snap-back guarded by IDLE_LOOP + IDLE->PLAYING + startup yaw refreshes)"
+            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=${POSE_RESEED_SCOPE} -- IMU-only bridge; snap-back guarded by IDLE_LOOP + IDLE->PLAYING + startup yaw refreshes)"
         else
-            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=full_root -- MuJoCo bridge has ground-truth xy/z)"
+            log "  closed-loop pose feedback: SUB tcp://${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT} topic=${POSE_FEEDBACK_TOPIC} (max_age=${POSE_FEEDBACK_MAX_AGE_S}s, scope=${POSE_RESEED_SCOPE} -- local-sim MuJoCo bridge; full_root regressed responsiveness, default flipped to none 2026-06)"
         fi
     else
         log "  closed-loop pose feedback: DISABLED (--no-pose-feedback); kplanner will publish stale yaw refs"
@@ -2496,14 +2517,20 @@ ${C_YELLOW}┌──────────────────────
 │    L stick L/R       side_left_step / side_right_step                │
 │    R stick L/R hard  turn_left_45deg / turn_right_45deg              │
 │    R stick L/R hard + X held   turn_left_90deg / turn_right_90deg    │
-│  Continuous waist (v7; soft R stick, position-mapped, slewed 60deg/s):│
-│    R stick fwd / back  forward / backward lean (clamp +/-20deg)      │
+│  Continuous waist (v7.4; position-mapped, slewed 60deg/s,           │
+│  yaw-priority cone on R-stick, roll-priority cone on L-stick):       │
+│    R stick fwd / back  bidirectional lean (clamp +/-20deg)           │
 │    R stick L/R soft    torso twist L/R       (clamp +/-40deg)        │
-│    (v7.2: lateral lean / roll removed -- A+R-stick is unreachable    │
-│     mid-lean with a single right thumb. Chain twist+lean instead.)   │
-│  v7.2: R-stick lean+twist now ALSO active in ARM_MANIPULATION        │
-│    (walk / turn still LOCO-only -- arm IK targets ride the torso so  │
-│     leaning extends reach, but a base translation would break IK).   │
+│    (yaw-priority cone: |rx| dominating |ry| past 0.4 suppresses     │
+│     pitch so a near-pure twist doesn't accidentally lean the body.)  │
+│  v7.4: R-stick lean+twist active in BOTH LOCOMOTION + ARM_MAN.       │
+│  ARM_MANIPULATION L-stick (v7.4; ignored in LOCOMOTION):             │
+│    L stick L/R         lateral lean / roll      (clamp +/-10deg)     │
+│    L stick fwd         continuous SQUAT (default ~9cm down)          │
+│    L stick back        continuous STAND-UP (default ~4cm up)         │
+│    (roll-priority cone: |lx| dominating |ly| past 0.4 suppresses    │
+│     hip-height so a pure roll doesn't accidentally squat. Hip       │
+│     height is kplanner-only -- the heuristic planner ignores it.)   │
 │  Note: the planner-log "command" appears flipped vs. the operator    │
 │  intent because the curated bins were authored in a body frame       │
 │  rotated 180 deg from the bridge's RSI init. End-to-end behaviour    │
@@ -2513,7 +2540,7 @@ ${C_YELLOW}┌──────────────────────
 │    X press           start episode (--with-record only)              │
 │    Y press           stop & save episode (--with-record only)        │
 │    R stick           SAME lean / twist as in LOCOMOTION (v7.2)       │
-│    L stick           NO-OP (walk / step gated to LOCO mode)          │
+│    L stick           roll (lx) + squat / stand (ly) (v7.4)           │
 │  (B-single still toggles LOCOMOTION <-> ARM_MANIPULATION; no chord.) │
 │  Headset audio for X/Y ('Recording.' / 'Saved.') is gated on the     │
 │  manager's --recorder-enabled flag (set iff --with-record). In       │

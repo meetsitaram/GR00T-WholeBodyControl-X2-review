@@ -144,6 +144,19 @@ class LocomotionCommand:
     # Heuristic planner: ignored (the heuristic uses ``as_bin_name`` and
     # has no raw-velocity surface; PKL replay is kplanner-only).
     direct_velocity: tuple[float, float, float, float] | None = None
+    # Optional override for the kplanner velocity tuple's 4th channel
+    # (``hip_h`` in metres). When non-None and ``intent == "hold_torso"``,
+    # the kplanner's ``intent_to_velocity`` substitutes this value into
+    # the channel-3 slot of ``_IDLE_INTENT`` so the operator's L-stick Y
+    # squat / stand drives the model's continuous hip-height target.
+    # Defaults to ``None`` so legacy callers (heuristic planner, every
+    # non-hold intent, and any hold_torso command that does not want a
+    # height delta) continue to use the planner's default hip height.
+    #
+    # Heuristic planner: ignored. The heuristic's STATIC_HOLD path
+    # synthesizes a frozen-feet waist pose; height is owned by the
+    # kplanner's neural model only.
+    hip_height_m: float | None = None
 
     def is_hold_torso(self) -> bool:
         return self.intent == HOLD_TORSO_INTENT

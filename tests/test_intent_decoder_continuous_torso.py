@@ -1,27 +1,34 @@
 """Tests for the continuous-torso path in :mod:`intent_decoder`.
 
-Pins the right-stick -> ``hold_torso`` mapping the Quest 3 manager
-relies on to drive STATIC_HOLD. Covers:
+Pins the stick -> ``hold_torso`` mapping the Quest 3 manager relies on
+to drive STATIC_HOLD / kplanner waist overlay. Covers:
 
-  - ``ry`` -> positive ``waist_pitch_deg`` (forward lean only).
-  - ``rx`` -> negative ``waist_yaw_deg`` (twist). v7.2: roll is
-    always 0 from the operator path; A-held no longer remaps rx
-    to roll because the operator's right thumb cannot reach A
-    while driving the R-stick on the same controller.
+  - ``ry`` -> signed ``waist_pitch_deg`` (forward + backward lean,
+    v7.4 -- pre-v7.4 the negative side was clamped to 0).
+  - ``rx`` -> negative ``waist_yaw_deg`` (twist). v7.2: A-held no
+    longer remaps rx to roll because the operator's right thumb
+    cannot reach A while driving the R-stick on the same controller.
+  - Yaw-priority cone (v7.4): when |rx| dominates |ry| past
+    ``pitch_dominance_ratio``, the pitch axis is suppressed so a
+    near-pure twist doesn't accidentally lean the body.
   - Deadzone yields neutral target.
   - Soft-band stick produces ``hold_torso`` (NOT discrete bins).
   - Hard ``rx`` deflection still wins as ``turn_*`` (operator wants to
     pivot, not lean).
   - Throttle: small noise around an existing target does NOT re-emit;
     a perceptible change DOES re-emit.
-  - ``continuous_waist_target`` returns the same clamped (pitch, roll,
-    yaw) tuple regardless of mode (used by the manager for B-press
-    latching).
-  - Mode gating (v7.2): in ARM_MANIPULATION the decoder allows
-    ``hold_torso`` through (lean / twist still steer the waist for
-    extra arm reach) but filters out walk / step / turn commands so
-    the base never slides under the operator's IK targets. In
-    LOCOMOTION the full vocabulary flows. In OFF nothing flows.
+  - ``continuous_waist_target`` returns the clamped 4-tuple ``(pitch,
+    roll, yaw, hip_height_m)`` regardless of mode (used by the manager
+    for B-press latching).
+  - Mode gating (v7.2 + v7.4): in ARM_MANIPULATION the decoder allows
+    ``hold_torso`` through (lean / twist / roll / squat all steer the
+    waist for extra arm reach + reach envelope) but filters out walk /
+    step / turn commands so the base never slides under the operator's
+    IK targets. In LOCOMOTION the L-stick still owns step / side /
+    walk; the L-stick contribution to roll + height is suppressed.
+    In OFF nothing flows.
+  - ARM_MAN L-stick (v7.4): roll (lx) + continuous hip height (ly,
+    squat / stand). Roll-priority cone gates height against roll.
   - Backward-compat: ``enable_continuous_torso=False`` (default)
     preserves the legacy decoder semantics covered by
     ``test_intent_decoder.py``.
@@ -68,7 +75,18 @@ def _make_decoder(
     max_roll: float = 10.0,
     max_yaw: float = 40.0,
     chord_debounce_s: float = 0.0,
+    pitch_dominance_ratio: float = 0.0,  # tests assume axes are independent
+    height_dominance_ratio: float = 0.0,
+    enable_arm_man_lstick: bool = True,
+    max_height_down_m: float = 0.09,
+    max_height_up_m: float = 0.04,
+    default_hip_height_m: float = 0.687,
+    hold_height_threshold_m: float = 0.005,
 ) -> IntentDecoder:
+    """Build a decoder with the dominance cones disabled by default so
+    legacy tests (which exercise individual axes one at a time) keep
+    their semantics. Tests that exercise the cones pass non-zero
+    ratios explicitly."""
     dec = IntentDecoder(
         stick_deadzone=deadzone,
         chord_debounce_s=chord_debounce_s,
@@ -77,6 +95,13 @@ def _make_decoder(
         max_waist_pitch_deg=max_pitch,
         max_waist_roll_deg=max_roll,
         max_waist_yaw_deg=max_yaw,
+        pitch_dominance_ratio=pitch_dominance_ratio,
+        height_dominance_ratio=height_dominance_ratio,
+        enable_arm_man_lstick=enable_arm_man_lstick,
+        max_height_down_m=max_height_down_m,
+        max_height_up_m=max_height_up_m,
+        default_hip_height_m=default_hip_height_m,
+        hold_height_threshold_m=hold_height_threshold_m,
     )
     dec.update_mode(_abxy_chord(), now=0.0)
     assert dec.mode is StreamMode.LOCOMOTION
@@ -139,13 +164,25 @@ def test_ry_positive_emits_pitch_only() -> None:
     assert cmd.waist_yaw_deg == 0.0
 
 
-def test_ry_negative_does_not_lean_back() -> None:
-    """Backward lean has no primitive; the decoder must clamp to 0."""
+def test_ry_negative_emits_negative_pitch_v7_4() -> None:
+    """v7.4: backward lean is now bidirectional. ry < 0 produces
+    negative ``waist_pitch_deg``; the kplanner's waist overlay (and
+    the heuristic STATIC_HOLD path) accept signed pitch and lean the
+    body the requested direction."""
     dec = _make_decoder()
     cmd = dec.decode_locomotion(0.0, 0.0, rx=0.0, ry=-0.9, y_held=False, now=0.0)
     assert cmd is not None
     assert cmd.intent == "hold_torso"
-    assert cmd.waist_pitch_deg == 0.0
+    assert cmd.waist_pitch_deg < 0.0
+
+
+def test_ry_negative_full_deflection_clamped_to_minus_max_pitch() -> None:
+    """Backward lean is symmetric with forward lean: full -ry deflection
+    clamps to ``-max_waist_pitch_deg``."""
+    dec = _make_decoder(max_pitch=20.0)
+    cmd = dec.decode_locomotion(0.0, 0.0, rx=0.0, ry=-1.0, y_held=False, now=0.0)
+    assert cmd is not None
+    assert cmd.waist_pitch_deg == pytest.approx(-20.0)
 
 
 def test_ry_full_deflection_clamped_to_max_pitch() -> None:
@@ -197,12 +234,13 @@ def test_a_held_left_no_longer_emits_roll() -> None:
     assert cmd.waist_yaw_deg > 0.0
 
 
-def test_roll_axis_never_emitted_from_operator_path() -> None:
-    """Sweep a few stick configurations and confirm roll is always 0.
+def test_roll_axis_not_emitted_from_locomotion_rstick_path() -> None:
+    """In LOCOMOTION mode, sweeping the R-stick alone (lx=ly=0) must not
+    leak any roll target -- L-stick X-axis owns side-step there.
 
-    Future scripted demos can still emit roll directly via the wire
-    format (``LocomotionCommand.waist_roll_deg``); this test only
-    pins that the *operator-driven* decoder path never produces it."""
+    v7.4 ARM_MANIPULATION decodes lx as roll, but that is a separate
+    test (see ``test_arm_man_lstick_lx_emits_roll``). The wire format
+    still reserves the field for scripted demos / future VLA outputs."""
     dec = _make_decoder()
     samples = [
         (0.0, 0.0, False, False),
@@ -223,7 +261,7 @@ def test_roll_axis_never_emitted_from_operator_path() -> None:
         if cmd is None or cmd.intent != "hold_torso":
             continue
         assert cmd.waist_roll_deg == 0.0, (
-            f"roll leaked from operator path: rx={rx} ry={ry} "
+            f"roll leaked from LOCO operator path: rx={rx} ry={ry} "
             f"a_held={a_held} x_held={x_held} -> {cmd}"
         )
 
@@ -371,18 +409,23 @@ def test_repeat_interval_re_emits_after_window_elapsed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_continuous_waist_target_returns_clamped_tuple() -> None:
+def test_continuous_waist_target_returns_clamped_4tuple() -> None:
     dec = _make_decoder(max_pitch=20.0, max_yaw=40.0)
-    pitch, roll, yaw = dec.continuous_waist_target(rx=0.5, ry=0.5)
+    pitch, roll, yaw, hip_h = dec.continuous_waist_target(rx=0.5, ry=0.5)
     assert pitch > 0.0
     assert roll == 0.0
     assert yaw < 0.0
+    # LOCOMOTION mode (default for _make_decoder): L-stick is silent
+    # in the waist path, so hip_height_m must be None even though the
+    # decoder accepts the lx / ly defaults.
+    assert hip_h is None
 
 
 def test_continuous_waist_target_neutral_for_in_deadzone() -> None:
     dec = _make_decoder(deadzone=0.3)
-    pitch, roll, yaw = dec.continuous_waist_target(rx=0.1, ry=0.1)
+    pitch, roll, yaw, hip_h = dec.continuous_waist_target(rx=0.1, ry=0.1)
     assert (pitch, roll, yaw) == (0.0, 0.0, 0.0)
+    assert hip_h is None
 
 
 def test_continuous_waist_target_a_held_kwarg_is_ignored() -> None:
@@ -391,13 +434,13 @@ def test_continuous_waist_target_a_held_kwarg_is_ignored() -> None:
     parameter is now ignored. The result must match the call with the
     kwarg omitted."""
     dec = _make_decoder()
-    pitch_a, roll_a, yaw_a = dec.continuous_waist_target(
+    pitch_a, roll_a, yaw_a, hip_a = dec.continuous_waist_target(
         rx=0.5, ry=0.0, a_held=True,
     )
-    pitch_b, roll_b, yaw_b = dec.continuous_waist_target(
+    pitch_b, roll_b, yaw_b, hip_b = dec.continuous_waist_target(
         rx=0.5, ry=0.0, a_held=False,
     )
-    assert (pitch_a, roll_a, yaw_a) == (pitch_b, roll_b, yaw_b)
+    assert (pitch_a, roll_a, yaw_a, hip_a) == (pitch_b, roll_b, yaw_b, hip_b)
     assert roll_a == 0.0
     assert yaw_a < 0.0  # rx still drives yaw, ignoring A
 
@@ -408,11 +451,15 @@ def test_continuous_waist_target_works_independent_of_mode() -> None:
         stick_deadzone=0.3,
         chord_debounce_s=0.0,
         enable_continuous_torso=False,  # off!
+        pitch_dominance_ratio=0.0,
     )
     assert dec.mode is StreamMode.OFF
-    pitch, roll, yaw = dec.continuous_waist_target(rx=0.5, ry=0.5)
+    pitch, roll, yaw, hip_h = dec.continuous_waist_target(rx=0.5, ry=0.5)
     assert pitch > 0.0
     assert yaw < 0.0
+    # OFF mode is not ARM_MANIPULATION, so the L-stick height path
+    # is gated off; hip_h must be None regardless of (lx, ly).
+    assert hip_h is None
 
 
 # ---------------------------------------------------------------------------
@@ -481,30 +528,29 @@ def test_arm_man_passes_neutral_hold_torso_through() -> None:
     )
 
 
-def test_arm_man_filters_walk_command() -> None:
-    """Left-stick walking must NOT bleed into ARM_MAN -- it would slide
-    the IK reference frame out from under the operator's hands."""
+def test_arm_man_lstick_y_emits_hold_torso_not_walk_v7_4() -> None:
+    """v7.4: in ARM_MANIPULATION the L-stick Y axis is owned by the
+    waist path (squat / stand) -- it must NEVER emit ``walk`` /
+    ``fwd_step`` / ``back_step`` (which would slide the IK reference
+    frame out from under the operator's hands). The decoder routes
+    L-stick deflections in ARM_MAN through ``_continuous_hold_cmd``
+    instead, producing a ``hold_torso`` with a hip-height override."""
     dec = _make_arm_man_decoder()
     cmd = dec.decode_locomotion(0.0, 0.9, rx=0.0, ry=0.0, y_held=False, now=2.0)
-    assert cmd is None, "walk leaked into ARM_MANIPULATION"
+    assert cmd is not None
+    assert cmd.intent == "hold_torso", f"L-stick Y leaked discrete intent: {cmd}"
+    assert cmd.hip_height_m is not None
 
 
-def test_arm_man_filters_fwd_step() -> None:
-    dec = _make_arm_man_decoder()
-    cmd = dec.decode_locomotion(0.0, 0.5, rx=0.0, ry=0.0, y_held=False, now=2.0)
-    assert cmd is None, "fwd_step leaked into ARM_MANIPULATION"
-
-
-def test_arm_man_filters_back_step() -> None:
-    dec = _make_arm_man_decoder()
-    cmd = dec.decode_locomotion(0.0, -0.5, rx=0.0, ry=0.0, y_held=False, now=2.0)
-    assert cmd is None, "back_step leaked into ARM_MANIPULATION"
-
-
-def test_arm_man_filters_side_step() -> None:
+def test_arm_man_lstick_x_emits_hold_torso_not_side_step_v7_4() -> None:
+    """v7.4: L-stick X-axis owns roll in ARM_MANIPULATION (not
+    side-step). Same rationale as the Y-axis: discrete locomotion
+    bins would slide the IK frame."""
     dec = _make_arm_man_decoder()
     cmd = dec.decode_locomotion(0.9, 0.0, rx=0.0, ry=0.0, y_held=False, now=2.0)
-    assert cmd is None, "side step leaked into ARM_MANIPULATION"
+    assert cmd is not None
+    assert cmd.intent == "hold_torso", f"L-stick X leaked discrete intent: {cmd}"
+    assert cmd.waist_roll_deg > 0.0
 
 
 def test_arm_man_filters_turn_command() -> None:
@@ -564,3 +610,275 @@ def test_off_blocks_everything() -> None:
         assert dec.decode_locomotion(
             lx, ly, rx=rx, ry=ry, y_held=False, now=0.0,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# v7.4: dominance cones (R-stick yaw priority + L-stick roll priority)
+# ---------------------------------------------------------------------------
+
+
+def test_yaw_priority_cone_suppresses_pitch_when_rx_dominates() -> None:
+    """Cone fires when |ry| past deadzone but |ry| < ratio*|rx|. Pick
+    ratio=0.8 so the inequality has room: with rx=0.6 the threshold
+    is 0.48; ry=0.35 (just past 0.3 deadzone) sits well below 0.48
+    so the cone should suppress pitch."""
+    dec = _make_decoder(pitch_dominance_ratio=0.8)
+    cmd = dec.decode_locomotion(0.0, 0.0, rx=0.6, ry=0.35, y_held=False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_pitch_deg == 0.0
+    assert cmd.waist_yaw_deg < 0.0
+
+
+def test_yaw_priority_cone_allows_pitch_when_ry_dominates() -> None:
+    """When ry dominates the cone allows both axes."""
+    dec = _make_decoder(pitch_dominance_ratio=0.4)
+    cmd = dec.decode_locomotion(0.0, 0.0, rx=0.5, ry=0.7, y_held=False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_pitch_deg > 0.0
+    assert cmd.waist_yaw_deg < 0.0
+
+
+def test_yaw_priority_cone_disabled_when_ratio_zero() -> None:
+    """ratio=0 -> the cone never suppresses; both axes fire whenever
+    they're past the deadzone."""
+    dec = _make_decoder(pitch_dominance_ratio=0.0)
+    cmd = dec.decode_locomotion(0.0, 0.0, rx=0.6, ry=0.35, y_held=False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_pitch_deg > 0.0
+    assert cmd.waist_yaw_deg < 0.0
+
+
+def test_yaw_priority_cone_does_not_block_pure_pitch() -> None:
+    """Pure forward lean (|rx| in deadzone) is never suppressed -- the
+    cone only acts when both axes are active."""
+    dec = _make_decoder(pitch_dominance_ratio=0.9)  # very strict
+    cmd = dec.decode_locomotion(0.0, 0.0, rx=0.0, ry=0.5, y_held=False, now=0.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_pitch_deg > 0.0
+
+
+# ---------------------------------------------------------------------------
+# v7.4: ARM_MANIPULATION L-stick decoding (roll + continuous height)
+# ---------------------------------------------------------------------------
+
+
+def _make_arm_man_decoder_v74(**kwargs) -> IntentDecoder:
+    dec = _make_decoder(**kwargs)
+    b_only = ButtonEvents(
+        a_pressed=False, b_pressed=True, x_pressed=False, y_pressed=False,
+        ab_pressed=False, xy_pressed=False,
+        ax_pressed=False, by_pressed=False,
+        abxy_pressed=False,
+    )
+    transition = dec.update_mode(b_only, now=1.0)
+    assert transition is not None
+    assert dec.mode is StreamMode.ARM_MANIPULATION
+    return dec
+
+
+def test_arm_man_lstick_lx_emits_positive_roll() -> None:
+    """v7.4: ARM_MAN L-stick X drives waist roll. lx > 0 -> positive
+    waist_roll_deg (operator's right-side lean)."""
+    dec = _make_arm_man_decoder_v74()
+    cmd = dec.decode_locomotion(0.5, 0.0, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_roll_deg > 0.0
+    assert cmd.waist_pitch_deg == 0.0
+    assert cmd.waist_yaw_deg == 0.0
+
+
+def test_arm_man_lstick_lx_negative_emits_negative_roll() -> None:
+    dec = _make_arm_man_decoder_v74()
+    cmd = dec.decode_locomotion(-0.5, 0.0, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.waist_roll_deg < 0.0
+
+
+def test_arm_man_lstick_ly_negative_emits_squat_below_default() -> None:
+    """Quest3 convention: ly < 0 = stick pushed forward (away from
+    operator) -> hip DOWN (squat). Asymmetric clamp: full forward
+    push gives default - max_height_down_m."""
+    default_h = 0.687
+    dec = _make_arm_man_decoder_v74(
+        default_hip_height_m=default_h,
+        max_height_down_m=0.09,
+        max_height_up_m=0.04,
+    )
+    cmd = dec.decode_locomotion(0.0, -1.0, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.hip_height_m is not None
+    assert cmd.hip_height_m == pytest.approx(default_h - 0.09)
+
+
+def test_arm_man_lstick_ly_positive_emits_stand_above_default() -> None:
+    default_h = 0.687
+    dec = _make_arm_man_decoder_v74(
+        default_hip_height_m=default_h,
+        max_height_down_m=0.09,
+        max_height_up_m=0.04,
+    )
+    cmd = dec.decode_locomotion(0.0, 1.0, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.hip_height_m is not None
+    assert cmd.hip_height_m == pytest.approx(default_h + 0.04)
+
+
+def test_arm_man_lstick_ly_in_deadzone_yields_no_height_override() -> None:
+    """In-deadzone ly leaves hip_height_m at None (== "use planner
+    default") so a tiny ly noise around neutral doesn't compete with
+    the kplanner's idle hip-height target."""
+    dec = _make_arm_man_decoder_v74(deadzone=0.3)
+    cmd = dec.decode_locomotion(0.0, 0.1, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.hip_height_m is None
+
+
+def test_locomotion_lstick_does_not_emit_height_or_roll() -> None:
+    """Sanity: in LOCOMOTION mode the L-stick still owns step / side /
+    walk; the v7.4 roll + height decoding does NOT activate. A neutral
+    R-stick (so the discrete-stick path is a no-op) and a small soft
+    L-stick lx that's past the deadzone should produce ``side_*`` (or
+    ``hold_torso`` with roll=0 / height=None if the L-stick is in
+    deadzone), never roll or height. Use a sub-deadzone L-stick to
+    fall through to the hold_torso branch."""
+    dec = _make_decoder()
+    assert dec.mode is StreamMode.LOCOMOTION
+    cmd = dec.decode_locomotion(
+        0.1, 0.1, rx=0.0, ry=0.0, y_held=False, now=0.0,
+    )
+    assert cmd is not None
+    if cmd.intent == "hold_torso":
+        assert cmd.waist_roll_deg == 0.0
+        assert cmd.hip_height_m is None
+
+
+def test_arm_man_lstick_disabled_via_flag() -> None:
+    """``enable_arm_man_lstick=False`` restores v7.3 behaviour:
+    L-stick is silent in ARM_MAN. The R-stick lean still works."""
+    dec = _make_arm_man_decoder_v74(enable_arm_man_lstick=False)
+    cmd = dec.decode_locomotion(
+        0.5, -0.5, rx=0.0, ry=0.5, y_held=False, now=2.0,
+    )
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_pitch_deg > 0.0
+    assert cmd.waist_roll_deg == 0.0
+    assert cmd.hip_height_m is None
+
+
+# ---------------------------------------------------------------------------
+# v7.4: roll-priority cone (L-stick height suppression on roll dominance)
+# ---------------------------------------------------------------------------
+
+
+def test_roll_priority_cone_suppresses_height_when_lx_dominates() -> None:
+    """Cone fires when |ly| past deadzone but |ly| < ratio*|lx|. Pick
+    ratio=0.8 so the inequality has room: with lx=0.5 the threshold
+    is 0.40; ly=0.35 (just past 0.3 deadzone) sits well below 0.40
+    so the cone should suppress hip_height_m."""
+    dec = _make_arm_man_decoder_v74(height_dominance_ratio=0.8)
+    cmd = dec.decode_locomotion(0.5, 0.35, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.intent == "hold_torso"
+    assert cmd.waist_roll_deg > 0.0
+    assert cmd.hip_height_m is None
+
+
+def test_roll_priority_cone_allows_height_when_ly_dominates() -> None:
+    dec = _make_arm_man_decoder_v74(height_dominance_ratio=0.4)
+    cmd = dec.decode_locomotion(0.5, -0.7, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.waist_roll_deg > 0.0
+    assert cmd.hip_height_m is not None
+    assert cmd.hip_height_m < 0.687  # squat
+
+
+def test_roll_priority_cone_does_not_block_pure_height() -> None:
+    """Pure ly (|lx| in deadzone) is never suppressed."""
+    dec = _make_arm_man_decoder_v74(height_dominance_ratio=0.9)
+    cmd = dec.decode_locomotion(0.0, -0.5, rx=0.0, ry=0.0, y_held=False, now=2.0)
+    assert cmd is not None
+    assert cmd.hip_height_m is not None
+    assert cmd.hip_height_m < 0.687
+
+
+# ---------------------------------------------------------------------------
+# v7.4: hip_height_m wire-side hysteresis (significant-change throttling)
+# ---------------------------------------------------------------------------
+
+
+def test_hip_height_below_threshold_throttled() -> None:
+    """ly noise smaller than ``hold_height_threshold_m`` must not
+    re-emit a hold_torso command -- the decoder treats two finite
+    hip_height_m targets within the threshold as equal."""
+    dec = _make_arm_man_decoder_v74(hold_height_threshold_m=0.005)
+    first = dec.decode_locomotion(
+        0.0, -1.0, rx=0.0, ry=0.0, y_held=False, now=2.0,
+    )
+    assert first is not None
+    # Tiny ly perturbation -> hip_height_m delta ~ max_height_down_m *
+    # |delta_ly_normalized|. With max_height_down_m=0.09 and
+    # rescale slope 1/0.7, lly delta of 0.001 is roughly 0.13mm,
+    # well below 5mm threshold.
+    repeat = dec.decode_locomotion(
+        0.0, -0.999, rx=0.0, ry=0.0, y_held=False, now=2.02,
+    )
+    assert repeat is None
+
+
+def test_hip_height_engagement_re_emits() -> None:
+    """The transition None <-> finite is always significant -- the
+    operator engaging or releasing the squat axis must re-emit."""
+    dec = _make_arm_man_decoder_v74(hold_height_threshold_m=0.05)
+    first = dec.decode_locomotion(
+        0.0, 0.0, rx=0.0, ry=0.0, y_held=False, now=2.0,
+    )
+    assert first is not None
+    assert first.hip_height_m is None
+    later = dec.decode_locomotion(
+        0.0, -0.5, rx=0.0, ry=0.0, y_held=False, now=2.02,
+    )
+    assert later is not None
+    assert later.hip_height_m is not None
+
+
+# ---------------------------------------------------------------------------
+# v7.4: constructor validation
+# ---------------------------------------------------------------------------
+
+
+def test_pitch_dominance_ratio_out_of_range_rejected() -> None:
+    with pytest.raises(ValueError):
+        IntentDecoder(pitch_dominance_ratio=-0.1)
+    with pytest.raises(ValueError):
+        IntentDecoder(pitch_dominance_ratio=1.1)
+
+
+def test_height_dominance_ratio_out_of_range_rejected() -> None:
+    with pytest.raises(ValueError):
+        IntentDecoder(height_dominance_ratio=-0.1)
+    with pytest.raises(ValueError):
+        IntentDecoder(height_dominance_ratio=1.1)
+
+
+def test_max_height_negative_rejected() -> None:
+    with pytest.raises(ValueError):
+        IntentDecoder(max_height_down_m=-0.01)
+    with pytest.raises(ValueError):
+        IntentDecoder(max_height_up_m=-0.01)
+
+
+def test_default_hip_height_zero_rejected() -> None:
+    with pytest.raises(ValueError):
+        IntentDecoder(default_hip_height_m=0.0)
+
+
+def test_hold_height_threshold_negative_rejected() -> None:
+    with pytest.raises(ValueError):
+        IntentDecoder(hold_height_threshold_m=-1e-3)

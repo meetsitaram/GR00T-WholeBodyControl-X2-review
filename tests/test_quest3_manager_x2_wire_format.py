@@ -362,7 +362,7 @@ def _step_main_loop_once(manager) -> None:
     if l_edge and in_active_mode and manager._viewer_cycler is not None:
         manager._viewer_cycler.cycle()
     if r_edge and in_active_mode:
-        manager._toggle_waist_freeze((0.0, 0.0, 0.0))
+        manager._toggle_waist_freeze((0.0, 0.0, 0.0, None))
 
 
 def test_camera_cycler_fires_on_rising_edge_in_arm_man(manager):

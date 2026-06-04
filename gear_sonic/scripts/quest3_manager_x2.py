@@ -229,6 +229,41 @@ class ManagerConfig:
     # to restore the legacy "full stick = full planner ceiling"
     # mapping for A/B comparison.
     intent_continuous_yaw_max: float = 0.5
+    # ARM_MANIPULATION L-stick mapping (v7.4). When True (default),
+    # the left thumbstick decodes as roll (lx) + continuous hip
+    # height (ly) inside ARM_MAN mode -- the analog "squat / stand"
+    # axis the kplanner consumes via the hip_height_m wire field.
+    # LOCOMOTION mode is unaffected (L-stick still owns step / side
+    # / continuous-walk). Set False for ablation runs that want
+    # ARM_MAN to behave exactly as in v7.3 (only R-stick lean / twist).
+    intent_enable_arm_man_lstick: bool = True
+    # Yaw-priority cone (R-stick): pitch is suppressed when |ry| <
+    # ratio * |rx|. Default 0.4 lets the operator twist while leaning
+    # slightly but blocks accidental lean from a yaw-intent stick
+    # wobble. 0.0 disables the cone (every axis past the deadzone
+    # fires independently); 1.0 is strict dominance.
+    intent_pitch_dominance_ratio: float = 0.4
+    # Roll-priority cone (L-stick, ARM_MAN): height is suppressed
+    # when |ly| < ratio * |lx|. Same range / semantics as the yaw
+    # priority cone above; 0.4 default.
+    intent_height_dominance_ratio: float = 0.4
+    # Continuous hip-height caps (metres, OFFSETS around the
+    # kplanner's default hip height of 0.687 m). Asymmetric defaults
+    # because the kplanner training distribution covers crouch-down
+    # ~9 cm before going OOD but only stand-up ~4 cm. Operators
+    # wanting a deeper / shallower envelope can override these on
+    # the CLI; the kplanner-side overlay still respects the model's
+    # in-distribution band so pushing past it gives degraded
+    # tracking, not catastrophic failure.
+    intent_max_height_down_m: float = 0.09
+    intent_max_height_up_m: float = 0.04
+    # Wire-side hysteresis for the hip-height channel (metres). The
+    # decoder treats two ``hold_torso`` commands as identical when
+    # their hip_height_m targets are within this many metres on the
+    # current emit; below that thumbstick noise on ly is suppressed
+    # at the publish layer. The kplanner's neural model has its own
+    # smoothing so coarse waypoints are fine.
+    intent_hold_height_threshold_m: float = 0.005
     # StickFilter config for taming raw VR stick step-inputs into a
     # band that matches the kplanner's training distribution.
     #
@@ -444,6 +479,14 @@ def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
         payload["waist_pitch_deg"] = float(cmd.waist_pitch_deg)
         payload["waist_roll_deg"] = float(cmd.waist_roll_deg)
         payload["waist_yaw_deg"] = float(cmd.waist_yaw_deg)
+        # ``hip_height_m`` is an optional channel-3 override for the
+        # kplanner's 4-D velocity intent (squat / stand). Emit only
+        # when the operator's L-stick Y is past the deadzone (decoder
+        # leaves it ``None`` otherwise) so legacy hold_torso wire
+        # payloads stay byte-identical and the kplanner default hip
+        # height still applies for pure pitch / roll / yaw leans.
+        if cmd.hip_height_m is not None:
+            payload["hip_height_m"] = float(cmd.hip_height_m)
     elif cmd.intent == "locomotion":
         payload["stick_fwd"]  = float(cmd.stick_fwd)
         payload["stick_side"] = float(cmd.stick_side)
@@ -503,6 +546,12 @@ class Quest3ManagerX2:
             enable_continuous_torso=cfg.intent_enable_continuous_torso,
             enable_continuous_locomotion=cfg.intent_enable_continuous_locomotion,
             continuous_yaw_max=cfg.intent_continuous_yaw_max,
+            enable_arm_man_lstick=cfg.intent_enable_arm_man_lstick,
+            pitch_dominance_ratio=cfg.intent_pitch_dominance_ratio,
+            height_dominance_ratio=cfg.intent_height_dominance_ratio,
+            max_height_down_m=cfg.intent_max_height_down_m,
+            max_height_up_m=cfg.intent_max_height_up_m,
+            hold_height_threshold_m=cfg.intent_hold_height_threshold_m,
         )
 
         # --- StickFilter (raw-axis smoother for continuous locomotion) ----
@@ -544,7 +593,15 @@ class Quest3ManagerX2:
         #      ON; the live waist target is captured here so the planner
         #      can be re-pinned later if needed.
         # ``None`` means "no latch active" (live stick drives the waist).
-        self._latched_waist: tuple[float, float, float] | None = None
+        # Tuple layout: ``(pitch_deg, roll_deg, yaw_deg, hip_height_m)``;
+        # the trailing element is None when the operator's L-stick Y is
+        # neutral (== "no hip-height override; kplanner default
+        # applies"). Pre-v7.4 this was a 3-tuple of angles only; the
+        # height channel was added when ARM_MAN L-stick decoded as
+        # squat / stand.
+        self._latched_waist: (
+            tuple[float, float, float, float | None] | None
+        ) = None
         # R-thumbstick-click freeze toggle. Independent of mode: a press
         # in LOCOMOTION freezes the body so the operator can keep
         # leaning/twisting while walking with the L stick; the freeze
@@ -881,19 +938,24 @@ class Quest3ManagerX2:
                 # for >= resume_chord_hold_s. No-op unless --resume-pub-enabled.
                 self._tick_resume_chord(buttons, tick_now)
 
-                # Live continuous waist target derived from the right
-                # stick. We compute this BEFORE the mode transition
-                # handler so a B-press into ARM_MANIPULATION can latch
-                # exactly the pose the operator was holding at the
-                # moment of the press, rather than the pose from the
-                # previous tick (which would drift by up to one 50 Hz
-                # interval). The continuous target is well-defined in
-                # any mode (it's a pure function of stick state) but
-                # only consumed on the LOCOMOTION -> ARM_MANIPULATION
-                # transition. v7.2: A-modifier removed from the waist
-                # path (right-thumb ergonomics; see decoder docstring).
+                # Live continuous waist target derived from BOTH sticks
+                # (R-stick = pitch/yaw, L-stick = roll/height in
+                # ARM_MANIPULATION mode only -- the decoder gates the
+                # L-stick path internally). We compute this BEFORE the
+                # mode transition handler so a B-press into
+                # ARM_MANIPULATION can latch exactly the pose the
+                # operator was holding at the moment of the press,
+                # rather than the pose from the previous tick (which
+                # would drift by up to one 50 Hz interval). The
+                # continuous target is well-defined in any mode (it's
+                # a pure function of stick state) but only consumed on
+                # the LOCOMOTION -> ARM_MANIPULATION transition. v7.2:
+                # A-modifier removed from the waist path (right-thumb
+                # ergonomics; see decoder docstring). v7.4: 4-tuple
+                # adds hip_height_m so the latched pose can pin the
+                # squat / stand target across the mode flip.
                 live_waist_target = self._intent.continuous_waist_target(
-                    rx=rx, ry=ry,
+                    rx=rx, ry=ry, lx=lx, ly=ly,
                 )
 
                 # 1) Mode transitions ---------------------------------------
@@ -1186,7 +1248,7 @@ class Quest3ManagerX2:
 
     def _toggle_waist_freeze(
         self,
-        live_waist_target: tuple[float, float, float],
+        live_waist_target: tuple[float, float, float, float | None],
     ) -> None:
         """R-thumbstick-click handler: toggle waist freeze on/off.
 
@@ -1212,13 +1274,14 @@ class Quest3ManagerX2:
                 "torso_released", fallback="Torso released.",
             )
         else:
-            pitch, roll, yaw = live_waist_target
+            pitch, roll, yaw, hip_h = live_waist_target
             self._waist_frozen = True
-            self._latched_waist = (pitch, roll, yaw)
+            self._latched_waist = (pitch, roll, yaw, hip_h)
             log.info(
                 "[R-click] waist freeze -> FROZEN at "
-                "pitch=%+.1f roll=%+.1f yaw=%+.1f",
+                "pitch=%+.1f roll=%+.1f yaw=%+.1f hip_h=%s",
                 pitch, roll, yaw,
+                f"{hip_h:.3f}m" if hip_h is not None else "default",
             )
             self._play_audio_prompt(
                 "torso_frozen", fallback="Torso frozen.",
@@ -1230,7 +1293,9 @@ class Quest3ManagerX2:
         *,
         vr_pose: np.ndarray,
         tick: int,
-        live_waist_target: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        live_waist_target: tuple[float, float, float, float | None] = (
+            0.0, 0.0, 0.0, None,
+        ),
     ) -> None:
         log.info("[manager-x2] mode %s -> %s", transition.previous.name, transition.current.name)
         # Re-arm the OFF-mode hint so it fires once again on next entry
@@ -1291,10 +1356,10 @@ class Quest3ManagerX2:
             # snap to a slightly different live sample). Otherwise, take
             # the live continuous target as today.
             if self._waist_frozen and self._latched_waist is not None:
-                pitch, roll, yaw = self._latched_waist
+                pitch, roll, yaw, hip_h = self._latched_waist
             else:
-                pitch, roll, yaw = live_waist_target
-                self._latched_waist = (pitch, roll, yaw)
+                pitch, roll, yaw, hip_h = live_waist_target
+                self._latched_waist = (pitch, roll, yaw, hip_h)
             self._publish_planner_cmd(
                 LocomotionCmd(
                     intent="hold_torso",
@@ -1302,13 +1367,15 @@ class Quest3ManagerX2:
                     waist_pitch_deg=pitch,
                     waist_roll_deg=roll,
                     waist_yaw_deg=yaw,
+                    hip_height_m=hip_h,
                 )
             )
             self._retargeter.reset_finger_filter()
             log.info(
-                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f"
-                "%s",
+                "[manager-x2] latched waist hold pitch=%+.1f roll=%+.1f yaw=%+.1f "
+                "hip_h=%s%s",
                 pitch, roll, yaw,
+                f"{hip_h:.3f}m" if hip_h is not None else "default",
                 " (R-click freeze active)" if self._waist_frozen else "",
             )
             # Audio cue: separate "torso_locked" prompt only when the
@@ -1918,6 +1985,66 @@ def _build_parser() -> argparse.ArgumentParser:
              "1.0 to restore the legacy 'full stick = full ceiling' "
              "mapping. Bucketed turn_left / turn_right are unaffected.",
     )
+    # ARM_MANIPULATION L-stick decoding (v7.4): roll (lx) + continuous
+    # squat / stand (ly). LOCOMOTION is unaffected by this gate.
+    p.add_argument(
+        "--enable-arm-man-lstick",
+        dest="enable_arm_man_lstick", action="store_true",
+        default=True,
+        help="(default) In ARM_MANIPULATION mode, decode the L-stick "
+             "as roll (lx) + continuous hip height (ly, squat / "
+             "stand). LOCOMOTION mode is unaffected (L-stick still "
+             "owns step / side / continuous-walk).",
+    )
+    p.add_argument(
+        "--no-enable-arm-man-lstick",
+        dest="enable_arm_man_lstick", action="store_false",
+        help="Disable v7.4 ARM_MAN L-stick decoding; restores the v7.3 "
+             "behaviour where only the R-stick drives lean / twist in "
+             "ARM_MANIPULATION (L-stick is idle).",
+    )
+    p.add_argument(
+        "--pitch-dominance-ratio",
+        dest="pitch_dominance_ratio", type=float, default=0.4,
+        help="Yaw-priority cone (R-stick): pitch is suppressed when "
+             "|ry| < ratio * |rx|. Range [0, 1]; default 0.4 lets the "
+             "operator twist while leaning slightly but blocks "
+             "accidental lean from a yaw-intent stick wobble. 0.0 "
+             "disables the cone; 1.0 is strict dominance.",
+    )
+    p.add_argument(
+        "--height-dominance-ratio",
+        dest="height_dominance_ratio", type=float, default=0.4,
+        help="Roll-priority cone (L-stick, ARM_MAN): height is "
+             "suppressed when |ly| < ratio * |lx|. Same range / "
+             "semantics as --pitch-dominance-ratio. Default 0.4.",
+    )
+    p.add_argument(
+        "--max-height-down-m",
+        dest="max_height_down_m", type=float, default=0.09,
+        help="Maximum hip-height OFFSET (downward, m) at full L-stick "
+             "Y forward push (squat). Default 0.09 m matches the "
+             "kplanner's in-distribution crouch envelope; pushing "
+             "past this gives degraded tracking, not catastrophic "
+             "failure.",
+    )
+    p.add_argument(
+        "--max-height-up-m",
+        dest="max_height_up_m", type=float, default=0.04,
+        help="Maximum hip-height OFFSET (upward, m) at full L-stick "
+             "Y backward push (stand-up). Default 0.04 m matches the "
+             "kplanner's in-distribution stand envelope; the "
+             "asymmetry vs --max-height-down-m reflects the model's "
+             "training-data coverage.",
+    )
+    p.add_argument(
+        "--hold-height-threshold-m",
+        dest="hold_height_threshold_m", type=float, default=0.005,
+        help="Wire-side hysteresis for the hip-height channel "
+             "(metres). Decoder treats two hold_torso commands as "
+             "identical when their hip_height_m targets are within "
+             "this many metres on the current emit. Default 0.005 m.",
+    )
     p.add_argument(
         "--loco-decoupled-arms",
         dest="loco_decoupled_arms", action="store_true",
@@ -2187,6 +2314,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         intent_enable_torso=args.enable_torso,
         intent_enable_continuous_locomotion=args.enable_continuous_locomotion,
         intent_continuous_yaw_max=args.continuous_yaw_max,
+        intent_enable_arm_man_lstick=args.enable_arm_man_lstick,
+        intent_pitch_dominance_ratio=args.pitch_dominance_ratio,
+        intent_height_dominance_ratio=args.height_dominance_ratio,
+        intent_max_height_down_m=args.max_height_down_m,
+        intent_max_height_up_m=args.max_height_up_m,
+        intent_hold_height_threshold_m=args.hold_height_threshold_m,
         intent_loco_decoupled_arms=args.loco_decoupled_arms,
         invert_lx=args.invert_lx,
         invert_ly=args.invert_ly,

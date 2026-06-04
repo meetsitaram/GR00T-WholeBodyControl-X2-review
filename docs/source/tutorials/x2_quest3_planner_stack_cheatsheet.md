@@ -90,7 +90,7 @@ inputs so the chord-release doesn't kick the robot.
 | **L stick L / R** | `side_left` / `side_right` | `side_left_step` / `side_right_step` | Single side stride |
 | **R stick L / R**, hard (\|rx\| ≥ 0.75) | `turn_left / deg_45` / `turn_right / deg_45` | `turn_*_45deg` | Yaw step |
 | **R stick L / R**, hard + **X held** | `turn_* / deg_90` | `turn_*_90deg` | Bigger yaw step |
-| **R stick fwd (ry > 0)** | `hold_torso / continuous` (waist_pitch_deg > 0) | `STATIC_HOLD` | Continuous **forward lean** (0 → 20° clamp) |
+| **R stick fwd / back (ry ≠ 0)** *(v7.4: bidirectional)* | `hold_torso / continuous` (waist_pitch_deg signed) | `STATIC_HOLD` | Continuous **forward / backward lean** (±20° clamp; pre-v7.4 only forward worked) |
 | **R stick L / R, soft (\|rx\| < 0.75)** | `hold_torso / continuous` (waist_yaw_deg ≠ 0) | `STATIC_HOLD` | Continuous **torso twist** (up to ±25.7° at the threshold; ±40° hard cap) |
 | Sticks neutral | `hold_torso / continuous` (0, 0, 0) | `STATIC_HOLD` (slewed back to neutral) | Stand still |
 | **R thumbstick CLICK** | (no `planner_cmd`; manager toggles `_waist_frozen`) | `STATIC_HOLD` pinned at click-time pose | Freeze the current lean / twist; release with another click |
@@ -101,8 +101,10 @@ inputs so the chord-release doesn't kick the robot.
 > emissions to a 0.5° change-or-50 ms cadence, the planner runs the
 > per-axis 60 °/s slew limit, and `_WAIST_RAMP_CAP_DEG` (pitch 20°,
 > roll 10°, yaw 40°) clamps the target so an extreme stick yank
-> can't drive SONIC out of distribution. Backward lean (`ry < 0`)
-> has no primitive and is clamped to 0.
+> can't drive SONIC out of distribution. **v7.4** flipped pitch
+> bidirectional — backward lean (`ry < 0`) now decodes to negative
+> `waist_pitch_deg` (clamped to `-20°`); pre-v7.4 the negative side
+> was clamped to 0.
 >
 > **v7.1 R-click waist freeze**: pressing the **right thumbstick
 > down** toggles `_waist_frozen`. While frozen the manager drops
@@ -143,6 +145,43 @@ inputs so the chord-release doesn't kick the robot.
 > continuous one. Pass `--no-intent-enable-continuous-torso` on the
 > manager to fall back to the v6 dominant-axis behavior.
 >
+> **v7.4 (2026-06-03): bidirectional pitch + ARM_MAN L-stick squat /
+> roll + dominance cones**:
+>
+> 1. **R-stick is bidirectional**: forward push leans forward, back
+>    push leans backward, all the way to ±20°. The wire format
+>    already allowed signed pitch — the decoder just stopped
+>    clamping the negative half.
+> 2. **L-stick repurposed in ARM_MANIPULATION** (LOCO unchanged).
+>    LX → continuous **roll** (`waist_roll_deg`, ±10° hard cap).
+>    LY → **continuous hip-height squat / stand** (`hip_height_m`,
+>    asymmetric cap: ~9 cm down, ~4 cm up — the kplanner's training
+>    distribution covers crouch-down further than stand-up before
+>    going OOD). The hip-height path is **kplanner only**; the
+>    heuristic planner ignores `hip_height_m` and synthesises a
+>    frozen-feet pose at the default pelvis height. For squat under
+>    the heuristic, fall back to `crouch_medium`. Disable the
+>    L-stick repurpose with `--no-enable-arm-man-lstick`.
+> 3. **Dominance cones**: pitch fires only when `|ry| ≥
+>    pitch_dominance_ratio · |rx|` (yaw-priority cone, R-stick); a
+>    similar `height_dominance_ratio` gates the L-stick LY squat
+>    against LX roll (roll-priority cone). 0.4 default. Lets the
+>    operator twist while leaning slightly without accidentally
+>    cranking lean / squat from a yaw-or-roll-intent stick wobble.
+> 4. **Why no bins**: with the trained kplanner now the default
+>    backend, continuous channels (`hip_height_m`, signed
+>    `waist_pitch_deg`) are first-class inputs — the manager no
+>    longer needs to map operator intent through the heuristic's
+>    discrete primitive labels. The kplanner's `intent_to_velocity`
+>    substitutes `hip_height_m` into channel-3 of the velocity
+>    intent for `hold_torso` commands and the publish loop runs a
+>    separate kinematic waist overlay (slew-limited `_HoldTracker`,
+>    same `make_waist_pose_frame` helper as the heuristic
+>    `STATIC_HOLD`) so the three waist DOFs ride on top of the
+>    neural model's leg motion. See [`x2_kplanner.md`](../references/x2_kplanner.md)
+>    ("Continuous waist hold (v7.4)" callout) for the full
+>    description.
+>
 > The hard turn (R stick L/R, |rx| ≥ 0.75) is **always on** in
 > LOCOMOTION and pre-empts the continuous hold — the operator wants
 > to PIVOT at the end of the stick, not just lean further. In
@@ -152,14 +191,17 @@ inputs so the chord-release doesn't kick the robot.
 
 ### Precedence rules (locked in by `tests/test_intent_decoder.py` + `tests/test_intent_decoder_continuous_torso.py`)
 
-1. **Y held** → would emit `crouch / medium`, but **crouch is currently disabled** (X2 SONIC tips over on the crouch primitive). Y held is silently ignored.
-2. **L stick** wins over R stick: any active L stick beats any R stick.
-3. On L stick, **dominant axis** wins: \|ly\| ≥ \|lx\| → fwd/back; otherwise side-step.
-4. On R stick (continuous mode, the default): hard \|rx\| ≥ 0.75 → discrete `turn_*` (operator wants a real pivot). Otherwise both `ry` and `rx` are read simultaneously and composed into a single `hold_torso / continuous` target (`pitch` from `ry`, `yaw` from `rx`; `roll` is always 0 from the operator path — see v7.2 callout). Stick fully released → `(0, 0, 0)` neutral hold.
-5. **A held** in LOCOMOTION promotes fwd/back L stick → `walk` (continuous gait). The legacy "A held + R-stick X → roll" path was removed in v7.2 (right-thumb ergonomics). In ARM_MANIPULATION A toggles arm IK; it does **not** modify any stick path.
-6. **X held** only modifies hard rx (\|rx\| ≥ 0.75) to a 90° turn; soft rx is unaffected.
-7. **B press** in LOCOMOTION → ARM_MANIPULATION **latches** the current `(pitch, roll, yaw)` waist target so the planner enters `STATIC_HOLD` at that pose with no jump. The latch is just a *seed*: the operator's R-stick is still live in ARM_MAN and will slew the planner away from the latched value (or back to neutral on release). **B press** in ARM_MANIPULATION → LOCOMOTION clears the latch and emits `idle / default`.
-8. **Mode gate (v7.2)**: in ARM_MANIPULATION the decoder allows `hold_torso` through (lean / twist still steer the waist for extra arm reach) but filters out walk / step / turn commands so the base never slides under the operator's IK targets. In LOCOMOTION the full vocabulary flows. In OFF nothing flows.
+1. **Y held** → would emit `crouch / medium`, but **crouch is currently disabled** (X2 SONIC tips over on the crouch primitive). Y held is silently ignored. v7.4 supersedes the discrete crouch with a continuous L-stick LY hip-height path under ARM_MANIPULATION (kplanner only).
+2. **In LOCOMOTION mode, L stick wins over R stick** for locomotion (walk / step). v7.4 changed nothing here.
+3. On L stick (LOCOMOTION), **dominant axis** wins: \|ly\| ≥ \|lx\| → fwd/back; otherwise side-step.
+4. On R stick (continuous mode, the default): hard \|rx\| ≥ 0.75 → discrete `turn_*` (operator wants a real pivot). Otherwise both `ry` and `rx` are read simultaneously and composed into a single `hold_torso / continuous` target (`pitch` from `ry` — **signed in both directions** since v7.4; `yaw` from `rx`; `roll` from the operator R-stick path is always 0 — see v7.2 callout for why and v7.4 callout for where roll moved). Stick fully released → `(0, 0, 0)` neutral hold.
+5. **Yaw-priority cone (v7.4, R-stick)**: pitch is suppressed unless `|ry| ≥ pitch_dominance_ratio · |rx|` (default 0.4). Soft yaw + tiny pitch deflection → pure twist. Lets the operator turn the torso a few degrees off-axis without accidentally adding lean.
+6. **In ARM_MANIPULATION mode (v7.4)**: the **L-stick is repurposed for waist control** (NOT walk). LX → `waist_roll_deg` (continuous, ±10° hard cap). LY → `hip_height_m` (continuous squat / stand, asymmetric cap ~9 cm down / ~4 cm up; kplanner only). The R-stick still drives pitch + yaw exactly as in LOCOMOTION. This is mode-gated: in LOCOMOTION the L-stick still drives walk / step / side. Pass `--no-enable-arm-man-lstick` to revert to the v7.3 behaviour (L-stick fully filtered out in ARM_MAN).
+7. **Roll-priority cone (v7.4, ARM_MAN L-stick)**: hip-height is suppressed unless `|ly| ≥ height_dominance_ratio · |lx|` (default 0.4). Soft roll + tiny LY deflection → pure roll. Same idea as the yaw-priority cone, in the orthogonal axis.
+8. **A held** in LOCOMOTION promotes fwd/back L stick → `walk` (continuous gait). The legacy "A held + R-stick X → roll" path was removed in v7.2 (right-thumb ergonomics). In ARM_MANIPULATION A toggles arm IK; it does **not** modify any stick path.
+9. **X held** only modifies hard rx (\|rx\| ≥ 0.75) to a 90° turn; soft rx is unaffected.
+10. **B press** in LOCOMOTION → ARM_MANIPULATION **latches** the current `(pitch, roll, yaw, hip_height_m)` waist target so the planner enters `STATIC_HOLD` (heuristic) / continuous-hold (kplanner) at that pose with no jump. The latch is just a *seed*: the operator's R-stick (and L-stick in v7.4) are still live in ARM_MAN and will slew the planner away from the latched value (or back to neutral on release). **B press** in ARM_MANIPULATION → LOCOMOTION clears the latch and emits `idle / default`.
+11. **Mode gate (v7.2 + v7.4)**: in ARM_MANIPULATION the decoder allows `hold_torso` through (lean / twist / roll / squat all still steer the waist for extra arm reach) but filters out walk / step / turn commands so the base never slides under the operator's IK targets. In LOCOMOTION the full vocabulary flows. In OFF nothing flows.
 
 ### What "hold the stick" does
 
@@ -180,12 +222,14 @@ Most planner primitives are **single-stride**: one push of the L stick = one `fw
 | **Y press** | stop & save episode. Same pattern: wire path always fires, recorder logs `ignored: no active episode` if there's nothing to save, and the "Saved." headset cue is gated on `--recorder-enabled` *(v7.2)*. |
 | **L thumbstick click** | cycle deploy MuJoCo viewer's fixed cameras (synthesises a `]` keystroke; works in LOCOMOTION too). Pre-v7.1 this was the right click; v7.1 also briefly used `Tab` here, but `Tab` only toggles the viewer's left UI panel — `]` is the real "next fixed camera" key. |
 | **R thumbstick click** | toggle waist freeze on / off — same control as in LOCOMOTION. Useful to release a freeze without flipping back to LOCOMOTION first. |
-| **R stick fwd (ry > 0)** | `hold_torso / continuous` (waist_pitch_deg > 0) → continuous **forward lean** while doing arm work, same 0 → 20° clamp as in LOCOMOTION. The arm IK rides the torso so this directly extends arm reach. *(v7.2)* |
+| **R stick fwd / back (ry ≠ 0)** *(v7.4 bidirectional)* | `hold_torso / continuous` (waist_pitch_deg signed) → continuous **forward / backward lean** while doing arm work, ±20° clamp. The arm IK rides the torso so this directly extends arm reach. |
 | **R stick L / R, soft** | `hold_torso / continuous` (waist_yaw_deg ≠ 0) → continuous **torso twist**, same ±25.7° / ±40° caps as in LOCOMOTION. *(v7.2)* |
 | **R stick L / R, hard** | **No-op** — the decoder fires `turn_*` internally but the ARM_MAN mode gate filters it out. Hard pivots while doing arm IK would slide your hands' reference frame; if you want to pivot, B-press to LOCOMOTION first. |
-| **L stick (any direction)** | **No-op** — walk / side / step commands are filtered out by the mode gate. Pre-position the body in LOCOMOTION before the B-press. |
+| **L stick L / R (lx ≠ 0)** *(v7.4)* | `hold_torso / continuous` (waist_roll_deg ≠ 0) → continuous **lateral lean** for sideways reach. ±10° hard cap. Roll-priority cone gates LY squat against LX roll. |
+| **L stick fwd / back (ly ≠ 0)** *(v7.4, kplanner only)* | `hold_torso / continuous` (`hip_height_m` set) → **continuous squat / stand**. Asymmetric cap: ~9 cm down (squat / push), ~4 cm up (stand / lift) from the kplanner's default hip height. The heuristic planner ignores `hip_height_m` and stays at default pelvis height; for a heuristic-mode squat fall back to the discrete `crouch_medium` primitive in a scripted demo. |
+| **L stick (any) — v7.3 and earlier** | **No-op** — walk / side / step commands were filtered out by the mode gate. v7.4 reroutes the L-stick to waist control (above); to restore the v7.3 behaviour pass `--no-enable-arm-man-lstick`. |
 
-> **Torso latch (v7) + live R-stick (v7.2)**: when the operator B-presses LOCOMOTION → ARM_MANIPULATION, the manager samples the live `(pitch, roll, yaw)` continuous waist target and pins the planner to `STATIC_HOLD(latched)`. The headset announces it with the `mode_torso_locked` audio cue (only when the latched pose is non-neutral; neutral latches just play the standard `mode_arm_manipulation` cue). The latch is a *no-jump seed* — the planner enters `STATIC_HOLD` at exactly the pre-flip pose so there's no transient — but the R-stick remains live in ARM_MAN and will continue to slew the planner toward whatever target the operator commands. Pre-pose with the R-stick in LOCOMOTION (`pitch=15°, yaw=20°` extends arm reach by ~15 cm in the chosen direction), B-press to lock-and-go, then either keep the stick deflected or use the **R-thumbstick click** to hard-freeze the pose if you want to release the stick and use both hands on arm IK without the torso slewing back to neutral. The reverse B-press clears the latch and emits `idle / default` so the planner cleanly blends back to standing.
+> **Torso latch (v7) + live R-stick (v7.2) + live L-stick (v7.4)**: when the operator B-presses LOCOMOTION → ARM_MANIPULATION, the manager samples the live `(pitch, roll, yaw, hip_height_m)` continuous waist target (v7.4 added the 4th component) and pins the planner to `STATIC_HOLD(latched)`. The headset announces it with the `mode_torso_locked` audio cue (only when the latched pose is non-neutral; neutral latches just play the standard `mode_arm_manipulation` cue). The latch is a *no-jump seed* — the planner enters `STATIC_HOLD` at exactly the pre-flip pose so there's no transient — but **both** sticks remain live in ARM_MAN: the R-stick continues to slew pitch / yaw, and the L-stick (v7.4) drives roll / squat. Pre-pose with the R-stick in LOCOMOTION (`pitch=15°, yaw=20°` extends arm reach by ~15 cm in the chosen direction), B-press to lock-and-go, then either keep the sticks deflected or use the **R-thumbstick click** to hard-freeze the pose if you want to release the sticks and use both hands on arm IK without the torso slewing back to neutral. The reverse B-press clears the latch and emits `idle / default` so the planner cleanly blends back to standing.
 
 **All recording triggers are gated on ARM_MANIPULATION mode.** A held + walk in LOCOMOTION can never accidentally start an episode; X held + 90° turn in LOCOMOTION never fires start. The episode lifecycle (`start` → frames → `save`) is owned by the manager and forwarded to the recorder over ZMQ topic `recorder_cmd`.
 
@@ -309,12 +353,18 @@ Set on the manager (passed through to `IntentDecoder`):
 |---|---|---|
 | `stick_deadzone` | 0.30 | Per-axis deflection treated as neutral |
 | `turn_threshold` | 0.75 | Soft / hard rx boundary (continuous torso twist below; discrete `turn_*_45deg` at or above). At 0.75 the soft band reaches ~25.7° of continuous waist yaw before the discrete pivot fires. |
-| `lean_medium_threshold` | 0.55 | ry boundary between `lean_fwd_small` and `lean_fwd_medium` |
-| `lean_large_threshold` | 0.80 | ry boundary between `lean_fwd_medium` and `lean_fwd_large` |
+| `lean_medium_threshold` | 0.55 | ry boundary between `lean_fwd_small` and `lean_fwd_medium` (legacy discrete bin path; bypassed by the v7 continuous hold) |
+| `lean_large_threshold` | 0.80 | ry boundary between `lean_fwd_medium` and `lean_fwd_large` (legacy discrete bin path) |
 | `chord_debounce_s` | 0.5 | Quiet window after the A+B+X+Y chord puts you in LOCOMOTION |
-| `enable_crouch` | `False` | Y-held → `crouch / medium` (currently destabilizes the policy; do not enable in sim until the planner-side fix lands) |
+| `enable_crouch` | `False` | Y-held → `crouch / medium` (currently destabilizes the policy; superseded by the v7.4 continuous L-stick LY squat under ARM_MAN + kplanner) |
+| `--pitch-dominance-ratio` | 0.4 | **v7.4** R-stick yaw-priority cone: pitch fires only when `|ry| ≥ ratio · |rx|`. Set to 0 to disable the cone (always emit pitch from `ry`). |
+| `--height-dominance-ratio` | 0.4 | **v7.4** L-stick (ARM_MAN) roll-priority cone: hip-height fires only when `|ly| ≥ ratio · |lx|`. |
+| `--max-height-down-m` | 0.09 | **v7.4** Maximum continuous squat below kplanner default hip height (m). Asymmetric: training distribution covers crouch-down further than stand-up. |
+| `--max-height-up-m` | 0.04 | **v7.4** Maximum continuous stand above kplanner default hip height (m). Lower than `--max-height-down-m` because the kplanner's training distribution is asymmetric. |
+| `--hold-height-threshold-m` | 0.005 | **v7.4** Hysteresis for re-emitting `hip_height_m` updates (0.5 cm). Prevents noisy stick chatter from spamming `hold_torso` commands. |
+| `--no-enable-arm-man-lstick` | (off; L-stick repurpose ON by default via `--enable-arm-man-lstick`) | **v7.4** Revert ARM_MAN L-stick to v7.3 behaviour (filtered out, no waist control). Useful for A/B comparison or operators who prefer the original feel. |
 
-These live in `gear_sonic/utils/teleop/vr/intent_decoder.py::IntentDecoder.__init__`. To expose them as CLI flags on the manager, add them to `ManagerConfig` and the argparse group in `quest3_manager_x2.py`.
+These live in `gear_sonic/utils/teleop/vr/intent_decoder.py::IntentDecoder.__init__`. The v7.4 flags are exposed on the manager (`gear_sonic/scripts/quest3_manager_x2.py`); the legacy ones still need to be added to `ManagerConfig` and the argparse group manually if you want to override them.
 
 ### Inline SONIC FSQ tokenizer (for `action.motion_token` in the LeRobot dataset)
 

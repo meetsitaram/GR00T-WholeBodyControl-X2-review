@@ -909,3 +909,70 @@ def test_forward_floor_does_not_affect_direct_velocity():
         direct_velocity=target,
     )
     assert intent_to_velocity(cmd) == pytest.approx(target, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# v7.4: hold_torso + hip_height_m channel-3 override.
+#
+# The continuous waist hold path is now a real velocity intent with a
+# specific job: keep yaw/vx/vz pinned at idle (no walk / no turn) but
+# substitute the operator's L-stick squat / stand target into channel-3
+# of the velocity tuple. Pre-v7.4 the kplanner ignored hold_torso
+# entirely; v7.4 adds the override + a kinematic waist overlay (covered
+# in a separate publish-loop test).
+# ---------------------------------------------------------------------------
+
+
+def test_hold_torso_default_resolves_to_idle_intent():
+    """Bare hold_torso (no hip_height_m, no waist angles) still idles
+    so the legacy invariants in test_runtime_scales_do_not_reanimate_idle_intent
+    keep holding."""
+    cmd = LocomotionCommand(intent="hold_torso", magnitude="continuous")
+    assert intent_to_velocity(cmd) == _IDLE_INTENT
+
+
+def test_hold_torso_hip_height_substitutes_channel_three():
+    """A finite hip_height_m must replace the 4th element of the
+    velocity tuple while leaving yaw / vel_x / vel_z at idle."""
+    cmd = LocomotionCommand(
+        intent="hold_torso",
+        magnitude="continuous",
+        hip_height_m=0.62,
+    )
+    yaw, vx, vz, hip_h = intent_to_velocity(cmd)
+    assert yaw == 0.0
+    assert vx == 0.0
+    assert vz == 0.0
+    assert hip_h == pytest.approx(0.62, abs=1e-9)
+
+
+def test_hold_torso_hip_height_with_waist_angles_still_idles_velocity():
+    """Even a non-zero waist_pitch / yaw must NOT bleed into the
+    velocity intent. The waist angles are consumed by the kinematic
+    overlay path; they have no velocity meaning here."""
+    cmd = LocomotionCommand(
+        intent="hold_torso",
+        magnitude="continuous",
+        waist_pitch_deg=15.0,
+        waist_yaw_deg=-20.0,
+        hip_height_m=0.65,
+    )
+    yaw, vx, vz, hip_h = intent_to_velocity(cmd)
+    assert (yaw, vx, vz) == (0.0, 0.0, 0.0)
+    assert hip_h == pytest.approx(0.65, abs=1e-9)
+
+
+def test_hold_torso_runtime_scales_dont_touch_hip_height():
+    """Boosting forward / lateral / turn scales must not multiply the
+    hip-height override -- hold_torso is not a velocity-scaled intent."""
+    kp._RUNTIME_FORWARD_SCALE = 5.0
+    kp._RUNTIME_LATERAL_SCALE = 5.0
+    kp._RUNTIME_TURN_LEFT_SCALE = 5.0
+    cmd = LocomotionCommand(
+        intent="hold_torso",
+        magnitude="continuous",
+        hip_height_m=0.60,
+    )
+    yaw, vx, vz, hip_h = intent_to_velocity(cmd)
+    assert (yaw, vx, vz) == (0.0, 0.0, 0.0)
+    assert hip_h == pytest.approx(0.60, abs=1e-9)
