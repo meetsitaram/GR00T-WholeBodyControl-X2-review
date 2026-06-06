@@ -436,6 +436,61 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    # ── Live gesture playback (PKL takeover during subscribe mode) ─────
+    # See gear_sonic/utils/teleop/gesture_session.py for wire shape and
+    # gear_sonic/data/motions/gestures/gestures_v1.yaml for catalog
+    # format. Trigger CLI lives at gear_sonic/scripts/play_gesture.py.
+    _default_gesture_catalog = (
+        Path(__file__).resolve().parent.parent
+        / "data" / "motions" / "gestures" / "gestures_v1.yaml"
+    )
+    parser.add_argument(
+        "--gesture-cmd-host", default="*",
+        help=(
+            "Interface for the gesture_cmd SUB bind. Defaults to '*' "
+            "(all interfaces) because the trigger script is the "
+            "transient side: recorder binds, play_gesture connects."
+        ),
+    )
+    parser.add_argument(
+        "--gesture-cmd-port", type=int, default=5568,
+        help=(
+            "Port for the gesture_cmd SUB. Must match the trigger "
+            "script's --port. Default matches "
+            "gesture_session.GESTURE_CMD_DEFAULT_PORT."
+        ),
+    )
+    parser.add_argument(
+        "--gesture-cmd-topic", default="gesture_cmd",
+        help="Topic for the gesture_cmd SUB.",
+    )
+    parser.add_argument(
+        "--gesture-catalog", type=str,
+        default=str(_default_gesture_catalog),
+        help=(
+            "YAML catalog mapping gesture names to PKL clips. Loaded "
+            "once at startup; ad-hoc --pkl payloads always work "
+            "regardless. Pass an empty string ('') to disable gesture "
+            "support entirely (no SUB bound)."
+        ),
+    )
+    parser.add_argument(
+        "--gesture-future-dt-s", type=float, default=0.1,
+        help=(
+            "Spacing of the strictly-future window during gesture "
+            "playback. Default 0.1 s matches the kplanner and the C++ "
+            "deploy's DT_FUTURE_REF."
+        ),
+    )
+    parser.add_argument(
+        "--gesture-future-window-frames", type=int, default=9,
+        help=(
+            "Number of strictly-future frames packed into the deploy "
+            "wire during gesture playback. Default 9 matches the "
+            "kplanner's NUM_FUTURE_FRAMES-1 convention."
+        ),
+    )
+
     # Misc
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--embodiment-tag", default="new_embodiment")
@@ -585,6 +640,19 @@ def main(argv: list[str] | None = None) -> int:
         body_pose_sub_topic=args.body_pose_sub_topic,
         arm_and_hands_sub_host=args.arm_and_hands_sub_host,
         arm_and_hands_sub_port=args.arm_and_hands_sub_port,
+        gesture_cmd_host=args.gesture_cmd_host,
+        gesture_cmd_port=args.gesture_cmd_port,
+        gesture_cmd_topic=args.gesture_cmd_topic,
+        # Empty string disables gesture support entirely. Strip
+        # whitespace so accidental "  " doesn't accidentally enable
+        # an unintended catalog path.
+        gesture_catalog_path=(
+            None
+            if not str(args.gesture_catalog).strip()
+            else Path(args.gesture_catalog)
+        ),
+        gesture_future_dt_s=args.gesture_future_dt_s,
+        gesture_future_window_frames=args.gesture_future_window_frames,
         idle_publish_enabled=(not args.no_idle_publish),
         verbose=(not args.quiet),
     )

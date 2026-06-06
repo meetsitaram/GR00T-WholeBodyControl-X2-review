@@ -39,6 +39,7 @@ import numpy as np
 
 from gear_sonic.utils.teleop.operator_calibration import (
     OperatorCalibration,
+    _quat_multiply_wxyz,
     head_yaw_from_quat,
     wrist_quat_to_head_yaw_frame,
     wrist_to_head_yaw_frame,
@@ -52,6 +53,40 @@ from gear_sonic.utils.teleop.vr_arm_teleop import (
     DEFAULT_LEFT_ARM_NEUTRAL_RAD,
     DEFAULT_RIGHT_ARM_NEUTRAL_RAD,
 )
+
+
+_IDENTITY_QUAT_WXYZ: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def _rpy_deg_to_quat_wxyz(rpy_deg: np.ndarray | tuple[float, float, float]) -> np.ndarray:
+    """Convert intrinsic XYZ Tait-Bryan RPY (degrees) to a wxyz quaternion.
+
+    Convention: ``q = q_x(roll) * q_y(pitch) * q_z(yaw)``, applied in the
+    object's body-fixed frame. ``q_axis(theta)`` is the unit quaternion
+    rotating ``theta`` radians about the named axis. This matches scipy's
+    ``Rotation.from_euler('XYZ', rpy, degrees=True)`` (uppercase 'XYZ' =
+    intrinsic) so callers can sanity-check from a python repl.
+
+    Returns the identity quaternion ``[1, 0, 0, 0]`` for an all-zeros
+    input (cheap fast path; the dataclass constructor uses this to
+    detect "no offset" and skip the multiply in the hot path).
+    """
+    arr = np.asarray(rpy_deg, dtype=np.float64).reshape(3)
+    if not np.any(arr):
+        return _IDENTITY_QUAT_WXYZ.copy()
+    r, p, y = np.deg2rad(arr)
+    cr, sr = np.cos(r * 0.5), np.sin(r * 0.5)
+    cp, sp = np.cos(p * 0.5), np.sin(p * 0.5)
+    cy, sy = np.cos(y * 0.5), np.sin(y * 0.5)
+    qx = np.array([cr, sr, 0.0, 0.0], dtype=np.float64)
+    qy = np.array([cp, 0.0, sp, 0.0], dtype=np.float64)
+    qz = np.array([cy, 0.0, 0.0, sy], dtype=np.float64)
+    return _quat_multiply_wxyz(_quat_multiply_wxyz(qx, qy), qz)
+
+
+def _is_identity_quat(q_wxyz: np.ndarray) -> bool:
+    """True if ``q_wxyz`` is exactly the identity (post-fast-path check)."""
+    return bool(np.array_equal(q_wxyz, _IDENTITY_QUAT_WXYZ))
 
 
 # The IK null-space "preferred" posture used while the operator is
@@ -168,7 +203,45 @@ class VRArmTeleopCalibrated:
         rotation_weight: float = 0.0,
         per_tick_step_rad: float = 0.30,
         null_space_gain: float = 0.10,
+        left_wrist_op_quat_offset_rpy_deg: (
+            tuple[float, float, float] | np.ndarray | None
+        ) = None,
+        right_wrist_op_quat_offset_rpy_deg: (
+            tuple[float, float, float] | np.ndarray | None
+        ) = None,
     ) -> None:
+        """``left_wrist_op_quat_offset_rpy_deg`` /
+        ``right_wrist_op_quat_offset_rpy_deg``: optional 3-tuple of
+        intrinsic Tait-Bryan ``(roll, pitch, yaw)`` degrees applied as a
+        post-multiplication on the operator's wrist quaternion in the
+        head-yaw frame, BEFORE the calibration's ``apply_to_wrist_quat``
+        runs. Equivalent to "the controller is rigidly mounted at this
+        rotation relative to the operator's actual wrist; pre-rotate it
+        back". Use this as a stop-gap until ``vr_operator_calibrate.py``
+        is re-run; once the YAML is refreshed the offsets should drop
+        back to zero.
+
+        The post-multiply ordering means the offset is applied in the
+        controller's own (operator-wrist) local frame:
+
+        * ``roll`` rotates about the operator's wrist long axis
+          (pronation / supination).
+        * ``pitch`` rotates about the operator's wrist lateral axis
+          (flex / extend).
+        * ``yaw`` rotates about the operator's wrist normal axis
+          (ulnar / radial deviation).
+
+        Defaults to ``None`` (== zero offset == identity quat == today's
+        behaviour). The fast path skips the multiply when both sides are
+        identity, so leaving these unset has zero per-tick cost.
+
+        IMPORTANT: only takes effect when ``rotation_weight > 0``. When
+        the IK is running position-only (``rotation_weight == 0`` --
+        either explicitly or auto-clamped by the legacy-YAML detector),
+        the IK never sees a rotation target and the offset is silently a
+        no-op. This is logged at construction time when both offsets
+        are non-zero but the effective rotation_weight is 0.
+        """
         if calibration is None:
             raise ValueError("calibration is required")
 
@@ -238,6 +311,33 @@ class VRArmTeleopCalibrated:
         # of zeros. Updated every clean tick.
         self._last_left_target: np.ndarray | None = None
         self._last_right_target: np.ndarray | None = None
+
+        # Pre-bake the optional operator-side wrist quat offsets to wxyz
+        # quaternions once. Both default to identity == no-op.
+        self._left_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(
+            (0.0, 0.0, 0.0)
+            if left_wrist_op_quat_offset_rpy_deg is None
+            else left_wrist_op_quat_offset_rpy_deg
+        )
+        self._right_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(
+            (0.0, 0.0, 0.0)
+            if right_wrist_op_quat_offset_rpy_deg is None
+            else right_wrist_op_quat_offset_rpy_deg
+        )
+        self._has_left_op_offset = not _is_identity_quat(self._left_op_quat_offset_wxyz)
+        self._has_right_op_offset = not _is_identity_quat(self._right_op_quat_offset_wxyz)
+        if (
+            (self._has_left_op_offset or self._has_right_op_offset)
+            and self._rotation_weight == 0.0
+        ):
+            print(
+                "[VRArmTeleopCalibrated] WARNING: wrist op-quat offsets "
+                f"requested (left_rpy_deg={left_wrist_op_quat_offset_rpy_deg}, "
+                f"right_rpy_deg={right_wrist_op_quat_offset_rpy_deg}) but "
+                "rotation_weight is 0. The IK runs position-only -- the "
+                "offsets will be a no-op until rotation_weight > 0.",
+                flush=True,
+            )
 
     @staticmethod
     def _has_identity_alignment(calibration: OperatorCalibration) -> bool:
@@ -389,6 +489,18 @@ class VRArmTeleopCalibrated:
         # apply the per-arm alignment learned at calibration so the
         # wrist quaternion is expressed in the robot's torso frame.
         # Skip on dropout frames since the quat is identity / corrupt.
+        #
+        # Optional per-side ``_*_op_quat_offset_wxyz`` is post-multiplied
+        # on the head-yaw-frame operator quat BEFORE the calibration
+        # alignment. This is the "controller mount calibration" knob:
+        # if the controller sits at a fixed rotation on the operator's
+        # wrist (e.g. left controller mounted with ~30deg outward yaw on
+        # the cuff), pre-rotating by the inverse of that mount alignment
+        # makes the calibration see a "corrected" operator quat. The
+        # offset is in the operator-wrist's local frame (post-mul); see
+        # the ctor docstring for the (roll, pitch, yaw) axis convention.
+        # Identity offsets are skipped via the ``_has_*_op_offset`` flag
+        # so the hot path stays free of wasted multiplies.
         if self._rotation_weight == 0.0:
             l_quat_target: np.ndarray | None = None
             r_quat_target: np.ndarray | None = None
@@ -397,11 +509,19 @@ class VRArmTeleopCalibrated:
                 l_quat_target = None
             else:
                 l_op_quat = wrist_quat_to_head_yaw_frame(vr[0, 3:], head_quat)
+                if self._has_left_op_offset:
+                    l_op_quat = _quat_multiply_wxyz(
+                        l_op_quat, self._left_op_quat_offset_wxyz,
+                    )
                 l_quat_target = self._calibration.apply_to_wrist_quat(l_op_quat, "left")
             if right_drop:
                 r_quat_target = None
             else:
                 r_op_quat = wrist_quat_to_head_yaw_frame(vr[1, 3:], head_quat)
+                if self._has_right_op_offset:
+                    r_op_quat = _quat_multiply_wxyz(
+                        r_op_quat, self._right_op_quat_offset_wxyz,
+                    )
                 r_quat_target = self._calibration.apply_to_wrist_quat(r_op_quat, "right")
 
         # IMPORTANT: skip the IK solve entirely on dropout frames.
@@ -460,4 +580,5 @@ __all__ = [
     "VRArmTeleopCalibrated",
     "_is_controller_dropout",
     "_is_twin_dropout",
+    "_rpy_deg_to_quat_wxyz",
 ]

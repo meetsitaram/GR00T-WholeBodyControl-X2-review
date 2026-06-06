@@ -49,18 +49,40 @@ Locomotion vocabulary (LOCOMOTION mode only)
 - Left stick left             -> ``(side_left,  default)``
 - Right stick hard left/right -> ``(turn_left/right, deg_45 [or deg_90])``
 - Right stick (continuous)    -> ``(hold_torso, continuous, waist_*_deg)``
-    * ``ry > 0`` => positive ``waist_pitch_deg`` (forward lean; backward
-      lean has no primitive and is clamped to 0)
+    * ``ry`` => signed ``waist_pitch_deg`` -- forward push (ry > 0)
+      gives positive pitch (forward lean), backward push (ry < 0)
+      gives negative pitch (backward lean). Bidirectional in v7.4;
+      pre-v7.4 the negative side was clamped to 0.
     * ``rx``     => negative ``waist_yaw_deg`` for stick-right (twist)
-    * ``waist_roll_deg`` is always 0 from the operator path. v7.0 used
-      "A held + rx -> roll" but A and the R-stick share the operator's
-      right thumb and the modifier was unreachable mid-lean; v7.2
-      removed it. The wire format still carries the field for scripted
-      demos / future VLA outputs, but the right thumbstick can no
-      longer steer it.
+    * Yaw-priority cone: when |rx| dominates |ry| past
+      ``pitch_dominance_ratio``, the pitch axis is suppressed to 0
+      so a near-pure twist doesn't accidentally lean the body. The
+      symmetric "lean while only slightly twisting" case still
+      works.
+- Left stick (ARM_MANIPULATION only, v7.4)
+                              -> ``(hold_torso, continuous, waist_*_deg)``
+    * ``lx`` => signed ``waist_roll_deg`` (lateral lean). Signs
+      match ``make_waist_pose_frame``: ``lx > 0`` => positive roll
+      (lean to operator's right). Roll is hard-disabled in
+      LOCOMOTION because L-stick X-axis owns side-step there.
+    * ``ly`` => signed ``hip_height_m`` (squat / stand). Forward push
+      (ly < 0 in Quest3 convention) pushes the hip DOWN (squat);
+      backward push (ly > 0) raises the hip up. Asymmetric caps:
+      down reach is larger than up reach because the kplanner's
+      training distribution covers crouch-down ~9cm but only
+      stand-up ~4cm before going OOD. The wire carries an absolute
+      ``hip_height_m`` (default + offset) so the kplanner can pin
+      the model's channel-3 target without tracking incremental
+      deltas.
+    * Roll-priority cone: when |lx| dominates |ly| past
+      ``height_dominance_ratio``, the height axis is suppressed (no
+      ``hip_height_m`` override emitted) so a near-pure roll
+      doesn't accidentally squat. ``hold_height_threshold_m``
+      hysteresis prevents tiny ly noise from spamming the wire.
 - ``Y`` held                  -> ``(crouch, medium)`` (only when enabled)
 - All sticks neutral          -> ``(idle, default)`` (or ``hold_torso`` at 0/0/0
-                                  while continuous mode is engaged)
+                                  with no hip_height override while continuous
+                                  mode is engaged)
 """
 
 from __future__ import annotations
@@ -116,6 +138,17 @@ class LocomotionCmd:
     stick_fwd: float = 0.0
     stick_side: float = 0.0
     stick_yaw: float = 0.0
+    # Continuous hip-height target in metres. Populated by the
+    # ARM_MANIPULATION L-stick Y path (squat / stand) and read by the
+    # kplanner's ``intent_to_velocity`` to override channel-3 of the
+    # 4-D velocity intent when ``intent == "hold_torso"``. ``None``
+    # means "no height delta requested" (kplanner uses its default
+    # hip height); a finite value is the absolute target. The decoder
+    # is asymmetric -- forward stick (squat) reaches further than
+    # backward stick (rise) because the kplanner's training
+    # distribution covers down ~9cm but only up ~4cm before going
+    # OOD. See ``IntentDecoder.__init__`` for the per-direction caps.
+    hip_height_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +196,37 @@ class IntentDecoder:
         max_waist_pitch_deg: float = 20.0,
         max_waist_roll_deg: float = 10.0,
         max_waist_yaw_deg: float = 40.0,
+        # Continuous hip-height (squat / stand) caps. These are
+        # OFFSETS in metres around ``default_hip_height_m`` (which
+        # mirrors the kplanner's ``_HIP_HEIGHT_M = 0.687``). Defaults
+        # are asymmetric to match the kplanner training distribution:
+        # crouch-down survives ~9cm before going OOD, stand-up only
+        # ~4cm. ``max_height_down_m`` is applied when ly < 0 (forward
+        # push -> hip down); ``max_height_up_m`` is applied when
+        # ly > 0 (backward push -> hip up).
+        default_hip_height_m: float = 0.687,
+        max_height_down_m: float = 0.09,
+        max_height_up_m: float = 0.04,
+        # Yaw-priority cone (R-stick): pitch is suppressed when
+        # ``|ry| < pitch_dominance_ratio * |rx|`` (i.e. yaw dominates).
+        # 0.0 disables the cone (pitch and yaw both fire whenever
+        # their axis is past the deadzone). 1.0 means pitch only
+        # fires when |ry| >= |rx| (strict dominance). The default
+        # 0.4 lets the operator twist while leaning slightly, but
+        # blocks accidental lean from a yaw-intent stick wobble.
+        pitch_dominance_ratio: float = 0.4,
+        # Roll-priority cone (L-stick, ARM_MANIPULATION only):
+        # symmetric to ``pitch_dominance_ratio``. height is
+        # suppressed when ``|ly| < height_dominance_ratio * |lx|``
+        # (roll dominates). Same range / semantics; 0.4 default.
+        height_dominance_ratio: float = 0.4,
+        # ARM_MANIPULATION L-stick gate. When True (default), the
+        # left stick decodes as roll (lx) + height (ly) in
+        # ARM_MANIPULATION mode only. When False, the left stick is
+        # idle in ARM_MAN exactly as in v7.3 -- only R-stick
+        # lean / twist is active. LOCOMOTION mode is unaffected
+        # by this flag (L-stick still owns step / side-step / walk).
+        enable_arm_man_lstick: bool = True,
         # Hysteresis for continuous hold_torso emission. The decoder
         # only re-emits when ANY axis target moves by at least this
         # many degrees from the last sent target (or repeat_interval_s
@@ -170,6 +234,14 @@ class IntentDecoder:
         # by inevitable stick noise without losing perceived smoothness:
         # the planner-side _HoldTracker slews between coarse waypoints.
         hold_target_threshold_deg: float = 0.5,
+        # Same idea for ``hip_height_m`` (metres). The decoder treats
+        # two ``hold_torso`` commands as identical when their
+        # hip-height targets are within this many metres on the
+        # current emit; below that threshold thumbstick noise on ly
+        # is suppressed at the wire layer. The kplanner's neural
+        # model has its own internal smoothing so coarse waypoints
+        # are fine.
+        hold_height_threshold_m: float = 0.005,
     ) -> None:
         if stick_deadzone <= 0 or stick_deadzone >= 1:
             raise ValueError(f"stick_deadzone must be in (0, 1); got {stick_deadzone}")
@@ -283,10 +355,41 @@ class IntentDecoder:
                 f"hold_target_threshold_deg must be >= 0; "
                 f"got {hold_target_threshold_deg}"
             )
+        if default_hip_height_m <= 0:
+            raise ValueError(
+                f"default_hip_height_m must be > 0; got {default_hip_height_m}"
+            )
+        if max_height_down_m < 0 or max_height_up_m < 0:
+            raise ValueError(
+                "max_height_{down,up}_m must be non-negative; got "
+                f"({max_height_down_m}, {max_height_up_m})"
+            )
+        if pitch_dominance_ratio < 0 or pitch_dominance_ratio > 1:
+            raise ValueError(
+                "pitch_dominance_ratio must be in [0, 1]; "
+                f"got {pitch_dominance_ratio}"
+            )
+        if height_dominance_ratio < 0 or height_dominance_ratio > 1:
+            raise ValueError(
+                "height_dominance_ratio must be in [0, 1]; "
+                f"got {height_dominance_ratio}"
+            )
+        if hold_height_threshold_m < 0:
+            raise ValueError(
+                f"hold_height_threshold_m must be >= 0; "
+                f"got {hold_height_threshold_m}"
+            )
         self._max_waist_pitch_deg = float(max_waist_pitch_deg)
         self._max_waist_roll_deg = float(max_waist_roll_deg)
         self._max_waist_yaw_deg = float(max_waist_yaw_deg)
+        self._default_hip_height_m = float(default_hip_height_m)
+        self._max_height_down_m = float(max_height_down_m)
+        self._max_height_up_m = float(max_height_up_m)
+        self._pitch_dominance_ratio = float(pitch_dominance_ratio)
+        self._height_dominance_ratio = float(height_dominance_ratio)
+        self._enable_arm_man_lstick = bool(enable_arm_man_lstick)
         self._hold_target_threshold_deg = float(hold_target_threshold_deg)
+        self._hold_height_threshold_m = float(hold_height_threshold_m)
 
         self._mode = StreamMode.OFF
         self._last_emitted: Optional[LocomotionCmd] = None
@@ -446,7 +549,18 @@ class IntentDecoder:
         # ``hold_torso`` (right-stick lean) and ARM_MAN gating still apply
         # on the calling site; this branch only owns L-stick + R-stick X
         # axis (rx), leaving the ry-driven hold_torso to the legacy path.
-        if self._enable_continuous_locomotion:
+        #
+        # ARM_MANIPULATION carve-out (v7.4): when the operator is in
+        # ARM_MAN, the L-stick decodes as roll (lx) + continuous hip
+        # height (ly) inside ``_continuous_hold_cmd``, NOT as
+        # ``locomotion / continuous`` (which would just be filtered
+        # out by the ARM_MAN gate at the call site, silently dropping
+        # the operator's L-stick movements). So skip both the
+        # continuous-locomotion path AND the discrete L-stick path
+        # when in ARM_MAN; fall straight through to the right-stick
+        # / hold_torso branch which now owns both sticks.
+        in_arm_man = self._mode == StreamMode.ARM_MANIPULATION
+        if self._enable_continuous_locomotion and not in_arm_man:
             stick_fwd, stick_side, stick_yaw = self._continuous_stick_targets(
                 lx=lx, ly=ly, rx=rx,
             )
@@ -472,8 +586,16 @@ class IntentDecoder:
         # roughly equal so a slight diagonal still produces forward
         # walking instead of jittering to side-step on a small lateral
         # component.
+        #
+        # ARM_MAN carve-out (v7.4): same rationale as the continuous-
+        # locomotion branch above -- L-stick is owned by the
+        # hold_torso / waist-overlay path in ARM_MAN, so don't return
+        # discrete fwd_step / side_* / walk commands that would be
+        # filtered out at the call site anyway.
         l_active = (
-            abs(ly) >= self._stick_deadzone or abs(lx) >= self._stick_deadzone
+            not in_arm_man
+            and (abs(ly) >= self._stick_deadzone
+                 or abs(lx) >= self._stick_deadzone)
         )
         if l_active:
             if abs(ly) >= abs(lx):
@@ -507,12 +629,19 @@ class IntentDecoder:
                 if rx > 0:
                     return LocomotionCmd("turn_right", magnitude)
                 return LocomotionCmd("turn_left", magnitude)
-            # v7.2: roll modifier removed; ``a_held`` is intentionally
-            # not forwarded to ``_continuous_hold_cmd``. The operator's
-            # right thumb drives the R-stick, so A on the same
-            # controller is unreachable mid-lean. See the docstring on
-            # ``_continuous_hold_cmd`` for the full rationale.
-            return self._continuous_hold_cmd(rx=rx, ry=ry)
+            # v7.4: lx/ly forwarded so ARM_MANIPULATION mode can decode
+            # roll (lx) + continuous hip height (ly) from the L-stick.
+            # In LOCOMOTION mode ``_continuous_hold_cmd`` ignores
+            # lx/ly because the L-stick already drove the discrete /
+            # continuous-locomotion path above; here we're past that
+            # branch (the L-stick was inactive this tick) so passing
+            # the residual deflections through is harmless.
+            #
+            # ``a_held`` is intentionally not forwarded: A and the
+            # R-stick share the operator's right thumb (v7.2).
+            return self._continuous_hold_cmd(
+                rx=rx, ry=ry, lx=lx, ly=ly,
+            )
 
         # ----- Legacy discrete-bin path -----------------------------------
         # Y axis (forward) -> graded lean_fwd_{small,medium,large}
@@ -623,8 +752,11 @@ class IntentDecoder:
         rx: float,
         ry: float,
         a_held: bool = False,
-    ) -> tuple[float, float, float]:
-        """Compute the (pitch, roll, yaw) continuous waist target in degrees.
+        *,
+        lx: float = 0.0,
+        ly: float = 0.0,
+    ) -> tuple[float, float, float, float | None]:
+        """Compute the (pitch, roll, yaw, hip_height_m) continuous target.
 
         Public companion to :meth:`_continuous_hold_cmd` for callers
         (e.g. the Quest 3 manager) that need the *target value* without
@@ -633,70 +765,136 @@ class IntentDecoder:
         the manager flips ``LOCOMOTION -> ARM_MANIPULATION``.
 
         Always returns clamped, deadzone-aware angles regardless of the
-        decoder's mode or the ``enable_continuous_torso`` flag.
+        decoder's mode or the ``enable_continuous_torso`` flag. The
+        4-tuple's ``hip_height_m`` is ``None`` when the L-stick is
+        within the height deadzone / the ARM_MAN gate is off (caller
+        should treat this as "no override; use planner default").
 
         The ``a_held`` parameter is accepted for backward compatibility
         with v7.1 callers but is now ignored: see :meth:`_continuous_hold_cmd`
         for the ergonomic rationale (operator's right thumb cannot reach
         A while driving the R-stick on the same controller).
+
+        ``lx`` / ``ly`` default to 0.0 so legacy v7.3 call-sites (which
+        only sampled the right stick) keep their semantics: roll stays
+        0.0 and ``hip_height_m`` stays ``None``.
         """
         del a_held  # v7.2: accepted but ignored
-        cmd = self._continuous_hold_cmd(rx=rx, ry=ry)
-        return (cmd.waist_pitch_deg, cmd.waist_roll_deg, cmd.waist_yaw_deg)
+        cmd = self._continuous_hold_cmd(rx=rx, ry=ry, lx=lx, ly=ly)
+        return (
+            cmd.waist_pitch_deg,
+            cmd.waist_roll_deg,
+            cmd.waist_yaw_deg,
+            cmd.hip_height_m,
+        )
 
     def _continuous_hold_cmd(
         self,
         *,
         rx: float,
         ry: float,
+        lx: float = 0.0,
+        ly: float = 0.0,
     ) -> LocomotionCmd:
-        """Build a continuous-hold LocomotionCmd from the right-stick state.
+        """Build a continuous-hold LocomotionCmd from the stick state.
 
-        Stick conventions (validated with the operator on 2026-05-13,
-        revised on 2026-05-14 to drop the lateral-lean (roll) axis):
+        Stick conventions (v7.4):
 
-        - ``ry > 0`` (stick up)   -> forward lean (positive pitch).
-          Backward lean is unsupported (no primitive, single-sided cap).
-        - ``rx``                  -> twist (yaw). Stick right (rx > 0)
-          maps to a NEGATIVE waist_yaw, matching ``torso_right_*deg``
-          which uses negative peak_deg.
+        - ``ry``                  -> signed pitch. ``ry > 0`` (forward
+          push) gives positive pitch (forward lean); ``ry < 0`` gives
+          negative pitch (backward lean). Bidirectional in v7.4;
+          pre-v7.4 the negative side was clamped to 0.
+        - ``rx``                  -> twist (yaw). Stick right (``rx > 0``)
+          maps to a NEGATIVE ``waist_yaw_deg``, matching
+          ``torso_right_*deg`` (negative peak_deg).
+        - ``lx``                  -> signed roll (ARM_MANIPULATION only,
+          gated on ``enable_arm_man_lstick``). ``lx > 0`` gives
+          positive roll (lean to operator's right). LOCOMOTION leaves
+          roll = 0 because the L-stick X-axis owns side-step there.
+        - ``ly``                  -> signed continuous hip height
+          (ARM_MANIPULATION only). Quest3 reports ``ly < 0`` for stick
+          pushed forward (away from the operator) -> hip DOWN (squat).
+          Asymmetric caps -- down reach is larger than up reach
+          because the kplanner's training distribution covers
+          crouch-down ~9cm but only stand-up ~4cm.
 
-        ``waist_roll_deg`` is always emitted as 0 from the operator
-        path. The underlying planner / ``make_waist_pose_frame`` still
-        supports continuous roll (and the wire format reserves the
-        field) so scripted demos and future VLA outputs can emit it,
-        but the right thumbstick can no longer steer it. The original
-        v7.1 design used "A held + R-stick X" -> roll, but A and the
-        R-stick share the operator's right thumb; in practice the
-        modifier was unreachable mid-lean. Rather than reassign roll
-        to a left-hand button (and burn a second face button for an
-        axis the operator can already approximate by chaining a brief
-        twist + lean), v7.2 simply removes it from the operator
-        vocabulary. See ``docs/source/tutorials/x2_quest3_planner_stack_cheatsheet.md``
-        for the operator-facing explanation.
+        Yaw-priority cone (R-stick): when the operator is making a
+        predominantly-yaw stick movement (|rx| dominates |ry| past
+        ``pitch_dominance_ratio``), the pitch axis is suppressed to 0
+        so a near-pure twist doesn't accidentally lean the body. The
+        symmetric "lean while only slightly twisting" case still
+        works.
 
-        Released stick (in deadzone) yields a (0, 0, 0) hold target;
-        the planner's STATIC_HOLD state slews back to neutral via the
-        same ``_HoldTracker`` path that any other change would use.
+        Roll-priority cone (L-stick): when |lx| dominates |ly| past
+        ``height_dominance_ratio``, the height axis is suppressed (no
+        ``hip_height_m`` override emitted) so a near-pure roll
+        doesn't accidentally squat.
+
+        Released stick (in deadzone) yields a neutral hold target;
+        the planner's STATIC_HOLD / waist-overlay slews back to
+        neutral via the same ``_HoldTracker`` path that any other
+        change would use.
         """
-        # Pitch: clamp ry > 0 to (0, max_waist_pitch_deg]; ry <= 0 -> 0.
-        pitch_deg = max(
-            0.0,
-            self._scaled_axis(
-                max(0.0, ry),
-                self._stick_deadzone,
-                self._max_waist_pitch_deg,
-            ),
-        )
         yaw_deg = -self._scaled_axis(
             rx, self._stick_deadzone, self._max_waist_yaw_deg,
         )
+
+        ry_active = abs(ry) >= self._stick_deadzone
+        rx_active = abs(rx) >= self._stick_deadzone
+        pitch_dominates = (
+            self._pitch_dominance_ratio <= 0.0
+            or not rx_active
+            or abs(ry) >= self._pitch_dominance_ratio * abs(rx)
+        )
+        if ry_active and pitch_dominates:
+            pitch_deg = self._scaled_axis(
+                ry, self._stick_deadzone, self._max_waist_pitch_deg,
+            )
+        else:
+            pitch_deg = 0.0
+
+        roll_deg = 0.0
+        hip_height_m: float | None = None
+        if (
+            self._mode == StreamMode.ARM_MANIPULATION
+            and self._enable_arm_man_lstick
+        ):
+            roll_deg = self._scaled_axis(
+                lx, self._stick_deadzone, self._max_waist_roll_deg,
+            )
+
+            ly_active = abs(ly) >= self._stick_deadzone
+            lx_active = abs(lx) >= self._stick_deadzone
+            height_dominates = (
+                self._height_dominance_ratio <= 0.0
+                or not lx_active
+                or abs(ly) >= self._height_dominance_ratio * abs(lx)
+            )
+            if ly_active and height_dominates:
+                # Quest3: ly < 0 = stick pushed forward (away from
+                # operator) -> hip DOWN (squat). Asymmetric clamp:
+                # down reach is larger than up reach. ``_scaled_axis``
+                # is sign-preserving, so we feed it ``|ly|`` and a
+                # direction-specific cap, then negate for the
+                # forward-push branch so the absolute target sits
+                # below the default.
+                if ly < 0:
+                    offset = -self._scaled_axis(
+                        -ly, self._stick_deadzone, self._max_height_down_m,
+                    )
+                else:
+                    offset = self._scaled_axis(
+                        ly, self._stick_deadzone, self._max_height_up_m,
+                    )
+                hip_height_m = float(self._default_hip_height_m + offset)
+
         return LocomotionCmd(
             intent="hold_torso",
             magnitude="continuous",
             waist_pitch_deg=float(pitch_deg),
-            waist_roll_deg=0.0,
+            waist_roll_deg=float(roll_deg),
             waist_yaw_deg=float(yaw_deg),
+            hip_height_m=hip_height_m,
         )
 
     def _maybe_emit(
@@ -747,11 +945,27 @@ class IntentDecoder:
             return True
         if new.intent == "hold_torso":
             thresh = self._hold_target_threshold_deg
-            return (
+            angle_changed = (
                 abs(new.waist_pitch_deg - old.waist_pitch_deg) >= thresh
                 or abs(new.waist_roll_deg - old.waist_roll_deg) >= thresh
                 or abs(new.waist_yaw_deg - old.waist_yaw_deg) >= thresh
             )
+            # hip_height_m: None <-> finite is always a significant
+            # change (operator engaged / released the squat axis); two
+            # finite values count when their delta meets the metres
+            # threshold.
+            new_h = new.hip_height_m
+            old_h = old.hip_height_m
+            if (new_h is None) != (old_h is None):
+                height_changed = True
+            elif new_h is None:
+                height_changed = False
+            else:
+                height_changed = (
+                    abs(float(new_h) - float(old_h))
+                    >= self._hold_height_threshold_m
+                )
+            return angle_changed or height_changed
         if new.intent == "locomotion":
             # Mirror the hold_torso hysteresis: only re-emit when the
             # operator has moved a stick by at least the configured

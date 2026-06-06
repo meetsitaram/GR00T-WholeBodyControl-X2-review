@@ -64,14 +64,28 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw  # noqa: E402
 from gear_sonic.utils.planner.state_machine import (  # noqa: E402
+    HOLD_HIP_PITCH_SHARE,
+    HOLD_HIP_YAW_SHARE,
+    HOLD_ANKLE_PITCH_SHARE,
+    HOLD_ANKLE_ROLL_SHARE,
+    HOLD_SLEW_DPS,
+    HOLD_TORSO_INTENT,
     LocomotionCommand,
     OUTPUT_FPS,
     PlannerState,
     StreamFrame,
+    _HoldTracker,
     build_pose_payload,
     commands_from_yaml,
 )
+from gear_sonic.utils.planner.constants import (  # noqa: E402
+    WAIST_PITCH_IDX,
+    WAIST_ROLL_IDX,
+    WAIST_YAW_IDX,
+)
+from gear_sonic.utils.planner.x2_recipes import make_waist_pose_frame  # noqa: E402
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message  # noqa: E402
 
 
@@ -126,6 +140,49 @@ _WALK_SPEED_MPS: float = 0.5
 _FAST_WALK_SPEED_MPS: float = 0.9
 _SIDE_SPEED_MPS: float = 0.4
 _BACK_SPEED_MPS: float = 0.35
+
+# Minimum forward velocity command (m/s) emitted whenever the operator
+# commits any non-zero forward stick deflection in the
+# continuous-locomotion path. Default 0.30 m/s lands the SONIC X2
+# root model inside its in-distribution forward-walk band as soon as
+# the operator pushes past the deadzone. Set to 0.0 to disable the
+# floor entirely (pre-2026-05-31 legacy behaviour).
+#
+# Rationale: ``x2_ultra_locowalk.pkl`` forward-walk training samples
+# are concentrated between roughly 0.3 - 1.0 m/s, with essentially no
+# coverage below 0.3 m/s. Commanding 0 < vel_z < 0.3 puts the policy
+# OOD -- empirically the robot wiggles its hips but never initiates
+# a step, then snaps into an unstable stride once vel_z finally
+# exceeds the training-band minimum (operator-reported 2026-05-31).
+# The backward channel does not need this floor because the same
+# corpus has dense backward samples all the way down to ~-0.08 m/s.
+#
+# 0.30 m/s was picked as the default because it sits just above the
+# training-band p1 (~0.28 m/s) -- the smallest forward speed the
+# policy has more than a handful of frames of. Operators who want
+# more aggressive lift-off (faster, less smooth deadzone transition)
+# can bump to ~0.40 m/s; operators who want to revert to raw
+# proportional control (and accept the hip-wiggle below ~0.3 m/s)
+# can set 0.0.
+#
+# The floor is applied **post** ``_RUNTIME_FORWARD_SCALE`` in
+# ``_apply_continuous_runtime_scales`` so it acts as a true
+# operator-felt minimum regardless of any scale override. Operators
+# who want progressive forward control above the floor should keep
+# ``floor < forward_scale * _WALK_SPEED_MPS`` (i.e.
+# ``floor < 0.5 m/s`` at scale=1.0); otherwise every forward stick
+# value collapses onto the floor. Tunable via
+# ``--continuous-forward-min-mps`` (CLI) or
+# ``KPLANNER_CONTINUOUS_FORWARD_MIN_MPS`` (env var on the
+# Quest 3 wrapper). The bucketed forward intents and the PKL replay
+# path are intentionally untouched -- the floor only fires when the
+# operator is on the analog stick.
+_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS: float = 0.30
+
+# Mutable runtime knob, set from ``run()`` per CLI flag. Reads in
+# ``_apply_continuous_runtime_scales`` pick up the override on every
+# dispatch call.
+_RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
 # Per-step yaw rate baseline; magnitude scalars in ``_TURN_SCALE`` rescale.
 _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
@@ -470,6 +527,27 @@ def intent_to_velocity(cmd: LocomotionCommand) -> tuple[float, float, float, flo
             cmd.stick_fwd, cmd.stick_side, cmd.stick_yaw,
         )
         return _apply_continuous_runtime_scales(result)
+    if cmd.intent == HOLD_TORSO_INTENT:
+        # ``hold_torso`` keeps the velocity intent at idle (no walking,
+        # no turning) so the SONIC policy plants the feet, but honours
+        # any operator-supplied hip-height override on channel-3 of
+        # the velocity tuple. ``cmd.hip_height_m is None`` -> no
+        # override -> fall through to ``_IDLE_INTENT`` -> kplanner
+        # default hip height (0.687m). When a finite value is
+        # present, substitute it into the channel-3 slot. The waist
+        # angles (pitch / roll / yaw) are NOT consumed here -- they
+        # ride on a separate kinematic-overlay path applied to the
+        # published frame after intent_to_velocity returns; see
+        # ``_apply_waist_overlay`` in the publish loop. Without that
+        # split the kplanner could not express the "lean while
+        # squatting" combo the operator can drive with both sticks.
+        yaw_idle, vx_idle, vz_idle, hip_idle = _IDLE_INTENT
+        hip_h = (
+            float(cmd.hip_height_m)
+            if cmd.hip_height_m is not None
+            else float(hip_idle)
+        )
+        return (float(yaw_idle), float(vx_idle), float(vz_idle), hip_h)
     result = _resolve_velocity(cmd.intent, cmd.magnitude)
     if result == _IDLE_INTENT and cmd.intent != "idle":
         log.debug("intent %s,%s has no velocity mapping; idling",
@@ -496,6 +574,16 @@ def _apply_continuous_runtime_scales(
         yaw *= _RUNTIME_TURN_RIGHT_SCALE
     if vz > 0:
         vz *= _RUNTIME_FORWARD_SCALE
+        # Forward-velocity floor: if the operator has committed any
+        # non-zero forward stick deflection (vz > 0 pre-scale), lift
+        # the post-scale forward command up to the in-distribution
+        # band so the SONIC root model commits to a stride instead of
+        # hip-wiggling below the training minimum. See
+        # ``_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS``'s docstring for the
+        # full rationale; default 0.0 = no-op so legacy invariants and
+        # unit tests still hold when the operator does not opt in.
+        if _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS > 0.0:
+            vz = max(vz, _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS)
     elif vz < 0:
         vz *= _RUNTIME_BACKWARD_SCALE
     vx *= _RUNTIME_LATERAL_SCALE
@@ -681,6 +769,10 @@ def _qpos_to_stream_frame(
         bin_name=bin_name,
         frame_index=frame_index,
         seam_blend=False,
+        # Carry the actual MuJoCo qpos[2] through to the wire so the
+        # kinematic viewer + PKL recorder can reconstruct world-frame
+        # pelvis height instead of pelvis-pinning at DEFAULT_PELVIS_Z_M.
+        root_z_world=float(root_xyz[2]),
     )
 
 
@@ -742,14 +834,27 @@ def _zmq_command_thread(
                 stick_fwd  = float(payload.get("stick_fwd",  0.0))
                 stick_side = float(payload.get("stick_side", 0.0))
                 stick_yaw  = float(payload.get("stick_yaw",  0.0))
-                # ``hold_torso`` (continuous waist target) passes through
-                # but the kplanner's dispatcher idles on it (no upper-body
-                # bins). We still parse the waist fields so future kplanner
-                # extensions can consume them without changing the wire
-                # format.
+                # ``hold_torso`` (continuous waist target) is consumed
+                # by the kplanner's waist-overlay path (v7.4): the
+                # tracker walks ``current_*_deg`` toward these targets
+                # at HOLD_SLEW_DPS each tick and the publish loop adds
+                # the deltas to the waist DOFs of the kplanner's
+                # output frame. ``hip_height_m`` is an optional
+                # absolute hip-height override (metres) consumed by
+                # ``intent_to_velocity``: when present and the intent
+                # is ``hold_torso`` it substitutes channel-3 of the
+                # 4-D velocity intent so the operator's L-stick Y
+                # squat / stand drives the model's continuous height
+                # target. Missing field -> None -> kplanner default.
                 waist_pitch_deg = float(payload.get("waist_pitch_deg", 0.0))
                 waist_roll_deg  = float(payload.get("waist_roll_deg",  0.0))
                 waist_yaw_deg   = float(payload.get("waist_yaw_deg",   0.0))
+                hip_height_raw  = payload.get("hip_height_m", None)
+                hip_height_m: Optional[float] = (
+                    float(hip_height_raw)
+                    if hip_height_raw is not None
+                    else None
+                )
                 # Optional raw 4-D velocity passthrough used by
                 # ``x2_pkl_command_source`` for replaying recorded motion
                 # clips through the planner -> deploy chain without the
@@ -794,6 +899,7 @@ def _zmq_command_thread(
                     stick_side=stick_side,
                     stick_yaw=stick_yaw,
                     direct_velocity=direct_velocity,
+                    hip_height_m=hip_height_m,
                 )
             )
     finally:
@@ -832,6 +938,41 @@ class PoseObservation:
 
     t_mono: float
     pelvis_qpos_wxyz: np.ndarray  # shape (7,)
+
+
+def _yaw_only_wxyz_from_pelvis(pelvis_qpos_wxyz: np.ndarray) -> np.ndarray:
+    """Extract world-frame yaw from a pelvis ``(x,y,z, qw,qx,qy,qz)`` row
+    and return ``R_z(yaw)`` packed as ``(qw, qx, qy, qz)``.
+
+    Used by the publish loop's IDLE_LOOP branch to re-anchor the
+    persisted reference yaw (``current_root_wxyz``) on every tick from
+    the latest ``robot_pose`` observation. Pitch + roll are dropped on
+    purpose so a transient leg lean (e.g. fall-recovery) doesn't bleed
+    into the published reference and confuse SONIC's upright-reference
+    training distribution.
+
+    Yaw extraction goes through :func:`yaw_of_quat_xyzw` so the
+    convention (lowercase ``"zyx"`` extrinsic, range ``(-pi, pi]``)
+    matches every other yaw-touching site in the stack -- the gesture
+    session yaw rebase, the recorder's snap quat, and the kplanner's
+    own state-machine logging. A custom closed-form would silently
+    drift from that convention under non-trivial pitch/roll.
+    """
+    qpos = np.asarray(pelvis_qpos_wxyz, dtype=np.float64).reshape(-1)
+    if qpos.shape[0] < 7:
+        raise ValueError(
+            f"pelvis_qpos_wxyz must be >= 7 long (got {qpos.shape[0]})"
+        )
+    quat_xyzw = np.array(
+        [qpos[4], qpos[5], qpos[6], qpos[3]],
+        dtype=np.float64,
+    )
+    yaw = yaw_of_quat_xyzw(quat_xyzw)
+    half = 0.5 * yaw
+    return np.array(
+        [math.cos(half), 0.0, 0.0, math.sin(half)],
+        dtype=np.float32,
+    )
 
 
 def _pose_feedback_thread(
@@ -894,7 +1035,23 @@ def _pose_feedback_thread(
 
 _RESEED_SCOPE_FULL_ROOT = "full_root"
 _RESEED_SCOPE_QUAT_ONLY = "quat_only"
-_VALID_RESEED_SCOPES = (_RESEED_SCOPE_FULL_ROOT, _RESEED_SCOPE_QUAT_ONLY)
+# ``none`` -> reseed disabled entirely (PLAYING side). Use this on real
+# robot where the pose source is the IMU-only x2_debug bridge (no
+# position measurement): ``full_root`` would overwrite the planner's
+# xy/z history with zeros every replan tick (catastrophic instability),
+# and ``quat_only`` would anchor the model's yaw integration to the
+# lagging measured yaw, causing commanded turns to under-rotate (the
+# model can never get more than one replan-tick ahead of the robot).
+# With ``none`` the planner integrates yaw open-loop during PLAYING --
+# snap-back protection still comes from the IDLE_LOOP yaw refresh and
+# the new IDLE -> PLAYING transition seed (both yaw-only, both writing
+# to ``current_root_wxyz`` only, never to the model's neural buffer).
+_RESEED_SCOPE_NONE = "none"
+_VALID_RESEED_SCOPES = (
+    _RESEED_SCOPE_FULL_ROOT,
+    _RESEED_SCOPE_QUAT_ONLY,
+    _RESEED_SCOPE_NONE,
+)
 
 
 def _reseed_root_from_observations(
@@ -935,6 +1092,15 @@ def _reseed_root_from_observations(
 
     Returns ``None`` on success, or a short skip-reason string.
     """
+    # Short-circuit ``none`` BEFORE any planner_core / pose_deque access
+    # so the call is cheap (a single string compare per replan tick) and
+    # the disabled state is observable in reseed_stats without taking
+    # the pose_lock. ``"disabled"`` is the canonical skip-reason; the
+    # caller maps non-{insufficient,stale,buffer_uninit} reasons into
+    # ``skipped_other`` for log accounting.
+    if scope == _RESEED_SCOPE_NONE:
+        return "disabled"
+
     import torch
 
     buf = planner_core.frames.get("mujoco_qpos")
@@ -1390,6 +1556,311 @@ class _ColdStartVelocityRamp:
         self._last_was_idle = True
 
 
+# ---------------------------------------------------------------------------
+# Reference-step smoother (publisher output, step-detection driven)
+# ---------------------------------------------------------------------------
+
+
+# Default ramp duration (s) used by ``_ReferenceStepSmoother`` when an
+# inbound reference step is detected. 0.30 s sits at the natural period of
+# the lower-body PD loop at deployed kp (hip/knee ~99 Nm/rad with leg
+# inertia O(few kg.m^2)), so the joint actually has time to follow the
+# rising reference instead of being thrown at the ramp's onset. Set 0.0 to
+# fall back to passthrough (cheaper than the ``shape=off`` path). Operators
+# tune via ``--ref-smoother-ms`` / ``KPLANNER_REF_SMOOTHER_MS``.
+_DEFAULT_REF_SMOOTHER_MS: float = 300.0
+
+# Default trigger threshold (rad) for the smoother. Per-tick reference
+# delta on any blended-channel joint exceeding this value will arm a
+# halfcos ramp. 0.05 rad ~= 3 deg cleanly separates the multi-degree
+# step a stick push/release creates (frozen anchor <-> neural buffer pose)
+# from the per-tick neural-buffer motion under steady walking (typ.
+# < 0.01 rad/tick on the hip pitch leader). Operators tune via
+# ``--ref-smoother-trigger-rad``; setting 0 makes every non-zero delta a
+# candidate (debug only -- ramps will fire continuously during smooth
+# walking and add steady-state lag).
+_DEFAULT_REF_SMOOTHER_TRIGGER_RAD: float = 0.05
+
+# Ramp shape options. ``halfcos`` is the operational default -- C^1 smooth
+# at both endpoints, so neither the start nor the end of the ramp injects
+# a velocity step into the PD law. ``linear`` is exposed for A/B
+# comparison; it has a step in dq/dt at t=0 and t=T, which materially
+# defeats the click-suppression goal but is useful for debugging the
+# shape's contribution. ``off`` short-circuits the smoother to a pure
+# passthrough -- byte-equivalent to the pre-2026-05-31 publisher output,
+# usable as a single-flag revert in case the smoother regresses anything.
+_REF_SMOOTHER_SHAPES: tuple[str, ...] = ("halfcos", "linear", "off")
+_DEFAULT_REF_SMOOTHER_SHAPE: str = "halfcos"
+
+# Joint-mask presets. ``lower_body`` (default) ramps legs + waist only
+# (MJ indices [0..14], confirmed against
+# ``policy_parameters.hpp::x2_action_scale`` / ``default_angles``). Arms,
+# wrists, and head pass through unchanged so manipulation tasks driven by
+# the same body_pose stream (e.g. future bimanual reach) are not affected
+# by any ramp -- the audible click is mechanical and lives in the leg
+# drivetrain; arms run on smaller kp (~14 Nm/rad) and have no observed
+# click symptom on the X2 hardware to date. ``legs_only`` skips the waist
+# block ([12..14]) in case waist twist needs to remain maximally
+# responsive. ``all`` blends all 31 DoFs (legacy debug A/B; the original
+# plan formulation). Fingers / OmniHand commands are on a separate command
+# path and never enter the kplanner body_pose stream, so they are
+# unconditionally untouched by every preset.
+_REF_SMOOTHER_JOINTS_PRESETS: dict[str, np.ndarray] = {
+    "lower_body": np.arange(0, 15, dtype=np.int64),
+    "legs_only":  np.arange(0, 12, dtype=np.int64),
+    "all":        np.arange(0, 31, dtype=np.int64),
+}
+_DEFAULT_REF_SMOOTHER_JOINTS: str = "lower_body"
+
+
+class _ReferenceStepSmoother:
+    """One-shot halfcos ramp on detected per-tick reference steps.
+
+    Why this exists
+    ---------------
+
+    The deploy publishes a 31-DoF position reference at 50 Hz. The PD law
+    closing on each motor is
+    ``tau = kp * (target_pos - q) + kd * (target_vel - dq) + effort_ff``,
+    evaluated at 500 Hz. When the published ``target_pos`` jumps by
+    several degrees in a single 20 ms tick (e.g. operator pushes the
+    Quest 3 thumbstick and the kplanner switches its reference source
+    from frozen ``default_angles`` to the live neural buffer; same in
+    reverse on release), the lower-body kp (hip/knee ~99 Nm/rad,
+    ankle ~21 Nm/rad after the 2026-05 stability bump) multiplies that
+    step into a torque step on the wire. The motor current loop slams
+    current to deliver it, and the real-hardware drivetrain absorbs the
+    step as a percussive backlash / bearing snap -- the operator-reported
+    "loud click" on every stick push and release. MuJoCo has no
+    backlash / bearing-snap model, so the symptom is silent in sim.
+
+    How it works (no FSM coupling)
+    ------------------------------
+
+    Every publish tick the caller hands the smoother the would-be
+    ``target_q`` (31-vector) and the wall-clock tick time. The smoother:
+
+    1. Computes ``delta_max = max(|target_q[i] - last_published_q[i]|)``
+       over the channels in ``blend_indices`` only. Arms / head are
+       excluded both from the step detection AND from any blending --
+       they pass through byte-equivalent to the input.
+    2. If no ramp is currently active AND ``delta_max > trigger_rad``,
+       it arms a one-shot ramp: ``source_q = last_published_q.copy()``,
+       ``ramp_start_t = t_now``, ``ramp_active = True``. The caller can
+       attribute the trigger from the published log line (joint name +
+       magnitude) but the smoother itself is intentionally agnostic to
+       what produced the step. Operator stick push, stick release,
+       primitive switch, future MC-handoff piped through this publisher
+       -- all are handled uniformly because the step on the wire is the
+       same signal.
+    3. If a ramp is active, it computes
+       ``alpha = blend_fn(min((t_now - ramp_start_t) / ramp_duration_s, 1.0))``
+       where ``blend_fn`` is ``halfcos`` by default (``0.5 * (1 - cos(pi*x))``,
+       ``C^1`` smooth at both endpoints). The output on blended channels is
+       ``(1 - alpha) * source_q[i] + alpha * target_q[i]``; on excluded
+       channels it's ``target_q[i]``. The target is sampled *live* every
+       tick so the ramp ends exactly on whatever the publisher would
+       have emitted anyway, eliminating a second click at the ramp's
+       far end.
+    4. When ``t_now - ramp_start_t >= ramp_duration_s``, the ramp clears
+       (``ramp_active = False``). Subsequent ticks are passthrough until
+       a new step is detected.
+
+    Behaviour invariants tested in
+    ``tests/test_x2_kplanner_reference_smoother.py``:
+
+      * ``shape=off`` is byte-equivalent passthrough (no detection, no
+        log lines, no state updates beyond ``last_published_q``).
+      * ``joints=lower_body`` (default) NEVER modifies indices [15..30]
+        even during an active ramp (manipulation-safety invariant).
+      * An active ramp does not restart on subsequent large deltas (the
+        smoother is one-shot per detected step; it must complete before
+        re-arming).
+      * Sub-trigger deltas pass through without arming a ramp (steady
+        walking does not introduce ongoing lag).
+
+    Hot-path cost is O(31) per tick (one np.abs + np.max on the blended
+    slice, one np.where or pre-built mask multiply during ramps). The
+    smoother is allocated once at startup and held by reference in the
+    publish loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        ramp_duration_s: float = _DEFAULT_REF_SMOOTHER_MS / 1000.0,
+        trigger_rad: float = _DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
+        shape: str = _DEFAULT_REF_SMOOTHER_SHAPE,
+        blend_indices: Optional[np.ndarray] = None,
+        num_dofs: int = 31,
+        log_fn: Optional[callable] = None,  # type: ignore[valid-type]
+    ) -> None:
+        if shape not in _REF_SMOOTHER_SHAPES:
+            raise ValueError(
+                f"_ReferenceStepSmoother: shape={shape!r} not in "
+                f"{_REF_SMOOTHER_SHAPES}"
+            )
+        self.ramp_duration_s = float(ramp_duration_s)
+        self.trigger_rad = float(trigger_rad)
+        self.shape = shape
+        self.num_dofs = int(num_dofs)
+        idx = (
+            np.asarray(blend_indices, dtype=np.int64)
+            if blend_indices is not None
+            else _REF_SMOOTHER_JOINTS_PRESETS[_DEFAULT_REF_SMOOTHER_JOINTS]
+        )
+        if idx.ndim != 1:
+            raise ValueError(
+                f"_ReferenceStepSmoother: blend_indices must be 1-D, "
+                f"got shape {idx.shape}"
+            )
+        if idx.size == 0:
+            raise ValueError(
+                "_ReferenceStepSmoother: blend_indices must be non-empty; "
+                "use shape='off' to disable the smoother instead."
+            )
+        if int(idx.min()) < 0 or int(idx.max()) >= self.num_dofs:
+            raise ValueError(
+                f"_ReferenceStepSmoother: blend_indices out of range "
+                f"[0, {self.num_dofs}); got "
+                f"[{int(idx.min())}, {int(idx.max())}]"
+            )
+        self.blend_indices = idx
+        self._log_fn = log_fn
+
+        # Persistent state.
+        self._last_published_q: Optional[np.ndarray] = None
+        self._ramp_active: bool = False
+        self._ramp_start_t: float = 0.0
+        self._source_q: Optional[np.ndarray] = None
+
+    @property
+    def enabled(self) -> bool:
+        """True iff the smoother will actually shape the output.
+
+        ``shape == 'off'`` and ``ramp_duration_s <= 0`` both short-
+        circuit to passthrough; useful for callers that want to skip
+        the per-tick subscribe / log overhead entirely.
+        """
+        return self.shape != "off" and self.ramp_duration_s > 0.0
+
+    @staticmethod
+    def _halfcos(x: float) -> float:
+        """``0.5 * (1 - cos(pi * x))``, clamped to [0, 1] in input."""
+        x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+        return 0.5 * (1.0 - math.cos(math.pi * x))
+
+    @staticmethod
+    def _linear(x: float) -> float:
+        return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+    def _alpha(self, t_in_ramp: float) -> float:
+        x = t_in_ramp / self.ramp_duration_s
+        if self.shape == "halfcos":
+            return self._halfcos(x)
+        if self.shape == "linear":
+            return self._linear(x)
+        # 'off' is short-circuited in update(); arrive here only via tests
+        # exercising _alpha directly.
+        return 1.0 if x >= 1.0 else 0.0
+
+    def _emit_arm_log(self, delta_max: float, worst_idx: int) -> None:
+        if self._log_fn is None:
+            return
+        self._log_fn(
+            "ref-smoother: armed (worst joint mj_idx=%d, delta=%.3f rad, "
+            "trigger=%.3f rad, T=%.0f ms, shape=%s)",
+            int(worst_idx),
+            float(delta_max),
+            float(self.trigger_rad),
+            float(self.ramp_duration_s * 1000.0),
+            self.shape,
+        )
+
+    def update(self, target_q: np.ndarray, t_now: float) -> np.ndarray:
+        """Return the smoothed reference for this tick.
+
+        Args:
+            target_q: the would-be published joint reference, shape
+                ``(num_dofs,)`` in MuJoCo joint order. Not modified.
+            t_now: monotonic wall-clock seconds. Only differences are
+                used; absolute origin is irrelevant.
+
+        Returns:
+            A new ``np.ndarray`` of dtype matching ``target_q``. On
+            channels in ``blend_indices`` and during an active ramp,
+            the value is the halfcos (or linear) blend of the snapshot
+            source pose to the live target. Everywhere else, the value
+            is ``target_q[i]`` verbatim. When ``shape='off'`` or
+            ``ramp_duration_s <= 0`` the returned array is byte-equal
+            to ``target_q``.
+        """
+        target_q = np.asarray(target_q)
+        if target_q.shape != (self.num_dofs,):
+            raise ValueError(
+                f"_ReferenceStepSmoother.update: target_q shape "
+                f"{target_q.shape} != ({self.num_dofs},)"
+            )
+
+        if not self.enabled:
+            # Passthrough fast path; keep the last-published cache fresh
+            # so the smoother can be re-enabled mid-run without seeding
+            # a phantom step from a stale snapshot.
+            self._last_published_q = target_q.astype(target_q.dtype, copy=True)
+            return self._last_published_q.copy()
+
+        if self._last_published_q is None:
+            # First tick: nothing to detect a step against. Seed the
+            # cache and pass the target through unchanged. The first
+            # genuinely-detectable step lands on tick 2 at the earliest.
+            self._last_published_q = target_q.astype(target_q.dtype, copy=True)
+            return self._last_published_q.copy()
+
+        # ---- Step detection (only on the blended channels).
+        diff = target_q[self.blend_indices] - self._last_published_q[self.blend_indices]
+        abs_diff = np.abs(diff)
+        worst_local = int(np.argmax(abs_diff)) if abs_diff.size > 0 else 0
+        delta_max = float(abs_diff[worst_local]) if abs_diff.size > 0 else 0.0
+        worst_mj = int(self.blend_indices[worst_local]) if abs_diff.size > 0 else -1
+
+        if (not self._ramp_active) and delta_max > self.trigger_rad:
+            self._ramp_active = True
+            self._ramp_start_t = float(t_now)
+            self._source_q = self._last_published_q.astype(target_q.dtype, copy=True)
+            self._emit_arm_log(delta_max, worst_mj)
+
+        # ---- Build the output.
+        if self._ramp_active and self._source_q is not None:
+            t_in_ramp = float(t_now) - self._ramp_start_t
+            if t_in_ramp >= self.ramp_duration_s:
+                # Ramp complete -- emit the live target and clear state.
+                self._ramp_active = False
+                self._source_q = None
+                out = target_q.astype(target_q.dtype, copy=True)
+            else:
+                alpha = self._alpha(t_in_ramp)
+                out = target_q.astype(target_q.dtype, copy=True)
+                bi = self.blend_indices
+                out[bi] = (
+                    (1.0 - alpha) * self._source_q[bi]
+                    + alpha * target_q[bi]
+                ).astype(target_q.dtype, copy=False)
+        else:
+            out = target_q.astype(target_q.dtype, copy=True)
+
+        self._last_published_q = out
+        return out.copy()
+
+    def reset(self) -> None:
+        """Clear all state. Safe to call from any caller-side reset path
+        (planner restart, mode flip). The next ``update()`` call will
+        re-seed the cache from its ``target_q`` and start fresh."""
+        self._last_published_q = None
+        self._ramp_active = False
+        self._ramp_start_t = 0.0
+        self._source_q = None
+
+
 class IntentState:
     """Thread-safe holder for the current velocity-intent target."""
 
@@ -1468,6 +1939,7 @@ def _planner_worker(
         "skipped_insufficient": 0,
         "skipped_stale": 0,
         "skipped_buffer_uninit": 0,
+        "skipped_disabled": 0,
         "skipped_other": 0,
     }
     stats_log_every = 50
@@ -1538,18 +2010,22 @@ def _planner_worker(
                 reseed_stats["skipped_stale"] += 1
             elif reason.startswith("buffer_uninit"):
                 reseed_stats["skipped_buffer_uninit"] += 1
+            elif reason == "disabled":
+                reseed_stats["skipped_disabled"] += 1
             else:
                 reseed_stats["skipped_other"] += 1
             total = sum(reseed_stats.values())
             if total > 0 and total % stats_log_every == 0:
                 log.info(
                     "reseed stats: total=%d applied=%d "
-                    "insufficient=%d stale=%d buf_uninit=%d other=%d",
+                    "insufficient=%d stale=%d buf_uninit=%d "
+                    "disabled=%d other=%d",
                     total,
                     reseed_stats["applied"],
                     reseed_stats["skipped_insufficient"],
                     reseed_stats["skipped_stale"],
                     reseed_stats["skipped_buffer_uninit"],
+                    reseed_stats["skipped_disabled"],
                     reseed_stats["skipped_other"],
                 )
 
@@ -1616,6 +2092,11 @@ def run(
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
     cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
     continuous_turn_max_rad_s: float = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
+    continuous_forward_min_mps: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
+    ref_smoother_ms: float = _DEFAULT_REF_SMOOTHER_MS,
+    ref_smoother_trigger_rad: float = _DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
+    ref_smoother_shape: str = _DEFAULT_REF_SMOOTHER_SHAPE,
+    ref_smoother_joints: str = _DEFAULT_REF_SMOOTHER_JOINTS,
 ) -> int:
     _setup_logging(verbose)
 
@@ -1626,6 +2107,7 @@ def run(
     global _RUNTIME_FORWARD_SCALE, _RUNTIME_BACKWARD_SCALE, _RUNTIME_LATERAL_SCALE
     global _RUNTIME_STICK_SHAPING_EXPONENT
     global _CONTINUOUS_TURN_MAX_RAD_S
+    global _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS
     _RUNTIME_TURN_LEFT_SCALE = float(turn_left_scale)
     _RUNTIME_TURN_RIGHT_SCALE = float(turn_right_scale)
     _RUNTIME_FORWARD_SCALE = float(forward_scale)
@@ -1644,6 +2126,70 @@ def run(
         )
         continuous_turn_max_rad_s = _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S
     _CONTINUOUS_TURN_MAX_RAD_S = float(continuous_turn_max_rad_s)
+    if continuous_forward_min_mps < 0.0:
+        log.error(
+            "--continuous-forward-min-mps must be >= 0 (got %s); "
+            "disabling forward floor",
+            continuous_forward_min_mps,
+        )
+        continuous_forward_min_mps = 0.0
+    if continuous_forward_min_mps > _WALK_SPEED_MPS:
+        log.warning(
+            "--continuous-forward-min-mps (%.3f m/s) exceeds the forward "
+            "stick cap _WALK_SPEED_MPS=%.3f m/s; every forward stick value "
+            "will collapse onto the floor with no progressive control. "
+            "Consider tuning down to <= %.3f m/s.",
+            continuous_forward_min_mps, _WALK_SPEED_MPS, _WALK_SPEED_MPS,
+        )
+    _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS = float(continuous_forward_min_mps)
+
+    # ---- Reference-step smoother validation + construction.
+    # Built once here so the publish loop holds it by reference and the
+    # config is logged exactly once. Validation is intentionally
+    # permissive (clamp + warn rather than refuse) so a stale env-var
+    # value can't take the whole stack down at startup.
+    if ref_smoother_ms < 0.0:
+        log.error(
+            "--ref-smoother-ms must be >= 0 (got %s); disabling smoother",
+            ref_smoother_ms,
+        )
+        ref_smoother_ms = 0.0
+    if ref_smoother_trigger_rad < 0.0:
+        log.error(
+            "--ref-smoother-trigger-rad must be >= 0 (got %s); using default %.3f",
+            ref_smoother_trigger_rad, _DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
+        )
+        ref_smoother_trigger_rad = _DEFAULT_REF_SMOOTHER_TRIGGER_RAD
+    if ref_smoother_shape not in _REF_SMOOTHER_SHAPES:
+        log.error(
+            "--ref-smoother-shape=%r not in %s; using default %r",
+            ref_smoother_shape, _REF_SMOOTHER_SHAPES, _DEFAULT_REF_SMOOTHER_SHAPE,
+        )
+        ref_smoother_shape = _DEFAULT_REF_SMOOTHER_SHAPE
+    if ref_smoother_joints not in _REF_SMOOTHER_JOINTS_PRESETS:
+        log.error(
+            "--ref-smoother-joints=%r not in %s; using default %r",
+            ref_smoother_joints, tuple(_REF_SMOOTHER_JOINTS_PRESETS),
+            _DEFAULT_REF_SMOOTHER_JOINTS,
+        )
+        ref_smoother_joints = _DEFAULT_REF_SMOOTHER_JOINTS
+    ref_smoother = _ReferenceStepSmoother(
+        ramp_duration_s=float(ref_smoother_ms) / 1000.0,
+        trigger_rad=float(ref_smoother_trigger_rad),
+        shape=ref_smoother_shape,
+        blend_indices=_REF_SMOOTHER_JOINTS_PRESETS[ref_smoother_joints],
+        log_fn=log.info,
+    )
+    log.info(
+        "ref-smoother: shape=%s T=%.0f ms trigger=%.3f rad joints=%s (%d DoFs) enabled=%s",
+        ref_smoother.shape,
+        ref_smoother.ramp_duration_s * 1000.0,
+        ref_smoother.trigger_rad,
+        ref_smoother_joints,
+        int(ref_smoother.blend_indices.size),
+        ref_smoother.enabled,
+    )
+
     if any(s != 1.0 for s in (
         turn_left_scale, turn_right_scale,
         forward_scale, backward_scale, lateral_scale,
@@ -1666,6 +2212,15 @@ def run(
         (math.pi / 2.0) / max(_CONTINUOUS_TURN_MAX_RAD_S, 1e-9),
         _TURN_45_RAD_S,
     )
+    if _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS > 0.0:
+        log.info(
+            "continuous-locomotion forward floor: %.3f m/s "
+            "(any post-deadzone forward stick lifts vel_z to this "
+            "minimum; backward / lateral / yaw unaffected)",
+            _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS,
+        )
+    else:
+        log.info("continuous-locomotion forward floor: disabled (0.0 m/s)")
     log.info("yaw-lock epsilon: %.3f rad/s (0=disabled)",
              yaw_lock_epsilon_rad_s)
 
@@ -1853,6 +2408,34 @@ def run(
     global_tick = 0
     last_intent_log: tuple[float, float, float, float] = _IDLE_INTENT
 
+    # ---- Continuous waist overlay (kplanner-side, v7.4).
+    #
+    # The neural model's intent space is a 4-D velocity vector
+    # (yaw_rate, vel_x, vel_z, hip_h); it has no "command the body to
+    # lean +15 deg" channel. Pre-v7.4 the manager could publish
+    # ``hold_torso`` commands with non-zero waist_pitch / roll / yaw,
+    # but the kplanner silently ignored them and the operator's stick
+    # produced no waist motion.
+    #
+    # v7.4 closes that gap by maintaining a small slew-rate-limited
+    # tracker (mirrors the heuristic planner's STATIC_HOLD path) and
+    # adding a kinematic OVERLAY to the published joint vector each
+    # tick: we add (target_pitch, target_roll, target_yaw) deltas to
+    # the three waist joint slots in cur_frame.joint_pos_mj after the
+    # neural model has produced its frame. This is intentionally
+    # "pure waist" (no hip / ankle counter-balance shares) so the
+    # overlay does NOT fight the model's leg motion when the
+    # operator leans WHILE walking. The hip-share counter-balance the
+    # heuristic planner uses is appropriate only for a feet-planted
+    # static stand pose; during walking we want to leave the legs
+    # entirely to the model.
+    #
+    # The tracker advances at OUTPUT_FPS (50 Hz) using HOLD_SLEW_DPS
+    # (60 deg/s) -- same parameters as the heuristic STATIC_HOLD path,
+    # so the operator-feel matches across planner backends.
+    waist_tracker: _HoldTracker = _HoldTracker()
+    last_waist_target_log: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
     # Always-available frozen-anchor StreamFrame, shared by the warmup
     # ticks below AND the IDLE_LOOP branch of the main publish loop.
     # Built once from warmup_qpos so all three paths emit a bit-identical
@@ -1913,6 +2496,82 @@ def run(
 
     try:
         with PidFile(pid_file):
+            # ---- One-shot startup yaw seed from pose-feedback.
+            #
+            # The IDLE_LOOP yaw refresh (added 2026-06-01) only kicks in
+            # once the main publish loop reaches its IDLE branch, but
+            # the quiet-stand warmup runs FIRST and publishes
+            # ``warmup_quiet_stand_s * OUTPUT_FPS`` frames at the
+            # un-seeded root (= warmup_qpos[3:7] = identity quat / world
+            # +X). The deploy treats the very first one of those as its
+            # ``ZmqPoseInputSource`` bootstrap reference and the policy
+            # twists the body to match -- this is the "VR planner stack
+            # turns me back to default orientation as soon as I start
+            # it" symptom on real robot.
+            #
+            # Fix: before publishing anything, block up to ~1s waiting
+            # for a measured robot pose to land in the SUB queue, then
+            # seed ``current_root_xy/z/wxyz`` from it. On sim runs the
+            # MuJoCo bridge supplies robot_pose immediately; on real
+            # robot the x2_debug -> robot_pose bridge (see
+            # gear_sonic_deploy/scripts/x2_debug_to_robot_pose_bridge.py)
+            # publishes within a few wifi RTTs. If neither is available
+            # within the timeout we fall back to the warmup_qpos default
+            # silently -- the IDLE_LOOP refresh will still correct it
+            # eventually, and the C++ bootstrap fix protects against the
+            # never-receive-a-frame case.
+            if pose_deque is not None and pose_lock is not None:
+                seed_timeout_s = 1.0
+                seed_poll_s = 0.02
+                seed_deadline = time.monotonic() + seed_timeout_s
+                seeded = False
+                while time.monotonic() < seed_deadline and not stop_event.is_set():
+                    latest_seed_obs: Optional[PoseObservation] = None
+                    with pose_lock:
+                        if pose_deque:
+                            latest_seed_obs = pose_deque[-1]
+                    if latest_seed_obs is not None:
+                        age_s = max(
+                            0.0, time.monotonic() - latest_seed_obs.t_mono
+                        )
+                        if age_s <= float(pose_feedback_max_age_s):
+                            # Yaw-only update. xy/z are NOT updated:
+                            # the real-robot bridge publishes those as
+                            # zeros (no IMU position measurement) and
+                            # the warmup_qpos defaults (xy=0, z=hip_h
+                            # from the PKL) are correct for both sim and
+                            # real anyway. Matches the IDLE_LOOP refresh
+                            # behaviour further down -- yaw is the only
+                            # field that needs starvation-protection.
+                            try:
+                                current_root_wxyz = _yaw_only_wxyz_from_pelvis(
+                                    latest_seed_obs.pelvis_qpos_wxyz
+                                ).astype(np.float32)
+                                log.info(
+                                    "startup yaw seed: pose-feedback age=%.3fs, "
+                                    "current_root_wxyz=%s (yaw-only re-projection "
+                                    "of measured pelvis; xy/z left at warmup defaults)",
+                                    age_s, current_root_wxyz.tolist(),
+                                )
+                                seeded = True
+                                break
+                            except (ValueError, TypeError) as exc:
+                                log.warning(
+                                    "startup yaw seed: rejected sample (%s); "
+                                    "continuing to poll", exc,
+                                )
+                    time.sleep(seed_poll_s)
+                if not seeded:
+                    log.warning(
+                        "startup yaw seed: TIMEOUT after %.2fs; falling back to "
+                        "warmup_qpos[3:7]=%s. Quiet-stand warmup will publish "
+                        "this stale reference; IDLE_LOOP refresh will correct "
+                        "it once a measured pose lands. If you see snap-back, "
+                        "check that the x2_debug -> robot_pose bridge is up "
+                        "(--with-x2-debug-bridge on the planner stack launcher).",
+                        seed_timeout_s, current_root_wxyz.tolist(),
+                    )
+
             # ---- Optional quiet-stand warmup (publishes the frozen anchor qpos)
             warmup_n = (
                 int(round(max(0.0, warmup_quiet_stand_s) * OUTPUT_FPS))
@@ -1937,6 +2596,7 @@ def run(
                         bin_name=anchor_frame.bin_name,
                         frame_index=warm_idx,
                         seam_blend=False,
+                        root_z_world=float(current_root_z),
                     )
                     publisher.publish(anchor_frame_idx)
                     next_tick += period_s
@@ -1970,6 +2630,7 @@ def run(
                 published root pose for every future slot."""
                 xyzw = _idle_root_xyzw()
                 xy = current_root_xy.astype(np.float64).copy()
+                z_world = float(current_root_z)
                 return [
                     StreamFrame(
                         joint_pos_mj=anchor_frame.joint_pos_mj,
@@ -1980,6 +2641,7 @@ def run(
                         bin_name="kplanner_idle_future",
                         frame_index=start_idx + step_ticks * (k + 1),
                         seam_blend=False,
+                        root_z_world=z_world,
                     )
                     for k in range(num_future)
                 ]
@@ -2003,6 +2665,32 @@ def run(
                             target,
                         )
                         last_intent_log = target
+                    # Waist-overlay target update. Honour every
+                    # ``hold_torso`` command (continuous waist intent
+                    # from the operator's R-stick / ARM_MAN L-stick);
+                    # everything else implicitly resets the waist to
+                    # neutral so a discrete ``walk / fwd_step / turn_*``
+                    # command relaxes the lean cleanly. The tracker's
+                    # slew limit handles the cross-tick smoothness;
+                    # there's no need to debounce here because the
+                    # decoder already throttles publishing.
+                    if latest_cmd.intent == HOLD_TORSO_INTENT:
+                        new_waist_target = (
+                            float(latest_cmd.waist_pitch_deg),
+                            float(latest_cmd.waist_roll_deg),
+                            float(latest_cmd.waist_yaw_deg),
+                        )
+                    else:
+                        new_waist_target = (0.0, 0.0, 0.0)
+                    waist_tracker.set_target(*new_waist_target)
+                    if new_waist_target != last_waist_target_log:
+                        log.info(
+                            "waist overlay target updated (%s, %s) -> "
+                            "pitch=%.1f roll=%.1f yaw=%.1f deg",
+                            latest_cmd.intent, latest_cmd.magnitude,
+                            *new_waist_target,
+                        )
+                        last_waist_target_log = new_waist_target
 
                 # ---- Resolve high-level state from current intent.
                 # IDLE_LOOP <-> PLAYING transitions are edge-triggered
@@ -2015,6 +2703,57 @@ def run(
                 )
                 if desired_state != current_planner_state:
                     if desired_state == PlannerState.PLAYING:
+                        # One-shot yaw refresh on IDLE -> PLAYING entry.
+                        # The IDLE_LOOP branch below refreshes
+                        # ``current_root_wxyz`` every tick while idle,
+                        # so when the operator releases the stick after
+                        # a gesture (the common workflow) the warm seed
+                        # is already measured-aligned. But if the
+                        # operator HOLDS the stick through a gesture --
+                        # so the kplanner stays in PLAYING the whole
+                        # time and gesture playback inside the recorder
+                        # silently moves the robot to a new heading --
+                        # there's no IDLE tick to refresh, and the
+                        # next ``_build_warm_qpos()`` would seed the
+                        # neural buffer at a stale model-integrated
+                        # yaw. Snap-back symptom on PLAYING resume.
+                        # Refresh here as a belt-and-braces measure;
+                        # cost is one yaw extraction per state
+                        # transition (~rare), and we never block more
+                        # than the existing pose_feedback_max_age_s
+                        # gate would allow.
+                        if pose_deque is not None and pose_lock is not None:
+                            latest_entry_obs: Optional[PoseObservation] = None
+                            with pose_lock:
+                                if pose_deque:
+                                    latest_entry_obs = pose_deque[-1]
+                            if latest_entry_obs is not None:
+                                age_s = (
+                                    time.monotonic() - latest_entry_obs.t_mono
+                                )
+                                if age_s <= float(pose_feedback_max_age_s):
+                                    try:
+                                        prev_wxyz = current_root_wxyz.copy()
+                                        current_root_wxyz = (
+                                            _yaw_only_wxyz_from_pelvis(
+                                                latest_entry_obs.pelvis_qpos_wxyz
+                                            ).astype(np.float32)
+                                        )
+                                        if not np.allclose(prev_wxyz, current_root_wxyz, atol=1e-4):
+                                            log.info(
+                                                "IDLE -> PLAYING yaw refresh: "
+                                                "pose-feedback age=%.3fs, "
+                                                "prev=%s -> measured=%s",
+                                                age_s,
+                                                prev_wxyz.tolist(),
+                                                current_root_wxyz.tolist(),
+                                            )
+                                    except (ValueError, TypeError) as exc:
+                                        log.debug(
+                                            "IDLE -> PLAYING yaw refresh "
+                                            "skipped: %s", exc,
+                                        )
+
                         # Seed the ring buffer with default_angles at
                         # the ROBOT'S CURRENT integrated root frame
                         # (not at world origin / identity quat). This
@@ -2049,10 +2788,49 @@ def run(
 
                 # ---- Build the published frame.
                 if current_planner_state == PlannerState.IDLE_LOOP:
+                    # Yaw-only resync from robot_pose feedback before we
+                    # publish. Without this, ``current_root_wxyz`` is
+                    # only ever updated by the model's own predictions
+                    # (PLAYING branch below), so anything that moves
+                    # the real robot off-yaw while the operator's stick
+                    # is centred -- fall recovery, slip, push, or a
+                    # recorder-side gesture override (sit_down /
+                    # stand_up that turns the body) -- leaves us
+                    # publishing a stale absolute yaw target. The C++
+                    # tokenizer feeds the SONIC policy
+                    # ``rel = inv(measured) * reference`` (see
+                    # gear_sonic_deploy/src/x2/.../tokenizer_obs.cpp:114),
+                    # so a stale reference causes the policy to twist
+                    # the body back to the old heading -- the "robot
+                    # always tries to recover to the same world
+                    # orientation" symptom. Refreshing here closes that
+                    # loop for the idle path while PLAYING continues
+                    # to publish model-predicted yaw verbatim (so
+                    # commanded turns still execute as intended).
+                    if pose_deque is not None and pose_lock is not None:
+                        latest_obs: Optional[PoseObservation] = None
+                        with pose_lock:
+                            if pose_deque:
+                                latest_obs = pose_deque[-1]
+                        if latest_obs is not None:
+                            age_s = time.monotonic() - latest_obs.t_mono
+                            if age_s <= float(pose_feedback_max_age_s):
+                                try:
+                                    current_root_wxyz = _yaw_only_wxyz_from_pelvis(
+                                        latest_obs.pelvis_qpos_wxyz
+                                    )
+                                except (ValueError, TypeError) as exc:
+                                    log.debug(
+                                        "yaw refresh skipped: %s "
+                                        "(continuing with stale current_root_wxyz)",
+                                        exc,
+                                    )
+
                     # Frozen-anchor branch: emit default_angles joints
                     # at the LAST integrated world root pose. Joint
                     # angles snap to anchor (default_angles); root XY
                     # and yaw carry over from the prior PLAYING session
+                    # (or from the latest pose_deque refresh above)
                     # so a release-after-turn doesn't trigger a SONIC
                     # yaw-correction back toward identity.
                     cur_frame = StreamFrame(
@@ -2064,6 +2842,7 @@ def run(
                         bin_name="kplanner_idle",
                         frame_index=global_tick,
                         seam_blend=False,
+                        root_z_world=float(current_root_z),
                     )
                     future_frames = _build_idle_future(global_tick)
                 else:
@@ -2134,6 +2913,112 @@ def run(
                         )
                         for k in range(num_future)
                     ]
+
+                # ---- Waist overlay (v7.4, kplanner-side STATIC_HOLD analogue).
+                # Step the tracker so ``current_*`` walks toward the
+                # operator-commanded target at HOLD_SLEW_DPS (60 deg/s),
+                # then add the (current_pitch, current_roll, current_yaw)
+                # deltas onto the published waist joint slots. We
+                # operate on a copy of joint_pos_mj because the IDLE
+                # branch shares ``anchor_frame.joint_pos_mj`` across
+                # ticks; mutating it in place would compound the
+                # overlay across consecutive idle ticks.
+                #
+                # PLAYING branch: only the 3 waist DOFs are touched so
+                # the kplanner's leg / arm motion is preserved
+                # byte-identical. IDLE_LOOP branch: same; the static
+                # stand pose's hip / ankle joints stay at default. We
+                # intentionally DO NOT apply the heuristic planner's
+                # hip / ankle counter-balance shares here -- those make
+                # sense for a feet-planted lean but would visually
+                # fight the kplanner's stride during locomotion.
+                # Operators wanting the "natural deadlift hinge" feel
+                # can fall back to ``--planner heuristic`` for static
+                # work; the kplanner trades that bit of ergonomic
+                # realism for a unified walk + lean experience.
+                waist_tracker.step(dt_s=period_s)
+                if (
+                    waist_tracker.current_pitch_deg != 0.0
+                    or waist_tracker.current_roll_deg != 0.0
+                    or waist_tracker.current_yaw_deg != 0.0
+                ):
+                    overlay_q = cur_frame.joint_pos_mj.copy()
+                    overlay_q[WAIST_PITCH_IDX] += float(
+                        np.deg2rad(waist_tracker.current_pitch_deg)
+                    )
+                    overlay_q[WAIST_ROLL_IDX] += float(
+                        np.deg2rad(waist_tracker.current_roll_deg)
+                    )
+                    overlay_q[WAIST_YAW_IDX] += float(
+                        np.deg2rad(waist_tracker.current_yaw_deg)
+                    )
+                    cur_frame = StreamFrame(
+                        joint_pos_mj=overlay_q.astype(np.float32, copy=False),
+                        root_quat_xyzw=cur_frame.root_quat_xyzw,
+                        root_xy_world=cur_frame.root_xy_world,
+                        yaw_world_deg=cur_frame.yaw_world_deg,
+                        state=cur_frame.state,
+                        bin_name=cur_frame.bin_name,
+                        frame_index=cur_frame.frame_index,
+                        seam_blend=cur_frame.seam_blend,
+                        root_z_world=cur_frame.root_z_world,
+                    )
+                    if future_frames:
+                        overlaid_futures: list[StreamFrame] = []
+                        for ff in future_frames:
+                            fq = ff.joint_pos_mj.copy()
+                            fq[WAIST_PITCH_IDX] += float(
+                                np.deg2rad(waist_tracker.current_pitch_deg)
+                            )
+                            fq[WAIST_ROLL_IDX] += float(
+                                np.deg2rad(waist_tracker.current_roll_deg)
+                            )
+                            fq[WAIST_YAW_IDX] += float(
+                                np.deg2rad(waist_tracker.current_yaw_deg)
+                            )
+                            overlaid_futures.append(StreamFrame(
+                                joint_pos_mj=fq.astype(np.float32, copy=False),
+                                root_quat_xyzw=ff.root_quat_xyzw,
+                                root_xy_world=ff.root_xy_world,
+                                yaw_world_deg=ff.yaw_world_deg,
+                                state=ff.state,
+                                bin_name=ff.bin_name,
+                                frame_index=ff.frame_index,
+                                seam_blend=ff.seam_blend,
+                                root_z_world=ff.root_z_world,
+                            ))
+                        future_frames = overlaid_futures
+
+                # ---- Reference-step smoother (publisher output, step-driven).
+                # Applied at a single point AFTER both IDLE / PLAYING
+                # branches have settled on ``cur_frame.joint_pos_mj`` so
+                # the smoother sees whatever the FSM produced regardless
+                # of which branch ran. The smoother is intentionally
+                # agnostic to the FSM -- it watches per-tick reference
+                # deltas on lower-body joints (legs + waist by default)
+                # and arms a half-cosine ramp whenever the delta exceeds
+                # ``--ref-smoother-trigger-rad``. Stick push, stick
+                # release, primitive switches, future MC-handoff piping
+                # -- all hit the same code path because they all create
+                # a step on the wire. ``cur_frame`` is a dataclass; we
+                # rebuild it with the smoothed joints, preserving every
+                # other field byte-equivalent so root quat / xy / state
+                # / bin_name semantics are untouched.
+                smoothed_q = ref_smoother.update(
+                    cur_frame.joint_pos_mj, time.monotonic()
+                )
+                cur_frame = StreamFrame(
+                    joint_pos_mj=smoothed_q.astype(np.float32, copy=False),
+                    root_quat_xyzw=cur_frame.root_quat_xyzw,
+                    root_xy_world=cur_frame.root_xy_world,
+                    yaw_world_deg=cur_frame.yaw_world_deg,
+                    state=cur_frame.state,
+                    bin_name=cur_frame.bin_name,
+                    frame_index=cur_frame.frame_index,
+                    seam_blend=cur_frame.seam_blend,
+                    root_z_world=cur_frame.root_z_world,
+                )
+
                 publisher.publish(cur_frame, future_frames=future_frames, future_dt_s=0.1)
                 global_tick += 1
 
@@ -2361,13 +3246,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(_VALID_RESEED_SCOPES),
         default=_RESEED_SCOPE_FULL_ROOT,
         help=(
-            "Which root channels the reseed rewrites. 'full_root' (default) "
-            "overwrites xyz + quat (4 root rows, 7 floats each). 'quat_only' "
-            "overwrites just the quaternion -- preserves the planner's "
-            "internal-model xy overshoot (which empirically helps the policy "
-            "track forward motion) while still anchoring heading to observed "
-            "reality. Use 'quat_only' when forward tracking regresses under "
-            "'full_root'."
+            "Which root channels the PLAYING-side reseed rewrites every "
+            "replan tick. 'full_root' (default) overwrites xyz + quat -- "
+            "best for sim, where the MuJoCo bridge supplies full "
+            "ground-truth qpos. 'quat_only' overwrites just the quaternion "
+            "-- preserves the planner's internal-model xy overshoot (which "
+            "helps the policy track forward motion) while still anchoring "
+            "heading to observed reality; use this with a pose source that "
+            "has VALID xy/z but you want quat anchoring only. 'none' "
+            "disables the PLAYING reseed entirely -- pose_deque still "
+            "feeds the IDLE_LOOP yaw refresh and the IDLE -> PLAYING "
+            "transition seed (both yaw-only, both writing to "
+            "current_root_wxyz only), but the model's neural buffer is "
+            "left untouched during PLAYING. REQUIRED on real robot with "
+            "the IMU-only x2_debug bridge: 'full_root' would teleport the "
+            "planner's xy history to zero every tick, and 'quat_only' "
+            "would anchor yaw integration to the lagging measured yaw "
+            "(commanded turns under-rotate)."
         ),
     )
     p.add_argument(
@@ -2385,6 +3280,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ) % _DEFAULT_CONTINUOUS_TURN_MAX_RAD_S,
     )
     p.add_argument(
+        "--continuous-forward-min-mps",
+        type=float,
+        default=_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
+        help=(
+            "Minimum forward velocity (m/s) commanded whenever the operator "
+            "commits any non-zero forward stick deflection in the "
+            "continuous-locomotion path. Default %.3f m/s lands the SONIC "
+            "X2 root model inside its in-distribution forward-walk band as "
+            "soon as the operator pushes past the deadzone -- empirically "
+            "the corpus has essentially no training samples below 0.3 m/s "
+            "forward, so commanding 0 < vel_z < 0.3 produces hip-wiggle "
+            "without stepping. Set 0.0 to disable the floor entirely "
+            "(pre-2026-05-31 legacy behaviour). Backward / lateral / yaw "
+            "are unaffected; bucketed forward intents and PKL replay are "
+            "also untouched. Applied post --forward-scale, so keep "
+            "``floor < forward_scale * 0.5 m/s`` to preserve progressive "
+            "control above the floor."
+        ) % _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS,
+    )
+    p.add_argument(
         "--cold-start-ramp-tau-s",
         type=float,
         default=_DEFAULT_COLD_START_RAMP_TAU_S,
@@ -2397,6 +3312,74 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "target after ~3 replans at threshold=2. Set 0.0 to disable the "
             "ramp (raw intent verbatim; pre-fix behaviour). hip_h is never "
             "ramped -- it's a posture target, not a velocity."
+        ),
+    )
+    p.add_argument(
+        "--ref-smoother-ms",
+        type=float,
+        default=_DEFAULT_REF_SMOOTHER_MS,
+        help=(
+            "Duration (ms) of the half-cosine ramp the publisher applies "
+            "whenever it detects a step in the lower-body joint reference "
+            "(legs + waist by default). Default %.0f ms ~= natural period "
+            "of the leg PD loop at deployed kp; the joint follows the "
+            "rising reference instead of being thrown by a 1-tick step. "
+            "Eliminates the audible motor click on stick push and release "
+            "(operator-reported on real hardware 2026-05-31; click is "
+            "drivetrain backlash absorbing the torque step that high "
+            "lower-body kp turns the reference step into). Set 0 to "
+            "disable the smoother entirely (passthrough; pre-fix "
+            "behaviour). Tune down to 150-200 ms if the ramp feels "
+            "sluggish; up to 500 ms if residual clicks remain. The "
+            "smoother is step-detection-driven, not FSM-driven -- it "
+            "fires on any source of reference step, not just IDLE<->PLAYING."
+        ) % _DEFAULT_REF_SMOOTHER_MS,
+    )
+    p.add_argument(
+        "--ref-smoother-trigger-rad",
+        type=float,
+        default=_DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
+        help=(
+            "Per-tick reference delta (rad) on any lower-body joint that "
+            "arms the smoother's half-cosine ramp. Default %.3f rad ~= "
+            "3 deg, cleanly separating the multi-degree jumps a stick "
+            "push/release creates (frozen anchor <-> neural buffer pose) "
+            "from the per-tick neural-buffer motion under steady walking "
+            "(typ. < 0.01 rad/tick). Set 0 to make every non-zero delta "
+            "a candidate (debug only; ramps will fire continuously during "
+            "smooth walking)."
+        ) % _DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
+    )
+    p.add_argument(
+        "--ref-smoother-shape",
+        choices=list(_REF_SMOOTHER_SHAPES),
+        default=_DEFAULT_REF_SMOOTHER_SHAPE,
+        help=(
+            "Ramp shape for the reference-step smoother. 'halfcos' (default) "
+            "is C^1 smooth at both endpoints -- no velocity step is injected "
+            "into the PD law at the start OR end of the ramp; this is what "
+            "the piano shoulder-click work used. 'linear' has a dq/dt step "
+            "at the endpoints (worse for the click) and is exposed for A/B "
+            "comparison. 'off' short-circuits the smoother to pure pass"
+            "through (single-flag revert; byte-equivalent to pre-2026-05-31 "
+            "publisher output)."
+        ),
+    )
+    p.add_argument(
+        "--ref-smoother-joints",
+        choices=list(_REF_SMOOTHER_JOINTS_PRESETS),
+        default=_DEFAULT_REF_SMOOTHER_JOINTS,
+        help=(
+            "Which MuJoCo joint indices participate in step detection AND "
+            "blending. 'lower_body' (default) = legs 0-11 + waist 12-14; "
+            "arms 15-28 and head 29-30 pass through unchanged so "
+            "manipulation tasks driven by the same body_pose stream are "
+            "not affected by any ramp. 'legs_only' = legs 0-11 only "
+            "(waist twist remains maximally responsive). 'all' = all 31 "
+            "DoFs (debug A/B against the legacy formulation). Fingers / "
+            "OmniHand commands live on a separate command path and are "
+            "never in this stream, so they are unconditionally untouched "
+            "by every preset."
         ),
     )
     p.add_argument("-v", "--verbose", action="store_true")
@@ -2440,6 +3423,11 @@ def main(argv: list[str] | None = None) -> int:
         pose_reseed_scope=args.pose_reseed_scope,
         cold_start_ramp_tau_s=args.cold_start_ramp_tau_s,
         continuous_turn_max_rad_s=args.continuous_turn_max_rad_s,
+        continuous_forward_min_mps=args.continuous_forward_min_mps,
+        ref_smoother_ms=args.ref_smoother_ms,
+        ref_smoother_trigger_rad=args.ref_smoother_trigger_rad,
+        ref_smoother_shape=args.ref_smoother_shape,
+        ref_smoother_joints=args.ref_smoother_joints,
     )
 
 

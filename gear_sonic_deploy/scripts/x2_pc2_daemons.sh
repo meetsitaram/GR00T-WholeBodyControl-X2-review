@@ -203,7 +203,17 @@ LAPTOP_HAND_PORT="${LAPTOP_HAND_PORT:-5564}"      # manager arm/hands on laptop
 # laptop) so the proxy can swap in idle_stand frames whenever the upstream
 # wire goes silent (>POSE_PROXY_STALE_MS) without the deploy noticing.
 PC2_POSE_PROXY_PORT="${PC2_POSE_PROXY_PORT:-5558}"
-POSE_PROXY_STALE_MS="${POSE_PROXY_STALE_MS:-100}"
+# Default 300 ms (was 100 ms before 2026-06-02). The laptop<->PC2 wifi link
+# in this lab routinely hits ~100 ms RTT with 23 ms stddev (measured via
+# 500-packet ping bursts), so a 100 ms threshold flipped the proxy
+# between live-forwarding and idle-fallback every few seconds. Each flip
+# is a step change in joint_pos_mj reference -> waist-yaw motor unlocks
+# and locks -> audible click. 300 ms is 3x the worst observed wifi gap
+# (absorbs every realistic blip) while still falling back to the safe
+# idle pose within ~0.3 s of a real outage (laptop crash / VR stack
+# shutdown), which keeps the deploy publishing constant 50 Hz pose --
+# SONIC's tracking policy expects an uninterrupted reference stream.
+POSE_PROXY_STALE_MS="${POSE_PROXY_STALE_MS:-300}"
 POSE_PROXY_IDLE_X2M2="${POSE_PROXY_IDLE_X2M2:-${PC2_PREFIX}/data/idle_stand.x2m2}"
 # Auto-disable the proxy if the X2M2 file isn't staged (operators on an
 # older bringup; failure mode is just "no idle fallback, behave like before").

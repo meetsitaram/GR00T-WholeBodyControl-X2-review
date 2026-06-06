@@ -228,11 +228,13 @@ def test_dataset_has_enough_engaged_frames(replay_results):
 # Motors with intentional anchor-shift deltas vs the v6 baseline.
 # These motors had their OPEN anchor shifted on 2026-05-13 (LEFT
 # thumb_roll 0 -> -12 deg, LEFT thumb_abad 10 -> 35 deg, mirrored
-# on RIGHT) to bias the resting thumb pose toward "naturally curled
-# across the palm" instead of "perpendicular to the fingers". The
-# CLOSED anchors did not move, but every frame's motor command on
-# these two indices now differs from the v6 NPZ by the (new_open -
-# old_open) * (1 - curl) lerp delta -- up to ~25 deg at full open.
+# on RIGHT) and again on 2026-06-03 (LEFT thumb_abad 35 -> 55 deg,
+# mirrored on RIGHT) to bias the resting thumb pose toward
+# "naturally curled across the palm, parallel to the middle finger"
+# instead of "perpendicular to the fingers". The CLOSED anchors did
+# not move, but every frame's motor command on these two indices
+# now differs from the v6 NPZ by the (new_open - old_open) *
+# (1 - curl) lerp delta -- up to ~45 deg at full open.
 # Mask them out of the float32-ulp parity assertion. The remaining
 # 8 motors (thumb_mcp + four non-thumb fingers) MUST still match
 # bit-for-bit. See HAND_GRASP_OPEN_LEFT_DEG / *_RIGHT_DEG in

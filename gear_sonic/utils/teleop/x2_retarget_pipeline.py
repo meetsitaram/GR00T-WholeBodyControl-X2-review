@@ -202,6 +202,14 @@ class Retargeter:
         apply_curl_compensation: Forwarded to
             ``per_finger_grasp_command_from_curls_and_oppose``.
         apply_oppose_compensation: ditto.
+        left_wrist_op_quat_offset_rpy_deg /
+        right_wrist_op_quat_offset_rpy_deg: optional 3-tuple of
+            intrinsic Tait-Bryan ``(roll, pitch, yaw)`` degrees applied
+            in the operator's wrist-local frame BEFORE the calibration
+            is applied. Stop-gap fix for a controller mount that's
+            slightly misaligned on the operator's wrist; rerun
+            ``vr_operator_calibrate.py`` to drop these to zero. See
+            :class:`VRArmTeleopCalibrated` for the axis convention.
     """
 
     def __init__(
@@ -217,6 +225,12 @@ class Retargeter:
         apply_oppose_compensation: bool = False,
         left_neutral_q: Optional[np.ndarray] = None,
         right_neutral_q: Optional[np.ndarray] = None,
+        left_wrist_op_quat_offset_rpy_deg: Optional[
+            tuple[float, float, float]
+        ] = None,
+        right_wrist_op_quat_offset_rpy_deg: Optional[
+            tuple[float, float, float]
+        ] = None,
     ) -> None:
         if calibration is None:
             raise ValueError("calibration is required")
@@ -234,6 +248,8 @@ class Retargeter:
             per_tick_step_rad=ik_per_tick_step_rad,
             left_neutral_q=left_neutral_q,
             right_neutral_q=right_neutral_q,
+            left_wrist_op_quat_offset_rpy_deg=left_wrist_op_quat_offset_rpy_deg,
+            right_wrist_op_quat_offset_rpy_deg=right_wrist_op_quat_offset_rpy_deg,
         )
 
         if finger_filter_params is not None:

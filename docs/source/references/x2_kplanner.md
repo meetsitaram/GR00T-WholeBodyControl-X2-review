@@ -61,6 +61,27 @@ plus the v4 future window `joint_pos_mj_future` / `root_quat_xyzw_future`
 recorder + deploy do not know which planner is upstream and do not need
 to.
 
+Post-2026-06 the payload also carries two additive **world-frame root**
+fields:
+
+| Field            | Shape | Dtype     | Meaning                                            |
+| ---------------- | ----- | --------- | -------------------------------------------------- |
+| `root_xy_world`  | (2,)  | `float32` | Pelvis XY in the global frame (metres).            |
+| `root_z_world`   | (1,)  | `float32` | Pelvis Z in the global frame (metres).             |
+
+The kplanner integrates these every tick (see `current_root_xy` /
+`current_root_z` in `gear_sonic/scripts/x2_kplanner.py`). The C++
+deploy iterates the wire header and ignores keys it doesn't recognise
+(`unpack_message` in `zmq_packed_message_decoder.py`), so the additions
+are **wire-safe**: a not-yet-rebuilt deploy continues to consume only
+the legacy fields. New subscribers that DO need the full world-frame
+root — the kinematic MuJoCo viewer (`view_x2_planner_mujoco
+--from-zmq`) and the Phase 2 motion-lib PKL recorder — read these
+fields to reconstruct `qpos[0:3]` without a separate sidecar topic.
+The `x2_dataset_recorder` passes these fields through verbatim on its
+merged `pose` stream too, so subscribers downstream of the recorder
+see the same world-root contract.
+
 ## Components
 
 ### 1. `NeuralPlannerCore` (robot-agnostic)
@@ -275,11 +296,38 @@ and via environment variables (`KPLANNER_YAW_LOCK_EPSILON`,
 `KPLANNER_TURN_LEFT_SCALE`, ...).
 
 **No-op intents.** Manager labels that have no locomotion meaning to
-the kplanner — `hold_torso / continuous`, `lean_fwd / *`,
-`torso_left|right / *`, `crouch / *` — resolve to `_IDLE_INTENT`. The
-heuristic planner handles them inside its state machine; the kplanner
-does not currently expose a separate torso / crouch channel. If you
-need upper-body / torso work, run with `--planner heuristic`.
+the kplanner — `lean_fwd / *`, `torso_left|right / *`, `crouch / *` —
+resolve to `_IDLE_INTENT` (the discrete-bin replay primitives the
+heuristic planner consumes have no kplanner counterpart).
+
+**Continuous waist hold (v7.4).** `hold_torso / continuous` is now a
+full first-class intent under the kplanner:
+
+- The dispatcher pins `(yaw_rate, vel_x, vel_z) = (0, 0, 0)` so the
+  policy plants the feet (no walking, no turning) but substitutes
+  `cmd.hip_height_m` (when present) into channel-3 of the velocity
+  tuple. This is how the operator's L-stick Y push (squat / stand)
+  reaches the model: `hip_h = default_hip_height_m + offset`, with
+  asymmetric per-direction caps because the training distribution
+  covers crouch-down ~9 cm but only stand-up ~4 cm before going OOD.
+- `cmd.hip_height_m is None` (the default for legacy `hold_torso`
+  payloads with only waist-angle fields) leaves channel-3 at the
+  kplanner's default hip height.
+- The waist-angle fields (`waist_pitch_deg`, `waist_roll_deg`,
+  `waist_yaw_deg`) ride on a separate **kinematic overlay** path:
+  the publish loop maintains a slew-rate-limited `_HoldTracker`
+  (60 deg/s, mirroring the heuristic planner's STATIC_HOLD), advances
+  the tracker every tick, and adds the `(current_pitch, current_roll,
+  current_yaw)` deltas (in radians) onto the three waist DOF slots
+  of the published frame. Future-window frames receive the same
+  deltas so the tokenizer's lookahead window stays consistent.
+- Overlay is "pure waist" (no hip / ankle counter-balance shares).
+  This is intentional: the heuristic planner's hip-share counter-
+  balance is appropriate for a feet-planted lean but visually fights
+  the kplanner's stride during locomotion. Operators wanting the
+  natural deadlift hinge feel for static work can fall back to
+  `--planner heuristic`; the kplanner trades that bit of ergonomic
+  realism for a unified walk + lean experience.
 
 **Tuning.** Edit the constants above and the two scale tables; values
 take effect on the next daemon restart, no model retrain needed. The
@@ -410,6 +458,33 @@ perfectly. Parity profile spawns the robot on the floor in a stable
 pose; the kplanner then publishes the same pose during its warmup
 quiet-stand (default 2 s in the wrapper, configurable via
 `--warmup-quiet-stand-s`); only then does the neural planner take over.
+
+### Closed-loop pose feedback and reseed scope
+
+The kplanner subscribes to a `robot_pose` topic (default
+`tcp://127.0.0.1:5570`) and uses the measured pelvis quaternion to
+re-anchor `current_root_wxyz`, preventing the "robot snaps back to a
+stale heading after fall recovery / gesture override" failure mode.
+Three reseed scopes exist on the daemon CLI
+(`--pose-reseed-scope`):
+
+| Scope | What it overwrites in the planner context buffer | When to use |
+| --- | --- | --- |
+| `full_root` | Slots `[0:7]` (xyz + quat) on every replan | **Avoid in this stack.** Tested OK on bench rigs where the bridge has true ground-truth qpos, but in this repo the SONIC-tracked sim qpos lags the planner reference, and the real-robot x2_debug bridge publishes xy=z=0 — both cause regressions (sluggish sim, instability on real). |
+| `quat_only` | Quat slots only | Under-rotates turns: pinning the neural-buffer quat to the lagged measured yaw means the planner can never get ahead of the robot. |
+| `none` (recommended) | Nothing in PLAYING — the model integrates open-loop | The `pose_deque` still feeds the IDLE_LOOP yaw refresh, the startup yaw seed, and the IDLE → PLAYING transition seed. Snap-back protection is preserved without the PLAYING-side correctness penalty. |
+
+The stack wrapper passes `--pose-reseed-scope=none` for **both** the
+sim and real paths since 2026-06 (previously it only set it on the
+x2_debug bridge path, and the sim path silently fell through to the
+daemon default `full_root` — see commit log). Override with
+`KPLANNER_POSE_RESEED_SCOPE=full_root` for A/B testing against the
+old behaviour.
+
+If you want to skip the feedback SUB entirely (regression baseline /
+diagnostic), pass `--no-pose-feedback` to the wrapper or set
+`WITH_POSE_FEEDBACK=0` in the environment. Note this also disables
+the snap-back protection.
 
 ## Runbook
 

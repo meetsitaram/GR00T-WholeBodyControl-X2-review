@@ -77,7 +77,20 @@ class MotionModel(LightningModule):
         self._vqvae_model_loaded = False
         vqvae_model_ckpt_path = self._args.vqvae_model_ckpt_path
         if os.path.exists(vqvae_model_ckpt_path):
-            vqvae_model_weights = t.load(vqvae_model_ckpt_path)['state_dict']
+            # PyTorch 2.6 flipped the ``torch.load`` default to
+            # ``weights_only=True``, which rejects this checkpoint
+            # (training-time pickled state_dict with non-tensor
+            # objects -> "Unsupported operand 118"). The VQVAE
+            # checkpoints are produced in-house by our own training
+            # runs, so the trust model is identical to every other
+            # ``torch.load`` in motionbricks (see
+            # load_x2_planner.py:223 / load_g1_planner.py:178, both
+            # of which already pass ``weights_only=False`` for the
+            # same reason). Pin the same flag here so kplanner
+            # bring-up doesn't crash under torch>=2.6.
+            vqvae_model_weights = t.load(
+                vqvae_model_ckpt_path, weights_only=False
+            )['state_dict']
             with t.no_grad():
                 for sub_network in ['pose_net', 'root_net']:
                     if self._supporting_networks[sub_network] is None:
