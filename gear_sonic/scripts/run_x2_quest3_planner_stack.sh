@@ -292,6 +292,22 @@ DURATION_S=0  # 0 = unlimited (run until Ctrl-C). Pass --duration N for a fixed 
 WITH_RECORD=0
 OUTPUT_DIR=""
 TASK=""
+
+# ── PC2 head-camera bridge (Orbbec + IMX900 stereo pair) ──────────────
+# When ``--head-cameras`` is set, the wrapper auto-runs
+# ``gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve`` against
+# ``CAMERA_HOST:CAMERA_PORT`` before spawning the recorder, then
+# forwards ``--head-cameras --camera-host --camera-port`` to
+# record_x2_dataset so the three real head streams
+# (observation.images.{head_front,stereo_left,stereo_right}) land in
+# the LeRobot parquets alongside the synthetic ego_view. Only
+# meaningful with ``--with-record``; ignored in --teleop-only.
+# CAMERA_HOST defaults to PC2_HOST when ``--pc2-host`` is set so the
+# operator can omit it on the typical real-robot invocation.
+HEAD_CAMERAS=0
+CAMERA_HOST=""
+CAMERA_PORT="5555"
+CAMERA_AUTOSTART=1
 # Robocasa scene mode (off by default; legacy flat-floor recordings).
 # When ROBOCASA_ENV != "none" we resolve a scene XML, forward
 # --sim-mjcf to deploy_x2.sh so the bridge loads the same MJCF the
@@ -700,6 +716,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --duration) DURATION_S="$2"; shift 2 ;;
         --with-record) WITH_RECORD=1; shift ;;
+        --head-cameras) HEAD_CAMERAS=1; shift ;;
+        --no-head-cameras) HEAD_CAMERAS=0; shift ;;
+        --camera-host) CAMERA_HOST="$2"; shift 2 ;;
+        --camera-port) CAMERA_PORT="$2"; shift 2 ;;
+        --no-camera-autostart) CAMERA_AUTOSTART=0; shift ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --task) TASK="$2"; shift 2 ;;
         --model) SIM_MODEL="$2"; shift 2 ;;
@@ -861,6 +882,12 @@ fi
 # --pc2-host and --remote-deploy is almost certainly a typo and we
 # bail out loudly rather than silently honour one and drop the other.
 if [[ -n "${PC2_HOST}" ]]; then
+    # Camera bridge runs on PC2; auto-target the same host when the
+    # operator didn't override --camera-host explicitly. Same fanout
+    # philosophy as REMOTE_DEPLOY_HOST / X2_DEBUG_BRIDGE_HOST.
+    if [[ -z "${CAMERA_HOST}" ]]; then
+        CAMERA_HOST="${PC2_HOST}"
+    fi
     if [[ -n "${REMOTE_DEPLOY_HOST}" && "${REMOTE_DEPLOY_HOST}" != "${PC2_HOST}" ]]; then
         echo "ERROR: --pc2-host '${PC2_HOST}' contradicts --remote-deploy '${REMOTE_DEPLOY_HOST}'." >&2
         echo "       Pass one or make them match." >&2
@@ -2637,6 +2664,46 @@ if [[ "${WITH_RECORD}" -eq 1 ]]; then
     fi
 else
     RECORDER_ARGS+=(--teleop-only)
+fi
+
+# Head-camera ingestion: only meaningful in --with-record (no parquet
+# means no place to write the frames). Auto-launch the PC2 bridge over
+# SSH unless the operator passed --no-camera-autostart, then forward
+# the three camera CLI flags to record_x2_dataset.
+if [[ "${HEAD_CAMERAS}" -eq 1 && "${WITH_RECORD}" -eq 1 ]]; then
+    if [[ -z "${CAMERA_HOST}" ]]; then
+        err "--head-cameras requires --camera-host (or --pc2-host) so we know" \
+            "which X2 PC2 the camera bridge should bind on."
+        exit 1
+    fi
+    if [[ "${CAMERA_AUTOSTART}" -eq 1 ]]; then
+        PC2_CAM_SH="${REPO_ROOT}/gear_sonic_deploy/scripts/x2_pc2_cameras.sh"
+        if [[ -x "${PC2_CAM_SH}" ]]; then
+            log "Camera bridge: launching x2_pc2_cameras.sh serve" \
+                "--host ${CAMERA_HOST} --port ${CAMERA_PORT} …"
+            X2_PC2_HOST="${CAMERA_HOST}" X2_PC2_CAM_PORT="${CAMERA_PORT}" \
+                "${PC2_CAM_SH}" serve --host "${CAMERA_HOST}" \
+                                       --port "${CAMERA_PORT}" \
+                || { err "PC2 camera bridge failed to start. Run" \
+                         "\`${PC2_CAM_SH} status --host ${CAMERA_HOST}\` to diagnose," \
+                         "then rerun with --no-camera-autostart once it's up."
+                     exit 1; }
+        else
+            err "${PC2_CAM_SH} not executable; cannot auto-start cameras."
+            exit 1
+        fi
+    else
+        log "Camera bridge: --no-camera-autostart set; assuming bridge already" \
+            "running on ${CAMERA_HOST}:${CAMERA_PORT}"
+    fi
+    RECORDER_ARGS+=(
+        --head-cameras
+        --camera-host "${CAMERA_HOST}"
+        --camera-port "${CAMERA_PORT}"
+    )
+elif [[ "${HEAD_CAMERAS}" -eq 1 && "${WITH_RECORD}" -eq 0 ]]; then
+    warn "--head-cameras has no effect in teleop-only mode (no parquet to" \
+         "write into); ignoring."
 fi
 # Forward the resolved SONIC tokenizer .pt + device. When mode==off
 # we deliberately omit --sonic-checkpoint so the recorder's None

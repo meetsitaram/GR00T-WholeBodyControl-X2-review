@@ -59,6 +59,24 @@ gymnastics. The render path itself is independent of the head camera
 FRONT_CAM_WIDTH: int = 640
 """``front_cam`` image width (pixels). See :data:`FRONT_CAM_HEIGHT`."""
 
+HEAD_CAM_HEIGHT: int = 480
+"""Physical head-camera image height (pixels) for the three real cameras
+``head_front`` (Orbbec RGB), ``stereo_left`` and ``stereo_right`` (IMX900s).
+Matches the resize target in
+``gear_sonic_deploy/scripts/x2_pc2_camera_zmq_publisher.py`` so the
+bridge can drop frames straight into ``observation.images.*`` without
+the recorder having to resize."""
+
+HEAD_CAM_WIDTH: int = 640
+"""Physical head-camera image width (pixels). See :data:`HEAD_CAM_HEIGHT`."""
+
+HEAD_CAM_KEYS: tuple[str, ...] = ("head_front", "stereo_left", "stereo_right")
+"""Mount-key names used by the PC2 camera bridge AND by the
+``observation.images.<key>`` features below when
+``include_head_cameras=True``. Single source of truth — the recorder
+trusts that the bridge publishes exactly these keys, and the LeRobot
+exporter rejects any mismatch at first frame."""
+
 FPS: int = 50
 """Dataset frame rate. Matches the SONIC tracking-policy control rate
 and the upstream ``unitree_g1_sonic`` reference."""
@@ -212,6 +230,7 @@ def get_features_x2_vla(
     *,
     post_sonic_canonical: bool = True,
     include_front_cam: bool = False,
+    include_head_cameras: bool = False,
 ) -> dict:
     """Return the LeRobot v2.1 ``features`` dict for the X2 SONIC dataset.
 
@@ -266,6 +285,25 @@ def get_features_x2_vla(
     and ``front_cam`` per frame; non-robocasa recordings keep the
     original single-camera schema for backwards compat with existing
     parquet files.
+
+    When ``include_head_cameras=True``, three additional video
+    features are added — one per real physical head camera on the
+    AgiBot X2's PC2 (Jetson Orin NX):
+
+    * ``observation.images.head_front`` — Orbbec Gemini 335 RGB
+      (native 2688×1944, downscaled to 640×480 at the bridge).
+    * ``observation.images.stereo_left`` / ``observation.images.stereo_right``
+      — Sony IMX900 GMSL cameras mounted on the X2's stereo head
+      rig (native 2064×1552, downscaled to 640×480 at the bridge).
+
+    Frames arrive over ZMQ from
+    ``gear_sonic_deploy/scripts/x2_pc2_camera_zmq_publisher.py`` and
+    are consumed by the recorder via
+    :class:`gear_sonic.camera.composed_camera.ComposedCameraClientSensor`.
+    The synthetic ``ego_view`` (MuJoCo render) coexists with these
+    real-sensor streams so a single episode carries both viewpoints
+    and downstream training can pick which one to use as the canonical
+    GR00T ``ego_view`` input.
     """
     body_joint_names = robot_model.joint_names
     num_body = robot_model.num_joints
@@ -303,6 +341,13 @@ def get_features_x2_vla(
             "shape": [FRONT_CAM_HEIGHT, FRONT_CAM_WIDTH, 3],
             "names": ["height", "width", "channel"],
         }
+    if include_head_cameras:
+        for cam_key in HEAD_CAM_KEYS:
+            features[f"observation.images.{cam_key}"] = {
+                "dtype": "video",
+                "shape": [HEAD_CAM_HEIGHT, HEAD_CAM_WIDTH, 3],
+                "names": ["height", "width", "channel"],
+            }
     features.update({
         "observation.state": {
             "dtype": "float64",
@@ -366,14 +411,19 @@ def get_features_x2_vla(
 # ---------------------------------------------------------------------------
 
 
-def _video_modality(*, include_front_cam: bool) -> dict:
+def _video_modality(
+    *,
+    include_front_cam: bool,
+    include_head_cameras: bool = False,
+) -> dict:
     """Build the ``video`` block of ``meta/modality.json``.
 
     Single-source-of-truth helper so :func:`get_modality_config_x2_vla`
-    and :func:`get_features_x2_vla` can't drift on whether
-    ``front_cam`` is in the schema. Both should be called with the same
-    ``include_front_cam`` value (the recorder enforces this; mismatched
-    callers will get a LeRobot exporter error at first frame).
+    and :func:`get_features_x2_vla` can't drift on which video keys
+    are in the schema. Both should be called with the same
+    ``include_front_cam`` / ``include_head_cameras`` values (the
+    recorder enforces this; mismatched callers will get a LeRobot
+    exporter error at first frame).
     """
     video = {
         "ego_view": {"original_key": "observation.images.ego_view"},
@@ -382,6 +432,11 @@ def _video_modality(*, include_front_cam: bool) -> dict:
         video["front_cam"] = {
             "original_key": "observation.images.front_cam",
         }
+    if include_head_cameras:
+        for cam_key in HEAD_CAM_KEYS:
+            video[cam_key] = {
+                "original_key": f"observation.images.{cam_key}",
+            }
     return video
 
 
@@ -390,6 +445,7 @@ def get_modality_config_x2_vla(
     hand_dof_per_side: int = HAND_DOF_OMNI,
     *,
     include_front_cam: bool = False,
+    include_head_cameras: bool = False,
 ) -> dict:
     """Return the ``meta/modality.json`` content for the X2 SONIC dataset.
 
@@ -458,7 +514,10 @@ def get_modality_config_x2_vla(
                 "original_key": "action.right_hand_joints",
             },
         },
-        "video": _video_modality(include_front_cam=include_front_cam),
+        "video": _video_modality(
+            include_front_cam=include_front_cam,
+            include_head_cameras=include_head_cameras,
+        ),
         "annotation": {
             "human.task_description": {"original_key": "task_index"},
         },
@@ -473,6 +532,9 @@ __all__ = [
     "FRONT_CAM_WIDTH",
     "HAND_DOF_G1_COMPAT",
     "HAND_DOF_OMNI",
+    "HEAD_CAM_HEIGHT",
+    "HEAD_CAM_KEYS",
+    "HEAD_CAM_WIDTH",
     "MUJOCO_JOINT_NAMES",
     "SONIC_MOTION_TOKEN_DIM",
     "assemble_observation_state",

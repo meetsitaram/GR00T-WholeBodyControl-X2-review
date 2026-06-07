@@ -1,0 +1,71 @@
+# Minimal pip install for the X2 LeRobot dataset Rerun viewer
+# (gear_sonic/scripts/view_x2_recorded_dataset.py).
+#
+# This file lives at the repo root next to ``requirements-teleop-record.txt``
+# so it follows the same convention. It is consumed by
+# ``install_scripts/install_viewer.sh``, which creates the dedicated
+# ``.venv-viewer/`` venv. The wrapper script
+# ``gear_sonic/scripts/view_x2_recorded_dataset.sh`` then dispatches to
+# that interpreter.
+#
+# ──────────────────────────────────────────────────────────────────────
+# WHY A DEDICATED VENV (and not the main .venv/)?
+# ──────────────────────────────────────────────────────────────────────
+# The main ``.venv/`` pins:
+#
+#     numpy==1.26.4          (required by pin/pinocchio 2.7.0 cmeel wheel)
+#     pin (pinocchio)==2.7.0 (used by the kinematic planner)
+#     rerun-sdk==0.21.0      (latest version that still accepts numpy<2)
+#
+# Upgrading rerun-sdk past 0.30 hard-requires ``numpy>=2``, which would
+# break the pre-built pinocchio wheel and crash the planner with:
+#
+#     ImportError: A module that was compiled using NumPy 1.x cannot be
+#     run in NumPy 2.x ... downgrade to 'numpy<2' or upgrade the
+#     affected module.
+#
+# Sticking with rerun-sdk 0.21, on the other hand, makes the recorded
+# .rrd files unreadable by the conda-shipped ``rerun-cli 0.31.4`` viewer:
+#
+#     ERROR re_data_loader::load_file: Failed to load data ...
+#     Codec error: Invalid encoding options: You are trying to load
+#     an old .rrd file that's not supported by this version of Rerun.
+#
+# The clean fix is to keep the planner stack pinned at numpy<2 and
+# put the upgraded Rerun stack in a separate venv that's never imported
+# by anything else. See:
+#
+#     - install_scripts/install_viewer.sh   (bootstrap)
+#     - gear_sonic/scripts/view_x2_recorded_dataset.sh   (wrapper)
+#     - gear_sonic/scripts/view_x2_recorded_dataset.py   (the script;
+#       has a guardrail that fails with exit 2 if you accidentally
+#       run it from the main .venv/)
+# ──────────────────────────────────────────────────────────────────────
+
+# Core: rerun-sdk MUST match the system rerun-cli on the user's PATH.
+# The workstation ships rerun-cli 0.31.4 via conda; pin SDK to the
+# matching 0.31.4 so the wire format and .rrd encoding agree.
+# Bumping this pin requires also bumping (or accepting) the conda
+# viewer to the same major.minor version.
+rerun-sdk==0.31.4
+
+# Parquet reader: the LeRobot v2.1 dataset stores per-episode state /
+# action vectors in parquet. We use pyarrow directly to skip torch +
+# torchcodec entirely (which has its own ABI mismatch story on this
+# laptop). rerun-sdk 0.31.x requires pyarrow>=18.
+pyarrow>=18
+
+# Imaging fallback (currently unused but kept for parity with rerun-sdk
+# install instructions; PIL is pulled in transitively by some rr.* code
+# paths and avoids a runtime ``ModuleNotFoundError`` if we ever start
+# emitting EncodedImage instead of AssetVideo).
+pillow>=8
+
+# NOTE: ``numpy`` and ``typing-extensions`` and ``attrs`` are
+# transitive deps of rerun-sdk and pyarrow. We deliberately do NOT
+# pin them here -- rerun-sdk 0.31.4 will resolve them to numpy>=2
+# automatically. If you want to verify the exact resolved set:
+#
+#     .venv-viewer/bin/python -m pip list
+#     # or:
+#     VIRTUAL_ENV=$(pwd)/.venv-viewer uv pip list

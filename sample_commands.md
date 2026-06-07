@@ -78,6 +78,48 @@ bash gear_sonic/scripts/record_x2_dataset.sh \
     --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
 ```
 
+### Full record session WITH X2 head cameras (Orbbec + IMX900 stereo)
+
+Adds the three real PC2 head-camera streams to the dataset alongside
+the MuJoCo `ego_view`. Auto-starts the ROS→ZMQ bridge on PC2 over SSH
+before launching the recorder; tear it down later with
+`gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve-stop`. Resulting
+parquets carry the extra video features
+`observation.images.{head_front,stereo_left,stereo_right}`.
+
+Pre-flight (once per robot boot): make sure all three head cameras
+came up properly on PC2 — there is a known boot-time Argus race that
+sometimes loses the IMX900 stereo pair, fixed by bouncing the HAL:
+
+```sh
+gear_sonic_deploy/scripts/x2_pc2_cameras.sh status   # see what pubs exist
+gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal  # bounce hal_sensor_orin if stereo pubs=0
+gear_sonic_deploy/scripts/x2_pc2_cameras.sh grab     # save one JPEG per cam for visual check
+```
+
+Then record:
+
+```sh
+cd /home/stickbot/Projects/GR00T-WholeBodyControl && \
+bash gear_sonic/scripts/record_x2_dataset.sh \
+    --output-dir data/lerobot/x2_quest3_sonic_cams_v1 \
+    --task "wave hello with both hands" \
+    --sim-omnihand \
+    --wrist-bypass ik \
+    --head-cameras \
+    --sonic-checkpoint /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+```
+
+Replay all four video tracks side-by-side:
+
+```sh
+DS=data/lerobot/x2_quest3_sonic_cams_v1
+EP=000000
+for cam in ego_view head_front stereo_left stereo_right; do
+    xdg-open ${DS}/videos/chunk-000/observation.images.${cam}/episode_${EP}.mp4 &
+done
+```
+
 Sanity-check the bypass is firing once SONIC reaches `CONTROL` state:
 the deploy log's periodic status line should end with
 `wrist_bypass_ticks=<N> wrist_bypass_max_dev_rad=<X.XXX>`, with `N`

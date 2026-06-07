@@ -239,6 +239,11 @@ uv.lock
 .venv_camera/
 .venv_inference/
 
+# Isolated viewer venv (rerun-sdk 0.31.4 + numpy>=2, separate from
+# planner .venv/ to avoid the pinocchio/numpy incompatibility -- see
+# gear_sonic/scripts/view_x2_recorded_dataset.sh).
+.venv-viewer/
+
 # XRoboToolkit-PC-Service-Pybind
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/

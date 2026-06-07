@@ -209,6 +209,19 @@ data-collection venv. Make sure:
 * `.venv/bin/python` resolves to the GR00T env with `zmq`, `mujoco`,
   `lerobot`, and `websockets` installed.
 
+* (Optional, but recommended once you start recording datasets)
+  the Rerun viewer for multi-camera replay lives in a separate
+  `.venv-viewer/` to avoid clashing with the planner's `pinocchio`
+  pin on `numpy<2`. Bootstrap it once with:
+
+  ```bash
+  bash install_scripts/install_viewer.sh
+  ```
+
+  See § 6.2.1 for why it's a separate venv and how to invoke it
+  via the [`view_x2_recorded_dataset.sh`](../../../../gear_sonic/scripts/view_x2_recorded_dataset.sh)
+  wrapper. Pins live in [`requirements-viewer.txt`](../../../../requirements-viewer.txt).
+
   :::{tip}
   **Optional dependencies are auto-installed on first launch.**
   The teleop / calibration / record entry-points call
@@ -906,8 +919,8 @@ print(f"{len(eps)} episodes, {sum(e['length'] for e in eps)} total frames")
 
 ### 6.2 Re-watch the ego_view footage
 
-The recorder writes one MP4 per episode under
-`videos/chunk-000/observation.images.ego_view/`. Open the MP4 in any
+The recorder writes one MP4 per episode per camera under
+`videos/chunk-000/observation.images.<camera>/`. Open the MP4 in any
 video player; that's exactly the frame stream the trained policy will
 see at deploy time (the same camera, same resolution, same FPS).
 
@@ -917,6 +930,85 @@ Quick CLI peek:
 ls data/lerobot/x2_quest3_v0/videos/chunk-000/observation.images.ego_view/
 mpv data/lerobot/x2_quest3_v0/videos/chunk-000/observation.images.ego_view/episode_000000.mp4
 ```
+
+For a full multi-camera replay with joint plots and state timelines,
+use the dedicated Rerun viewer instead -- see § 6.2.1.
+
+#### 6.2.1 Rerun viewer (multi-camera + scalar plots)
+
+```bash
+./gear_sonic/scripts/view_x2_recorded_dataset.sh \
+    --dataset x2_grab_a_drink --episode 6
+```
+
+This spawns the system `rerun-cli 0.31.4` viewer and streams every
+camera (ego_view, head_front, stereo_left, stereo_right when
+recorded) plus the per-joint scalar plots in a single window. The
+viewer uses native H.264 decode on the GPU and a columnar rerun
+log path, so even an 8 K-frame, 4-camera episode is interactive in
+< 2 s with no broken-pipe / "Dropping messages" warnings.
+
+##### Why this needs its own venv
+
+This is the most common foot-gun in this repo right now, so it's
+worth understanding once:
+
+| Stack | numpy | pinocchio (`pin`) | rerun-sdk | What it can do |
+|---|---|---|---|---|
+| `.venv/` (planner) | 1.26.4 | 2.7.0 (cmeel wheel) | 0.21.0 | Runs the kinematic planner. **Cannot view recorded datasets** (0.21 .rrd files are rejected by the conda 0.31.4 viewer with `Codec error: Invalid encoding options`). |
+| `.venv-viewer/` (viewer) | ≥2 | not installed | 0.31.4 | Matches the conda `rerun-cli 0.31.4` on the user's PATH; decodes H.264 natively. **Cannot import `pinocchio`** because pin 2.7's pre-built wheel needs numpy<2. |
+
+Upgrading rerun-sdk in `.venv/` would pull `numpy>=2`, which immediately
+breaks `pin.buildSampleModelHumanoid` with:
+
+```
+ImportError: A module that was compiled using NumPy 1.x cannot be run
+in NumPy 2.x ... downgrade to 'numpy<2' or upgrade the affected module.
+```
+
+Downgrading the conda viewer to 0.21 would let `.venv/` talk to it,
+but 0.21's native viewer only decodes **AV1** (`Only MP4 containers
+with AV1 are generally supported`, per `rr.AssetVideo`'s own
+docstring) -- our recorder writes H.264, so all camera panes would
+render blank.
+
+The two-venv setup avoids both traps: keep the planner pinned, ship
+a thin (~600 MB) parallel venv just for the viewer, dispatch via a
+wrapper script. **The wrapper handles the interpreter selection;
+operators never have to know which venv to activate.**
+
+##### Installing or repairing the viewer venv
+
+If `.venv-viewer/` is missing or broken, the wrapper prints exit
+code 2 with recovery instructions. The idempotent installer is:
+
+```bash
+bash install_scripts/install_viewer.sh
+```
+
+Pinned versions live in [`requirements-viewer.txt`](../../../../requirements-viewer.txt)
+at the repo root. The installer also verifies the columnar rerun
+API surface (`TimeColumn`, `Scalars.columns`, etc.) at install
+time so a future SDK bump that drops one of those symbols fails
+at `bash install_scripts/install_viewer.sh` instead of mid-replay.
+
+##### Viewer CLI flags
+
+```bash
+./gear_sonic/scripts/view_x2_recorded_dataset.sh --help
+```
+
+Useful selectors:
+
+| Flag | Effect |
+|---|---|
+| `--dataset NAME` | Resolve `data/lerobot/NAME/` automatically. |
+| `--root PATH` | Use an absolute dataset path instead. |
+| `--episode N` | Required; the on-disk `episode_index`. Read off the recorder log (`on-disk episode_index=N`) or from `ls data/lerobot/.../episode_NNNNNN.parquet`. |
+| `--save FILE.rrd` | Dump a self-contained recording instead of spawning the viewer. Replay later with `rerun FILE.rrd`. |
+| `--skip-scalars` | Videos only -- fastest cold load when you just want a visual eyeball pass. |
+| `--scalar-decimate N` | Subsample scalars to every Nth frame; useful for > 30 K-frame sessions where chart panes get sluggish. |
+| `--max-scalar-dims K` | Per-column cap on vector expansion. Default 64 covers `body_q_mj` (30) + omnihand (10 + 10) + projected gravity (3). Set to 0 to skip scalars (same as `--skip-scalars`). |
 
 ### 6.3 Re-publish the recorded motion tokens to a fresh deploy
 

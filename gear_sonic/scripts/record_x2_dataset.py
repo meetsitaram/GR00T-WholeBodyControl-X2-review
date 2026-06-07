@@ -377,6 +377,65 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "post-hoc schema additions)."
         ),
     )
+
+    # ── Real PC2 head cameras (Orbbec head_front + IMX900 stereo L/R) ──
+    # Pull the three physical head cameras off the X2's PC2 (Jetson
+    # Orin NX) over ZMQ and write them into the dataset alongside the
+    # MuJoCo-rendered `ego_view`. Requires the bridge to be running:
+    #
+    #   ./gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve
+    #
+    # Feature keys land as observation.images.{head_front,stereo_left,
+    # stereo_right}; see gear_sonic/data/features_x2_vla.py
+    # `HEAD_CAM_KEYS` for the single source of truth.
+    head_grp = parser.add_argument_group("head cameras (PC2 physical)")
+    head_grp.add_argument(
+        "--head-cameras", dest="head_cameras",
+        action="store_true", default=False,
+        help=(
+            "Ingest the three PC2 head-camera ZMQ streams (Orbbec "
+            "head_front + IMX900 stereo_left/right) and write them as "
+            "observation.images.* into the LeRobot dataset. Requires "
+            "the bridge launched by "
+            "./gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve to be "
+            "running on PC2. Off by default for back-compat with "
+            "existing sim-only parquets."
+        ),
+    )
+    head_grp.add_argument(
+        "--no-head-cameras", dest="head_cameras",
+        action="store_false",
+        help="Explicitly suppress head-camera ingestion (default).",
+    )
+    head_grp.add_argument(
+        "--camera-host", type=str, default="10.0.1.41",
+        help=(
+            "PC2 hostname/IP where the camera bridge is bound. Default "
+            "matches the LAN-wired Jetson Orin NX (10.0.1.41)."
+        ),
+    )
+    head_grp.add_argument(
+        "--camera-port", type=int, default=5555,
+        help="ZMQ PUB port for the camera bridge (default 5555).",
+    )
+    head_grp.add_argument(
+        "--camera-warmup-timeout", type=float, default=8.0,
+        help=(
+            "Seconds to wait at startup for the first fully-populated "
+            "camera frame bundle. Exceeding this aborts the recorder "
+            "boot so we never write partial-schema parquets."
+        ),
+    )
+    head_grp.add_argument(
+        "--camera-max-staleness", type=float, default=0.5,
+        help=(
+            "Seconds. Per-tick freshness threshold: if the latest "
+            "camera bundle is older than this when the recorder "
+            "writes a tick, that tick is dropped (no parquet row). "
+            "Default 0.5s tolerates short HAL hiccups without losing "
+            "whole episodes."
+        ),
+    )
     # Stash the resolved scenes dir on the parser so the resolver in
     # main() can find scene XMLs without recomputing the path.
     parser.set_defaults(_robocasa_scenes_dir=_scenes_dir)
@@ -628,6 +687,11 @@ def main(argv: list[str] | None = None) -> int:
         record_front_cam=_resolve_front_cam_default(
             args.front_cam, scene_xml_path
         ),
+        record_head_cameras=bool(args.head_cameras),
+        camera_host=args.camera_host,
+        camera_port=args.camera_port,
+        camera_warmup_timeout_s=args.camera_warmup_timeout,
+        camera_max_staleness_s=args.camera_max_staleness,
         scene_state_sub_host=args.scene_state_sub_host,
         scene_state_sub_port=args.scene_state_sub_port,
         scene_reset_pub_host=args.scene_reset_pub_host,

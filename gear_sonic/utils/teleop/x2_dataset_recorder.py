@@ -440,6 +440,55 @@ class RecorderConfig:
     parquets). Has no effect in ``--teleop-only`` mode (no recorder ->
     no schema)."""
 
+    # ── PC2 physical head-cameras (Orbbec + IMX900 stereo pair) ────────
+    # When ``record_head_cameras`` is True the recorder opens a ZMQ
+    # ``SUB`` (via :class:`gear_sonic.camera.composed_camera.ComposedCameraClientSensor`)
+    # to the PC2 camera bridge launched by
+    # ``gear_sonic_deploy/scripts/x2_pc2_camera_zmq_publisher.py`` and
+    # writes the three real head streams into the LeRobot dataset
+    # alongside the synthetic MuJoCo ``ego_view``. Feature keys:
+    # ``observation.images.head_front`` (Orbbec RGB),
+    # ``observation.images.stereo_left`` / ``stereo_right`` (IMX900s).
+    # The flag also flips ``include_head_cameras=True`` on
+    # :func:`get_features_x2_vla` / :func:`get_modality_config_x2_vla`
+    # so the schema declares the three new video tracks up front --
+    # mismatches trip the exporter's strict per-frame validator.
+    # No-op in ``--teleop-only`` mode.
+    record_head_cameras: bool = False
+    """Whether to ingest the three PC2 head-camera ZMQ streams into the
+    LeRobot dataset (``head_front`` Orbbec + ``stereo_left/right``
+    IMX900s). The bridge MUST be running before the recorder is
+    started; the recorder fails fast (within
+    :attr:`camera_warmup_timeout_s`) if the first complete frame
+    bundle does not arrive."""
+
+    camera_host: str = "10.0.1.41"
+    """PC2 hostname/IP where ``x2_pc2_camera_zmq_publisher.py`` is bound.
+    Default matches the LAN-wired Jetson Orin NX address used by
+    every other deploy script (PC1 is .40, PC2 is .41, PC3 is .42)."""
+
+    camera_port: int = 5555
+    """ZMQ PUB port for the camera bridge. Default 5555 matches the
+    ``composed_camera`` convention; override on both sides if you're
+    running multiple bridges on the same robot."""
+
+    camera_warmup_timeout_s: float = 8.0
+    """Seconds to wait at startup for the first fully-populated camera
+    frame bundle (all of ``head_front`` / ``stereo_left`` /
+    ``stereo_right`` present). Exceeding this is a fail-fast at
+    recorder boot so we never write partial-schema parquet shards.
+    Set to 0 to skip the wait (recorder will still error out on the
+    first frame if the bundle is incomplete)."""
+
+    camera_max_staleness_s: float = 0.5
+    """If the most recent camera frame is older than this many seconds
+    when the recorder tries to write a tick, the frame is skipped (no
+    parquet row, no warning spam). Larger values mean the dataset
+    will reuse stale frames during transient bridge hiccups; smaller
+    values mean tighter freshness at the cost of episode length.
+    Default 500 ms tolerates short HAL restarts without dropping
+    whole episodes."""
+
     robot_pose_sub_host: str = "localhost"
     robot_pose_sub_port: int = 5570
     robot_pose_sub_topic: str = "robot_pose"
@@ -1134,11 +1183,13 @@ class X2DatasetRecorder:
             self._robot_model,
             hand_dof_per_side=HAND_DOF_OMNI,
             include_front_cam=cfg.record_front_cam,
+            include_head_cameras=cfg.record_head_cameras,
         )
         self._modality_cfg = get_modality_config_x2_vla(
             self._robot_model,
             hand_dof_per_side=HAND_DOF_OMNI,
             include_front_cam=cfg.record_front_cam,
+            include_head_cameras=cfg.record_head_cameras,
         )
         if self._robot_model.num_joints != NUM_BODY_DOFS:
             raise RuntimeError(
@@ -1439,6 +1490,25 @@ class X2DatasetRecorder:
         # :meth:`_build_renderer` and :meth:`_record_frame`.
         self._front_cam_renderer: Any | None = None
 
+        # ── PC2 head-camera ZMQ client (head_front + stereo L/R) ───────
+        # ``cfg.record_head_cameras`` flips on a background thread that
+        # pulls merged ``ImageMessageSchema`` frames from the bridge
+        # (see ``gear_sonic_deploy/scripts/x2_pc2_camera_zmq_publisher.py``)
+        # at the polling rate below. Each tick of ``_record_frame``
+        # consults :meth:`_snapshot_head_camera_images` for the freshest
+        # bundle; bundles older than ``cfg.camera_max_staleness_s`` cause
+        # the tick to be dropped (no parquet row written) so the dataset
+        # never contains stale physical-camera frames silently.
+        self._head_camera_client: Any | None = None
+        self._head_camera_thread: Optional[threading.Thread] = None
+        self._head_camera_lock = threading.Lock()
+        self._head_camera_latest: Optional[dict[str, np.ndarray]] = None
+        self._head_camera_latest_ts: float = 0.0
+        self._head_camera_frames_received: int = 0
+        self._head_camera_stale_warns: int = 0
+        if not cfg.teleop_only and cfg.record_head_cameras:
+            self._init_head_cameras()
+
         # ── Live pelvis-pose cache ─────────────────────────────────────
         # Most-recent ``(x, y, z)`` from the bridge's ``robot_pose`` PUB
         # (see :data:`gear_sonic.utils.teleop.zmq.robot_pose_zmq`). The
@@ -1663,6 +1733,8 @@ class X2DatasetRecorder:
             self._scene_state_thread.start()
         if self._robot_pose_thread is not None:
             self._robot_pose_thread.start()
+        if self._head_camera_thread is not None:
+            self._head_camera_thread.start()
         # Give PUB-SUB sockets a beat to wire up before we start
         # blasting messages.
         time.sleep(0.2)
@@ -1805,6 +1877,16 @@ class X2DatasetRecorder:
         if self._robot_pose_thread is not None:
             try:
                 self._robot_pose_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._head_camera_thread is not None:
+            try:
+                self._head_camera_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._head_camera_client is not None:
+            try:
+                self._head_camera_client.close()
             except Exception:
                 pass
         try:
@@ -2484,9 +2566,26 @@ class X2DatasetRecorder:
                 )
 
         self._is_recording = True
+        # Surface BOTH the session-local 1-based counter (matches
+        # operator intuition "I just opened the Nth episode of this
+        # session") AND the exporter's actual on-disk episode_index
+        # (the slot the parquet will land at). They differ by the
+        # number of episodes already in the dataset when this process
+        # spawned -- so on a resumed dataset the on-disk index is
+        # ``last_finalized + 1 + self._episode_count``, not just
+        # ``self._episode_count + 1``.
+        next_disk_idx_str = "?"
+        if self._exporter is not None:
+            try:
+                next_disk_idx_str = str(
+                    int(self._exporter.episode_buffer["episode_index"])
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
         print(
             f"[recorder] [X] episode start (task={self._cfg.task!r}, "
-            f"# {self._episode_count + 1})",
+            f"# {self._episode_count + 1} this session, "
+            f"on-disk episode_index={next_disk_idx_str})",
             flush=True,
         )
 
@@ -2510,6 +2609,17 @@ class X2DatasetRecorder:
             assert self._exporter is not None
             for frame in self._episode_buffer.frames:
                 self._exporter.add_frame(frame)
+            # Capture the exporter's on-disk episode_index BEFORE
+            # ``save_episode`` rolls the buffer over to the next slot
+            # (it reassigns ``self._exporter.episode_buffer`` to a
+            # fresh buffer for episode_index+1 as part of finalize).
+            # When the operator resumes an existing dataset (preflight
+            # found ``meta/info.json`` + finalized episodes), this is
+            # ``last_finalized + 1``, NOT ``self._episode_count`` --
+            # the latter is process-local and starts at 0 on every
+            # spawn, so it would mis-label resumed runs as
+            # ``episode_000000`` even though the file lands at slot N.
+            saved_idx = int(self._exporter.episode_buffer["episode_index"])
             self._exporter.save_episode()
             self._episode_count += 1
             # Resolve and print the on-disk paths so the operator
@@ -2525,20 +2635,21 @@ class X2DatasetRecorder:
             # ``[recorder]`` line plus a 4-space indent to surface
             # these to the foreground; changing the indent or the
             # arrow style breaks that mirror silently.
-            saved_idx = self._episode_count - 1
             out_root = self._cfg.output_dir
+            chunk_idx = saved_idx // 1000
             parquet_path = (
-                out_root / "data" / "chunk-000"
+                out_root / "data" / f"chunk-{chunk_idx:03d}"
                 / f"episode_{saved_idx:06d}.parquet"
             )
             mp4_path = (
-                out_root / "videos" / "chunk-000"
+                out_root / "videos" / f"chunk-{chunk_idx:03d}"
                 / "observation.images.ego_view"
                 / f"episode_{saved_idx:06d}.mp4"
             )
             print(
                 f"[recorder] [Y] episode saved: {n} frames "
-                f"(total saved={self._episode_count})",
+                f"(on-disk episode_index={saved_idx}, "
+                f"total saved this session={self._episode_count})",
                 flush=True,
             )
             print(f"[recorder]     parquet -> {parquet_path}", flush=True)
@@ -3396,6 +3507,25 @@ class X2DatasetRecorder:
             arm_delta_max=arm_delta_max,
         )
 
+        # Pull the real head-camera bundle (Orbbec + IMX900 stereo pair)
+        # BEFORE we assemble the frame_data dict so we can fail-fast and
+        # skip the tick if the bridge is stale -- writing a partial
+        # frame would trip ``Gr00tDataExporter.validate_frame`` and
+        # crash the recording session. The helper returns None when
+        # head cameras are disabled (no-op for non-cam recordings) OR
+        # when the bridge is silent / stale.
+        head_cam_frame_data: dict[str, np.ndarray] = {}
+        if self._cfg.record_head_cameras:
+            head_bundle = self._snapshot_head_camera_images()
+            if head_bundle is None:
+                # Stale / missing bundle. We've already logged a
+                # rate-limited warning inside the snapshot helper;
+                # just drop the tick here so the parquet stays
+                # schema-complete. Resumes automatically on the next
+                # tick once the bridge catches up.
+                return
+            head_cam_frame_data = self._format_head_camera_frame_data(head_bundle)
+
         frame_data = {
             "observation.state": observation_state,
             "observation.projected_gravity": proj_grav,
@@ -3419,6 +3549,14 @@ class X2DatasetRecorder:
             # here mirrors the conditional render above; the exporter
             # rejects either side mismatching at validate time.
             frame_data["observation.images.front_cam"] = front_view
+        # Splice in the three real head-camera streams. The keys map
+        # 1:1 with ``observation.images.{head_front,stereo_left,stereo_right}``
+        # so a missing key here means the bridge missed that mount
+        # this tick -- the staleness check above already guarantees
+        # the bundle was complete + fresh, so this is a noop on the
+        # happy path.
+        if head_cam_frame_data:
+            frame_data.update(head_cam_frame_data)
         # Robocasa mode: append per-frame success / reward / subtask
         # signals from the task mirror. The mirror's mj_data has been
         # synced from the deploy bridge's most recent ``scene_state``
@@ -3628,6 +3766,241 @@ class X2DatasetRecorder:
         """
         with self._pelvis_pose_lock:
             return self._latest_pelvis_xyz.copy()
+
+    # -- PC2 head-camera ingestion ------------------------------------------
+
+    def _init_head_cameras(self) -> None:
+        """Bootstrap the head-camera ZMQ SUB and verify the bridge is live.
+
+        Called once from ``__init__`` when ``cfg.record_head_cameras`` is
+        set. Constructs a :class:`ComposedCameraClientSensor`, drains it
+        for up to :attr:`RecorderConfig.camera_warmup_timeout_s` seconds
+        waiting for the first frame bundle that contains all three
+        expected mount keys (``head_front`` + ``stereo_left`` +
+        ``stereo_right``), and then kicks off a daemon poller. Failing
+        the warmup check is a fail-fast: better to abort here than to
+        write a half-populated parquet shard the trainer rejects.
+        """
+        from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+        from gear_sonic.data.features_x2_vla import (
+            HEAD_CAM_HEIGHT,
+            HEAD_CAM_KEYS,
+            HEAD_CAM_WIDTH,
+        )
+
+        cfg = self._cfg
+        print(
+            f"[recorder] head cameras ENABLED -> connecting to "
+            f"tcp://{cfg.camera_host}:{cfg.camera_port}",
+            flush=True,
+        )
+        self._head_camera_client = ComposedCameraClientSensor(
+            server_ip=cfg.camera_host, port=cfg.camera_port
+        )
+
+        # Warmup: pull until we either see a complete bundle or hit the
+        # operator-configured timeout. Discarded warmup bundles also
+        # double as the publisher-rate sanity check (we report what we
+        # saw).
+        deadline = time.monotonic() + max(cfg.camera_warmup_timeout_s, 0.0)
+        last_seen_keys: set[str] = set()
+        last_print = 0.0
+        required = set(HEAD_CAM_KEYS)
+        ready = False
+        while time.monotonic() < deadline:
+            msg = self._head_camera_client.read(blocking=False)
+            if msg and msg.get("images"):
+                got_keys = {k for k, v in msg["images"].items() if v is not None}
+                if got_keys >= required:
+                    sample = {
+                        k: msg["images"][k].shape for k in HEAD_CAM_KEYS
+                    }
+                    print(
+                        f"[recorder] head-camera bridge ready: "
+                        f"keys={sorted(got_keys)} shapes={sample}",
+                        flush=True,
+                    )
+                    ready = True
+                    break
+                if got_keys != last_seen_keys and time.monotonic() - last_print > 1.0:
+                    print(
+                        f"[recorder] head cameras: waiting for full bundle "
+                        f"(got {sorted(got_keys)}, need {sorted(required)})",
+                        flush=True,
+                    )
+                    last_seen_keys = got_keys
+                    last_print = time.monotonic()
+            time.sleep(0.05)
+
+        if not ready:
+            try:
+                self._head_camera_client.close()
+            except Exception:
+                pass
+            self._head_camera_client = None
+            raise RuntimeError(
+                f"[recorder] head-camera bridge at "
+                f"tcp://{cfg.camera_host}:{cfg.camera_port} did NOT publish a "
+                f"complete frame bundle within {cfg.camera_warmup_timeout_s:.1f}s "
+                f"(required mount keys: {sorted(required)}). Start the bridge "
+                f"with `./gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve` "
+                f"and confirm `status` shows publishers for "
+                f"rgb_head_front_center + stereo_head_front_{{left,right}}."
+            )
+
+        # Sanity-check the bridge's output dimensions match the schema.
+        # The bridge is expected to resize to (HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT)
+        # so the recorder can skip a resize per tick.
+        for k in HEAD_CAM_KEYS:
+            shp = msg["images"][k].shape  # type: ignore[index]
+            if shp[:2] != (HEAD_CAM_HEIGHT, HEAD_CAM_WIDTH):
+                print(
+                    f"[recorder] WARN: head camera {k!r} produces "
+                    f"{shp[1]}x{shp[0]} (HxW={shp[:2]}); expected "
+                    f"{HEAD_CAM_WIDTH}x{HEAD_CAM_HEIGHT}. Re-encoding per tick "
+                    f"to the schema size (extra CPU cost). Run the bridge with "
+                    f"--width {HEAD_CAM_WIDTH} --height {HEAD_CAM_HEIGHT} to "
+                    f"eliminate this.",
+                    flush=True,
+                )
+
+        # Seed cache with the warmup bundle so the very first
+        # ``_record_frame`` call has something to write even before the
+        # poller wakes up.
+        with self._head_camera_lock:
+            self._head_camera_latest = {
+                k: msg["images"][k] for k in HEAD_CAM_KEYS  # type: ignore[index]
+            }
+            self._head_camera_latest_ts = time.time()
+            self._head_camera_frames_received = 1
+
+        self._head_camera_thread = threading.Thread(
+            target=self._head_camera_subscriber,
+            name="head-camera-sub",
+            daemon=True,
+        )
+
+    def _head_camera_subscriber(self) -> None:
+        """Background poller for the PC2 camera bridge.
+
+        Pulls merged frames as fast as the wire delivers them and keeps
+        the latest complete bundle in ``self._head_camera_latest`` for
+        :meth:`_snapshot_head_camera_images`. The poll period is set to
+        a fraction of the record-tick interval so the cache is always
+        fresher than the recorder's next read.
+        """
+        from gear_sonic.data.features_x2_vla import HEAD_CAM_KEYS
+
+        client = self._head_camera_client
+        if client is None:
+            return
+        required = set(HEAD_CAM_KEYS)
+        # Poll at 4x the record rate so the cache is fresher than the
+        # next tick read by definition; cap at 200 Hz.
+        record_period = 1.0 / max(self._cfg.record_rate_hz, 1.0)
+        poll_period = min(record_period / 4.0, 1.0 / 200.0)
+        while not self._stop_event.is_set():
+            try:
+                msg = client.read(blocking=False)
+            except Exception as exc:
+                print(
+                    f"[recorder] head-camera poll error: {exc}",
+                    flush=True,
+                )
+                time.sleep(0.1)
+                continue
+            if msg and msg.get("images"):
+                got = {
+                    k: v
+                    for k, v in msg["images"].items()
+                    if v is not None and k in required
+                }
+                if set(got.keys()) >= required:
+                    with self._head_camera_lock:
+                        self._head_camera_latest = got
+                        self._head_camera_latest_ts = time.time()
+                        self._head_camera_frames_received += 1
+            time.sleep(poll_period)
+
+    def _snapshot_head_camera_images(self) -> Optional[dict[str, np.ndarray]]:
+        """Return the latest complete head-camera bundle if fresh enough.
+
+        Returns ``None`` when:
+        * head cameras are disabled, OR
+        * no bundle has arrived yet, OR
+        * the latest bundle is older than
+          :attr:`RecorderConfig.camera_max_staleness_s`.
+
+        The caller is expected to skip the frame (no parquet write) in
+        all three cases. A throttled warning fires the first time we
+        drop a frame for staleness so silent freezes are obvious.
+        """
+        if not self._cfg.record_head_cameras or self._head_camera_client is None:
+            return None
+        with self._head_camera_lock:
+            latest = self._head_camera_latest
+            ts = self._head_camera_latest_ts
+        now = time.time()
+        if latest is None:
+            return None
+        if now - ts > self._cfg.camera_max_staleness_s:
+            # Rate-limit the warning to once per second; the dropped
+            # frames are otherwise silent so the recorder doesn't spam
+            # the terminal during a long bridge hiccup.
+            if (
+                self._head_camera_stale_warns == 0
+                or now - getattr(self, "_last_cam_warn_t", 0.0) > 1.0
+            ):
+                print(
+                    f"[recorder] WARN: head-camera bundle is "
+                    f"{(now - ts)*1000:.0f}ms stale (>"
+                    f"{self._cfg.camera_max_staleness_s*1000:.0f}ms); "
+                    f"skipping frame. Check the PC2 bridge is alive.",
+                    flush=True,
+                )
+                self._head_camera_stale_warns += 1
+                self._last_cam_warn_t = now
+            return None
+        # Return a shallow copy so the recorder can mutate dtype/shape
+        # without affecting the cache.
+        return dict(latest)
+
+    def _format_head_camera_frame_data(
+        self,
+        bundle: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Normalize a head-camera bundle into the LeRobot-frame dict shape.
+
+        The bridge already publishes uint8 RGB at (HEAD_CAM_HEIGHT,
+        HEAD_CAM_WIDTH, 3) so this is usually just a key-rename
+        (``head_front`` -> ``observation.images.head_front``) + a
+        contiguity guarantee. Frames that arrive at the wrong size are
+        resized here (with a one-shot warning logged at warmup); frames
+        already at the right size pay only the ``ascontiguousarray``
+        cost.
+        """
+        from gear_sonic.data.features_x2_vla import (
+            HEAD_CAM_HEIGHT,
+            HEAD_CAM_KEYS,
+            HEAD_CAM_WIDTH,
+        )
+        import cv2 as _cv2
+
+        out: dict[str, np.ndarray] = {}
+        for cam_key in HEAD_CAM_KEYS:
+            img = bundle.get(cam_key)
+            if img is None:
+                continue
+            if img.shape[:2] != (HEAD_CAM_HEIGHT, HEAD_CAM_WIDTH):
+                img = _cv2.resize(
+                    img,
+                    (HEAD_CAM_WIDTH, HEAD_CAM_HEIGHT),
+                    interpolation=_cv2.INTER_AREA,
+                )
+            if img.dtype != np.uint8:
+                img = img.astype(np.uint8)
+            out[f"observation.images.{cam_key}"] = np.ascontiguousarray(img)
+        return out
 
     def _drain_scene_state_into_mirror(self) -> None:
         """Pull the latest scene_state snapshot and apply it to the mirror.

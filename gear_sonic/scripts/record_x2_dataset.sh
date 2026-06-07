@@ -73,6 +73,23 @@
 #   --deploy-model-dir DIR      Override the ONNX model dir
 #                               (default: dirname of --sonic-checkpoint).
 #   --sim-duration SECONDS      Auto-stop the deploy after N seconds (default 3600).
+#   --head-cameras              Ingest the three PC2 head-camera ZMQ streams
+#                               (Orbbec head_front + IMX900 stereo_left/right)
+#                               into the LeRobot dataset alongside the
+#                               MuJoCo-rendered ego_view. Auto-starts the
+#                               PC2-side bridge via
+#                               ``gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve``
+#                               before launching the recorder, then tears it
+#                               down on shutdown. Requires SSH access to
+#                               PC2 (defaults to user 'run' @ 10.0.1.41;
+#                               override with X2_PC2_HOST / X2_PC2_USER).
+#   --camera-host HOST          PC2 hostname/IP for the camera bridge
+#                               (default: 10.0.1.41).
+#   --camera-port PORT          ZMQ PUB port for the camera bridge
+#                               (default: 5555).
+#   --no-camera-autostart       Skip the auto ``serve`` step (use this when
+#                               you've already launched the bridge by hand
+#                               via ``x2_pc2_cameras.sh serve``).
 #
 # Pass-through flags (forwarded verbatim to record_x2_dataset.py):
 #   --tokenizer-device cuda
@@ -115,6 +132,10 @@ TELEOP_ONLY=false
 USE_VLA=true
 SIM_OMNIHAND=false
 ROBOCASA_ENV="none"
+HEAD_CAMERAS=false
+CAMERA_HOST="${X2_PC2_HOST:-10.0.1.41}"
+CAMERA_PORT="${X2_PC2_CAM_PORT:-5555}"
+CAMERA_AUTOSTART=true
 # Default to 'ik' so VR teleop / dataset recording produces honest wrist
 # tracking out of the box. Operators can pass --wrist-bypass off to fall
 # back to pure SONIC for sim-to-real fidelity probes. Bridge safety:
@@ -136,6 +157,10 @@ while [[ $# -gt 0 ]]; do
         --robocasa-env)       ROBOCASA_ENV="$2"; shift 2 ;;
         --wrist-bypass)       WRIST_BYPASS="$2"; shift 2 ;;
         --teleop-only)        TELEOP_ONLY=true; shift ;;
+        --head-cameras)       HEAD_CAMERAS=true; shift ;;
+        --camera-host)        CAMERA_HOST="$2"; shift 2 ;;
+        --camera-port)        CAMERA_PORT="$2"; shift 2 ;;
+        --no-camera-autostart) CAMERA_AUTOSTART=false; shift ;;
         -h|--help)
             grep -E "^# " "$0" | sed -e 's/^# //; s/^#//'
             exit 0
@@ -571,6 +596,42 @@ if [[ "${ROBOCASA_ENV}" != "none" ]]; then
     # from the .json sidecar, so the LeRobot task column matches the
     # scene the deploy is rendering.
     RECORDER_ARGS+=("--robocasa-env" "${ROBOCASA_ENV}")
+fi
+
+# Head cameras: auto-launch the PC2 ROS->ZMQ bridge (idempotent;
+# bounces any prior instance) and forward the --head-cameras /
+# --camera-host / --camera-port flags to the recorder so the new
+# observation.images.{head_front,stereo_left,stereo_right} streams
+# land in the LeRobot dataset alongside the MuJoCo ego_view. The
+# bridge stays alive after the recorder exits so back-to-back
+# recording sessions don't pay the cold-start cost (operator can
+# always tear it down via `x2_pc2_cameras.sh serve-stop`).
+PC2_CAM_SH="${REPO_ROOT}/gear_sonic_deploy/scripts/x2_pc2_cameras.sh"
+if ${HEAD_CAMERAS} && ! ${TELEOP_ONLY}; then
+    if ${CAMERA_AUTOSTART}; then
+        if [[ -x "${PC2_CAM_SH}" ]]; then
+            echo "[record_x2_dataset.sh] starting PC2 head-camera bridge " \
+                 "on ${CAMERA_HOST}:${CAMERA_PORT} …"
+            X2_PC2_HOST="${CAMERA_HOST}" X2_PC2_CAM_PORT="${CAMERA_PORT}" \
+                "${PC2_CAM_SH}" serve --host "${CAMERA_HOST}" \
+                                       --port "${CAMERA_PORT}" \
+                || {
+                    echo "Error: PC2 camera bridge failed to start. " \
+                         "Run \`${PC2_CAM_SH} status\` to inspect, then " \
+                         "rerun with --no-camera-autostart once it's up." >&2
+                    exit 1
+                }
+        else
+            echo "Error: ${PC2_CAM_SH} not executable; cannot auto-start cameras." >&2
+            exit 1
+        fi
+    else
+        echo "[record_x2_dataset.sh] --head-cameras + --no-camera-autostart: " \
+             "assuming bridge is already running on ${CAMERA_HOST}:${CAMERA_PORT}"
+    fi
+    RECORDER_ARGS+=("--head-cameras"
+                    "--camera-host" "${CAMERA_HOST}"
+                    "--camera-port" "${CAMERA_PORT}")
 fi
 
 # Run the recorder in its own session so the deploy watchdog can
