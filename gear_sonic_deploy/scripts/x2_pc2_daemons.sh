@@ -182,6 +182,10 @@ X2_TUNING="${X2_TUNING:-}"
 # targets when --input-type=zmq, which is what every Quest-3-driven
 # split-topology run wants. Set to 'off' to fall back to pure policy.
 X2_WRIST_BYPASS="${X2_WRIST_BYPASS:-ik}"
+# When --lock-head-straight is set, pass --max-target-dev-head to the
+# deploy so the policy head target is clamped near the trained default
+# (yaw=0, pitch=0). Must be > 0: 0.0 disables the safety clamp.
+LOCK_HEAD_STRAIGHT_RAD="${LOCK_HEAD_STRAIGHT_RAD:-0.01}"
 
 # Friendly warn if the operator still has X2_MOTION exported from a
 # pre-2026-05 setup; the deploy is now driven by --input-type=zmq so
@@ -260,6 +264,7 @@ Per-command flags (after the subcommand):
              [--pc2-onnxruntime O] [--pc2-deploy-sh PATH] [--aimdk-prefix A]
              [--model PATH] [--tuning PATH] [--no-sync-tuning]
              [--wrist-bypass {ik,off}]
+             [--lock-head-straight]
              [--no-confirm] [--no-monitor] [--no-hand] [--no-pose-proxy]
              [--pose-proxy-port N] [--pose-proxy-stale-ms MS]
              [--pose-proxy-idle-x2m2 PATH]
@@ -306,6 +311,7 @@ if [[ $# -lt 1 ]]; then usage; fi
 SUBCMD="$1"; shift
 
 EXTRA_DEPLOY_ARGS=()
+LOCK_HEAD_STRAIGHT=0
 NO_MONITOR=0
 NO_HAND=0
 NO_MC_RESTART=0
@@ -351,6 +357,7 @@ while [[ $# -gt 0 ]]; do
         --tuning) X2_TUNING="$2"; shift 2 ;;
         --no-sync-tuning) NO_SYNC_TUNING=1; shift ;;
         --wrist-bypass) X2_WRIST_BYPASS="$2"; shift 2 ;;
+        --lock-head-straight) LOCK_HEAD_STRAIGHT=1; shift ;;
         --no-confirm) DEPLOY_NO_CONFIRM=1; shift ;;
         --no-monitor) NO_MONITOR=1; shift ;;
         --no-hand) NO_HAND=1; shift ;;
@@ -518,6 +525,8 @@ cmd_start() {
     log "  ws=${PC2_WS}  venv=${PC2_VENV}  onnxruntime=${PC2_ONNXRUNTIME}"
     log "  model=${X2_MODEL}"
     log "  wrist_bypass=${X2_WRIST_BYPASS}"
+    [[ "${LOCK_HEAD_STRAIGHT}" -eq 1 ]] \
+        && log "  lock_head_straight=1 (max_target_dev_head=${LOCK_HEAD_STRAIGHT_RAD})"
     [[ -n "${X2_TUNING}" ]] && log "  tuning=${X2_TUNING}"
 
     log "  ensuring ${PC2_LOG_ROOT} exists on PC2 (user-owned, no sudo)"
@@ -675,6 +684,9 @@ cmd_start() {
     fi
     if [[ "${DEPLOY_NO_CONFIRM}" -eq 1 ]]; then
         deploy_args+=(--no-confirm)
+    fi
+    if [[ "${LOCK_HEAD_STRAIGHT}" -eq 1 ]]; then
+        deploy_args+=(--max-target-dev-head "${LOCK_HEAD_STRAIGHT_RAD}")
     fi
     for a in "${EXTRA_DEPLOY_ARGS[@]:-}"; do
         deploy_args+=("$a")
@@ -1075,6 +1087,7 @@ cmd_print_env() {
     printf '  %-22s %s\n' "X2_MODEL"           "${X2_MODEL:-<unset>}"
     printf '  %-22s %s\n' "X2_TUNING"          "${X2_TUNING:-<unset>}"
     printf '  %-22s %s\n' "X2_WRIST_BYPASS"    "${X2_WRIST_BYPASS}"
+    printf '  %-22s %s\n' "LOCK_HEAD_STRAIGHT" "${LOCK_HEAD_STRAIGHT} (rad=${LOCK_HEAD_STRAIGHT_RAD})"
     printf '\n'
 
     # Light-touch reachability probe (no daemons touched).

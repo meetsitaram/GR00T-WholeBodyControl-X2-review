@@ -75,6 +75,9 @@ class RunSummary:
     keys_seen: list[str] = field(default_factory=list)
     max_token_norm: float = 0.0
     max_body_q_drift: float | None = None  # filled in when default_pose is known
+    min_grav_z: float | None = None  # body-frame gravity z (upright ≈ -1)
+    max_last_action_l2: float = 0.0
+    tilt_trip_count: int = 0
     safety_events: int = 0
     drops_estimated: int = 0  # set when --rate is provided
 
@@ -173,6 +176,19 @@ def _summarize_message(msg: DecodedMessage, prefix: str = "") -> str:
         else:
             parts.append(f"{name}<{arr.shape}{arr.dtype}>")
     return f"{prefix}v={msg.version} count={msg.count} | " + "  ".join(parts)
+
+
+def _body_grav_z(fields: dict[str, np.ndarray]) -> float | None:
+    """Approximate deploy ``grav_z`` from ``base_quat`` (wxyz)."""
+    base_q = fields.get("base_quat")
+    if base_q is None:
+        return None
+    q = np.asarray(base_q, dtype=np.float64).reshape(-1)
+    if q.shape[0] != 4:
+        return None
+    w, x, y, z = q
+    # World gravity [0,0,-1] rotated into body frame; z component only.
+    return float(-(1.0 - 2.0 * (x * x + y * y)))
 
 
 def _maybe_drift(
@@ -295,6 +311,22 @@ def main(argv: list[str] | None = None) -> int:
                     summary.max_token_norm,
                     float(np.linalg.norm(msg.fields["motion_token"])),
                 )
+            if "last_action" in msg.fields:
+                summary.max_last_action_l2 = max(
+                    summary.max_last_action_l2,
+                    float(np.linalg.norm(msg.fields["last_action"])),
+                )
+            grav_z = _body_grav_z(msg.fields)
+            if grav_z is not None:
+                summary.min_grav_z = (
+                    grav_z
+                    if summary.min_grav_z is None
+                    else min(summary.min_grav_z, grav_z)
+                )
+            if msg.fields.get("tilt_trip") is not None and bool(
+                np.asarray(msg.fields["tilt_trip"]).reshape(-1)[0]
+            ):
+                summary.tilt_trip_count += 1
             drift = _maybe_drift(msg.fields, default_pose)
             if drift is not None:
                 summary.max_body_q_drift = (

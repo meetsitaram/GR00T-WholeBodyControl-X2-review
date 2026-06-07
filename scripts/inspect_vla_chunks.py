@@ -34,6 +34,15 @@ from pathlib import Path
 import numpy as np
 
 
+def _camera_array_key(files: list[str]) -> str | None:
+    for name in sorted(files):
+        if name.startswith("view_"):
+            return name
+    if "ego_view" in files:
+        return "ego_view"
+    return None
+
+
 def _summarise_chunk(idx: int, path: Path) -> dict:
     d = np.load(path, allow_pickle=False)
     token = d["token"].astype(np.float32)            # (T, 64)
@@ -41,17 +50,38 @@ def _summarise_chunk(idx: int, path: Path) -> dict:
     right = d["right_hand"].astype(np.float32)       # (T, 10)
     body_q = d["body_q_mj"].astype(np.float32)       # (31,)
     base_q = d["base_quat_wxyz"].astype(np.float32)  # (4,)
+    wire_jpos = d["wire_joint_pos_mj"].astype(np.float32) if "wire_joint_pos_mj" in d.files else None
+    wire_delta_body = float(d["wire_delta_body_rad"][0]) if "wire_delta_body_rad" in d.files else None
     left_obs = d["left_hand_q_obs"].astype(np.float32)
     right_obs = d["right_hand_q_obs"].astype(np.float32)
     elapsed = float(d["elapsed_ms"][0])
     n_inf = int(d["n_inference"][0])
     wall_t = float(d["wall_t_s"][0])
+    cam_key = _camera_array_key(list(d.files))
 
     # First-step vs last-step delta -- a "live" chunk should change
     # along the horizon; a dead chunk repeats the same target.
     token_traj = float(np.linalg.norm(token[-1] - token[0]))
     left_traj = float(np.linalg.norm(left[-1] - left[0]))
     right_traj = float(np.linalg.norm(right[-1] - right[0]))
+    left_step_delta = (
+        np.linalg.norm(np.diff(left, axis=0), axis=1)
+        if left.shape[0] > 1
+        else np.array([0.0], dtype=np.float32)
+    )
+    right_step_delta = (
+        np.linalg.norm(np.diff(right, axis=0), axis=1)
+        if right.shape[0] > 1
+        else np.array([0.0], dtype=np.float32)
+    )
+    max_hand_step_delta = float(
+        max(left_step_delta.max(initial=0.0), right_step_delta.max(initial=0.0))
+    )
+    wire_delta_hand = (
+        float(d["wire_delta_hand_rad"][0])
+        if "wire_delta_hand_rad" in d.files
+        else None
+    )
 
     return {
         "idx": idx,
@@ -63,13 +93,22 @@ def _summarise_chunk(idx: int, path: Path) -> dict:
         "token_traj": token_traj,
         "left_norm0": float(np.linalg.norm(left[0])),
         "left_traj": left_traj,
+        "max_hand_step_delta": max_hand_step_delta,
         "right_norm0": float(np.linalg.norm(right[0])),
         "right_traj": right_traj,
+        "wire_delta_hand": wire_delta_hand,
         "body_q_p2p": float(np.ptp(body_q)),
+        "wire_delta_body": wire_delta_body,
+        "wire_body_dev": (
+            float(np.max(np.abs(wire_jpos - body_q)))
+            if wire_jpos is not None and wire_jpos.shape == body_q.shape
+            else None
+        ),
         "base_q": base_q.copy(),
         "left_obs_p2p": float(np.ptp(left_obs)),
         "right_obs_p2p": float(np.ptp(right_obs)),
-        "ego_view_shape": tuple(d["ego_view"].shape),
+        "camera_key": cam_key,
+        "camera_shape": tuple(d[cam_key].shape) if cam_key is not None else (),
         "_path": path,
     }
 
@@ -83,7 +122,18 @@ def _print_chunk(s: dict) -> None:
         f"tok_traj={s['token_traj']:.3f}  "
         f"|L|={s['left_norm0']:.3f}/Δ{s['left_traj']:.3f}  "
         f"|R|={s['right_norm0']:.3f}/Δ{s['right_traj']:.3f}  "
+        f"handStepΔ={s['max_hand_step_delta']:.3f}  "
         f"body_p2p={s['body_q_p2p']:.3f}"
+        + (
+            f"  wireΔhand={s['wire_delta_hand']:.3f}"
+            if s.get("wire_delta_hand") is not None
+            else ""
+        )
+        + (
+            f"  wireΔbody={s['wire_delta_body']:.3f}"
+            if s.get("wire_delta_body") is not None
+            else ""
+        )
     )
 
 
@@ -101,8 +151,10 @@ def _export_video(chunks: list[dict], out_path: Path, fps: float = 4.0) -> None:
     with imageio.get_writer(out_path, fps=fps) as w:
         for s in chunks:
             d = np.load(s["_path"], allow_pickle=False)
-            ego = d["ego_view"]
-            w.append_data(ego)
+            cam_key = _camera_array_key(list(d.files))
+            if cam_key is None:
+                continue
+            w.append_data(d[cam_key])
     print(f"  wrote {out_path}")
 
 
@@ -154,11 +206,28 @@ def main() -> int:
     # consecutive chunks change? If this is ~0 the VLA is rehearsing
     # the same motion every chunk regardless of input.
     inter_token_drift = []
+    inter_left_boundary = []
+    inter_right_boundary = []
     for a, b in zip(chunks[:-1], chunks[1:]):
-        ta = np.load(a["_path"])["token"][0].astype(np.float32)
-        tb = np.load(b["_path"])["token"][0].astype(np.float32)
+        da = np.load(a["_path"], allow_pickle=False)
+        db = np.load(b["_path"], allow_pickle=False)
+        ta = da["token"][0].astype(np.float32)
+        tb = db["token"][0].astype(np.float32)
         inter_token_drift.append(float(np.linalg.norm(tb - ta)))
+        la = da["left_hand"][-1].astype(np.float32)
+        lb = db["left_hand"][0].astype(np.float32)
+        ra = da["right_hand"][-1].astype(np.float32)
+        rb = db["right_hand"][0].astype(np.float32)
+        inter_left_boundary.append(float(np.linalg.norm(lb - la)))
+        inter_right_boundary.append(float(np.linalg.norm(rb - ra)))
     inter_token_drift_arr = np.array(inter_token_drift) if inter_token_drift else np.array([0.0])
+    inter_left_boundary_arr = (
+        np.array(inter_left_boundary) if inter_left_boundary else np.array([0.0])
+    )
+    inter_right_boundary_arr = (
+        np.array(inter_right_boundary) if inter_right_boundary else np.array([0.0])
+    )
+    hand_step_deltas = np.array([s["max_hand_step_delta"] for s in chunks])
 
     print("\naggregates over all chunks:")
     print(
@@ -185,6 +254,16 @@ def main() -> int:
     print(
         f"  |right_hand[0]|      : mean={right_norms.mean():.3f}"
         f"  min={right_norms.min():.3f}  max={right_norms.max():.3f}"
+    )
+    print(
+        f"  intra-chunk hand step: mean={hand_step_deltas.mean():.3f}"
+        f"  max={hand_step_deltas.max():.3f}   (||hand[t+1]-hand[t]|| L2)"
+    )
+    print(
+        f"  inter-chunk hand seam: left mean={inter_left_boundary_arr.mean():.3f}"
+        f"  max={inter_left_boundary_arr.max():.3f}"
+        f"  right mean={inter_right_boundary_arr.mean():.3f}"
+        f"  max={inter_right_boundary_arr.max():.3f}"
     )
     print(
         f"  input body_q peak2pk : mean={body_p2p.mean():.3f}"

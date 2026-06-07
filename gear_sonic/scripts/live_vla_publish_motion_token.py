@@ -75,12 +75,30 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import signal
 import sys
 import threading
 import time
+import warnings
+from enum import Enum
 from typing import Any, Optional
+
+# Silence the three cosmetic UserWarnings the vendored Isaac-GR00T
+# ``image_augmentations`` module emits the first time each augmentation
+# class is constructed: it passes ``always_apply=...`` to
+# ``albumentations.BasicTransform.__init__``, which the installed
+# albumentations release has deprecated. The warnings fire once per
+# class on first instantiation -- three lines per bridge launch --
+# and otherwise have no functional impact. Suppressing them keeps
+# the bridge.log signal-to-noise sane (it's the first thing the
+# operator sees scrolling past before the policy reports ready).
+warnings.filterwarnings(
+    "ignore",
+    message=r".*'always_apply' are not valid for transform BasicTransform.*",
+    category=UserWarning,
+)
 
 import joblib
 import numpy as np
@@ -149,6 +167,14 @@ DEFAULT_STAND_POSE_MUJOCO_RAD: tuple[float, ...] = (
 )
 assert len(DEFAULT_STAND_POSE_MUJOCO_RAD) == NUM_BODY_DOFS
 
+# MJ-order slot for ``waist_yaw_joint`` -- the dominant heading-correction
+# effector. Matches ``gear_sonic.utils.planner.constants.WAIST_YAW_IDX``;
+# duplicated here to avoid a planner-package import in the publisher hot
+# path. Used by the partial-body freeze to surgically pin waist_yaw to
+# the measured value while keeping the rest of the legs+waist DOFs on
+# the idle_stand clip's training-distribution jitter (see section F).
+WAIST_YAW_IDX: int = 12
+
 
 # Permutation MJ_TO_PIN[i] = j means: the i-th joint in Pinocchio order
 # is the j-th joint in MuJoCo order. The dataset's ``observation.state``
@@ -173,6 +199,34 @@ DEFAULT_ACTION_HORIZON: int = 40
 
 def _identity_quat_xyzw() -> np.ndarray:
     return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _root_quat_xyzw_from_base_quat_wxyz(base_quat_wxyz: np.ndarray) -> np.ndarray:
+    """Yaw-only root quat for the wire, derived from live IMU base_quat.
+
+    Mirrors :meth:`X2DatasetRecorder._compute_idle_root_quat_xyzw` so the
+    deploy tokenizer's orientation reference matches the robot's current
+    heading instead of the idle_stand clip's yaw=0 frame (which otherwise
+    drives a ~45 deg waist-yaw correction when VLA connects mid-session).
+    """
+    from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw
+
+    wxyz = np.asarray(base_quat_wxyz, dtype=np.float64).reshape(-1)
+    if wxyz.shape[0] < 4:
+        return _identity_quat_xyzw()
+    quat_xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64)
+    yaw = float(yaw_of_quat_xyzw(quat_xyzw))
+    half = 0.5 * yaw
+    return np.array(
+        [0.0, 0.0, math.sin(half), math.cos(half)],
+        dtype=np.float32,
+    )
+
+
+def _tile_root_quat_future(quat_xyzw: np.ndarray) -> np.ndarray:
+    """Broadcast a single xyzw quat across the 9-slot future window."""
+    q = np.asarray(quat_xyzw, dtype=np.float32).reshape(4)
+    return np.broadcast_to(q, (_NUM_FUTURE_SLOTS, 4)).copy()
 
 
 def _default_stand_body_pose_f32() -> np.ndarray:
@@ -228,6 +282,172 @@ def _idle_future_payload_fields(*, base_frame_index: int) -> dict[str, np.ndarra
     }
 
 
+def _clamp_vector_deviation(
+    target: np.ndarray,
+    anchor: np.ndarray,
+    max_dev: float,
+) -> np.ndarray:
+    """Pull ``target`` toward ``anchor`` if any joint exceeds ``max_dev`` (rad)."""
+    if max_dev <= 0.0:
+        return np.asarray(target, dtype=np.float32)
+    tgt = np.asarray(target, dtype=np.float32)
+    anc = np.asarray(anchor, dtype=np.float32)
+    delta = tgt - anc
+    peak = float(np.abs(delta).max())
+    if peak <= max_dev:
+        return tgt
+    return (anc + delta * (max_dev / peak)).astype(np.float32)
+
+
+def _clamp_vector_step(
+    target: np.ndarray,
+    prev: np.ndarray | None,
+    max_step: float,
+) -> np.ndarray:
+    """Limit per-tick joint delta on the wire (rad)."""
+    if max_step <= 0.0 or prev is None:
+        return np.asarray(target, dtype=np.float32)
+    tgt = np.asarray(target, dtype=np.float32)
+    prv = np.asarray(prev, dtype=np.float32)
+    delta = tgt - prv
+    peak = float(np.abs(delta).max())
+    if peak <= max_step:
+        return tgt
+    return (prv + delta * (max_step / peak)).astype(np.float32)
+
+
+def _lpf_alpha_from_hz(cutoff_hz: float, dt_s: float) -> float:
+    if cutoff_hz <= 0.0:
+        return 0.0
+    return float(1.0 - math.exp(-2.0 * math.pi * cutoff_hz * dt_s))
+
+
+def _lpf_vector(
+    target: np.ndarray,
+    state: np.ndarray | None,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """One-pole low-pass; returns (filtered, new_state)."""
+    tgt = np.asarray(target, dtype=np.float32)
+    if alpha <= 0.0:
+        return tgt, tgt.copy()
+    if state is None:
+        return tgt, tgt.copy()
+    out = ((1.0 - alpha) * state + alpha * tgt).astype(np.float32)
+    return out, out.copy()
+
+
+class VlaBodyMode(str, Enum):
+    """VLA body authority modes — mirrors Quest 3 ``StreamMode`` semantics.
+
+    * ``manipulation`` — like VR ``ARM_MANIPULATION``: decode motion tokens
+      for arms/head/hands but pin ``legs`` + ``waist`` to ``idle_stand``
+      (reach + grasp without locomotion collapse risk).
+    * ``locomotion`` — like VR ``LOCOMOTION``: full-body decode from motion
+      tokens (requires ``--motion-token-decoder``).
+    """
+
+    MANIPULATION = "manipulation"
+    LOCOMOTION = "locomotion"
+
+
+def _parse_vla_body_mode(name: str) -> VlaBodyMode:
+    key = name.strip().lower().replace("-", "_")
+    if key == "upper_body":
+        print(
+            "[live-VLA] WARN: body mode 'upper_body' is deprecated; "
+            "use 'manipulation' (arms+hands decode, legs/waist frozen).",
+            flush=True,
+        )
+        key = VlaBodyMode.MANIPULATION.value
+    for mode in VlaBodyMode:
+        if mode.value == key:
+            return mode
+    known = ", ".join(m.value for m in VlaBodyMode)
+    raise ValueError(f"unknown VLA body mode {name!r}; choose one of: {known}")
+
+
+def _body_mode_wire_settings(
+    mode: VlaBodyMode,
+    *,
+    decoder_loaded: bool,
+    freeze_groups_override: str = "",
+) -> tuple[np.ndarray, bool]:
+    """Return ``(freeze_indices, decode_body)`` for a mode."""
+    if mode is VlaBodyMode.MANIPULATION:
+        groups = freeze_groups_override.strip() or "legs,waist"
+        freeze = _resolve_freeze_body_indices(groups)
+        return freeze, decoder_loaded
+    # LOCOMOTION
+    return np.array([], dtype=np.int64), decoder_loaded
+
+
+def _read_body_mode_control_file(path: str) -> Optional[VlaBodyMode]:
+    """Read optional runtime mode switch file (one word per line)."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip().split()
+        if not raw:
+            return None
+        return _parse_vla_body_mode(raw[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_freeze_body_indices(groups: str) -> np.ndarray:
+    """Parse comma-separated planner joint-group names into MJ DOF indices."""
+    from gear_sonic.utils.planner.x2_recipes import _GROUP_INDICES
+
+    if not groups.strip():
+        return np.array([], dtype=np.int64)
+    indices: set[int] = set()
+    for raw in groups.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        if name not in _GROUP_INDICES:
+            known = ", ".join(sorted(_GROUP_INDICES))
+            raise ValueError(
+                f"unknown --vla-freeze-body-groups entry {name!r}; "
+                f"known groups: {known}"
+            )
+        indices.update(_GROUP_INDICES[name])
+    return np.asarray(sorted(indices), dtype=np.int64)
+
+
+def _apply_frozen_body_groups(
+    *,
+    jpos: np.ndarray,
+    future_fields: dict[str, np.ndarray],
+    idle_jpos: np.ndarray,
+    freeze_indices: np.ndarray,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Overwrite selected body DOFs with the idle_stand reference."""
+    if freeze_indices.size == 0:
+        return jpos, future_fields
+    out = np.asarray(jpos, dtype=np.float32).copy()
+    idle = np.asarray(idle_jpos, dtype=np.float32)
+    out[freeze_indices] = idle[freeze_indices]
+    ff = dict(future_fields)
+    if "joint_pos_mj_future" in ff:
+        jf = np.asarray(ff["joint_pos_mj_future"], dtype=np.float32).copy()
+        jf[:, freeze_indices] = idle[freeze_indices]
+        ff["joint_pos_mj_future"] = jf
+        ff["joint_vel_mj_future"] = _jvel_future_from_poses(out, jf)
+    return out, ff
+
+
+def _jvel_future_from_poses(
+    jpos_now: np.ndarray, jpos_future: np.ndarray
+) -> np.ndarray:
+    """Finite-difference joint velocities for the v5 future window."""
+    jvel_future = np.zeros_like(jpos_future)
+    prev = np.asarray(jpos_now, dtype=np.float32)
+    for k in range(jpos_future.shape[0]):
+        jvel_future[k] = (jpos_future[k] - prev) / max(_FUTURE_DT_S, 1e-6)
+        prev = jpos_future[k]
+    return jvel_future
+
+
 def _build_vla_decoded_pose_payload(
     *,
     decoder: Any,
@@ -236,20 +456,27 @@ def _build_vla_decoded_pose_payload(
     chunk_step: int,
     horizon: int,
     base_frame_index: int,
-) -> Optional[tuple[np.ndarray, dict[str, np.ndarray]]]:
+) -> Optional[tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]]:
     """Decode VLA tokens to body trajectory + build wire payload.
 
     Pulls the current step's motion_token plus 9 future steps spaced
     :data:`_FUTURE_STEP_TICKS` apart from ``token_chunk``, runs them
     through :class:`SonicTokenToPoseDecoder` (which mirrors the C++
     deploy's ``target_mj = default + action_il * action_scale``
-    formula), and returns
+    formula), and returns the 3-tuple
 
     * ``joint_pos_mj_now``: ``(31,) float32`` MuJoCo-order pose for
       the current tick;
     * ``future_fields``: dict matching :func:`_idle_future_payload_fields`
       shape (``joint_pos_mj_future`` etc.) with the next 9 decoded
-      poses.
+      poses;
+    * ``action_il_now``: ``(31,) float32`` raw IsaacLab-order
+      residual that the decoder produced for the current step. The
+      publisher feeds this back into its
+      :class:`~gear_sonic.utils.teleop.sonic_decoder_proprio.ProprioceptionBuffer`
+      as ``last_action_il`` for the *next* tick's decode, mirroring the
+      C++ deploy's own ``prop_buf_.Append(..., last_action_il_, ...)``
+      bookkeeping.
 
     Returns ``None`` (caller falls back to idle wire) on any decode
     failure -- we never want a render glitch / NaN to brick the
@@ -263,7 +490,7 @@ def _build_vla_decoded_pose_payload(
     """
     try:
         from gear_sonic.utils.teleop.sonic_token_to_pose_decoder import (
-            decode_token_chunk_to_pose_chunk,
+            action_il_to_target_pose_mj,
         )
         slot_indices = [
             min(chunk_step + (k + 1) * _FUTURE_STEP_TICKS, horizon - 1)
@@ -275,10 +502,18 @@ def _build_vla_decoded_pose_payload(
         )
         # decode_chunk handles batched torch inference in one shot so
         # the per-tick cost stays around 1-2 ms even with the 9 future
-        # slots in the same call.
-        poses = decode_token_chunk_to_pose_chunk(
-            decoder, sampled_tokens.astype(np.float32), proprio_990
+        # slots in the same call. We split the wrapper here so the
+        # caller can capture the raw ``action_il`` residual (needed
+        # for next-tick proprio bookkeeping) before it gets folded
+        # into a MuJoCo-order target via the deploy parity formula.
+        actions_il = decoder.decode_chunk(
+            sampled_tokens.astype(np.float32), proprio_990
         )
+        poses = np.stack(
+            [action_il_to_target_pose_mj(actions_il[i]) for i in range(actions_il.shape[0])],
+            axis=0,
+        )
+        action_il_now = actions_il[0].astype(np.float32, copy=False)
     except Exception as exc:  # noqa: BLE001
         # Caller logs (sticky one-shot, see _publisher); we just bail.
         print(
@@ -318,7 +553,7 @@ def _build_vla_decoded_pose_payload(
         "frame_index_future": fidx_future,
         "future_dt_s": _FUTURE_DT_FIELD,
     }
-    return joint_pos_mj_now, future_fields
+    return joint_pos_mj_now, future_fields, action_il_now
 
 
 class _IdleStandLoop:
@@ -594,6 +829,17 @@ class _LatestState:
     base_quat_wxyz: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     )
+    # body_dq_mj + base_ang_vel are required to assemble the live
+    # 990-D proprio that the SONIC pose decoder was trained on (see
+    # gear_sonic/utils/teleop/sonic_decoder_proprio.py). The
+    # ``x2_debug`` stream already publishes them per tick as ``body_dq``
+    # and ``base_ang_vel`` respectively; sniffed live 2026-06-07.
+    body_dq_mj: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_BODY_DOFS, dtype=np.float64)
+    )
+    base_ang_vel: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64)
+    )
     left_hand_q: np.ndarray = field(default_factory=lambda: np.zeros(DEFAULT_HAND_DOF))
     right_hand_q: np.ndarray = field(default_factory=lambda: np.zeros(DEFAULT_HAND_DOF))
     revision: int = 0
@@ -608,10 +854,24 @@ class _LatestState:
         base_quat_wxyz: np.ndarray,
         left_hand_q: np.ndarray,
         right_hand_q: np.ndarray,
+        # body_dq_mj + base_ang_vel were added 2026-06-07 for the
+        # bridge-side ProprioceptionBuffer. They default to None so
+        # legacy callers (the recorder yaw-rebase unit tests, future
+        # mock-state helpers, etc.) keep working without having to
+        # synthesise velocity terms they don't care about. When
+        # omitted, the previously stored values are preserved -- so
+        # an old caller that already filled in velocities via a prior
+        # update() won't see them silently cleared.
+        body_dq_mj: Optional[np.ndarray] = None,
+        base_ang_vel: Optional[np.ndarray] = None,
     ) -> None:
         with self.cv:
             self.body_q_mj = body_q_mj.astype(np.float64, copy=False)
             self.base_quat_wxyz = base_quat_wxyz.astype(np.float64, copy=False)
+            if body_dq_mj is not None:
+                self.body_dq_mj = body_dq_mj.astype(np.float64, copy=False)
+            if base_ang_vel is not None:
+                self.base_ang_vel = base_ang_vel.astype(np.float64, copy=False)
             self.left_hand_q = left_hand_q.astype(np.float64, copy=False)
             self.right_hand_q = right_hand_q.astype(np.float64, copy=False)
             self.revision += 1
@@ -660,6 +920,21 @@ class _LatestState:
                 self.revision,
                 alive,
             )
+
+    def snapshot_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        """Atomic snapshot of (``body_dq_mj``, ``base_ang_vel``).
+
+        Split from the main :meth:`snapshot` so existing call sites can
+        keep their 6-tuple destructuring. The publisher uses this to
+        feed the bridge-side ``ProprioceptionBuffer`` -- consuming
+        ``snapshot()`` for positions+aliveness then this method for
+        velocities is exactly equivalent to one combined call (both
+        acquire ``self.cv`` and the underlying arrays are immutable
+        copies); the worst case is one tick of staleness between the
+        two reads, which is below the publisher's 50 Hz cadence.
+        """
+        with self.cv:
+            return (self.body_dq_mj.copy(), self.base_ang_vel.copy())
 
     def wait_for_new(self, last_revision: int, timeout: float) -> int:
         """Block until ``revision`` advances past ``last_revision``."""
@@ -724,13 +999,79 @@ class _LatestChunk:
             )
 
 
+@dataclass
+class _LatestWireDebug:
+    """Last wire pose + diagnostics for chunk dumps / postmortem."""
+
+    joint_pos_mj: np.ndarray = field(
+        default_factory=lambda: np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32).copy()
+    )
+    left_hand_joints: np.ndarray = field(
+        default_factory=lambda: np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
+    )
+    right_hand_joints: np.ndarray = field(
+        default_factory=lambda: np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
+    )
+    raw_delta_idle: float = 0.0
+    wire_delta_idle: float = 0.0
+    wire_delta_body: float = 0.0
+    wire_delta_hand: float = 0.0
+    chunk_id: int = 0
+    chunk_step: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def update(
+        self,
+        *,
+        joint_pos_mj: np.ndarray,
+        left_hand_joints: np.ndarray,
+        right_hand_joints: np.ndarray,
+        raw_delta_idle: float,
+        wire_delta_idle: float,
+        wire_delta_body: float,
+        wire_delta_hand: float,
+        chunk_id: int,
+        chunk_step: int,
+    ) -> None:
+        with self.lock:
+            self.joint_pos_mj = np.asarray(joint_pos_mj, dtype=np.float32).copy()
+            self.left_hand_joints = np.asarray(
+                left_hand_joints, dtype=np.float32
+            ).copy()
+            self.right_hand_joints = np.asarray(
+                right_hand_joints, dtype=np.float32
+            ).copy()
+            self.raw_delta_idle = float(raw_delta_idle)
+            self.wire_delta_idle = float(wire_delta_idle)
+            self.wire_delta_body = float(wire_delta_body)
+            self.wire_delta_hand = float(wire_delta_hand)
+            self.chunk_id = int(chunk_id)
+            self.chunk_step = int(chunk_step)
+
+    def snapshot(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, int, int]:
+        with self.lock:
+            return (
+                self.joint_pos_mj.copy(),
+                self.left_hand_joints.copy(),
+                self.right_hand_joints.copy(),
+                self.raw_delta_idle,
+                self.wire_delta_idle,
+                self.wire_delta_body,
+                self.wire_delta_hand,
+                self.chunk_id,
+                self.chunk_step,
+            )
+
+
 def _build_observation(
     *,
     body_q_mj: np.ndarray,
     base_quat_wxyz: np.ndarray,
     left_hand_q: np.ndarray,
     right_hand_q: np.ndarray,
-    ego_view: np.ndarray,
+    camera_frames: dict[str, np.ndarray],
     prompt: str,
 ) -> dict[str, Any]:
     """Build the (B=1, T=1)-batched observation dict expected by ``Gr00tPolicy``.
@@ -745,11 +1086,21 @@ def _build_observation(
     * ``state.left_hand``          = left_hand_q[:10]
     * ``state.right_hand``         = right_hand_q[:10]
     * ``state.projected_gravity``  = R(base_quat).T @ [0, 0, -1]
-    * ``video.ego_view``           = (1, 1, H, W, 3) uint8
+    * ``video.<key>``              = (1, 1, H, W, 3) uint8, one slot per
+                                     ``modality_keys`` entry in the loaded
+                                     ``video`` ModalityConfig (e.g.
+                                     ``ego_view`` for sim, or
+                                     ``stereo_left`` + ``stereo_right``
+                                     for the real-robot omnihand stereo
+                                     config).
     * ``language.annotation.human.task_description`` = [[prompt]]
 
     Note: head joints (pin[15:17]) are *not* exposed to the policy; they
     are intentionally omitted from ``modality.json``.
+
+    The ``camera_frames`` keys must exactly match the registered video
+    ``modality_keys`` (no remapping is performed here); the caller is
+    expected to use :func:`_get_required_video_keys` to derive them.
     """
     body_q_pin = np.asarray(body_q_mj, dtype=np.float32)[list(MJ_TO_PIN)]
     proj_grav = _quat_wxyz_to_projected_gravity(base_quat_wxyz).astype(np.float32)
@@ -769,8 +1120,12 @@ def _build_observation(
         "right_hand": _b1(right_h),
         "projected_gravity": _b1(proj_grav),
     }
+    video: dict[str, np.ndarray] = {}
+    for key, frame in camera_frames.items():
+        frame_u8 = np.ascontiguousarray(frame).astype(np.uint8, copy=False)
+        video[key] = frame_u8.reshape(1, 1, *frame_u8.shape)
     return {
-        "video": {"ego_view": ego_view.reshape(1, 1, *ego_view.shape).astype(np.uint8)},
+        "video": video,
         "state": state,
         "language": {"annotation.human.task_description": [[prompt]]},
     }
@@ -988,6 +1343,18 @@ def _x2_debug_subscriber(
             base_quat = np.asarray(msg.fields.get("base_quat", [1.0, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(-1)
             if base_quat.shape[0] != 4:
                 base_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            # ``body_dq`` + ``base_ang_vel`` feed the bridge-side
+            # ProprioceptionBuffer (sonic_decoder_proprio.py). Fall
+            # back to zeros if the deploy publishes an older schema
+            # without them -- the SONIC decoder is OOD with zero
+            # velocities but won't crash, and the operator will see a
+            # WARN on first tick (logged from the publisher loop).
+            body_dq = np.asarray(msg.fields.get("body_dq", np.zeros(NUM_BODY_DOFS)), dtype=np.float64).reshape(-1)
+            if body_dq.shape[0] != NUM_BODY_DOFS:
+                body_dq = np.zeros(NUM_BODY_DOFS, dtype=np.float64)
+            base_ang_vel = np.asarray(msg.fields.get("base_ang_vel", np.zeros(3)), dtype=np.float64).reshape(-1)
+            if base_ang_vel.shape[0] != 3:
+                base_ang_vel = np.zeros(3, dtype=np.float64)
             left_hq = np.asarray(msg.fields.get("left_hand_q", np.zeros(DEFAULT_HAND_DOF)), dtype=np.float64).reshape(-1)[:DEFAULT_HAND_DOF]
             right_hq = np.asarray(msg.fields.get("right_hand_q", np.zeros(DEFAULT_HAND_DOF)), dtype=np.float64).reshape(-1)[:DEFAULT_HAND_DOF]
             if left_hq.shape[0] < DEFAULT_HAND_DOF:
@@ -998,6 +1365,8 @@ def _x2_debug_subscriber(
             state.update(
                 body_q_mj=body_q,
                 base_quat_wxyz=base_quat,
+                body_dq_mj=body_dq,
+                base_ang_vel=base_ang_vel,
                 left_hand_q=left_hq,
                 right_hand_q=right_hq,
             )
@@ -1011,9 +1380,12 @@ def _x2_debug_subscriber(
 def _inference_worker(
     *,
     policy: Any,
-    renderer_factory: Any,
+    ghost_provider_factory: Any | None,
+    camera_provider: _RealCameraProvider | None,
+    camera_max_age_s: float,
     state: _LatestState,
     chunk: _LatestChunk,
+    wire_debug: _LatestWireDebug,
     prompt: str,
     stop_event: threading.Event,
     min_period_s: float,
@@ -1021,32 +1393,66 @@ def _inference_worker(
     dump_chunks_dir: str | None = None,
     dump_chunks_every: int = 5,
 ) -> None:
-    """Thread B: render + run VLA continuously, post fresh chunks.
+    """Thread B: render or grab frames + run VLA continuously, post fresh chunks.
 
     We don't run faster than ``1/min_period_s`` Hz to avoid burning GPU
     cycles when the deploy hasn't even consumed the previous chunk yet.
 
-    The MuJoCo renderer is constructed *inside* this thread because EGL
-    contexts are thread-local: a renderer instantiated in the main thread
-    raises ``EGLError(EGL_BAD_DISPLAY)`` the first time another thread
-    tries to call ``render_frame``. Building it here owns the EGL context
-    on the same thread that will use it for the entire process lifetime.
+    Two camera sources are supported:
+
+    * ``ghost_provider_factory`` (sim / ghost): a zero-arg callable that
+      returns a *built* :class:`_GhostCameraProvider`. Called from inside
+      this thread so the underlying MuJoCo EGL contexts (one per unique
+      MJCF camera) are created on the thread that will actually render.
+      An identity ``root_quat`` is used on the inference path so the
+      VLA never sees a tilted horizon (the video-recorder thread uses
+      the live ``base_quat`` instead — they are intentionally asymmetric).
+    * ``camera_provider`` (real-robot / ZMQ): reuses the on-PC2
+      :class:`ComposedCameraClientSensor` stream and returns whatever
+      keys the registered video modality config requests (typically
+      ``stereo_left`` + ``stereo_right``). The provider runs its own
+      background polling thread, so we just call ``read_frames`` here
+      with a staleness threshold.
+
+    Exactly one of the two must be supplied.
     """
-    print("[live-VLA] inference thread: building MujocoFrameRenderer …", flush=True)
-    try:
-        renderer = renderer_factory()
-    except Exception as exc:
-        print(f"[live-VLA] FATAL: renderer init failed in worker: {exc}", flush=True)
-        stop_event.set()
-        return
-    print(
-        f"[live-VLA] inference thread: renderer ready "
-        f"({renderer.width}x{renderer.height}, omnihand={renderer.with_omnihand})",
-        flush=True,
-    )
+    if (ghost_provider_factory is None) == (camera_provider is None):
+        raise ValueError(
+            "_inference_worker requires exactly one of ghost_provider_factory or "
+            "camera_provider (got ghost_provider_factory="
+            f"{'set' if ghost_provider_factory is not None else 'None'}, "
+            f"camera_provider={'set' if camera_provider is not None else 'None'})."
+        )
+    ghost_provider: _GhostCameraProvider | None = None
+    if ghost_provider_factory is not None:
+        print("[live-VLA] inference thread: building MuJoCo ghost cameras …", flush=True)
+        try:
+            ghost_provider = ghost_provider_factory()
+        except Exception as exc:
+            print(f"[live-VLA] FATAL: ghost camera init failed in worker: {exc}", flush=True)
+            stop_event.set()
+            return
+        # ``ghost_provider`` is guaranteed non-None here.
+        ghost_provider_obj = ghost_provider  # for type-narrowing below
+        print(
+            f"[live-VLA] inference thread: ghost cameras ready — "
+            f"keys={ghost_provider_obj.required_keys} "
+            f"(MJ cams={ghost_provider_obj.unique_cameras}, "
+            f"{ghost_provider_obj.width}x{ghost_provider_obj.height}, "
+            f"omnihand={ghost_provider_obj.with_omnihand})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[live-VLA] inference thread: using real-camera provider "
+            f"(staleness threshold {camera_max_age_s:.2f}s)",
+            flush=True,
+        )
 
     last_revision = -1
     n_inferences = 0
+    n_dropped_stale_cam = 0
+    last_stale_log_t = 0.0
     dump_dir_path: Path | None = None
     if dump_chunks_dir:
         dump_dir_path = Path(dump_chunks_dir)
@@ -1069,38 +1475,64 @@ def _inference_worker(
         last_revision = revision
 
         t0 = time.monotonic()
-        try:
-            # The inference ego-view deliberately uses the renderer's
-            # default identity root quat -- the VLA training set
-            # (record_synthetic_smoketest_dataset.py) renders frames the
-            # same way, so feeding a live ``base_quat`` here would
-            # inject a tilted horizon the policy has never seen and
-            # cause OOD behaviour mid-rollout. The *video recorder*
-            # thread does pass the live ``base_quat`` so the recording
-            # reflects physical reality (tip / fall) -- those two
-            # renderers are intentionally asymmetric.
-            ego_view = renderer.render_frame(
-                body_q=body_q_mj,
-                left_active=left_hq.astype(np.float64),
-                right_active=right_hq.astype(np.float64),
-            )
-        except Exception as exc:
-            print(f"[live-VLA] render error: {exc}", flush=True)
-            _post_safe_idle_chunk(
-                chunk,
-                state=state,
-                last_inference_ms=0.0,
-                log_line="[live-VLA] render error → zero-token safe chunk posted",
-            )
-            time.sleep(0.05)
-            continue
+        camera_frames: dict[str, np.ndarray] = {}
+        if ghost_provider is not None:
+            try:
+                # The inference cameras deliberately use the renderer's
+                # default identity root quat -- the VLA training set
+                # (record_synthetic_smoketest_dataset.py) renders frames the
+                # same way, so feeding a live ``base_quat`` here would
+                # inject a tilted horizon the policy has never seen and
+                # cause OOD behaviour mid-rollout. The *video recorder*
+                # thread does pass the live ``base_quat`` so the recording
+                # reflects physical reality (tip / fall) -- those two
+                # renderers are intentionally asymmetric.
+                camera_frames = ghost_provider.render_frames(
+                    body_q=body_q_mj,
+                    left_active=left_hq.astype(np.float64),
+                    right_active=right_hq.astype(np.float64),
+                )
+            except Exception as exc:
+                print(f"[live-VLA] render error: {exc}", flush=True)
+                _post_safe_idle_chunk(
+                    chunk,
+                    state=state,
+                    last_inference_ms=0.0,
+                    log_line="[live-VLA] render error → zero-token safe chunk posted",
+                )
+                time.sleep(0.05)
+                continue
+        else:
+            assert camera_provider is not None  # for type-checkers
+            frames = camera_provider.read_frames(max_age_s=camera_max_age_s)
+            if frames is None:
+                n_dropped_stale_cam += 1
+                now = time.monotonic()
+                if now - last_stale_log_t >= 2.0:
+                    print(
+                        f"[live-VLA] cameras stale (>{camera_max_age_s:.2f}s "
+                        f"old; latest age={camera_provider.latest_age_s:.2f}s, "
+                        f"total dropped inferences={n_dropped_stale_cam}) → "
+                        f"posting safe idle chunk",
+                        flush=True,
+                    )
+                    last_stale_log_t = now
+                _post_safe_idle_chunk(
+                    chunk,
+                    state=state,
+                    last_inference_ms=0.0,
+                    log_line=None,
+                )
+                time.sleep(0.05)
+                continue
+            camera_frames = frames
 
         observation = _build_observation(
             body_q_mj=body_q_mj,
             base_quat_wxyz=base_quat_wxyz,
             left_hand_q=left_hq,
             right_hand_q=right_hq,
-            ego_view=ego_view,
+            camera_frames=camera_frames,
             prompt=prompt,
         )
 
@@ -1170,6 +1602,25 @@ def _inference_worker(
         if dump_dir_path is not None and (n_inferences - 1) % max(dump_chunks_every, 1) == 0:
             try:
                 out_path = dump_dir_path / f"chunk_{n_inferences - 1:05d}.npz"
+                # Save one ``view_<key>`` slot per camera frame the
+                # observation carried. The ghost path keeps the legacy
+                # ``view_ego_view`` key, the real-camera path saves one
+                # ``view_stereo_left`` / ``view_stereo_right`` slot each.
+                camera_arrays = {
+                    f"view_{k}": v.astype(np.uint8)
+                    for k, v in camera_frames.items()
+                }
+                (
+                    wire_jpos,
+                    wire_left,
+                    wire_right,
+                    raw_delta_idle,
+                    wire_delta_idle,
+                    wire_delta_body,
+                    wire_delta_hand,
+                    wire_chunk_id,
+                    wire_chunk_step,
+                ) = wire_debug.snapshot()
                 np.savez_compressed(
                     out_path,
                     token=token,
@@ -1179,11 +1630,20 @@ def _inference_worker(
                     base_quat_wxyz=base_quat_wxyz.astype(np.float32),
                     left_hand_q_obs=left_hq.astype(np.float32),
                     right_hand_q_obs=right_hq.astype(np.float32),
-                    ego_view=ego_view.astype(np.uint8),
+                    wire_joint_pos_mj=wire_jpos.astype(np.float32),
+                    wire_left_hand=wire_left.astype(np.float32),
+                    wire_right_hand=wire_right.astype(np.float32),
+                    raw_delta_idle_rad=np.array([raw_delta_idle], dtype=np.float32),
+                    wire_delta_idle_rad=np.array([wire_delta_idle], dtype=np.float32),
+                    wire_delta_body_rad=np.array([wire_delta_body], dtype=np.float32),
+                    wire_delta_hand_rad=np.array([wire_delta_hand], dtype=np.float32),
+                    wire_chunk_id=np.array([wire_chunk_id], dtype=np.int64),
+                    wire_chunk_step=np.array([wire_chunk_step], dtype=np.int64),
                     elapsed_ms=np.array([elapsed_ms], dtype=np.float32),
                     revision=np.array([revision], dtype=np.int64),
                     n_inference=np.array([n_inferences - 1], dtype=np.int64),
                     wall_t_s=np.array([time.time()], dtype=np.float64),
+                    **camera_arrays,
                 )
             except Exception as exc:
                 print(f"[live-VLA] chunk dump failed: {exc}", flush=True)
@@ -1215,10 +1675,11 @@ def _inference_worker(
                     break
                 time.sleep(min(slack, 0.1))
 
-    try:
-        renderer.close()
-    except Exception:
-        pass
+    if ghost_provider is not None:
+        try:
+            ghost_provider.close()
+        except Exception:
+            pass
 
 
 def _publisher(
@@ -1235,6 +1696,22 @@ def _publisher(
     idle_loop: Optional[_IdleStandLoop] = None,
     silent_wire: bool = False,
     pose_decoder: Optional[Any] = None,
+    ramp_in_ticks: int = 75,
+    target_lpf_hz: float = 2.0,
+    future_lpf_hz: float = 2.0,
+    hand_lpf_hz: float = 1.0,
+    hand_chunk_blend_ticks: int = 30,
+    max_hand_step: float = 0.08,
+    max_wire_dev_from_body: float = 0.18,
+    max_wire_step: float = 0.035,
+    chunk_blend_ticks: int = 40,
+    max_action_il: float = 8.0,
+    decode_delay_ticks: int = 150,
+    body_mode: VlaBodyMode = VlaBodyMode.MANIPULATION,
+    body_mode_control_file: str = "",
+    decoder_loaded: bool = False,
+    freeze_groups_override: str = "",
+    wire_debug: Optional[_LatestWireDebug] = None,
 ) -> int:
     """Thread C (= main thread): publish action[step] at ``rate_hz``.
 
@@ -1294,8 +1771,93 @@ def _publisher(
     horizon = 40
     tick = 0
 
+    # --- Bridge-side proprio assembly state ---------------------------
+    # The SONIC pose decoder was trained against the IsaacLab
+    # ProprioceptionBuffer (10-frame history of base_ang_vel /
+    # jpos_rel / jvel / last_action / gravity = 990 floats). The
+    # previous v0 placeholder (zeros) made the decoder OOD and pushed
+    # the wire to ~0.46 rad from idle on EVERY chunk (the on-robot
+    # vibration seen 2026-06-07). We assemble the real vector each
+    # tick from the x2_debug stream and the bridge's own
+    # ``last_action_il`` echo. See sonic_decoder_proprio.py for the
+    # layout.
+    decoder_buf: Optional[Any] = None
+    last_action_il = np.zeros(NUM_BODY_DOFS, dtype=np.float32)
+    decoder_default_il: Optional[np.ndarray] = None
+    proprio_decode_log_done = False
+    if pose_decoder is not None:
+        from gear_sonic.utils.teleop.sonic_decoder_proprio import (
+            ProprioceptionBuffer,
+            build_proprio_990,
+            default_angles_il,
+        )
+        decoder_buf = ProprioceptionBuffer()
+        decoder_default_il = default_angles_il()
+
+    # --- Ramp-in + LPF state ------------------------------------------
+    # ``ramp_remaining`` is decremented per tick from
+    # ``ramp_in_ticks`` after the first successful VLA decode lands;
+    # while it's >0 the wire ships ``lerp(ramp_from, decoded, alpha)``
+    # for both the current slot and the future window so the C++
+    # tokeniser sees a coherent slowly-rising trajectory rather than
+    # a step jump on every joint.
+    # ``lpf_state`` is the one-pole low-pass output state for the
+    # current ``joint_pos_mj`` slot; reset to the freshly transitioned
+    # pose when leaving idle, then continuously updated.
+    ramp_from: Optional[np.ndarray] = None
+    ramp_remaining: int = 0
+    lpf_state: Optional[np.ndarray] = None
+    lpf_future_state: Optional[np.ndarray] = None
+    lpf_alpha = _lpf_alpha_from_hz(target_lpf_hz, period)
+    future_lpf_alpha = _lpf_alpha_from_hz(future_lpf_hz, period)
+    hand_lpf_alpha = _lpf_alpha_from_hz(hand_lpf_hz, period)
+    hand_lpf_left: Optional[np.ndarray] = None
+    hand_lpf_right: Optional[np.ndarray] = None
+    prev_wire_left: Optional[np.ndarray] = None
+    prev_wire_right: Optional[np.ndarray] = None
+    last_wire_hand_chunk_id = -1
+    hand_blend_from_left: Optional[np.ndarray] = None
+    hand_blend_from_right: Optional[np.ndarray] = None
+    hand_chunk_blend_remaining = 0
+    decoded_was_active = False  # tracks the previous tick's mode
+    prev_wire_jpos: Optional[np.ndarray] = None
+    last_wire_chunk_id = -1
+    chunk_blend_from: Optional[np.ndarray] = None
+    chunk_blend_remaining = 0
+    yaw_rebase_logged = False
+    bootstrap_publish_logged = False
+    bootstrap_first_publish_logged = False
+    active_body_mode = body_mode
+    _freeze_idx, decode_body = _body_mode_wire_settings(
+        active_body_mode,
+        decoder_loaded=decoder_loaded,
+        freeze_groups_override=freeze_groups_override,
+    )
+
     while not stop_event.is_set() and time.monotonic() < deadline:
-        _, _, _, _, _, deploy_fresh = state.snapshot()
+        if body_mode_control_file:
+            polled = _read_body_mode_control_file(body_mode_control_file)
+            if polled is not None and polled is not active_body_mode:
+                active_body_mode = polled
+                _freeze_idx, decode_body = _body_mode_wire_settings(
+                    active_body_mode,
+                    decoder_loaded=decoder_loaded,
+                    freeze_groups_override=freeze_groups_override,
+                )
+                ramp_from = None
+                ramp_remaining = 0
+                lpf_state = None
+                lpf_future_state = None
+                chunk_blend_remaining = 0
+                hand_lpf_left = None
+                hand_lpf_right = None
+                hand_chunk_blend_remaining = 0
+                print(
+                    f"[live-VLA] body mode -> {active_body_mode.value} "
+                    f"(decode_body={decode_body}, freeze={_freeze_idx.tolist()})",
+                    flush=True,
+                )
+        body_q_mj_now, base_quat_now, _, _, _, deploy_fresh = state.snapshot()
         token, left, right, _body_pose_chunk, chunk_id = chunk.read()
         horizon = int(token.shape[0])
         if chunk_id != last_chunk_id:
@@ -1312,6 +1874,39 @@ def _publisher(
             cur_jpos = _default_stand_body_pose_f32()
             cur_quat = _identity_quat_xyzw()
             future_fields = _idle_future_payload_fields(base_frame_index=tick)
+        # Capture the unmodified idle pose for the ramp-in baseline
+        # BEFORE the decoder potentially overwrites cur_jpos.
+        idle_baseline = np.asarray(cur_jpos, dtype=np.float32).copy()
+
+        # --- Live 990-D proprio assembly --------------------------------
+        # Even when we won't actually decode this tick (cold start,
+        # deploy stale, no decoder, etc.) we still want to APPEND to
+        # the history buffer so by the time decoding kicks in the 10
+        # frames are real observations rather than the
+        # broadcast-primed zeros.
+        proprio_990 = None
+        if decoder_buf is not None:
+            body_dq_mj_now, base_ang_vel_now = state.snapshot_velocities()
+            try:
+                proprio_990 = build_proprio_990(
+                    decoder_buf,
+                    body_q_mj=body_q_mj_now,
+                    body_dq_mj=body_dq_mj_now,
+                    base_quat_wxyz=base_quat_now,
+                    base_ang_vel=base_ang_vel_now,
+                    last_action_il=last_action_il,
+                    default_angles_il_cached=decoder_default_il,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not proprio_decode_log_done:
+                    print(
+                        f"[live-VLA] WARN: live proprio assembly failed "
+                        f"({exc!r}); falling back to zero proprio for "
+                        f"the rest of this run.",
+                        flush=True,
+                    )
+                    proprio_decode_log_done = True
+                proprio_990 = _PROPRIO_ZERO_990
 
         # SONIC token decoder: decode chunk[step] + 9 future steps to a
         # body trajectory and publish that as joint_pos_mj instead of
@@ -1324,25 +1919,272 @@ def _publisher(
         # --vla-no-policy stable wire content. The chunk_id check
         # avoids any ambiguity.
         decoded_now = None
+        proprio_ready = (
+            decoder_buf is None or getattr(decoder_buf, "primed", False)
+        )
         if (
             pose_decoder is not None
+            and decode_body
             and deploy_fresh
+            and tick >= decode_delay_ticks
+            and proprio_ready
             and chunk_id > 0
             and np.linalg.norm(token[step]) > 1e-3
         ):
             decoded = _build_vla_decoded_pose_payload(
                 decoder=pose_decoder,
-                proprio_990=_PROPRIO_ZERO_990,
+                proprio_990=proprio_990 if proprio_990 is not None else _PROPRIO_ZERO_990,
                 token_chunk=token,
                 chunk_step=step,
                 horizon=horizon,
                 base_frame_index=tick,
             )
             if decoded is not None:
-                decoded_now, future_fields = decoded
+                decoded_now, future_fields, action_il_now = decoded
+                # Feed the just-emitted residual back as next tick's
+                # ``last_action_il`` -- mirrors the C++ deploy's
+                # ``last_action_il_ = action_il`` line and is what the
+                # ``last_action`` proprioception term was trained on.
+                if max_action_il > 0.0:
+                    action_il_now = np.clip(
+                        action_il_now,
+                        -max_action_il,
+                        max_action_il,
+                    ).astype(np.float32, copy=False)
+                last_action_il = action_il_now
                 cur_jpos = decoded_now
                 # cur_quat stays as the idle_loop / identity choice --
                 # the SONIC body-only decoder doesn't predict root.
+
+                # ---- B: ramp-in on idle -> VLA transition ----------
+                if not decoded_was_active and ramp_in_ticks > 0:
+                    ramp_from = idle_baseline.copy()
+                    ramp_remaining = int(ramp_in_ticks)
+                    # Reset LPF state so the filter doesn't lag the
+                    # ramp; we re-prime it at idle_baseline.
+                    lpf_state = idle_baseline.copy() if lpf_alpha > 0.0 else None
+                    lpf_future_state = None
+                    hand_lpf_left = None
+                    hand_lpf_right = None
+
+                if ramp_remaining > 0 and ramp_from is not None:
+                    progress = float(ramp_in_ticks - ramp_remaining + 1) / float(ramp_in_ticks)
+                    progress = min(max(progress, 0.0), 1.0)
+                    ramped_now = (
+                        ramp_from * (1.0 - progress) + decoded_now * progress
+                    ).astype(np.float32)
+                    # Lerp the future window with the same progress.
+                    # Future slots represent t + 0.1..0.9 s; keeping
+                    # the ramp coherent across them avoids the tokeniser
+                    # seeing a sharp slope between the current slot
+                    # and the first future slot.
+                    jpos_future = future_fields["joint_pos_mj_future"]
+                    ramped_future = (
+                        ramp_from[None, :] * (1.0 - progress)
+                        + jpos_future * progress
+                    ).astype(np.float32)
+                    # Recompute jvel_future as the finite-diff of the
+                    # ramped trajectory so the deploy doesn't see a
+                    # velocity profile that disagrees with the ramped
+                    # positions.
+                    jvel_future = _jvel_future_from_poses(ramped_now, ramped_future)
+                    future_fields = {
+                        **future_fields,
+                        "joint_pos_mj_future": ramped_future,
+                        "joint_vel_mj_future": jvel_future,
+                    }
+                    cur_jpos = ramped_now
+                    ramp_remaining -= 1
+
+                # ---- C: inter-chunk blend (before LPF) --------------
+                if chunk_id != last_wire_chunk_id:
+                    chunk_blend_from = (
+                        prev_wire_jpos.copy()
+                        if prev_wire_jpos is not None
+                        else idle_baseline.copy()
+                    )
+                    chunk_blend_remaining = int(chunk_blend_ticks)
+                    last_wire_chunk_id = chunk_id
+                if chunk_blend_remaining > 0 and chunk_blend_from is not None:
+                    progress = float(
+                        chunk_blend_ticks - chunk_blend_remaining + 1
+                    ) / float(max(chunk_blend_ticks, 1))
+                    progress = min(max(progress, 0.0), 1.0)
+                    cur_jpos = (
+                        chunk_blend_from * (1.0 - progress)
+                        + np.asarray(cur_jpos, dtype=np.float32) * progress
+                    ).astype(np.float32)
+                    chunk_blend_remaining -= 1
+
+                # ---- D: one-pole LPF on body (current + future) -----
+                cur_jpos, lpf_state = _lpf_vector(cur_jpos, lpf_state, lpf_alpha)
+                if future_lpf_alpha > 0.0 and "joint_pos_mj_future" in future_fields:
+                    jf = future_fields["joint_pos_mj_future"]
+                    jf_smooth, lpf_future_state = _lpf_vector(
+                        jf, lpf_future_state, future_lpf_alpha
+                    )
+                    future_fields = {
+                        **future_fields,
+                        "joint_pos_mj_future": jf_smooth,
+                        "joint_vel_mj_future": _jvel_future_from_poses(
+                            cur_jpos, jf_smooth
+                        ),
+                    }
+
+                # ---- E: rate + anchor clamps (anti-jitter) ------------
+                cur_jpos = _clamp_vector_step(cur_jpos, prev_wire_jpos, max_wire_step)
+                cur_jpos = _clamp_vector_deviation(
+                    cur_jpos,
+                    np.asarray(body_q_mj_now, dtype=np.float32),
+                    max_wire_dev_from_body,
+                )
+
+                decoded_was_active = True
+        else:
+            # Idle wire (deploy stale, no decoder, or zero-token chunk).
+            # Clear the ramp / LPF state so the next idle->VLA
+            # transition primes them again from a fresh idle baseline.
+            if decoded_was_active:
+                ramp_from = None
+                ramp_remaining = 0
+                lpf_state = None
+                lpf_future_state = None
+            decoded_was_active = False
+
+        # ---- F: optional partial-body freeze (legs/waist hold idle_stand) ---
+        # Freeze the selected DOFs to the ``idle_stand`` clip (with its
+        # small per-frame jitter). The clip's jitter is what the policy
+        # was TRAINED against during ManagerEnvWrapper episodes -- without
+        # it, the tracker output saturates and the robot leans ~25 deg
+        # under gravity within a few seconds (see ``_IdleStandLoop``
+        # docstring for the empirical comparison).
+        #
+        # We then SURGICALLY pin only ``waist_yaw_joint`` (slot 12) to
+        # the live measured value -- waist_yaw is the dominant
+        # heading-correction effector and ``idle_stand[0]``'s waist_yaw
+        # is ~33 deg off DEFAULT_STAND_POSE_NP, which would otherwise
+        # drive a steady-state ~33 deg heading drift on every
+        # manipulation run. Every other frozen DOF (waist_pitch,
+        # waist_roll, hip/knee/ankle) keeps the clip jitter for
+        # balance. Falls back to identity (no waist_yaw override) when
+        # x2_debug has never arrived.
+        if _freeze_idx.size > 0:
+            cur_jpos, future_fields = _apply_frozen_body_groups(
+                jpos=cur_jpos,
+                future_fields=future_fields,
+                idle_jpos=idle_baseline,
+                freeze_indices=_freeze_idx,
+            )
+            if deploy_fresh and bool(np.isin(WAIST_YAW_IDX, _freeze_idx)):
+                measured_waist_yaw = float(body_q_mj_now[WAIST_YAW_IDX])
+                cur_jpos = np.asarray(cur_jpos, dtype=np.float32).copy()
+                cur_jpos[WAIST_YAW_IDX] = measured_waist_yaw
+                if "joint_pos_mj_future" in future_fields:
+                    jf = np.asarray(
+                        future_fields["joint_pos_mj_future"], dtype=np.float32
+                    ).copy()
+                    jf[:, WAIST_YAW_IDX] = measured_waist_yaw
+                    future_fields = {
+                        **future_fields,
+                        "joint_pos_mj_future": jf,
+                        "joint_vel_mj_future": _jvel_future_from_poses(
+                            cur_jpos, jf
+                        ),
+                    }
+
+        # ---- G: hand joint shaping (chunk blend + LPF + step cap) ---
+        if deploy_fresh:
+            left_tgt = np.asarray(left[step], dtype=np.float32)
+            right_tgt = np.asarray(right[step], dtype=np.float32)
+            if chunk_id != last_wire_hand_chunk_id:
+                hand_blend_from_left = (
+                    prev_wire_left.copy()
+                    if prev_wire_left is not None
+                    else np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
+                )
+                hand_blend_from_right = (
+                    prev_wire_right.copy()
+                    if prev_wire_right is not None
+                    else np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
+                )
+                hand_chunk_blend_remaining = int(hand_chunk_blend_ticks)
+                last_wire_hand_chunk_id = chunk_id
+            if (
+                hand_chunk_blend_remaining > 0
+                and hand_blend_from_left is not None
+                and hand_blend_from_right is not None
+            ):
+                progress = float(
+                    hand_chunk_blend_ticks - hand_chunk_blend_remaining + 1
+                ) / float(max(hand_chunk_blend_ticks, 1))
+                progress = min(max(progress, 0.0), 1.0)
+                left_tgt = (
+                    hand_blend_from_left * (1.0 - progress)
+                    + left_tgt * progress
+                ).astype(np.float32)
+                right_tgt = (
+                    hand_blend_from_right * (1.0 - progress)
+                    + right_tgt * progress
+                ).astype(np.float32)
+                hand_chunk_blend_remaining -= 1
+            left_step = left_tgt
+            right_step = right_tgt
+            if hand_lpf_alpha > 0.0:
+                left_step, hand_lpf_left = _lpf_vector(
+                    left_step, hand_lpf_left, hand_lpf_alpha
+                )
+                right_step, hand_lpf_right = _lpf_vector(
+                    right_step, hand_lpf_right, hand_lpf_alpha
+                )
+            left_step = _clamp_vector_step(
+                left_step, prev_wire_left, max_hand_step
+            )
+            right_step = _clamp_vector_step(
+                right_step, prev_wire_right, max_hand_step
+            )
+        else:
+            left_step = _ZERO_HAND_STEP
+            right_step = _ZERO_HAND_STEP
+        hand_delta_tick = 0.0
+        if deploy_fresh:
+            if prev_wire_left is not None and prev_wire_right is not None:
+                hand_delta_tick = float(
+                    max(
+                        np.abs(left_step - prev_wire_left).max(),
+                        np.abs(right_step - prev_wire_right).max(),
+                    )
+                )
+
+        # ---- H: live yaw rebase on root_quat (tokenizer orientation) ---
+        # The idle_stand clip is yaw-aligned to 0; if we ship that quat
+        # while the robot is physically facing another heading, SONIC's
+        # tokenizer obs sees a large orientation error and keeps twisting
+        # waist_yaw (even with legs/waist joint targets frozen).
+        if deploy_fresh:
+            live_root_quat = _root_quat_xyzw_from_base_quat_wxyz(base_quat_now)
+            cur_quat = live_root_quat
+            if "root_quat_xyzw_future" in future_fields:
+                future_fields = {
+                    **future_fields,
+                    "root_quat_xyzw_future": _tile_root_quat_future(
+                        live_root_quat
+                    ),
+                }
+            if not yaw_rebase_logged:
+                from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw
+
+                wxyz = np.asarray(base_quat_now, dtype=np.float64).reshape(-1)
+                q = np.array(
+                    [wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64
+                )
+                yaw_deg = math.degrees(float(yaw_of_quat_xyzw(q)))
+                print(
+                    f"[live-VLA] root_quat yaw-rebase ACTIVE: wire "
+                    f"root_quat_xyzw now tracks live x2_debug heading "
+                    f"(yaw={yaw_deg:+.1f}deg)",
+                    flush=True,
+                )
+                yaw_rebase_logged = True
 
         if not deploy_fresh:
             payload = {
@@ -1355,21 +2197,107 @@ def _publisher(
                 **future_fields,
             }
         else:
+            wire_token = (
+                _ZERO_MOTION_TOKEN_STEP
+                if not decode_body
+                else token[step]
+            )
             payload = {
                 "joint_pos_mj": cur_jpos,
                 "root_quat_xyzw": cur_quat,
-                "motion_token": token[step],
-                "left_hand_joints": left[step],
-                "right_hand_joints": right[step],
+                "motion_token": wire_token,
+                "left_hand_joints": left_step,
+                "right_hand_joints": right_step,
                 "frame_index": np.array([tick], dtype=np.int64),
                 **future_fields,
             }
-        if not silent_wire:
+        if wire_debug is not None:
+            idle_for_metrics = idle_baseline
+            if decoded_now is not None:
+                raw_d_met = float(
+                    np.abs(
+                        decoded_now.astype(np.float32) - idle_for_metrics.astype(np.float32)
+                    ).max()
+                )
+            else:
+                raw_d_met = 0.0
+            wire_d_idle = float(
+                np.abs(
+                    np.asarray(cur_jpos, dtype=np.float32)
+                    - idle_for_metrics.astype(np.float32)
+                ).max()
+            )
+            wire_d_body = float(
+                np.abs(
+                    np.asarray(cur_jpos, dtype=np.float32)
+                    - np.asarray(body_q_mj_now, dtype=np.float32)
+                ).max()
+            )
+            wire_debug.update(
+                joint_pos_mj=cur_jpos,
+                left_hand_joints=left_step,
+                right_hand_joints=right_step,
+                raw_delta_idle=raw_d_met,
+                wire_delta_idle=wire_d_idle,
+                wire_delta_body=wire_d_body,
+                wire_delta_hand=hand_delta_tick,
+                chunk_id=chunk_id,
+                chunk_step=step,
+            )
+
+        # ---- Bootstrap-safe publish gate ---------------------------------
+        # CRITICAL: never publish a pose frame before the bridge has seen
+        # at least one ``x2_debug`` packet. Until then ``base_quat_now`` is
+        # the dataclass default (identity quat = yaw=0 in world frame) and
+        # the wire would ship ``root_quat_xyzw = yaw=0`` to a deploy that
+        # is ALREADY in CONTROL (the PC2 SONIC daemon persists across
+        # teleop/VLA sessions). The deploy then sees
+        # ``rel = inv(R_z(measured_yaw)) * R_z(0)`` -- a real orientation
+        # error -- and commands waist_yaw rotation toward yaw=0. On a
+        # robot that started at yaw=-45 deg, this drags the body to
+        # yaw=0 over the bootstrap window (~tick 0..T where T is when
+        # x2_debug first arrives at the bridge). Subsequent VLA starts
+        # find the robot already at yaw=0 so no further turn -- the
+        # symptom captured 2026-06-07 as "first VLA start turns the
+        # robot ~45 deg left, subsequent runs hold heading".
+        #
+        # The C++ deploy already has a bootstrap-safe path: when
+        # ``ZmqPoseInputSource::LastReceivedMonotonicS() < 0``,
+        # ``BuildTokenizerObs`` substitutes the measured quat as the
+        # orientation reference and the policy holds whatever heading
+        # the body is in. We just have to NOT BREAK that escape hatch by
+        # publishing a phantom yaw=0 frame the moment the PUB socket
+        # binds. Gating on ``state.received_any`` (one-way sticky: True
+        # once a real packet has ever arrived) keeps the deploy on the
+        # measured-quat bootstrap path until the bridge can ship a
+        # correctly yaw-rebased ``root_quat_xyzw``.
+        if not silent_wire and state.received_any:
+            if not bootstrap_first_publish_logged:
+                print(
+                    f"[live-VLA] first pose publish (tick={tick}); "
+                    f"x2_debug seen, root_quat now tracks live heading.",
+                    flush=True,
+                )
+                bootstrap_first_publish_logged = True
             msg = pack_pose_message(payload, topic=topic, version=protocol_version)
             try:
                 pub_sock.send(msg, flags=zmq.NOBLOCK)
             except zmq.Again:
                 pass
+        elif not silent_wire and not bootstrap_publish_logged:
+            print(
+                "[live-VLA] withholding pose publish until first x2_debug "
+                "frame arrives (deploy stays on its measured-quat bootstrap "
+                "override; prevents yaw=0 phantom reference that would drag "
+                "the robot to world +X heading on VLA start).",
+                flush=True,
+            )
+            bootstrap_publish_logged = True
+
+        prev_wire_jpos = np.asarray(cur_jpos, dtype=np.float32).copy()
+        if deploy_fresh:
+            prev_wire_left = np.asarray(left_step, dtype=np.float32).copy()
+            prev_wire_right = np.asarray(right_step, dtype=np.float32).copy()
 
         if tick % print_every == 0:
             _, _, _, _, _, alive = state.snapshot()
@@ -1387,26 +2315,55 @@ def _publisher(
                     # Joint-pose deviation from idle so the operator
                     # can confirm at-a-glance whether the decoded body
                     # is doing anything meaningful (vs. just hovering
-                    # at the idle setpoint).
+                    # at the idle setpoint). Reports BOTH the raw
+                    # decoder Δ (policy intent) and the wire Δ
+                    # (post-ramp post-LPF, what the deploy actually
+                    # receives) so operator can distinguish a quiet
+                    # policy from a clamped wire.
                     if idle_loop is not None:
                         idle_now, _ = idle_loop.current(tick)
                     else:
                         idle_now = _default_stand_body_pose_f32()
-                    pose_delta = float(
+                    raw_delta = float(
                         np.abs(
                             decoded_now.astype(np.float32)
                             - idle_now.astype(np.float32)
                         ).max()
                     )
-                    decoded_tag = f"VLA-pose Δ={pose_delta:.3f}rad"
+                    wire_delta = float(
+                        np.abs(
+                            np.asarray(cur_jpos, dtype=np.float32)
+                            - idle_now.astype(np.float32)
+                        ).max()
+                    )
+                    ramp_tag = (
+                        f" ramp={ramp_remaining}/{ramp_in_ticks}"
+                        if ramp_remaining > 0 else ""
+                    )
+                    wire_d_body = float(
+                        np.abs(
+                            np.asarray(cur_jpos, dtype=np.float32)
+                            - np.asarray(body_q_mj_now, dtype=np.float32)
+                        ).max()
+                    )
+                    decoded_tag = (
+                        f"VLA-pose raw_Δ={raw_delta:.3f}rad "
+                        f"wire_Δ={wire_delta:.3f}rad "
+                        f"body_Δ={wire_d_body:.3f}rad{ramp_tag}"
+                    )
                 else:
                     decoded_tag = "idle-pose"
+                hand_tag = (
+                    f" hand_Δ={hand_delta_tick:.3f}rad"
+                    if deploy_fresh
+                    else ""
+                )
                 print(
                     f"[live-VLA] pub tick={tick:6d} "
                     f"chunk_id={chunk_id:4d} step={step:2d}/{horizon} "
                     f"|token|={float(np.linalg.norm(token[step])):.3f} "
                     f"|left|={float(np.linalg.norm(left[step])):.3f} "
-                    f"{decoded_tag} "
+                    f"{decoded_tag}{hand_tag} "
                     f"deploy_alive={alive}",
                     flush=True,
                 )
@@ -1540,16 +2497,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "~28 deg under --vla-no-policy.",
     )
     parser.add_argument(
-        "--sonic-checkpoint", type=str, default=None,
-        help="Path to a SONIC .pt checkpoint (e.g. model_step_025000.pt) used "
-             "to decode the predicted motion_token chunks back into "
-             "joint_pos_mj poses on the wire. Without this, the bridge emits "
-             "idle_stand for joint_pos_mj on every tick and the C++ deploy's "
-             "fused encoder+FSQ+decoder ONNX re-tokenises that idle reference "
-             "and ignores the live motion_token field (header explicitly "
-             "documents 'motion_token: currently logged but otherwise unused' "
-             "-- see zmq_pose_input_source.hpp:22-25), so the body never "
-             "moves under VLA authority. With --sonic-checkpoint set, each "
+        "--motion-token-decoder", type=str, default=None,
+        dest="motion_token_decoder",
+        help="Path to the SONIC decoder .pt checkpoint (e.g. "
+             "model_step_025000.pt) used to decode the VLA's predicted "
+             "motion_token chunks back into joint_pos_mj poses on the wire. "
+             "Without this, the bridge emits idle_stand for joint_pos_mj on "
+             "every tick and the C++ deploy's fused encoder+FSQ+decoder ONNX "
+             "re-tokenises that idle reference and ignores the live "
+             "motion_token field (header explicitly documents 'motion_token: "
+             "currently logged but otherwise unused' -- see "
+             "zmq_pose_input_source.hpp:22-25), so the body never moves "
+             "under VLA authority. With --motion-token-decoder set, each "
              "publish tick decodes chunk[step] (and 9 future steps) via the "
              "g1_dyn decoder + the C++ deploy's "
              "target_mj=default+action_il*scale formula and ships the result "
@@ -1558,6 +2517,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "body actually track the predicted motion. Recommended path: "
              "the .pt that pairs with the deploy ONNX you're running.",
     )
+    # Deprecated alias kept for backwards compat with old runbooks and
+    # CI scripts. Same dest as the canonical flag; the post-parse
+    # bookkeeping below logs a one-shot warning when the alias is what
+    # the operator actually typed.
+    parser.add_argument(
+        "--sonic-checkpoint", type=str, default=None,
+        dest="motion_token_decoder",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--sonic-decoder-device", type=str, default="cpu",
         help="Torch device for the bridge-side SONIC decoder. Default cpu "
@@ -1565,6 +2533,109 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "well within the 20 ms 50 Hz budget). Use cuda:0 only if your "
              ".venv torch build supports your GPU (see SONIC_TOKENIZER_DEVICE "
              "comment in run_x2_quest3_planner_stack.sh).",
+    )
+    parser.add_argument(
+        "--vla-ramp-in-ticks", type=int, default=75,
+        help="Number of 50 Hz publish ticks (default 25 = 0.5 s) over "
+             "which to linearly interpolate from the idle wire to the "
+             "first decoded VLA pose. Eliminates the step-input shove "
+             "that previously corresponded to up to 0.5 rad joint "
+             "deviation in a single tick on the very first chunk -- "
+             "see the runtime-architecture doc for the failure mode. "
+             "Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-target-lpf-hz", type=float, default=2.0,
+        help="One-pole low-pass cutoff (Hz) on the wire's current "
+             "``joint_pos_mj`` slot. Default 2 Hz heavily attenuates "
+             "inter-chunk saw-tooth / vibration. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-future-lpf-hz", type=float, default=2.0,
+        help="LPF cutoff (Hz) for ``joint_pos_mj_future`` (the 9-slot "
+             "window the deploy tokeniser reads). Matching the body "
+             "LPF prevents sharp future slopes that excite SONIC "
+             "tracking vibration. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-hand-lpf-hz", type=float, default=1.0,
+        help="LPF cutoff (Hz) for left/right hand joint targets on the "
+             "wire. Default 1 Hz attenuates finger jitter from noisy VLA "
+             "hand chunks. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-hand-chunk-blend-ticks", type=int, default=30,
+        help="Linear blend length (50 Hz ticks) when a new VLA hand "
+             "chunk lands, softening inter-chunk finger seams. Pass 0 "
+             "to disable.",
+    )
+    parser.add_argument(
+        "--vla-max-hand-step", type=float, default=0.08,
+        help="Max per-tick hand joint delta (rad) on the wire at 50 Hz. "
+             "Limits how fast finger targets can move tick-to-tick. "
+             "Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-max-wire-dev-from-body", type=float, default=0.18,
+        help="Max per-joint deviation (rad) of the wire ``joint_pos_mj`` "
+             "from the live observed ``body_q`` (x2_debug). Prevents the "
+             "decoder from commanding runaway poses far from the robot's "
+             "actual configuration -- the dominant sim collapse mode when "
+             "this is unset. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-max-wire-step", type=float, default=0.035,
+        help="Max per-tick joint delta (rad) on the wire at 50 Hz. Limits "
+             "how fast the pose reference can move tick-to-tick. Pass 0 "
+             "to disable.",
+    )
+    parser.add_argument(
+        "--vla-chunk-blend-ticks", type=int, default=40,
+        help="Linear blend length (50 Hz ticks) when a new VLA chunk "
+             "lands, softening chunk-boundary seams. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-max-action-il", type=float, default=8.0,
+        help="Clip the decoder's raw IsaacLab-order action residual before "
+             "it is echoed into the 990-D proprio ``last_action`` term. "
+             "Matches training ``action_clip_value=20`` headroom but "
+             "prevents proprio feedback blow-up. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-decode-delay-ticks", type=int, default=150,
+        help="Publish ticks (50 Hz) of idle_stand wire after deploy comes "
+             "up before the SONIC decoder is allowed to overwrite "
+             "``joint_pos_mj``. Lets parity RSI + proprio history "
+             "stabilise before VLA authority lands. Pass 0 to disable.",
+    )
+    parser.add_argument(
+        "--vla-body-mode",
+        type=str,
+        default=VlaBodyMode.MANIPULATION.value,
+        choices=[m.value for m in VlaBodyMode],
+        help="Which DOFs the VLA may command on the pose wire. "
+             "'manipulation' = decode arms/head/hands; freeze legs+waist "
+             "to idle_stand (VR ARM_MANIPULATION analog; needs decoder). "
+             "'locomotion' = full-body decode (VR LOCOMOTION analog).",
+    )
+    parser.add_argument(
+        "--vla-mode-control-file", type=str, default="",
+        help="Optional path watched each publish tick; file contains one "
+             "of manipulation | locomotion. Lets an operator flip modes "
+             "at runtime without restarting (e.g. echo "
+             "manipulation > /tmp/vla_body_mode).",
+    )
+    parser.add_argument(
+        "--vla-hands-only", action="store_true",
+        help="DEPRECATED and ignored. Former fingers-only mode was removed; "
+             "use --vla-body-mode manipulation (arms+hands, frozen legs).",
+    )
+    parser.add_argument(
+        "--vla-freeze-body-groups", type=str, default="",
+        help="Optional override for manipulation-mode freeze groups "
+             "(comma-separated names pinned to idle_stand after decode). "
+             "Default manipulation freeze is legs,waist. Group names match "
+             "x2_recipes: legs, waist, arms, left_arm, ...",
     )
     parser.add_argument(
         "--dump-chunks-dir", type=str, default=None,
@@ -1636,9 +2707,83 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--video-front-height", type=int, default=720,
         help="Front-view height. Independent of the VLA's --render-height.",
     )
+    parser.add_argument(
+        "--cameras-source",
+        type=str,
+        choices=("ghost", "zmq"),
+        default="ghost",
+        help=(
+            "Where the VLA's image observation comes from. "
+            "'ghost' (default, sim path): build a MuJoCo EGL renderer "
+            "inside the inference thread and render an ``ego_view`` from "
+            "the live body_q_mj — matches "
+            "``record_synthetic_smoketest_dataset.py``. "
+            "'zmq' (real-robot path): subscribe to the PC2 "
+            "``ComposedCameraClientSensor`` PUB and pass through whichever "
+            "video.modality_keys the registered modality config requests "
+            "(typically ``stereo_left`` + ``stereo_right`` for the omnihand "
+            "stereo config). Requires the PC2 camera bridge to be running — "
+            "see ``gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve``."
+        ),
+    )
+    parser.add_argument(
+        "--cameras-zmq-host",
+        type=str,
+        default="10.0.1.41",
+        help=(
+            "Host of the PC2 ComposedCameraClientSensor PUB. Only used "
+            "with --cameras-source zmq. Default matches the X2 ultra "
+            "wired-LAN address used by ``x2_pc2_cameras.sh``."
+        ),
+    )
+    parser.add_argument(
+        "--cameras-zmq-port",
+        type=int,
+        default=5555,
+        help=(
+            "Port of the PC2 ComposedCameraClientSensor PUB. Must match "
+            "the publisher's --port (default 5555)."
+        ),
+    )
+    parser.add_argument(
+        "--cameras-staleness-s",
+        type=float,
+        default=2.0,
+        help=(
+            "Maximum age (s) of the latest camera frame before the "
+            "inference thread refuses to run and posts a safe idle chunk. "
+            "Only used with --cameras-source zmq. 2 s is generous given "
+            "the publisher runs at 15 Hz."
+        ),
+    )
+    parser.add_argument(
+        "--cameras-warmup-s",
+        type=float,
+        default=10.0,
+        help=(
+            "Time (s) to wait at startup for the first complete camera "
+            "payload (containing all required modality keys) before "
+            "aborting. Only used with --cameras-source zmq."
+        ),
+    )
     args = parser.parse_args(argv)
     if not args.no_policy and not args.model_path:
         parser.error("--model-path is required unless --no-policy is set")
+    if args.cameras_source == "zmq":
+        if args.no_policy:
+            parser.error(
+                "--cameras-source zmq is redundant with --no-policy (the "
+                "inference worker isn't started, so the camera stream isn't "
+                "consumed). Drop one or the other."
+            )
+        if args.video_out or args.video_front_out:
+            parser.error(
+                "--video-out / --video-front-out require the MuJoCo "
+                "renderer and are sim-only; they cannot be combined with "
+                "--cameras-source zmq. Use --dump-chunks-dir instead for "
+                "real-robot diagnostics — the dump includes every camera "
+                "frame the policy saw."
+            )
     return args
 
 
@@ -1662,6 +2807,389 @@ def _load_modality_config(path_or_module: str) -> None:
         importlib.import_module(path_or_module)
 
 
+def _get_required_video_keys(embodiment_tag: str) -> list[str]:
+    """Return the list of required ``video.modality_keys`` for the loaded config.
+
+    Must be called *after* :func:`_load_modality_config` has populated
+    ``gr00t.configs.data.embodiment_configs.MODALITY_CONFIGS``. The
+    returned keys are the source of truth for which cameras the policy
+    expects on every inference (e.g. ``["ego_view"]`` for the sim 10dof
+    config, ``["stereo_left", "stereo_right"]`` for the real-robot
+    omnihand stereo config).
+    """
+    from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+
+    if embodiment_tag not in MODALITY_CONFIGS:
+        raise RuntimeError(
+            f"embodiment_tag={embodiment_tag!r} is not registered in "
+            f"MODALITY_CONFIGS. Available tags: {sorted(MODALITY_CONFIGS.keys())}. "
+            f"Make sure --modality-config side-loaded a module that calls "
+            f"register_modality_config(..., embodiment_tag=...)."
+        )
+    cfg = MODALITY_CONFIGS[embodiment_tag]
+    video_cfg = cfg.get("video")
+    if video_cfg is None:
+        raise RuntimeError(
+            f"embodiment_tag={embodiment_tag!r} has no 'video' modality config."
+        )
+    keys = list(video_cfg.modality_keys)
+    if not keys:
+        raise RuntimeError(
+            f"embodiment_tag={embodiment_tag!r} has empty video.modality_keys."
+        )
+    return keys
+
+
+class _GhostCameraProvider:
+    """Multi-view MuJoCo ghost-renderer for the sim path.
+
+    The bridge originally supported a single ego-view ``MujocoFrameRenderer``
+    behind a simple ``renderer_factory`` callable. That covers the
+    single-camera (``video.modality_keys=["ego_view"]``) sim modality
+    config, but real-robot checkpoints are trained with the omnihand-stereo
+    config which declares two video keys (``stereo_left``, ``stereo_right``)
+    and the older single-renderer path silently fed nothing for them.
+
+    This provider replaces the single ``renderer_factory`` slot in
+    :func:`_inference_worker` with a multi-renderer dict. Internally it
+    keeps **one** :class:`MujocoFrameRenderer` per *unique* underlying
+    MJCF camera (the X2 MJCF has separate ``rgbd_head_front`` and
+    ``stereo_head_front`` mounts but only one stereo optical centre), then
+    aliases each required modality key onto its mapped MJCF camera before
+    returning the per-tick frame dict. So requesting
+    ``["stereo_left", "stereo_right"]`` builds *one* renderer for
+    ``stereo_head_front`` and ships the same frame under both keys --
+    "degenerate stereo" -- which is enough to validate the data flow,
+    ramp/LPF, and SONIC body motion in sim without breaking the real
+    robot. True stereo (separate L/R camera mounts in the MJCF) is the
+    natural follow-up if depth-disparity reasoning becomes the bottleneck.
+
+    EGL contexts are thread-local, so :meth:`build` (which actually
+    instantiates the renderers) must be called from inside the thread
+    that will call :meth:`render_frames`. Use the :func:`build_factory`
+    helper to capture the construction args; the inference worker will
+    invoke it from its own thread.
+
+    Keys are mapped via :data:`MODALITY_TO_MJ_CAMERA`. Unknown keys raise
+    at construction time so misconfigured modality configs fail fast
+    instead of mid-rollout.
+    """
+
+    # Map ``video.modality_keys`` -> MJCF camera name (one of the head
+    # mounts defined in ``HEAD_CAMERAS`` in
+    # ``render_smoketest_episode_video.py``). The aliases mirror the
+    # ``HeadCameraSpec.aliases`` field on each spec; we keep the explicit
+    # table here so a bad key fails at provider construction with a
+    # readable error rather than deep inside ``resolve_camera_spec``.
+    MODALITY_TO_MJ_CAMERA: dict[str, str] = {
+        # Egocentric / RGB-D head module
+        "ego_view": "rgbd_head_front",
+        "rgbd": "rgbd_head_front",
+        "rgbd_head_front": "rgbd_head_front",
+        "head_front": "rgbd_head_front",
+        # Stereo head block (single optical centre in MJCF, aliased
+        # into both L and R modality slots for "degenerate stereo")
+        "stereo_left": "stereo_head_front",
+        "stereo_right": "stereo_head_front",
+        "stereo": "stereo_head_front",
+        "stereo_head_front": "stereo_head_front",
+        # Pass-through for any direct MJCF camera names someone might
+        # use in a custom modality config.
+        "rgb_head_center": "rgb_head_center",
+        "rgb_head_rear": "rgb_head_rear",
+    }
+
+    def __init__(
+        self,
+        *,
+        required_keys: list[str],
+        width: int,
+        height: int,
+        with_omnihand: bool,
+    ) -> None:
+        self._required_keys: list[str] = list(required_keys)
+        self._width = int(width)
+        self._height = int(height)
+        self._with_omnihand = bool(with_omnihand)
+        # key -> MJCF camera name. Validated eagerly so misconfigured
+        # modality configs blow up before the inference thread starts.
+        self._key_to_camera: dict[str, str] = {}
+        for key in self._required_keys:
+            cam = self.MODALITY_TO_MJ_CAMERA.get(key)
+            if cam is None:
+                raise ValueError(
+                    f"ghost camera provider: video.modality_key {key!r} has "
+                    f"no MJCF camera mapping. Known mappings: "
+                    f"{sorted(self.MODALITY_TO_MJ_CAMERA.keys())}. Add a new "
+                    f"entry to _GhostCameraProvider.MODALITY_TO_MJ_CAMERA "
+                    f"and (if needed) extend HEAD_CAMERAS in "
+                    f"render_smoketest_episode_video.py."
+                )
+            self._key_to_camera[key] = cam
+        # Lazy: filled by build() inside the inference thread.
+        self._renderers: dict[str, Any] = {}
+
+    @property
+    def required_keys(self) -> list[str]:
+        return list(self._required_keys)
+
+    @property
+    def key_to_camera(self) -> dict[str, str]:
+        return dict(self._key_to_camera)
+
+    @property
+    def unique_cameras(self) -> list[str]:
+        # Stable order: by camera name.
+        return sorted(set(self._key_to_camera.values()))
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def with_omnihand(self) -> bool:
+        return self._with_omnihand
+
+    def build(self) -> "_GhostCameraProvider":
+        """Instantiate the underlying MuJoCo renderers.
+
+        Must be called from the thread that will call :meth:`render_frames`
+        (EGL contexts are thread-local). Returns ``self`` so the inference
+        worker can chain ``provider = factory().build()``.
+        """
+        if self._renderers:
+            return self
+        from gear_sonic.scripts.render_smoketest_episode_video import MujocoFrameRenderer
+
+        for cam in self.unique_cameras:
+            self._renderers[cam] = MujocoFrameRenderer(
+                camera=cam,
+                width=self._width,
+                height=self._height,
+                with_omnihand=self._with_omnihand,
+                egl=True,
+            )
+        return self
+
+    def render_frames(
+        self,
+        *,
+        body_q: np.ndarray,
+        left_active: np.ndarray,
+        right_active: np.ndarray,
+        root_quat_wxyz: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Render every unique MJCF camera once, alias into the required keys.
+
+        The same uint8 RGB array is shared across modality keys that map
+        to the same MJCF camera (e.g. ``stereo_left`` and ``stereo_right``
+        both map to ``stereo_head_front``). Callers must treat the
+        returned frames as read-only or copy them before mutating.
+        """
+        if not self._renderers:
+            raise RuntimeError(
+                "_GhostCameraProvider.render_frames() called before build(); "
+                "call build() from the rendering thread first."
+            )
+        # Render each unique MJCF camera once; this is the expensive
+        # MuJoCo + EGL step. For the omnihand-stereo case that's one
+        # render per tick (both L and R alias the same camera).
+        cam_to_frame: dict[str, np.ndarray] = {}
+        for cam, renderer in self._renderers.items():
+            if root_quat_wxyz is not None:
+                cam_to_frame[cam] = renderer.render_frame(
+                    body_q=body_q,
+                    left_active=left_active,
+                    right_active=right_active,
+                    root_quat_wxyz=root_quat_wxyz,
+                )
+            else:
+                cam_to_frame[cam] = renderer.render_frame(
+                    body_q=body_q,
+                    left_active=left_active,
+                    right_active=right_active,
+                )
+        # Alias the underlying frames into the modality dict.
+        return {
+            key: cam_to_frame[self._key_to_camera[key]]
+            for key in self._required_keys
+        }
+
+    def close(self) -> None:
+        for renderer in list(self._renderers.values()):
+            try:
+                renderer.close()
+            except Exception:
+                pass
+        self._renderers.clear()
+
+
+class _RealCameraProvider:
+    """Background-polled wrapper around :class:`ComposedCameraClientSensor`.
+
+    The underlying ZMQ SUB socket already uses ``CONFLATE=True`` so each
+    ``read()`` returns the latest available frame (intermediate frames
+    are dropped by the kernel). We add a short polling thread so the
+    inference thread never blocks on socket I/O and so we can track the
+    age of the freshest delivered frame independently of read calls
+    (the client only updates its internal ``_last_new_message_time``
+    when a non-blocking ``read()`` happens to arrive at the right
+    moment).
+
+    Required keys are validated against the publisher's first arriving
+    payload at construction time (with a configurable warm-up window) so
+    a misconfigured publisher fails fast instead of silently feeding
+    zeros into the VLA.
+
+    Frames are returned as HxWx3 uint8 **RGB** ndarrays — matching the
+    format produced by :class:`gear_sonic.camera.sensor_server.ImageMessageSchema`
+    (the JPEG bytes are decoded BGR via cv2 and converted to RGB on the
+    client side; see ``sensor_server.py::ImageMessageSchema.deserialize``).
+    The training data was captured with the same publisher pipeline so
+    no further colour-space conversion is needed.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_ip: str,
+        port: int,
+        required_keys: list[str],
+        warmup_timeout_s: float = 10.0,
+        poll_period_s: float = 0.02,
+    ) -> None:
+        from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+        self._required_keys = list(required_keys)
+        self._client = ComposedCameraClientSensor(server_ip=server_ip, port=port)
+        self._server_ip = server_ip
+        self._port = port
+
+        self._frames_lock = threading.Lock()
+        self._latest_frames: dict[str, np.ndarray] = {}
+        self._latest_t_mono: float = 0.0
+        self._n_seen = 0
+        self._stop_event = threading.Event()
+
+        # Warm-up: block until we've received at least one payload that
+        # contains *all* required keys, or fail loudly.
+        print(
+            f"[live-VLA] cameras: connecting to ZMQ PUB tcp://{server_ip}:{port} "
+            f"(required keys: {self._required_keys}, warmup {warmup_timeout_s:.1f}s) …",
+            flush=True,
+        )
+        deadline = time.monotonic() + warmup_timeout_s
+        observed_keys: set[str] = set()
+        while time.monotonic() < deadline:
+            data = self._client.read(blocking=False)
+            if data is not None and "images" in data:
+                imgs = data["images"]
+                observed_keys.update(imgs.keys())
+                if all(k in imgs and imgs[k] is not None for k in self._required_keys):
+                    with self._frames_lock:
+                        self._latest_frames = {
+                            k: np.ascontiguousarray(imgs[k])
+                            for k in self._required_keys
+                        }
+                        self._latest_t_mono = time.monotonic()
+                        self._n_seen += 1
+                    h, w = self._latest_frames[self._required_keys[0]].shape[:2]
+                    print(
+                        f"[live-VLA] cameras: ready — "
+                        f"keys={self._required_keys} "
+                        f"shape=({h}x{w}x3 uint8 RGB)",
+                        flush=True,
+                    )
+                    break
+            time.sleep(0.05)
+        else:
+            self._client.close()
+            raise RuntimeError(
+                f"camera warm-up failed: no payload containing all required keys "
+                f"{self._required_keys} within {warmup_timeout_s:.1f}s. "
+                f"Keys actually observed on tcp://{server_ip}:{port}: "
+                f"{sorted(observed_keys) if observed_keys else 'NONE (publisher silent?)'}. "
+                f"Check: 'x2-pc2-cameras serve --status' on PC2, plus the PC2 publisher "
+                f"args (--width / --height / --mount keys)."
+            )
+
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop,
+            args=(poll_period_s,),
+            name="vla-camera-poll",
+            daemon=True,
+        )
+        self._poll_thread.start()
+
+    def _poll_loop(self, period_s: float) -> None:
+        period_s = max(period_s, 0.005)
+        next_tick = time.monotonic()
+        while not self._stop_event.is_set():
+            try:
+                data = self._client.read(blocking=False)
+            except Exception as exc:
+                print(f"[live-VLA] camera poll error: {exc}", flush=True)
+                data = None
+            if data is not None and "images" in data:
+                imgs = data["images"]
+                # Only accept payloads that have every required key
+                # populated; partial payloads would force us to mix
+                # frames from different timestamps in the VLA
+                # observation, which is OOD vs the training data.
+                if all(k in imgs and imgs[k] is not None for k in self._required_keys):
+                    snapshot = {
+                        k: np.ascontiguousarray(imgs[k])
+                        for k in self._required_keys
+                    }
+                    with self._frames_lock:
+                        self._latest_frames = snapshot
+                        self._latest_t_mono = time.monotonic()
+                        self._n_seen += 1
+            next_tick += period_s
+            slack = next_tick - time.monotonic()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                next_tick = time.monotonic()
+
+    def read_frames(self, *, max_age_s: float) -> dict[str, np.ndarray] | None:
+        """Return the latest frames if fresher than ``max_age_s``, else None."""
+        with self._frames_lock:
+            if not self._latest_frames:
+                return None
+            age = time.monotonic() - self._latest_t_mono
+            if age > max_age_s:
+                return None
+            return {k: v.copy() for k, v in self._latest_frames.items()}
+
+    @property
+    def frame_count(self) -> int:
+        with self._frames_lock:
+            return self._n_seen
+
+    @property
+    def latest_age_s(self) -> float:
+        with self._frames_lock:
+            if self._latest_t_mono == 0.0:
+                return float("inf")
+            return time.monotonic() - self._latest_t_mono
+
+    def close(self) -> None:
+        self._stop_event.set()
+        try:
+            self._poll_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -1673,6 +3201,7 @@ def main(argv: list[str] | None = None) -> int:
     # the C++ SUB never comes up on a silent port.
     state = _LatestState()
     chunk = _LatestChunk()
+    wire_debug = _LatestWireDebug()
     stop_event = threading.Event()
 
     ctx = zmq.Context.instance()
@@ -1729,25 +3258,63 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    # One-shot deprecation warning for the legacy --sonic-checkpoint
+    # alias. We scan sys.argv directly because argparse collapses the
+    # alias onto the canonical dest before we ever see it.
+    if "--sonic-checkpoint" in sys.argv:
+        print(
+            "[live-VLA] WARN: --sonic-checkpoint is DEPRECATED on this "
+            "bridge. Use --motion-token-decoder instead (same .pt path; "
+            "the new name says what the bridge actually does with it). "
+            "See docs/source/references/x2_sonic_runtime_architecture.md.",
+            flush=True,
+        )
+
     # SONIC token-to-pose decoder. Loaded once on the main thread
     # before the publisher starts so the very first VLA chunk that
     # arrives can be decoded without a cold-start hitch. Any failure
     # here is non-fatal -- the publisher falls back to the idle wire
     # (same behaviour as before this feature was added) and the
-    # operator can rerun without --sonic-checkpoint to confirm.
+    # operator can rerun without --motion-token-decoder to confirm.
+    freeze_groups_override = args.vla_freeze_body_groups.strip()
+    if args.vla_hands_only:
+        print(
+            "[live-VLA] WARN: --vla-hands-only is deprecated and ignored. "
+            "Fingers-only mode was removed; manipulation now decodes "
+            "arms+hands with legs/waist frozen.",
+            flush=True,
+        )
+    body_mode = _parse_vla_body_mode(args.vla_body_mode)
+
     pose_decoder: Optional[Any] = None
-    if args.sonic_checkpoint and not args.no_policy:
+    if body_mode is VlaBodyMode.MANIPULATION:
+        print(
+            "[live-VLA] body mode=manipulation (VR ARM_MANIPULATION analog): "
+            "decode motion tokens for arms/head/hands; pin "
+            f"{'custom ' if freeze_groups_override else ''}"
+            f"freeze groups "
+            f"{freeze_groups_override or 'legs,waist'} to idle_stand.",
+            flush=True,
+        )
+    elif body_mode is VlaBodyMode.LOCOMOTION:
+        print(
+            "[live-VLA] body mode=locomotion (VR LOCOMOTION analog): "
+            "full-body decode from motion tokens when decoder is loaded.",
+            flush=True,
+        )
+
+    if args.motion_token_decoder and not args.no_policy:
         try:
             from gear_sonic.utils.teleop.sonic_token_to_pose_decoder import (
                 SonicTokenToPoseDecoder,
             )
             pose_decoder = SonicTokenToPoseDecoder(
-                args.sonic_checkpoint,
+                args.motion_token_decoder,
                 device=args.sonic_decoder_device,
             )
             print(
-                f"[live-VLA] SONIC pose decoder loaded from "
-                f"{args.sonic_checkpoint} (device={args.sonic_decoder_device}). "
+                f"[live-VLA] motion-token decoder loaded from "
+                f"{args.motion_token_decoder} (device={args.sonic_decoder_device}). "
                 "Wire joint_pos_mj will be VLA-decoded for chunks with "
                 "|token|>1e-3; cold-start chunks (chunk_id=0, all-zero "
                 "tokens) keep the idle_stand reference.",
@@ -1755,26 +3322,38 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as exc:
             print(
-                f"[live-VLA] WARN: SONIC decoder load failed: {exc}. "
+                f"[live-VLA] WARN: motion-token decoder load failed: {exc}. "
                 "Wire joint_pos_mj will stay at idle_stand and the body "
-                "will not move under VLA authority. Pass --sonic-checkpoint "
-                "to a known-good .pt to fix.",
+                "will not move under VLA authority. Pass "
+                "--motion-token-decoder to a known-good .pt to fix.",
+                flush=True,
+            )
+    decoder_loaded = pose_decoder is not None
+    if not decoder_loaded and not args.no_policy:
+        if body_mode is VlaBodyMode.MANIPULATION:
+            print(
+                "[live-VLA] WARN: manipulation mode needs "
+                "--motion-token-decoder; arms will stay on idle_stand until "
+                "a decoder is loaded (hands still follow VLA).",
+                flush=True,
+            )
+        elif body_mode is VlaBodyMode.LOCOMOTION:
+            print(
+                "[live-VLA] WARN: locomotion mode without decoder — body "
+                "tracks idle_stand only. Pass --motion-token-decoder for "
+                "full-body VLA.",
                 flush=True,
             )
     elif args.no_policy:
         print(
-            "[live-VLA] --no-policy mode: SONIC pose decoder skipped (no "
+            "[live-VLA] --no-policy mode: motion-token decoder skipped (no "
             "VLA tokens to decode).",
             flush=True,
         )
-    else:
+    if args.vla_mode_control_file:
         print(
-            "[live-VLA] --sonic-checkpoint not set: VLA motion_token will be "
-            "published on the wire but the C++ deploy ignores that field "
-            "(see zmq_pose_input_source.hpp:22-25). Body will track idle "
-            "stand only; hands still get the VLA chunk's per-tick targets "
-            "via AimDK passthrough. Pass --sonic-checkpoint to make the "
-            "body move under VLA control.",
+            f"[live-VLA] runtime mode switch file: {args.vla_mode_control_file} "
+            "(write manipulation | locomotion to flip modes).",
             flush=True,
         )
 
@@ -1797,6 +3376,22 @@ def main(argv: list[str] | None = None) -> int:
             idle_loop=idle_loop,
             silent_wire=bool(args.silent_wire),
             pose_decoder=pose_decoder,
+            ramp_in_ticks=int(args.vla_ramp_in_ticks),
+            target_lpf_hz=float(args.vla_target_lpf_hz),
+            future_lpf_hz=float(args.vla_future_lpf_hz),
+            hand_lpf_hz=float(args.vla_hand_lpf_hz),
+            hand_chunk_blend_ticks=int(args.vla_hand_chunk_blend_ticks),
+            max_hand_step=float(args.vla_max_hand_step),
+            max_wire_dev_from_body=float(args.vla_max_wire_dev_from_body),
+            max_wire_step=float(args.vla_max_wire_step),
+            chunk_blend_ticks=int(args.vla_chunk_blend_ticks),
+            max_action_il=float(args.vla_max_action_il),
+            decode_delay_ticks=int(args.vla_decode_delay_ticks),
+            body_mode=body_mode,
+            body_mode_control_file=args.vla_mode_control_file,
+            decoder_loaded=decoder_loaded,
+            freeze_groups_override=freeze_groups_override,
+            wire_debug=wire_debug,
         )
 
     publisher_thread = threading.Thread(
@@ -1809,43 +3404,114 @@ def main(argv: list[str] | None = None) -> int:
     _validate_pin_order_or_die()
     _load_modality_config(args.modality_config)
 
-    # The MuJoCo renderer is constructed inside the inference thread (see
-    # ``_inference_worker``): MuJoCo's EGL backend uses thread-local GL
-    # contexts, so a renderer built here would raise EGLError the first
-    # time the worker tried to render. We hand workers a zero-arg factory
-    # instead. Each video thread / inference thread gets its own EGL
-    # context via its own factory invocation.
-    from gear_sonic.scripts.render_smoketest_episode_video import MujocoFrameRenderer
+    # ------------------------------------------------------------------
+    # Camera source selection
+    # ------------------------------------------------------------------
+    # ``ghost``: the original sim path — build a MuJoCo EGL renderer
+    # inside the inference thread (thread-local GL contexts require
+    # that the renderer is constructed by the thread that will call
+    # ``render_frame``).
+    #
+    # ``zmq``: real-robot path — subscribe to the PC2
+    # ``ComposedCameraClientSensor`` PUB stream. The required video
+    # keys are pulled from the registered modality config so a config
+    # mismatch fails loudly here rather than mid-rollout.
+    # ------------------------------------------------------------------
+    ghost_provider_factory = None
+    camera_provider: _RealCameraProvider | None = None
 
-    def _make_renderer_factory(
-        *, camera: str, width: int, height: int
-    ):
-        def _factory() -> MujocoFrameRenderer:
-            return MujocoFrameRenderer(
-                camera=camera,
-                width=width,
-                height=height,
-                with_omnihand=not args.no_omnihand,
-                egl=True,
+    if args.cameras_source == "ghost":
+        # Read the registered modality config to discover which video
+        # keys the policy expects. The omnihand-stereo config (used by
+        # real-robot checkpoints) declares ``stereo_left + stereo_right``;
+        # the legacy 10dof sim config declares just ``ego_view``. The
+        # provider maps both into the right number of MJCF renderers
+        # (one per unique mount) without changing the wire / observation
+        # plumbing further downstream.
+        required_keys = _get_required_video_keys(args.embodiment_tag)
+        # Inference-side renderer must match the dataset camera +
+        # resolution exactly (the VLA's vision encoder is
+        # dimension-locked).
+        render_w = int(args.render_width)
+        render_h = int(args.render_height)
+        with_omnihand = not args.no_omnihand
+
+        def _ghost_factory() -> _GhostCameraProvider:
+            provider = _GhostCameraProvider(
+                required_keys=required_keys,
+                width=render_w,
+                height=render_h,
+                with_omnihand=with_omnihand,
             )
-        return _factory
+            return provider.build()
 
-    # Inference-side renderer must match the dataset camera + resolution
-    # exactly (the VLA's vision encoder is dimension-locked).
-    _renderer_factory = _make_renderer_factory(
-        camera="ego_view",
-        width=args.render_width,
-        height=args.render_height,
-    )
+        ghost_provider_factory = _ghost_factory
+        print(
+            f"[live-VLA] cameras: ghost mode — modality keys "
+            f"{required_keys} -> MJCF cameras "
+            f"{sorted(set(_GhostCameraProvider.MODALITY_TO_MJ_CAMERA.get(k, '?') for k in required_keys))} "
+            f"({render_w}x{render_h}, omnihand={with_omnihand}). "
+            "Stereo keys both alias the same ``stereo_head_front`` "
+            "optical centre (degenerate stereo) -- enough to validate the "
+            "loop in sim without breaking the real robot.",
+            flush=True,
+        )
+    else:  # args.cameras_source == "zmq"
+        required_keys = _get_required_video_keys(args.embodiment_tag)
+        try:
+            camera_provider = _RealCameraProvider(
+                server_ip=args.cameras_zmq_host,
+                port=args.cameras_zmq_port,
+                required_keys=required_keys,
+                warmup_timeout_s=args.cameras_warmup_s,
+            )
+        except BaseException:
+            stop_event.set()
+            publisher_thread.join(timeout=30.0)
+            try:
+                pub_sock.close(linger=0)
+            except Exception:
+                pass
+            raise
 
     sub_url = f"tcp://{args.sub_host}:{args.sub_port}"
 
     video_threads: list[threading.Thread] = []
     if args.video_out:
+        # Guard: ``--video-out`` requires a MuJoCo renderer, which only
+        # exists in ghost mode. Arg parser already rejects this combo,
+        # but defend in depth in case someone wires the function
+        # directly.
+        if args.cameras_source != "ghost":
+            raise RuntimeError(
+                "--video-out requires --cameras-source ghost (sim renderer)"
+            )
+        from gear_sonic.scripts.render_smoketest_episode_video import MujocoFrameRenderer  # noqa: F401
+
+        def _make_video_renderer_factory(
+            *, camera: str, width: int, height: int
+        ):
+            from gear_sonic.scripts.render_smoketest_episode_video import MujocoFrameRenderer as _MFR
+
+            def _factory() -> Any:
+                return _MFR(
+                    camera=camera,
+                    width=width,
+                    height=height,
+                    with_omnihand=not args.no_omnihand,
+                    egl=True,
+                )
+            return _factory
+
+        ego_video_factory = _make_video_renderer_factory(
+            camera="ego_view",
+            width=args.render_width,
+            height=args.render_height,
+        )
         video_threads.append(threading.Thread(
             target=_video_recorder,
             kwargs=dict(
-                renderer_factory=_renderer_factory,
+                renderer_factory=ego_video_factory,
                 state=state,
                 output_path=args.video_out,
                 fps=args.video_fps,
@@ -1857,15 +3523,25 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True,
         ))
     if args.video_front_out:
-        front_factory = _make_renderer_factory(
-            camera=args.video_front_camera,
-            width=args.video_front_width,
-            height=args.video_front_height,
-        )
+        if args.cameras_source != "ghost":
+            raise RuntimeError(
+                "--video-front-out requires --cameras-source ghost (sim renderer)"
+            )
+        from gear_sonic.scripts.render_smoketest_episode_video import MujocoFrameRenderer as _MFR
+
+        def _front_factory() -> Any:
+            return _MFR(
+                camera=args.video_front_camera,
+                width=args.video_front_width,
+                height=args.video_front_height,
+                with_omnihand=not args.no_omnihand,
+                egl=True,
+            )
+
         video_threads.append(threading.Thread(
             target=_video_recorder,
             kwargs=dict(
-                renderer_factory=front_factory,
+                renderer_factory=_front_factory,
                 state=state,
                 output_path=args.video_front_out,
                 fps=args.video_fps,
@@ -1928,8 +3604,11 @@ def main(argv: list[str] | None = None) -> int:
         inf_thread = threading.Thread(
             target=_inference_worker,
             kwargs=dict(
-                policy=policy, renderer_factory=_renderer_factory,
-                state=state, chunk=chunk,
+                policy=policy,
+                ghost_provider_factory=ghost_provider_factory,
+                camera_provider=camera_provider,
+                camera_max_age_s=args.cameras_staleness_s,
+                state=state, chunk=chunk, wire_debug=wire_debug,
                 prompt=args.prompt, stop_event=stop_event,
                 min_period_s=args.inference_min_period_s, verbose=not args.quiet,
                 dump_chunks_dir=args.dump_chunks_dir,
@@ -1953,14 +3632,25 @@ def main(argv: list[str] | None = None) -> int:
         # Video threads may need an extra beat to flush the encoder queue.
         for vt in video_threads:
             vt.join(timeout=15.0)
+        if camera_provider is not None:
+            try:
+                camera_provider.close()
+            except Exception:
+                pass
         try:
             pub_sock.close(linger=0)
         except Exception:
             pass
+        cam_summary = ""
+        if camera_provider is not None:
+            cam_summary = (
+                f", camera_frames_seen={camera_provider.frame_count}"
+            )
         print(
             f"[live-VLA] done after {n_ticks_holder[0]} pub ticks, "
             f"{chunk.inference_count} inferences, "
-            f"last_inference_ms={chunk.last_inference_ms:.1f}",
+            f"last_inference_ms={chunk.last_inference_ms:.1f}"
+            f"{cam_summary}",
             flush=True,
         )
     return 0

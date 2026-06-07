@@ -285,7 +285,7 @@ In `_publisher`, after pulling the latest chunk + the deploy's freshness
 flag, the bridge decides per tick whether to ship VLA-decoded or
 idle-stand poses:
 
-```1326:1346:gear_sonic/scripts/live_vla_publish_motion_token.py
+```1547:1567:gear_sonic/scripts/live_vla_publish_motion_token.py
         decoded_now = None
         if (
             pose_decoder is not None
@@ -295,24 +295,50 @@ idle-stand poses:
         ):
             decoded = _build_vla_decoded_pose_payload(
                 decoder=pose_decoder,
-                proprio_990=_PROPRIO_ZERO_990,
+                proprio_990=proprio_990 if proprio_990 is not None else _PROPRIO_ZERO_990,
                 token_chunk=token,
                 chunk_step=step,
                 horizon=horizon,
                 base_frame_index=tick,
             )
             if decoded is not None:
-                decoded_now, future_fields = decoded
+                decoded_now, future_fields, action_il_now = decoded
+                last_action_il = action_il_now.astype(np.float32, copy=False)
                 cur_jpos = decoded_now
-                # cur_quat stays as the idle_loop / identity choice --
-                # the SONIC body-only decoder doesn't predict root.
+                # ramp-in (B) + LPF (C) applied below before publish
 ```
+
+The wire-shaping pipeline that wraps this decode (added 2026-06-07
+after the first on-robot powered run shook violently because the
+decoder was being fed zero proprio):
+
+1. **Live 990-D proprio** assembled from the `x2_debug` stream
+   (`body_q`, `body_dq`, `base_quat`, `base_ang_vel`) plus the
+   bridge's own `last_action_il` echo, via
+   `gear_sonic.utils.teleop.sonic_decoder_proprio.ProprioceptionBuffer`.
+   See [§7](#7-bridge-side-proprio-assembly) for the layout.
+2. **Ramp-in (`--vla-ramp-in-ticks`, default 25 = 0.5 s)**: on the
+   first decoded chunk after an idle wire, the publisher linearly
+   interpolates `joint_pos_mj` (and the whole `joint_pos_mj_future`
+   window, with re-computed `joint_vel_mj_future`) from the last
+   idle baseline to the decoded pose over N ticks. This eliminates
+   the step input that previously corresponded to ~0.46 rad on
+   every joint at once.
+3. **One-pole LPF (`--vla-target-lpf-hz`, default 8 Hz)**: applied
+   to the current `joint_pos_mj` slot after the ramp. Transparent
+   for the natural <3 Hz spectral content of a reach trajectory;
+   attenuates inter-chunk discontinuities. The future window is
+   shipped unfiltered so the deploy's tokeniser sees the policy's
+   intent directly.
+
+Both safety knobs accept `0` to disable.
 
 The four guards matter:
 
-1. **`pose_decoder is not None`** — `--sonic-checkpoint` was supplied
-   *and* loaded successfully. Without this we keep the legacy
-   idle-stand wire so the deploy stays stable.
+1. **`pose_decoder is not None`** — `--motion-token-decoder` (legacy
+   alias: `--sonic-checkpoint`) was supplied *and* loaded successfully.
+   Without this we keep the legacy idle-stand wire so the deploy stays
+   stable.
 2. **`deploy_fresh`** — `x2_debug` is alive, i.e. the deploy is
    running. If the deploy crashes mid-run we go back to idle.
 3. **`chunk_id > 0`** — the cold-start safe-idle chunk is `chunk_id=0`
@@ -333,6 +359,62 @@ at the 50 Hz publisher cadence. Joint velocities are computed by
 finite-differencing the decoded pose trajectory so `joint_vel_mj_future`
 is non-zero (the idle window ships zeros), which materially helps the
 deploy's tokeniser.
+
+### 3.5 Bridge-side proprio assembly
+
+(Added 2026-06-07.) The SONIC `g1_dyn` decoder was trained against
+the IsaacLab `ProprioceptionBuffer`: 10 frames of history per term,
+in the term order
+
+```
+base_ang_vel  (3)    ← body-local, from x2_debug.base_ang_vel
+joint_pos_rel (31)   ← (body_q_mj - default_angles_mj)[IL_TO_MJ_DOF]
+joint_vel     (31)   ← body_dq_mj[IL_TO_MJ_DOF]
+last_action   (31)   ← bridge's own decoded action_il from last tick
+gravity_dir   (3)    ← quat_rotate_inverse(base_quat, [0,0,-1])
+```
+
+`10 * (3 + 31 + 31 + 31 + 3) = 990`. Each term's history block is
+oldest-first inside the flat vector, matching IsaacLab's
+`CircularBuffer.buffer` convention.
+
+The bridge maintains this buffer in
+[`gear_sonic/utils/teleop/sonic_decoder_proprio.py`](../../../gear_sonic/utils/teleop/sonic_decoder_proprio.py).
+Every publish tick:
+
+1. Snapshot the freshest `x2_debug` frame (positions + velocities +
+   quat + angular velocity) — already cached in `_LatestState`.
+2. Permute joint terms from MuJoCo order to IL order via
+   `IL_TO_MJ_DOF`.
+3. Compute projected gravity from `base_quat`.
+4. Append `(gravity, base_ang_vel, jpos_rel_il, jvel_il, last_action_il)`
+   to the buffer.
+5. Flatten + return the 990-D vector.
+
+The `last_action_il` slot is the *bridge's own* most-recent decoded
+residual, not the `x2_debug.last_action` field. The deploy publishes
+`last_action` as `target_pos_mj` (the commanded position after
+`default_angles + action_il * action_scale`), which is the wrong
+quantity for this term — the proprio buffer wants the raw IsaacLab
+residual the policy emitted. The bridge captures it directly from
+its own decoder output and feeds it back next tick, mirroring the
+C++ deploy's `last_action_il_ = action_il` bookkeeping at
+`x2_deploy_onnx_ref.cpp:2680`.
+
+The buffer is *always* ticked when the decoder is configured, even
+on the idle wire (before the first VLA chunk lands). Reason: the
+10-frame history must be populated with real observations by the
+time decoding kicks in, otherwise the first inference consumes a
+broadcast-primed buffer of stale stand observations (still better
+than zeros, but not ideal). The buffer is never reset — even across
+idle↔VLA transitions — because it reflects *observation* history,
+which is continuous across mode changes.
+
+Cold start: on the very first append after process start the buffer
+broadcast-fills all 10 history slots with the first observation
+(IsaacLab `CircularBuffer.buffer` semantics, mirrored in the C++
+deploy via `ResetIdleBuffer`). This avoids the `HISTORY_LEN - 1`
+zero frames the policy would otherwise see.
 
 ---
 
@@ -406,8 +488,10 @@ grep "VLA-pose Δ" "$LOG_DIR/vla-bridge.log"         # is bridge emitting decode
 ```
 
 A non-trivial `|token|` on the first command, a zero `Δ` on the third,
-and no `--sonic-checkpoint` line in the bridge log is the unambiguous
-"loop is open" signature.
+and no `motion-token decoder loaded` line in the bridge log
+(historically printed as `SONIC pose decoder loaded` before the flag
+rename to `--motion-token-decoder`) is the unambiguous "loop is open"
+signature.
 
 ---
 
@@ -522,15 +606,21 @@ from the deploy's `--model` path (`/exported/foo_g1.onnx` →
 If you bypass the wrapper, the matching `live_vla_publish_motion_token`
 flags are:
 
-* `--sonic-checkpoint PATH` — load the SONIC decoder. Without this
-  the body will only track `idle_stand`.
+* `--motion-token-decoder PATH` — load the SONIC decoder. Without
+  this the body will only track `idle_stand`. (Legacy alias:
+  `--sonic-checkpoint PATH` — still accepted, prints a one-shot
+  deprecation warning. The argument is hidden from `--help` now;
+  prefer the canonical name in new scripts.)
 * `--sonic-decoder-device {cpu,cuda:0,...}` — torch device.
 * `--dump-chunks-dir PATH` / `--dump-chunks-every N` — per-inference
   I/O dump.
 
 The full CLI surface is documented inline in
 `gear_sonic/scripts/live_vla_publish_motion_token.py` — see the
-`argparse` block starting around line 1500.
+`argparse` block starting around line 1500. The same flag is exposed
+through the dedicated VLA runtime launcher
+`gear_sonic/scripts/run_x2_vla_runtime.sh` (env: `MOTION_TOKEN_DECODER`),
+which is the recommended entry point for real-robot runs.
 
 ### 7.3 How to tell if it's working
 
@@ -602,7 +692,7 @@ The complete set of files involved in the bridge-side decoder:
 
 ## 9. Limitations & future work
 
-### 9.1 Zero proprio (v0)
+### 9.1 ~~Zero proprio (v0)~~ — fixed 2026-06-07 (v1)
 
 The decoder takes `(token, proprio)` and produces an action. The
 correct proprio is a 990-D vector containing the deploy's recent
@@ -612,18 +702,37 @@ bridge side means subscribing to `x2_debug`, maintaining a history
 ring, and assembling the vector exactly the way the deploy's encoder
 expects.
 
-For v0 we ship `np.zeros((990,), dtype=np.float32)` and accept the
-~0.30 rad RMSE penalty. The body still moves visibly; the goal of v0
-was to confirm the VLA could drive *anything*. v1 should:
+**v0 (deprecated)**: shipped `np.zeros((990,), dtype=np.float32)` and
+accepted the ~0.30 rad RMSE penalty. The body moved visibly, but on
+the first powered real-robot run (2026-06-07) the cumulative effect
+was a ~0.46 rad joint deviation from idle on every chunk regardless
+of VLA intent. With the C++ deploy's `--max-target-dev` clamp
+intentionally disabled in VLA mode (see §5.3), this step input shook
+the motors hard enough that the operator had to E-stop within a
+second of the first chunk.
 
-1. Subscribe the bridge to `x2_debug` (we already do this for `deploy_fresh`).
-2. Maintain a history ring matching the encoder's expected layout.
-3. Fall back to zeros + one-shot warning if history is insufficient.
+**v1 (current)**: see
+[§3.5 Bridge-side proprio assembly](#35-bridge-side-proprio-assembly).
+The bridge now maintains a `ProprioceptionBuffer` in
+`gear_sonic/utils/teleop/sonic_decoder_proprio.py` keyed off the
+`x2_debug` stream (`body_q`, `body_dq`, `base_quat`,
+`base_ang_vel`) plus its own `last_action_il` echo. The 990-D
+vector is rebuilt every publish tick.
 
-`SonicTokenToPoseDecoder.decode_step(token, proprio)` already takes
-proprio explicitly, so this is purely a builder change. There's a
-TODO marker (`assemble_proprio_from_x2_debug`) referenced in the
-module's docstring (lines 47-51).
+The wire path is additionally protected by:
+
+* a 0.5 s ramp-in (`--vla-ramp-in-ticks 25`) on the idle→VLA
+  transition that linearly interpolates the current slot AND the
+  9-slot future window from the last idle pose to the decoded
+  pose;
+* an 8 Hz one-pole LPF (`--vla-target-lpf-hz 8.0`) on the current
+  slot to attenuate inter-chunk discontinuities.
+
+Both knobs accept `0` to disable. Together they take the worst
+single-tick wire jump on the cold-start 0.46 rad chunk from
+~0.46 rad → ~0.018 rad (~25×). See
+`docs/source/references/x2_sonic_runtime_architecture.md` for the
+full data flow.
 
 ### 9.2 No root-pose prediction
 

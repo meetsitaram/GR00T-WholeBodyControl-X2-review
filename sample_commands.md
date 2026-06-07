@@ -39,6 +39,46 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
 ```
 
+- real-robot autonomous VLA (laptop-side bridge only; assumes
+  `x2_pc2_daemons.sh start` is already running on PC2 — same SONIC
+  deploy you use for teleop and recording).
+
+  One command. Preflight (PC2 ping + x2_debug + cameras + model files
+  + bridge python) runs inside the launcher; auto-SSHes to PC2 to
+  start the camera bridge if it's silent. See
+  [`docs/source/tutorials/x2_vla_runtime.md`](docs/source/tutorials/x2_vla_runtime.md)
+  for the full operator runbook and
+  [`docs/source/references/x2_sonic_runtime_architecture.md`](docs/source/references/x2_sonic_runtime_architecture.md)
+  for how this launcher relates to the teleop + recording stack.
+
+```sh
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --pc2-host 192.168.86.32 \
+    --model data/checkpoints/x2_grab_a_drink_n17_30k_v1/checkpoint-25000 \
+    --motion-token-decoder $HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "grab the can from the table"
+```
+
+> Legacy alias: `--sonic-checkpoint` / `SONIC_CHECKPOINT` still works
+> (one-shot deprecation warning printed). Use
+> `--motion-token-decoder` going forward.
+
+Knobs you'll actually touch (matching `--FLAG VALUE` form — env-var
+names are accepted as fallbacks, see the full runbook):
+
+| Flag                          | Default                                                       | What it does                                                    |
+| ----------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------- |
+| `--model PATH`                | required                                                      | Fine-tuned GR00T-N1.7 checkpoint dir (`model.safetensors` + `experiment_cfg/` + `processor/`) |
+| `--motion-token-decoder PATH` | auto-resolve next to `--model`, fallback 25k canonical        | Body-pose decoder `.pt`; empty = body holds idle, fingers move only. Legacy alias: `--sonic-checkpoint`. |
+| `--prompt STR`                | `"grab a drink"`                                              | Language instruction. Use exactly the training prompt for first runs |
+| `--max-duration SEC`          | `30`                                                          | Increase only after a successful bounded run                    |
+| `--pc2-host HOST`             | `10.0.1.41` (wired LAN)                                       | WiFi address differs — check `x2_pc2_daemons.sh print-env`     |
+| `--modality-config PATH`      | `gear_sonic/data/x2_modality_config_omnihand_stereo.py`       | Uses `stereo_left` + `stereo_right` from PC2 cameras            |
+| `--bridge-py PATH`            | `~/miniconda3/envs/env_isaaclab/bin/python`                   | Override for non-Blackwell GPUs                                 |
+| `--inference-min-period-s S`  | `0.8`                                                         | Matches the 40-step chunk horizon at 50 Hz                      |
+| `--skip-preflight`            | off                                                           | Bypass connectivity probes. Do NOT use on a powered robot.      |
+| `--no-cameras-autostart`      | off                                                           | Skip the auto-SSH `x2_pc2_cameras.sh serve` if you manage the camera bridge manually |
+
 Top-level cheat-sheet for the X2 + Quest 3 teleop / record / replay
 loop. Defaults assume a `uv venv` at `.venv/` and the dataset
 landing under `data/lerobot/`.
