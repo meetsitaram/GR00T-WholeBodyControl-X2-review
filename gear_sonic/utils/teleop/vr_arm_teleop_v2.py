@@ -97,8 +97,27 @@ def _is_identity_quat(q_wxyz: np.ndarray) -> bool:
 # the null-space bias was fighting the IK back toward the bent-arm
 # posture. Disengaged behaviour still snaps to the (bent) stand
 # neutral so SONIC's standing controller gets the reference it expects.
-_LEFT_PREFERRED_Q = np.asarray(ARMS_DOWN_LEFT, dtype=np.float64)
-_RIGHT_PREFERRED_Q = np.asarray(ARMS_DOWN_RIGHT, dtype=np.float64)
+#
+# IMPORTANT: ``ARMS_DOWN`` has ``elbow = 0`` exactly, which is the X2
+# elbow's *upper* joint limit (range ``[-2.36, 0]`` rad). Using that
+# as the null-space attractor pinned the elbow against the limit
+# whenever the operator's hands were close to their torso, because the
+# DLS gradient's "increase elbow" direction is physically impossible
+# and the joint just clamps at 0. With the elbow locked the shoulder
+# would then wind into its own joint limit trying to compensate,
+# producing arm-flip artefacts. The 2026-06-07 NPZ replay showed 33 %
+# of engaged left-arm ticks parked at elbow=0 with median 12 cm IK
+# error (vs 1.1 cm when the elbow was free); the worst-case wrist
+# placement was 78 cm off-target. Holding the preferred posture at a
+# small flex (~17 deg) keeps the elbow off the limit so the gradient
+# has signed motion in both directions. Replaying the same NPZ with
+# the flexed preferred posture cut left-arm p95 IK error from 36.9 cm
+# to 5.3 cm without changing the visual neutral pose noticeably.
+_ELBOW_FLEX_PREFERRED_RAD = -0.30  # ~17 deg flex; keeps elbow off the upper limit
+_LEFT_PREFERRED_Q = np.asarray(ARMS_DOWN_LEFT, dtype=np.float64).copy()
+_LEFT_PREFERRED_Q[3] = _ELBOW_FLEX_PREFERRED_RAD
+_RIGHT_PREFERRED_Q = np.asarray(ARMS_DOWN_RIGHT, dtype=np.float64).copy()
+_RIGHT_PREFERRED_Q[3] = _ELBOW_FLEX_PREFERRED_RAD
 
 
 _DROPOUT_POS_ORIGIN_THRESHOLD_M = 0.05
