@@ -1,20 +1,8 @@
-"""Surgical wrist-/arm-target override for X2 SONIC deploy.
+"""Surgical wrist-target override for the four broken X2 wrist DOFs.
 
 This is a Python port of
 ``gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/wrist_bypass.hpp``;
 keep the two implementations in lock-step.
-
-Two override sets:
-
-- :data:`BYPASSED_WRIST_MJ_DOFS` (4 DOFs, default for
-  :func:`apply_wrist_bypass`): MJ {20, 21, 27, 28} = left/right
-  wrist_pitch + wrist_roll. Used by ``--wrist-bypass=ik`` on the deploy.
-- :data:`BYPASSED_ARM_MJ_DOFS` (14 DOFs): MJ 15..28 = both arms in full
-  (shoulders + elbows + wrist_yaw + wrist_pitch + wrist_roll). Used by
-  ``--wrist-bypass=ik-arms`` -- VR IK drives both arms direct to motors
-  while SONIC keeps controlling legs+waist+head for balance. Call
-  :func:`apply_arm_bypass` (or pass ``bypassed_dofs=BYPASSED_ARM_MJ_DOFS``
-  to :func:`apply_wrist_bypass`).
 
 Why the bypass exists
 =====================
@@ -51,7 +39,7 @@ from typing import Sequence, Tuple
 import numpy as np
 
 
-# MJ-order joint indices the wrist-only bypass overrides:
+# MJ-order joint indices the bypass overrides:
 #   20 = left_wrist_pitch_joint
 #   21 = left_wrist_roll_joint
 #   27 = right_wrist_pitch_joint
@@ -60,23 +48,6 @@ import numpy as np
 # IMPORTANT: keep in sync with ``policy_parameters.hpp``'s
 # ``mujoco_joint_names`` ordering.
 BYPASSED_WRIST_MJ_DOFS: Tuple[int, ...] = (20, 21, 27, 28)
-
-# MJ-order joint indices the full-arm bypass overrides (matches
-# ``kBypassedArmMjDofs`` in ``wrist_bypass.hpp``, used by the C++
-# deploy binary when ``--wrist-bypass=ik-arms``):
-#   15..21 = left  shoulder_pitch, shoulder_roll, shoulder_yaw,
-#            elbow, wrist_yaw, wrist_pitch, wrist_roll
-#   22..28 = right shoulder_pitch, shoulder_roll, shoulder_yaw,
-#            elbow, wrist_yaw, wrist_pitch, wrist_roll
-#
-# This is the "operator drives both arms straight to the motors while
-# SONIC keeps legs+waist+head" mode. See
-# ``docs/source/user_guide/milestones/2026-06-08_arm_bypass_v1.md`` for
-# the design notes + stability caveats.
-BYPASSED_ARM_MJ_DOFS: Tuple[int, ...] = (
-    15, 16, 17, 18, 19, 20, 21,
-    22, 23, 24, 25, 26, 27, 28,
-)
 
 # X2 has 31 DOF in the SONIC MJ-order vector.
 NUM_DOFS: int = 31
@@ -151,17 +122,3 @@ def wrist_bypass_max_delta(
     ref_arr = np.asarray(ik_ref_pos_mj)
     deltas = np.abs(target_arr[list(bypassed_dofs)] - ref_arr[list(bypassed_dofs)])
     return float(deltas.max()) if deltas.size > 0 else 0.0
-
-
-def apply_arm_bypass(
-    target_pos_mj: np.ndarray,
-    ik_ref_pos_mj: Sequence[float] | np.ndarray,
-) -> float:
-    """Full-arm bypass alias: override the 14 arm DOFs (MJ 15..28).
-
-    Mirrors ``ApplyArmBypass`` in ``wrist_bypass.hpp``. Thin wrapper
-    around :func:`apply_wrist_bypass` with ``BYPASSED_ARM_MJ_DOFS``.
-    """
-    return apply_wrist_bypass(
-        target_pos_mj, ik_ref_pos_mj, bypassed_dofs=BYPASSED_ARM_MJ_DOFS
-    )

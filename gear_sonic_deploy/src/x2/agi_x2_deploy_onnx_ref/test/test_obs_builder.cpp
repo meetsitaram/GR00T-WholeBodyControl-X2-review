@@ -395,89 +395,6 @@ void TestWristBypassZeroDeltaWhenAligned()
   std::cout << "  ok TestWristBypassZeroDeltaWhenAligned\n";
 }
 
-// ---------------------------------------------------------------------------
-// Arm bypass: pin the 14-DOF override set documented in
-// include/wrist_bypass.hpp (MJ 15..28 = both shoulders + elbows +
-// wrist_yaw + wrist_pitch + wrist_roll). Asserts the right slots, only
-// those slots, and a truthful max-delta return value -- same contract as
-// the wrist-bypass tests, just over the full arm.
-// ---------------------------------------------------------------------------
-void TestArmBypassOverridesExactly14Slots()
-{
-  // Arrange: sentinel-fill the target_pos_mj so any accidental writes
-  // outside the 14 arm slots are detectable. Per-slot unique reference
-  // (slot * 0.01 rad) lets us verify each landed in the right place.
-  std::array<double, NUM_DOFS> target_pos_mj;
-  target_pos_mj.fill(1.234);
-
-  ReferenceFrame ref{};
-  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
-    ref.joint_pos_mj[mj] = static_cast<double>(mj) * 0.01;
-    ref.joint_vel_mj[mj] = 0.0;
-  }
-  ref.root_quat_xyzw = {0.0, 0.0, 0.0, 1.0};
-
-  const double max_delta = ApplyArmBypass(target_pos_mj, ref);
-
-  // Assert (1): bypassed-arm index set matches the documented MJ table.
-  EXPECT(kBypassedArmMjDofs.size() == 14,
-         "kBypassedArmMjDofs must have exactly 14 entries");
-  // Left arm slots 15..21 in order.
-  EXPECT(kBypassedArmMjDofs[0]  == 15, "slot 0 must be left_shoulder_pitch (MJ 15)");
-  EXPECT(kBypassedArmMjDofs[1]  == 16, "slot 1 must be left_shoulder_roll  (MJ 16)");
-  EXPECT(kBypassedArmMjDofs[2]  == 17, "slot 2 must be left_shoulder_yaw   (MJ 17)");
-  EXPECT(kBypassedArmMjDofs[3]  == 18, "slot 3 must be left_elbow          (MJ 18)");
-  EXPECT(kBypassedArmMjDofs[4]  == 19, "slot 4 must be left_wrist_yaw      (MJ 19)");
-  EXPECT(kBypassedArmMjDofs[5]  == 20, "slot 5 must be left_wrist_pitch    (MJ 20)");
-  EXPECT(kBypassedArmMjDofs[6]  == 21, "slot 6 must be left_wrist_roll     (MJ 21)");
-  // Right arm slots 22..28 in order.
-  EXPECT(kBypassedArmMjDofs[7]  == 22, "slot 7 must be right_shoulder_pitch(MJ 22)");
-  EXPECT(kBypassedArmMjDofs[8]  == 23, "slot 8 must be right_shoulder_roll (MJ 23)");
-  EXPECT(kBypassedArmMjDofs[9]  == 24, "slot 9 must be right_shoulder_yaw  (MJ 24)");
-  EXPECT(kBypassedArmMjDofs[10] == 25, "slot 10 must be right_elbow        (MJ 25)");
-  EXPECT(kBypassedArmMjDofs[11] == 26, "slot 11 must be right_wrist_yaw    (MJ 26)");
-  EXPECT(kBypassedArmMjDofs[12] == 27, "slot 12 must be right_wrist_pitch  (MJ 27)");
-  EXPECT(kBypassedArmMjDofs[13] == 28, "slot 13 must be right_wrist_roll   (MJ 28)");
-
-  // Assert (2): every arm slot now carries the IK reference; every leg /
-  // waist / head slot is untouched (== sentinel). This is what guarantees
-  // SONIC keeps balance control while VR IK owns the arms.
-  for (std::size_t mj = 0; mj < NUM_DOFS; ++mj) {
-    const bool is_bypassed = (mj >= 15 && mj <= 28);
-    if (is_bypassed) {
-      EXPECT_NEAR(target_pos_mj[mj], ref.joint_pos_mj[mj], 1e-12);
-    } else {
-      EXPECT_NEAR(target_pos_mj[mj], 1.234, 1e-12);
-    }
-  }
-
-  // Assert (3): max_delta is the largest |sentinel - ref| across the
-  // bypassed slots. With sentinel=1.234 and ref values {0.15..0.28} the
-  // worst case is slot 15: |1.234 - 0.15| = 1.084.
-  EXPECT_NEAR(max_delta, 1.234 - 0.15, 1e-12);
-
-  std::cout << "  ok TestArmBypassOverridesExactly14Slots\n";
-}
-
-// ---------------------------------------------------------------------------
-// Arm bypass is a STRICT SUPERSET of wrist bypass: every wrist DOF that
-// the 4-slot mode overrides must also be present in the 14-slot mode.
-// Catches a maintainer error where someone re-orders the arm array and
-// accidentally drops one of the wrist slots, silently regressing the
-// wrist-pitch/-roll fix that has been in production since v2.
-// ---------------------------------------------------------------------------
-void TestArmBypassIsSupersetOfWristBypass()
-{
-  for (const int wrist_mj : kBypassedWristMjDofs) {
-    bool found = false;
-    for (const int arm_mj : kBypassedArmMjDofs) {
-      if (arm_mj == wrist_mj) { found = true; break; }
-    }
-    EXPECT(found, "every kBypassedWristMjDofs entry must also be in kBypassedArmMjDofs");
-  }
-  std::cout << "  ok TestArmBypassIsSupersetOfWristBypass\n";
-}
-
 int main()
 {
   std::cout << "agi_x2_deploy_onnx_ref unit tests\n";
@@ -488,8 +405,6 @@ int main()
   TestPklMotionYawAnchor();
   TestWristBypassOverridesExactly4Slots();
   TestWristBypassZeroDeltaWhenAligned();
-  TestArmBypassOverridesExactly14Slots();
-  TestArmBypassIsSupersetOfWristBypass();
   std::cout << "all OK\n";
   return 0;
 }

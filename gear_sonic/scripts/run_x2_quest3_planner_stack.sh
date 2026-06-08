@@ -326,11 +326,6 @@ SIM_CAM_TRACK_BODY="pelvis"
 SIM_CAM_DISTANCE="3.5"
 SIM_CAM_ELEVATION="-12"
 SIM_CAM_AZIMUTH="135"
-# --wrist-bypass {off,ik,ik-arms} forwarded to the deploy binary.
-# 'ik' (default) overrides 4 wrist DOFs with the IK reference; 'ik-arms'
-# extends that to the full 14-DOF arm so VR IK drives both arms direct
-# to the motors while SONIC still controls legs+waist+head for balance.
-# See docs/source/user_guide/milestones/2026-06-08_arm_bypass_v1.md.
 WRIST_BYPASS="ik"
 WARMUP_QUIET_STAND_S="2.0"
 RATE="50"
