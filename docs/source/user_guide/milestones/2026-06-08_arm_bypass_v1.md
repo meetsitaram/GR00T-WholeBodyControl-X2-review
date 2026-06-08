@@ -60,13 +60,27 @@ The `agi_x2_deploy_onnx_ref` binary is the same code in both targets - only the 
 
 ### Sim rollout first (recommended)
 
-```bash
-# Inside docker_x2
-cd ~/x2_ws
-colcon build --packages-select agi_x2_deploy_onnx_ref --symlink-install
-source install/setup.bash
+The docker_x2 sim image already has a built binary cached in
+`/workspace/sonic/gear_sonic_deploy/install/agi_x2_deploy_onnx_ref` from
+the initial build session (commit `70afdb3`, ~10s incremental colcon),
+and the CLI parser was verified end-to-end: `--wrist-bypass ik-arms`
+accepted, garbage rejected with the updated error message. To re-build
+after any C++ changes:
 
-# Then run the planner stack against the rebuilt binary
+```bash
+# From the host, inside docker_x2
+cd gear_sonic_deploy/docker_x2
+docker compose run --rm x2sim bash -c \
+    "source /opt/ros/humble/setup.bash && \
+     cd /workspace/sonic/gear_sonic_deploy && \
+     colcon build --packages-select agi_x2_deploy_onnx_ref \
+         --base-paths src/x2/agi_x2_deploy_onnx_ref \
+         --cmake-args -DONNXRUNTIME_ROOT=/opt/onnxruntime"
+```
+
+Then run the planner stack against the rebuilt binary:
+
+```bash
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --wrist-bypass ik-arms
 ```
 
