@@ -8,6 +8,16 @@
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
     --lock-head-straight
 
+### start sonic on PC2 with FULL-ARM bypass (VR IK arms direct to motors, legs/waist/head via SONIC)
+# See docs/source/user_guide/milestones/2026-06-08_arm_bypass_v1.md.
+# Rebuild the deploy binary on PC2 first if not already rebuilt.
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
+    --lock-head-straight \
+    --wrist-bypass ik-arms
+
 ### stop sonic
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
 

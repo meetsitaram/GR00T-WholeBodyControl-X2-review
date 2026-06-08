@@ -597,7 +597,17 @@ struct CliArgs {
   // (corr ~0.8). Default off to preserve sim-to-real fidelity for the
   // motion-file replay path; record_x2_dataset.sh flips it to ``ik``.
   // ────────────────────────────────────────────────────────────────────
-  enum class WristBypass { Off, Ik };
+  //
+  // ``ik-arms`` extends ``ik`` to the FULL 14-DOF arm (shoulder + elbow +
+  // wrist_yaw + wrist_pitch + wrist_roll, both sides, MJ indices 15..28).
+  // Use it when you want VR IK to drive both arms straight to the motors
+  // while SONIC keeps legs + waist + head under policy control for
+  // balance. The mechanism is identical to ``ik`` -- override sits BEFORE
+  // the safety stack, tokenizer obs is unchanged, ``--input-type=zmq`` is
+  // required -- only the bypassed slot set grows from 4 to 14. See
+  // wrist_bypass.hpp and docs/source/user_guide/milestones/
+  // 2026-06-08_arm_bypass_v1.md for the design notes + stability caveats.
+  enum class WristBypass { Off, Ik, IkArms };
   WristBypass wrist_bypass      = WristBypass::Off;
 };
 
@@ -863,19 +873,24 @@ void PrintUsage()
       << "                             in the packed-binary wire format consumed by\n"
       << "                             gear_sonic/scripts/dump_x2_debug.py. 0 disables.\n"
       << "  --zmq-debug-topic TOPIC    Topic prefix for telemetry frames (default 'x2_debug').\n"
-      << "  --wrist-bypass MODE        {off, ik} (default 'off'). When 'ik' AND\n"
-      << "                             --input-type=zmq, OnControl overwrites\n"
+      << "  --wrist-bypass MODE        {off, ik, ik-arms} (default 'off'). When 'ik'\n"
+      << "                             AND --input-type=zmq, OnControl overwrites\n"
       << "                             target_pos_mj for the 4 broken wrist DOFs\n"
       << "                             (left/right wrist_pitch + wrist_roll, MJ\n"
       << "                             indices {20,21,27,28}) with the latest IK\n"
       << "                             reference from the ZMQ pose feed BEFORE the\n"
-      << "                             safety stack. SONIC still drives the other 27\n"
-      << "                             DOFs (legs, waist, shoulders, elbows,\n"
-      << "                             wrist_yaw, head). Use 'ik' for VR teleop /\n"
+      << "                             safety stack. 'ik-arms' extends the override\n"
+      << "                             to the FULL 14-DOF arm (shoulders + elbows +\n"
+      << "                             wrist_yaw + wrist_pitch + wrist_roll, MJ\n"
+      << "                             indices 15..28); SONIC still drives legs,\n"
+      << "                             waist, and head. Use 'ik' for VR teleop /\n"
       << "                             VLA dataset recording where SONIC's wrist\n"
       << "                             attractor masks the operator's hand pose;\n"
-      << "                             keep 'off' for sim-to-real fidelity tests so\n"
-      << "                             the policy's own commands reach every joint.\n"
+      << "                             use 'ik-arms' when SONIC's whole-arm policy\n"
+      << "                             output is also fighting the operator (e.g.\n"
+      << "                             slow workspace-corner targets); keep 'off'\n"
+      << "                             for sim-to-real fidelity tests so the\n"
+      << "                             policy's own commands reach every joint.\n"
       << "  --pose-ref-stale-s SEC     Split-topology safety (--input-type=zmq).\n"
       << "                             Pose-ref age (s) at which the deploy trips\n"
       << "                             into SAFE_IDLE (legs locked, default angles,\n"
@@ -1013,10 +1028,11 @@ CliArgs ParseCli(int argc, char** argv)
       a.zmq_debug_topic = next("--zmq-debug-topic");
     else if (s == "--wrist-bypass") {
       const std::string v = next("--wrist-bypass");
-      if      (v == "off") a.wrist_bypass = CliArgs::WristBypass::Off;
-      else if (v == "ik")  a.wrist_bypass = CliArgs::WristBypass::Ik;
+      if      (v == "off")     a.wrist_bypass = CliArgs::WristBypass::Off;
+      else if (v == "ik")      a.wrist_bypass = CliArgs::WristBypass::Ik;
+      else if (v == "ik-arms") a.wrist_bypass = CliArgs::WristBypass::IkArms;
       else throw std::runtime_error(
-          "--wrist-bypass must be 'off' or 'ik', got: " + v);
+          "--wrist-bypass must be 'off', 'ik', or 'ik-arms', got: " + v);
     }
     else if (s == "--pose-ref-stale-s")
       a.pose_ref_stale_s = std::stod(next("--pose-ref-stale-s"));
@@ -1045,10 +1061,13 @@ CliArgs ParseCli(int argc, char** argv)
     throw std::runtime_error(
         "--input-type must be 'motion_file' or 'zmq', got: " + a.input_type);
   }
-  if (a.wrist_bypass == CliArgs::WristBypass::Ik && a.input_type != "zmq") {
+  if ((a.wrist_bypass == CliArgs::WristBypass::Ik
+       || a.wrist_bypass == CliArgs::WristBypass::IkArms)
+      && a.input_type != "zmq") {
     throw std::runtime_error(
-        "--wrist-bypass=ik requires --input-type=zmq (no IK reference is "
-        "available on the motion_file path; the bypass would be a no-op)");
+        "--wrist-bypass={ik,ik-arms} requires --input-type=zmq (no IK "
+        "reference is available on the motion_file path; the bypass "
+        "would be a no-op)");
   }
 
   // Reject non-positive PD scales. Zero would silently disable a joint
@@ -2710,18 +2729,30 @@ class X2Deploy {
       target_pos_mj[mj] = default_angles[mj] + action_il[il] * x2_action_scale[mj];
     }
 
-    // ---- Wrist bypass: honour IK reference for the 4 broken wrist DOFs -----
+    // ---- Wrist / arm bypass: honour IK reference for selected DOFs --------
     // CLI-gated; preserves sim-to-real fidelity on the motion-file replay
     // path when --wrist-bypass=off (default). Override sits BEFORE the
     // safety stack so soft-start blend, --max-target-dev clamp, and the
     // tilt-trip force-to-default branch all apply uniformly. Loop body
     // lives in include/wrist_bypass.hpp so the unit test can exercise it
     // without a ROS 2 / ONNX runtime in scope.
-    if (cli_.wrist_bypass == CliArgs::WristBypass::Ik
+    //
+    //   --wrist-bypass=ik       -> 4 wrist DOFs (MJ {20,21,27,28})
+    //   --wrist-bypass=ik-arms  -> 14 arm DOFs (MJ 15..28)
+    //
+    // wrist_bypass_tick_count_ / wrist_bypass_max_delta_ are reused for
+    // both modes; the periodic status line label stays "wrist_bypass_*"
+    // for backward compatibility but the underlying number reflects the
+    // selected slot set.
+    if ((cli_.wrist_bypass == CliArgs::WristBypass::Ik
+         || cli_.wrist_bypass == CliArgs::WristBypass::IkArms)
         && zmq_pose_source_ != nullptr
         && zmq_pose_source_->has_body_reference()) {
       const auto ref_frame = zmq_pose_source_->Sample(policy_time);
-      const double max_delta = ApplyWristBypass(target_pos_mj, ref_frame);
+      const double max_delta =
+          (cli_.wrist_bypass == CliArgs::WristBypass::IkArms)
+              ? ApplyArmBypass(target_pos_mj, ref_frame)
+              : ApplyWristBypass(target_pos_mj, ref_frame);
       ++wrist_bypass_tick_count_;
       if (max_delta > wrist_bypass_max_delta_) wrist_bypass_max_delta_ = max_delta;
     }
@@ -3212,14 +3243,19 @@ class X2Deploy {
   std::uint64_t                     action_clip_tick_count_   = 0;
   double                            action_clip_max_pre_clip_ = 0.0;
 
-  // Wrist-bypass diagnostics. ``wrist_bypass_tick_count_`` increments once
-  // per tick on which the override actually fired (i.e. --wrist-bypass=ik
-  // AND a body-bearing ZMQ frame was available). ``wrist_bypass_max_delta_``
-  // tracks the largest |policy_target - ik_target| across the bypassed
-  // wrist DOFs over the whole run, so the operator can see at a glance how
-  // hard SONIC is being overruled (large numbers are normal -- they're
-  // exactly why the bypass exists). Both reported on the periodic status
-  // line. Stay at 0/0 when --wrist-bypass=off.
+  // Wrist-/arm-bypass diagnostics. ``wrist_bypass_tick_count_`` increments
+  // once per tick on which the override actually fired (i.e.
+  // --wrist-bypass={ik,ik-arms} AND a body-bearing ZMQ frame was
+  // available). ``wrist_bypass_max_delta_`` tracks the largest
+  // |policy_target - ik_target| across the bypassed slot set over the
+  // whole run -- for --wrist-bypass=ik that's the 4 wrist DOFs; for
+  // --wrist-bypass=ik-arms it's the full 14-DOF arm. Operator can see at
+  // a glance how hard SONIC is being overruled (large numbers are normal
+  // -- they're exactly why the bypass exists). Both reported on the
+  // periodic status line. Stay at 0/0 when --wrist-bypass=off. The
+  // metric name keeps the legacy "wrist_bypass_*" prefix for backward
+  // compatibility with log parsers; the meaning now depends on the CLI
+  // mode.
   std::uint64_t                     wrist_bypass_tick_count_  = 0;
   double                            wrist_bypass_max_delta_   = 0.0;
 

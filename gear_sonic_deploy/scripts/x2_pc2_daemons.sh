@@ -180,7 +180,14 @@ X2_TUNING="${X2_TUNING:-}"
 # Wrist-bypass mode (C++ binary --wrist-bypass): 'ik' overwrites the
 # policy's wrist commands with the laptop-computed inverse-kinematics
 # targets when --input-type=zmq, which is what every Quest-3-driven
-# split-topology run wants. Set to 'off' to fall back to pure policy.
+# split-topology run wants. 'ik-arms' extends the override to the FULL
+# 14-DOF arm (shoulders + elbows + wrist_yaw + wrist_pitch + wrist_roll,
+# both sides) so VR IK drives the arms directly to the motors while
+# SONIC keeps controlling legs+waist+head for balance -- use this when
+# the policy's whole-arm output is fighting the operator on slow
+# workspace-corner targets (see milestone
+# docs/source/user_guide/milestones/2026-06-08_arm_bypass_v1.md).
+# Set to 'off' to fall back to pure policy.
 X2_WRIST_BYPASS="${X2_WRIST_BYPASS:-ik}"
 # When --lock-head-straight is set, pass --max-target-dev-head to the
 # deploy so the policy head target is clamped near the trained default
@@ -263,7 +270,7 @@ Per-command flags (after the subcommand):
              [--prefix DIR] [--pc2-ws W] [--pc2-venv V]
              [--pc2-onnxruntime O] [--pc2-deploy-sh PATH] [--aimdk-prefix A]
              [--model PATH] [--tuning PATH] [--no-sync-tuning]
-             [--wrist-bypass {ik,off}]
+             [--wrist-bypass {ik,ik-arms,off}]
              [--lock-head-straight]
              [--no-confirm] [--no-monitor] [--no-hand] [--no-pose-proxy]
              [--pose-proxy-port N] [--pose-proxy-stale-ms MS]

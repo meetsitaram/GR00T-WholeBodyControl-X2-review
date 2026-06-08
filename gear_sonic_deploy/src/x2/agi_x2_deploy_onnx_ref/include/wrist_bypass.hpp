@@ -38,7 +38,7 @@
 
 namespace agi_x2 {
 
-/// MJ-order joint indices the bypass overrides:
+/// MJ-order joint indices the wrist-only bypass overrides:
 ///   20 = left_wrist_pitch
 ///   21 = left_wrist_roll
 ///   27 = right_wrist_pitch
@@ -51,25 +51,67 @@ namespace agi_x2 {
 /// invariant on top of the index numbers themselves).
 inline constexpr std::array<int, 4> kBypassedWristMjDofs = {20, 21, 27, 28};
 
+/// MJ-order joint indices the full-arm bypass overrides (used by
+/// ``--wrist-bypass=ik-arms``):
+///   15..21 = left  shoulder_pitch, shoulder_roll, shoulder_yaw,
+///            elbow, wrist_yaw, wrist_pitch, wrist_roll
+///   22..28 = right shoulder_pitch, shoulder_roll, shoulder_yaw,
+///            elbow, wrist_yaw, wrist_pitch, wrist_roll
+///
+/// This is the "operator drives both arms straight to the motors while
+/// SONIC keeps legs+waist+head" mode. The override semantics are
+/// identical to ``kBypassedWristMjDofs`` -- only the set of slots
+/// changes -- so the safety stack (soft-start blend, ``--max-target-dev``
+/// clamp, tilt-trip force-to-default) and the tokenizer obs flow are
+/// unchanged. The leg policy is still conditioned on the IK reference
+/// for all 31 DOFs (we lie about nothing in tokenizer obs; only the
+/// FINAL per-tick PD target gets the override).
+///
+/// IMPORTANT: keep in sync with ``policy_parameters.hpp``'s
+/// ``mujoco_joint_names`` ordering.
+inline constexpr std::array<int, 14> kBypassedArmMjDofs = {
+    15, 16, 17, 18, 19, 20, 21,
+    22, 23, 24, 25, 26, 27, 28,
+};
+
 /// Override ``target_pos_mj[mj]`` with ``ref.joint_pos_mj[mj]`` for every
-/// joint index in ``kBypassedWristMjDofs``. Returns the largest absolute
-/// delta between the original target and the IK reference across the
-/// overridden slots, so the deploy can surface it on the periodic status
-/// line as a "how hard is SONIC being overruled" indicator.
+/// joint index in ``bypassed_dofs``. Returns the largest absolute delta
+/// between the original target and the IK reference across the
+/// overridden slots, so the deploy can surface it on the periodic
+/// status line as a "how hard is SONIC being overruled" indicator.
 ///
 /// All other slots of ``target_pos_mj`` are left untouched. The function
 /// has no global state; safe to call from the deploy's 50 Hz control
 /// loop and from unit tests interchangeably.
-inline double ApplyWristBypass(std::array<double, NUM_DOFS>& target_pos_mj,
-                               const ReferenceFrame&         ref)
+template <std::size_t N>
+inline double ApplyIkBypass(std::array<double, NUM_DOFS>& target_pos_mj,
+                            const ReferenceFrame&         ref,
+                            const std::array<int, N>&     bypassed_dofs)
 {
   double max_delta = 0.0;
-  for (const int mj : kBypassedWristMjDofs) {
+  for (const int mj : bypassed_dofs) {
     const double delta = std::fabs(target_pos_mj[mj] - ref.joint_pos_mj[mj]);
     if (delta > max_delta) max_delta = delta;
     target_pos_mj[mj] = ref.joint_pos_mj[mj];
   }
   return max_delta;
+}
+
+/// Wrist-only bypass (4 DOFs: left/right wrist_pitch + wrist_roll).
+/// Thin wrapper around ``ApplyIkBypass`` kept for backward compatibility
+/// with the unit tests and any out-of-tree callers.
+inline double ApplyWristBypass(std::array<double, NUM_DOFS>& target_pos_mj,
+                               const ReferenceFrame&         ref)
+{
+  return ApplyIkBypass(target_pos_mj, ref, kBypassedWristMjDofs);
+}
+
+/// Full-arm bypass (14 DOFs: every shoulder/elbow/wrist slot, both sides).
+/// Used by ``--wrist-bypass=ik-arms``.
+inline double ApplyArmBypass(std::array<double, NUM_DOFS>& target_pos_mj,
+                             const ReferenceFrame&         ref)
+{
+  return ApplyIkBypass(target_pos_mj, ref, kBypassedArmMjDofs);
 }
 
 }  // namespace agi_x2
