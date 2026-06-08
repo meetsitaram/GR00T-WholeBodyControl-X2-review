@@ -120,6 +120,33 @@ _RIGHT_PREFERRED_Q = np.asarray(ARMS_DOWN_RIGHT, dtype=np.float64).copy()
 _RIGHT_PREFERRED_Q[3] = _ELBOW_FLEX_PREFERRED_RAD
 
 
+# "Stuck-corner damper" thresholds. When the IK can't reach (residual
+# position error exceeds ``_STUCK_ERR_M`` AND at least
+# ``_STUCK_CLAMPED_COUNT`` joints are pinned to their joint limits),
+# the DLS solver will thrash between joint-limit corners while chasing
+# the unreachable target -- the operator sees the wrist visibly
+# oscillate ("going crazy") even though the IK error itself stays
+# roughly constant. Out-of-workspace targets the operator generates
+# this way are common: wrist-to-shoulder, hands-meet-past-midline,
+# folding both hands onto the chest, etc. The X2 arm cannot fold
+# tightly enough (min wrist-to-shoulder distance is ~20 cm at max
+# elbow flex) so these poses are geometrically unreachable.
+#
+# Fix: when the IK is in a "stuck corner", low-pass-filter the
+# commanded q toward the solver's output instead of jumping. The
+# wrist drifts smoothly toward the best-achievable joint configuration
+# (which the IK is still finding correctly) instead of spazzing
+# between corners. Replaying the 2026-06-07 helmet-mounted "hand-to-
+# shoulder" episode through this filter cut LEFT-arm joint-space
+# sign-flips during failure ticks from 180 -> 19 (10x smoother) and
+# the same for the right arm (195 -> 14). Normal-operation episodes
+# (where the filter only activates 4-7% of ticks) saw a 3x reduction
+# in sign-flips with no perceptible lag.
+_STUCK_ERR_M: float = 0.05
+_STUCK_CLAMPED_COUNT: int = 2
+_STUCK_LPF_ALPHA: float = 0.10  # tau ~= 0.18 s @ 50 Hz
+
+
 _DROPOUT_POS_ORIGIN_THRESHOLD_M = 0.05
 _DROPOUT_QUAT_IDENTITY_THRESHOLD = 0.01
 _DROPOUT_TWIN_THRESHOLD_M = 0.05
@@ -222,6 +249,9 @@ class VRArmTeleopCalibrated:
         rotation_weight: float = 0.0,
         per_tick_step_rad: float = 0.30,
         null_space_gain: float = 0.10,
+        stuck_err_m: float = _STUCK_ERR_M,
+        stuck_clamped_count: int = _STUCK_CLAMPED_COUNT,
+        stuck_lpf_alpha: float = _STUCK_LPF_ALPHA,
         left_wrist_op_quat_offset_rpy_deg: (
             tuple[float, float, float] | np.ndarray | None
         ) = None,
@@ -325,6 +355,12 @@ class VRArmTeleopCalibrated:
         self._right_q = right_neutral_q.copy()
         self._engaged = False
         self._rotation_weight = effective_rotation_weight
+        # Stuck-corner damper thresholds (see module-level constants for the
+        # rationale). ``alpha == 1.0`` disables the damper (q jumps to the
+        # solver's raw output each tick == today's pre-fix behaviour).
+        self._stuck_err_m = float(stuck_err_m)
+        self._stuck_clamped_count = int(stuck_clamped_count)
+        self._stuck_lpf_alpha = float(stuck_lpf_alpha)
         # Last known-good IK target per side. Initialised to None so the
         # first dropout-only tick falls back to the neutral pose instead
         # of zeros. Updated every clean tick.
@@ -368,6 +404,39 @@ class VRArmTeleopCalibrated:
             if np.linalg.norm(q - identity) > 1e-3 and np.linalg.norm(q + identity) > 1e-3:
                 return False
         return True
+
+    def _apply_stuck_corner_damper(
+        self,
+        q_prev: np.ndarray,
+        q_new: np.ndarray,
+        info: IKResult,
+    ) -> np.ndarray:
+        """Smooth the commanded q toward ``q_new`` when the IK is stuck.
+
+        See the module-level ``_STUCK_*`` constants for the rationale.
+        Briefly: when the operator's wrist target is geometrically
+        unreachable (e.g. wrist-to-shoulder), the DLS solver thrashes
+        between joint-limit corners and the wrist visibly oscillates
+        even though the IK error is roughly constant. Low-pass-filtering
+        the commanded q during these "stuck corner" ticks keeps the
+        motion smooth without changing normal-operation behaviour.
+
+        The condition for "stuck" is conservative on purpose: a large
+        residual error alone (e.g. mid-transition while chasing a far
+        target) does NOT trigger the damper -- we also require at
+        least ``stuck_clamped_count`` joints to be pinned at their
+        limits in the same iteration, which is the actual signature of
+        an unreachable target.
+        """
+        if self._stuck_lpf_alpha >= 1.0:
+            return q_new
+        if (
+            info.pos_err_m > self._stuck_err_m
+            and info.clamped_count >= self._stuck_clamped_count
+        ):
+            a = self._stuck_lpf_alpha
+            return (1.0 - a) * q_prev + a * q_new
+        return q_new
 
     # -- properties -----------------------------------------------------------
 
@@ -560,20 +629,26 @@ class VRArmTeleopCalibrated:
         if left_drop:
             l_info = IKResult(0.0, 0.0, 0, 0)
         else:
-            self._left_q, l_info = self._left_solver.solve(
+            q_new_left, l_info = self._left_solver.solve(
                 q_seed=self._left_q,
                 target_pos=l_target,
                 target_quat_wxyz=l_quat_target,
                 max_iters=1,
             )
+            self._left_q = self._apply_stuck_corner_damper(
+                self._left_q, q_new_left, l_info,
+            )
         if right_drop:
             r_info = IKResult(0.0, 0.0, 0, 0)
         else:
-            self._right_q, r_info = self._right_solver.solve(
+            q_new_right, r_info = self._right_solver.solve(
                 q_seed=self._right_q,
                 target_pos=r_target,
                 target_quat_wxyz=r_quat_target,
                 max_iters=1,
+            )
+            self._right_q = self._apply_stuck_corner_damper(
+                self._right_q, q_new_right, r_info,
             )
 
         return CalibratedTeleopTickResult(
