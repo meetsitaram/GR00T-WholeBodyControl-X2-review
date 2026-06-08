@@ -325,16 +325,19 @@ ROBOT_REFERENCE_Q_RAD: dict[str, dict[str, np.ndarray]] = {
 CALIBRATION_POSE_INSTRUCTIONS: dict[str, str] = {
     "arms_down": (
         "Stand relaxed with both arms hanging fully straight down at your "
-        "sides. Do not bend the elbows. "
+        "sides. Do not bend the elbows. Palms face inward toward your thighs. "
+        "Hold the controllers the same way you will during teleop. "
         "Press A on either controller when ready."
     ),
     "t_pose": (
         "Raise both arms straight out sideways, parallel to the floor. "
+        "Palms face down toward the floor. "
         "Press A when steady."
     ),
     "arms_forward": (
         "Hold both arms straight out forward at shoulder height. "
         "Keep your hands close together, about as wide as your shoulders. "
+        "Palms face each other (inward). "
         "Press A when steady."
     ),
     "namaste": (
@@ -446,9 +449,21 @@ class ArmFit:
     tracker reported. The product of the robot-quat and the inverse of
     the operator-quat is the alignment.
 
-    Defaults to identity for backward compat with v0 calibration YAMLs
-    (which give correct *position* targets but identity orientation, so
-    callers can still run with ``rotation_weight=0``).
+    ``op_quat_offset_rpy_deg`` is an optional per-operator constant
+    rotation (intrinsic XYZ Tait-Bryan ``(roll, pitch, yaw)`` degrees)
+    that compensates for the Quest 3 controller's fixed grip tilt: the
+    way the controller body angles relative to the operator's actual
+    wrist in a closed-fist grip. At runtime ``VRArmTeleopCalibrated``
+    post-multiplies this offset on the operator's head-yaw-frame wrist
+    quat **before** ``wrist_alignment_quat`` runs, so a single set of
+    values applies to every launcher (kinematic teleop, dataset
+    recording, VLA bridge) without per-script CLI plumbing.
+
+    Defaults: identity ``wrist_alignment_quat`` and zero
+    ``op_quat_offset_rpy_deg`` for backward compat with v0 / v1
+    calibration YAMLs (which give correct *position* targets but
+    identity orientation, so callers can still run with
+    ``rotation_weight=0`` and no per-operator offset).
     """
 
     scale: np.ndarray  # (3,) per-axis multiplicative factor
@@ -456,6 +471,9 @@ class ArmFit:
     residual_m: float  # max per-pose Euclidean error after fit
     wrist_alignment_quat: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    )
+    op_quat_offset_rpy_deg: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64)
     )
 
     def apply(self, op_wrist_in_head_yaw_frame: np.ndarray) -> np.ndarray:
@@ -490,7 +508,7 @@ class ArmFit:
         return _quat_multiply_wxyz(self.wrist_alignment_quat, q)
 
     def to_yaml_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "scale": [float(v) for v in self.scale],
             "translation": [float(v) for v in self.translation],
             "residual_m": float(self.residual_m),
@@ -498,6 +516,13 @@ class ArmFit:
                 float(v) for v in self.wrist_alignment_quat
             ],
         }
+        # Omit the offset when zero so v1 YAMLs round-trip unchanged
+        # (op_quat_offset_rpy_deg defaults to zeros on load).
+        if np.any(self.op_quat_offset_rpy_deg):
+            out["op_quat_offset_rpy_deg"] = [
+                float(v) for v in self.op_quat_offset_rpy_deg
+            ]
+        return out
 
     @classmethod
     def from_yaml_dict(cls, data: dict[str, Any]) -> "ArmFit":
@@ -507,6 +532,10 @@ class ArmFit:
             residual_m=float(data["residual_m"]),
             wrist_alignment_quat=np.asarray(
                 data.get("wrist_alignment_quat_wxyz", [1.0, 0.0, 0.0, 0.0]),
+                dtype=np.float64,
+            ),
+            op_quat_offset_rpy_deg=np.asarray(
+                data.get("op_quat_offset_rpy_deg", [0.0, 0.0, 0.0]),
                 dtype=np.float64,
             ),
         )

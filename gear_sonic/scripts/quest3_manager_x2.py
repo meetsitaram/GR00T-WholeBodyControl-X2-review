@@ -382,8 +382,13 @@ class ManagerConfig:
     # degrees, intrinsic XYZ Tait-Bryan; see ``VRArmTeleopCalibrated``
     # docstring for the axis convention. Defaults to no offset on
     # either side -- existing setups stay bit-exact.
-    left_wrist_op_quat_offset_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    right_wrist_op_quat_offset_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #
+    # ``None`` means "use whatever the calibration YAML carries" (see
+    # ``VRArmTeleopCalibrated`` constructor for the three-tier resolution
+    # order). Passing an explicit tuple here -- including ``(0,0,0)`` to
+    # force identity -- *overrides* the YAML value.
+    left_wrist_op_quat_offset_rpy_deg: Optional[tuple[float, float, float]] = None
+    right_wrist_op_quat_offset_rpy_deg: Optional[tuple[float, float, float]] = None
 
     # Sidecar
     sidecar_log_path: Optional[Path] = None
@@ -551,11 +556,15 @@ class Quest3ManagerX2:
             hand_input_mode=cfg.hand_input_mode,
             apply_curl_compensation=cfg.apply_curl_compensation,
             apply_oppose_compensation=cfg.apply_oppose_compensation,
-            left_wrist_op_quat_offset_rpy_deg=tuple(
-                cfg.left_wrist_op_quat_offset_rpy_deg
+            left_wrist_op_quat_offset_rpy_deg=(
+                tuple(cfg.left_wrist_op_quat_offset_rpy_deg)
+                if cfg.left_wrist_op_quat_offset_rpy_deg is not None
+                else None
             ),
-            right_wrist_op_quat_offset_rpy_deg=tuple(
-                cfg.right_wrist_op_quat_offset_rpy_deg
+            right_wrist_op_quat_offset_rpy_deg=(
+                tuple(cfg.right_wrist_op_quat_offset_rpy_deg)
+                if cfg.right_wrist_op_quat_offset_rpy_deg is not None
+                else None
             ),
         )
         self._intent = IntentDecoder(
@@ -2139,11 +2148,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--left-wrist-offset-rpy-deg",
         dest="left_wrist_offset_rpy_deg",
         type=float, nargs=3, metavar=("ROLL", "PITCH", "YAW"),
-        default=(0.0, 0.0, 0.0),
+        default=None,
         help="Operator-side wrist quat offset for the LEFT controller "
              "(degrees, intrinsic XYZ in the operator's wrist-local "
-             "frame). Stop-gap fix for a controller mount misalignment; "
-             "rerun vr_operator_calibrate.py to drop this back to zero. "
+             "frame). When omitted, the value from the calibration YAML "
+             "(``fit.left.op_quat_offset_rpy_deg``, populated by "
+             "``vr_operator_calibrate.py``) is used; pass a tuple here "
+             "to override -- including ``0 0 0`` to force identity. "
              "Only takes effect when --ik-rotation-weight > 0. Example: "
              "'--left-wrist-offset-rpy-deg 0 0 -30' compensates a left "
              "controller that sits ~30deg outward (yaw) on the cuff.",
@@ -2152,9 +2163,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--right-wrist-offset-rpy-deg",
         dest="right_wrist_offset_rpy_deg",
         type=float, nargs=3, metavar=("ROLL", "PITCH", "YAW"),
-        default=(0.0, 0.0, 0.0),
+        default=None,
         help="Operator-side wrist quat offset for the RIGHT controller "
-             "(see --left-wrist-offset-rpy-deg for axis convention).",
+             "(see --left-wrist-offset-rpy-deg for axis convention and "
+             "calibration-YAML fallback).",
     )
 
     # Sidecar
@@ -2385,11 +2397,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         apply_curl_compensation=args.apply_curl_compensation,
         apply_oppose_compensation=args.apply_oppose_compensation,
         enable_finger_filter=not args.no_finger_filter,
-        left_wrist_op_quat_offset_rpy_deg=tuple(
-            float(v) for v in args.left_wrist_offset_rpy_deg
+        left_wrist_op_quat_offset_rpy_deg=(
+            tuple(float(v) for v in args.left_wrist_offset_rpy_deg)
+            if args.left_wrist_offset_rpy_deg is not None
+            else None
         ),
-        right_wrist_op_quat_offset_rpy_deg=tuple(
-            float(v) for v in args.right_wrist_offset_rpy_deg
+        right_wrist_op_quat_offset_rpy_deg=(
+            tuple(float(v) for v in args.right_wrist_offset_rpy_deg)
+            if args.right_wrist_offset_rpy_deg is not None
+            else None
         ),
         sidecar_log_path=args.sidecar_log,
         quest3_raw_log_path=args.quest3_record_to,

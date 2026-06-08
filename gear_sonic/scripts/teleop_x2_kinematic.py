@@ -301,6 +301,41 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "auto-detected and force position-only.",
     )
     p.add_argument("--ik-per-tick-step-rad", type=float, default=0.30)
+    # Per-operator controller-grip wrist offsets. Quest 3 controllers sit
+    # at a small fixed rotation relative to the operator's actual wrist
+    # (the way the controller body angles forward in a closed-fist grip).
+    # The single ``wrist_alignment_quat`` from arms-down calibration
+    # cancels some of this tilt but not perfectly across all poses. These
+    # offsets are post-multiplied on the operator's head-yaw-frame wrist
+    # quat BEFORE the calibration alignment runs, in the operator's own
+    # wrist frame. Typical magnitudes are 5-20 deg per axis.
+    #
+    # Provenance & known limits: derive values via a Markley quaternion
+    # LS average over arms_down + t_pose + arms_forward (excluding
+    # namaste). See
+    # docs/source/user_guide/milestones/2026-06-07_wrist_offset_v1.md
+    # for the full derivation, the residual-error breakdown per pose,
+    # and the v2 follow-up ideas (persist in calibration YAML,
+    # per-pose interpolated alignment, etc.).
+    p.add_argument(
+        "--left-wrist-op-quat-offset-rpy-deg",
+        type=float, nargs=3, default=None, metavar=("ROLL", "PITCH", "YAW"),
+        help="Intrinsic Tait-Bryan (roll, pitch, yaw) degrees applied as "
+             "a constant rotation on the LEFT operator wrist quat in its "
+             "local frame, before the calibration's wrist_alignment runs. "
+             "Compensates for the Quest 3 controller's fixed grip tilt. "
+             "When omitted, the value from the calibration YAML "
+             "(``fit.left.op_quat_offset_rpy_deg``) is used; pass a tuple "
+             "here -- including ``0 0 0`` -- to override.",
+    )
+    p.add_argument(
+        "--right-wrist-op-quat-offset-rpy-deg",
+        type=float, nargs=3, default=None, metavar=("ROLL", "PITCH", "YAW"),
+        help="Same as --left-wrist-op-quat-offset-rpy-deg but for the "
+             "RIGHT controller. The two sides usually have mirror-symmetric "
+             "yaw (and may differ in roll/pitch). Defaults to the value "
+             "in the calibration YAML when omitted.",
+    )
 
     # Calibration (replaces the engage-anchor path)
     p.add_argument(
@@ -460,7 +495,22 @@ def main(argv: list[str] | None = None) -> int:
         damping=args.ik_damping,
         rotation_weight=args.ik_rotation_weight,
         per_tick_step_rad=args.ik_per_tick_step_rad,
+        left_wrist_op_quat_offset_rpy_deg=args.left_wrist_op_quat_offset_rpy_deg,
+        right_wrist_op_quat_offset_rpy_deg=args.right_wrist_op_quat_offset_rpy_deg,
     )
+    if (
+        args.left_wrist_op_quat_offset_rpy_deg is not None
+        or args.right_wrist_op_quat_offset_rpy_deg is not None
+    ):
+        print(
+            f"[teleop-kinematic] CLI-provided wrist op-quat offset overrides: "
+            f"left={args.left_wrist_op_quat_offset_rpy_deg} "
+            f"right={args.right_wrist_op_quat_offset_rpy_deg} "
+            f"(roll, pitch, yaw deg, operator wrist local frame; "
+            f"these supersede the calibration YAML's "
+            f"fit.<side>.op_quat_offset_rpy_deg)",
+            flush=True,
+        )
 
     if calibration.hand_range is not None:
         hr = calibration.hand_range

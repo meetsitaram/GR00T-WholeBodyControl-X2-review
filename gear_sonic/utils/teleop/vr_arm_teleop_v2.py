@@ -369,28 +369,48 @@ class VRArmTeleopCalibrated:
 
         # Pre-bake the optional operator-side wrist quat offsets to wxyz
         # quaternions once. Both default to identity == no-op.
-        self._left_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(
-            (0.0, 0.0, 0.0)
-            if left_wrist_op_quat_offset_rpy_deg is None
-            else left_wrist_op_quat_offset_rpy_deg
-        )
-        self._right_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(
-            (0.0, 0.0, 0.0)
-            if right_wrist_op_quat_offset_rpy_deg is None
-            else right_wrist_op_quat_offset_rpy_deg
-        )
+        #
+        # Resolution order (first non-None / non-zero wins):
+        #   1. Explicit constructor kwarg (CLI override path).
+        #   2. ``calibration.fit[side].op_quat_offset_rpy_deg`` from the
+        #      YAML, so a single calibration file applies the same
+        #      offset across every launcher (kinematic teleop, dataset
+        #      recording, VLA bridge) without per-script CLI plumbing.
+        #   3. Zero (no offset).
+        def _resolve_offset(
+            side: str,
+            override: tuple[float, float, float] | np.ndarray | None,
+        ) -> tuple[tuple[float, float, float] | np.ndarray, str]:
+            if override is not None:
+                return override, "constructor-kwarg"
+            yaml_v = calibration.fit[side].op_quat_offset_rpy_deg
+            if np.any(yaml_v):
+                return tuple(float(v) for v in yaml_v), "calibration-yaml"
+            return (0.0, 0.0, 0.0), "default-identity"
+
+        l_off_resolved, l_src = _resolve_offset("left", left_wrist_op_quat_offset_rpy_deg)
+        r_off_resolved, r_src = _resolve_offset("right", right_wrist_op_quat_offset_rpy_deg)
+        self._left_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(l_off_resolved)
+        self._right_op_quat_offset_wxyz = _rpy_deg_to_quat_wxyz(r_off_resolved)
         self._has_left_op_offset = not _is_identity_quat(self._left_op_quat_offset_wxyz)
         self._has_right_op_offset = not _is_identity_quat(self._right_op_quat_offset_wxyz)
+        if self._has_left_op_offset or self._has_right_op_offset:
+            print(
+                f"[VRArmTeleopCalibrated] wrist op-quat offsets active: "
+                f"left_rpy_deg={tuple(float(v) for v in l_off_resolved)} "
+                f"({l_src}); right_rpy_deg={tuple(float(v) for v in r_off_resolved)} "
+                f"({r_src}).",
+                flush=True,
+            )
         if (
             (self._has_left_op_offset or self._has_right_op_offset)
             and self._rotation_weight == 0.0
         ):
             print(
                 "[VRArmTeleopCalibrated] WARNING: wrist op-quat offsets "
-                f"requested (left_rpy_deg={left_wrist_op_quat_offset_rpy_deg}, "
-                f"right_rpy_deg={right_wrist_op_quat_offset_rpy_deg}) but "
-                "rotation_weight is 0. The IK runs position-only -- the "
-                "offsets will be a no-op until rotation_weight > 0.",
+                "configured but rotation_weight is 0. The IK runs "
+                "position-only -- the offsets will be a no-op until "
+                "rotation_weight > 0.",
                 flush=True,
             )
 

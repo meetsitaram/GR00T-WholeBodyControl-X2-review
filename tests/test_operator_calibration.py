@@ -401,6 +401,47 @@ def test_save_load_yaml_round_trip_without_hand_range(tmp_path: Path) -> None:
     assert loaded.hand_range is None
 
 
+def test_op_quat_offset_yaml_round_trip(tmp_path: Path) -> None:
+    """``ArmFit.op_quat_offset_rpy_deg`` round-trips through YAML and is
+    omitted from the YAML when zero (so v1 calibrations stay unchanged
+    on a save/reload cycle).
+
+    This is the persistent home for the per-operator wrist offset that
+    every launcher (kinematic teleop, dataset recording, VLA bridge)
+    consumes via ``VRArmTeleopCalibrated`` -- see
+    ``docs/.../2026-06-07_wrist_offset_v1.md``.
+    """
+    s_l = np.array([0.95, 1.05, 1.0])
+    t_l = np.array([0.01, -0.02, 0.03])
+    s_r = np.array([0.92, 1.03, 0.98])
+    t_r = np.array([0.02, 0.01, 0.05])
+    ms = _make_synthetic_measurements(s_l, t_l, s_r, t_r)
+    cal = fit_calibration(ms, operator_id="op_offset", notes="rpy")
+
+    # Zero offsets (default) must be omitted from the YAML payload entirely
+    import yaml
+    zero_path = tmp_path / "zero_offset.yaml"
+    cal.save_yaml(zero_path)
+    raw = yaml.safe_load(zero_path.read_text())
+    for side in ("left", "right"):
+        assert "op_quat_offset_rpy_deg" not in raw["fit"][side], (
+            f"zero offset must be omitted from YAML for {side}; got {raw['fit'][side]}"
+        )
+
+    # Set non-zero offsets, save, reload, expect bit-exact recovery
+    cal.fit["left"].op_quat_offset_rpy_deg = np.array([-5.7, 1.8, -6.0])
+    cal.fit["right"].op_quat_offset_rpy_deg = np.array([0.3, 4.4, 10.4])
+    yaml_path = tmp_path / "with_offset.yaml"
+    cal.save_yaml(yaml_path)
+    loaded = OperatorCalibration.load_yaml(yaml_path)
+    np.testing.assert_allclose(
+        loaded.fit["left"].op_quat_offset_rpy_deg, [-5.7, 1.8, -6.0]
+    )
+    np.testing.assert_allclose(
+        loaded.fit["right"].op_quat_offset_rpy_deg, [0.3, 4.4, 10.4]
+    )
+
+
 def test_hand_range_fit_validation() -> None:
     """``HandRangeFit`` rejects ranges with floor>=ceiling and out-of-bounds
     oppose ranges so we never feed invalid data to the retargeting."""

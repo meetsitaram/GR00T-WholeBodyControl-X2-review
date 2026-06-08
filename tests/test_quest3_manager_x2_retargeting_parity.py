@@ -135,6 +135,15 @@ def replay_results(npz_episode):
         # measure DLS convergence transients (see module docstring).
         left_neutral_q=npz["ik_left_q_rad"][0].astype(np.float64),
         right_neutral_q=npz["ik_right_q_rad"][0].astype(np.float64),
+        # The v6 NPZ was recorded BEFORE per-operator wrist offsets were
+        # persisted into the calibration YAML (see milestone
+        # 2026-06-07_wrist_offset_v1). Suppress whatever offset the live
+        # ``default.yaml`` currently carries so this parity check stays
+        # apples-to-apples with the v6 recorder. Passing the explicit
+        # ``(0,0,0)`` tuple overrides the YAML; ``None`` would inherit
+        # it (see ``VRArmTeleopCalibrated``'s three-tier resolution).
+        left_wrist_op_quat_offset_rpy_deg=(0.0, 0.0, 0.0),
+        right_wrist_op_quat_offset_rpy_deg=(0.0, 0.0, 0.0),
     )
 
     left_diff_per_joint = np.zeros((n, 7))

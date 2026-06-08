@@ -43,17 +43,18 @@ PROMPT_TEXTS: dict[str, str] = {
     # Pose-show prompts.
     "show_arms_down": (
         "Pose 1 of 4. Stand relaxed with both arms hanging fully straight down "
-        "at your sides. Do not bend your elbows. Press A on either controller "
-        "when ready."
+        "at your sides. Do not bend your elbows. Palms face inward toward your "
+        "thighs. Hold the controllers the same way you will during teleop. "
+        "Press A on either controller when ready."
     ),
     "show_t_pose": (
         "Pose 2 of 4. Raise both arms straight out sideways, parallel to the "
-        "floor. Press A when steady."
+        "floor. Palms face down toward the floor. Press A when steady."
     ),
     "show_arms_forward": (
         "Pose 3 of 4. Hold both arms straight out forward at shoulder height. "
         "Keep your hands close together, about as wide as your shoulders. "
-        "Press A when steady."
+        "Palms face each other. Press A when steady."
     ),
     "show_namaste": (
         "Pose 4 of 4. Bring both palms together at your chest in a namaste "
@@ -65,15 +66,15 @@ PROMPT_TEXTS: dict[str, str] = {
     # Recapture prompts (same family as show, different lead-in).
     "recapture_arms_down": (
         "Recapture arms down pose. Hold both arms fully straight down at your "
-        "sides and press A again."
+        "sides with palms facing inward toward your thighs, and press A again."
     ),
     "recapture_t_pose": (
-        "Recapture t-pose. Stretch both arms straight sideways and press A "
-        "again."
+        "Recapture t-pose. Stretch both arms straight sideways with palms "
+        "facing down, and press A again."
     ),
     "recapture_arms_forward": (
         "Recapture arms-forward pose. Hold both arms straight forward at "
-        "shoulder height and press A again."
+        "shoulder height with palms facing each other, and press A again."
     ),
     "recapture_namaste": (
         "Recapture namaste pose. Bring both palms together at your chest and "

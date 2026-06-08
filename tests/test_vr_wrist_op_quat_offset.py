@@ -416,7 +416,7 @@ def test_offset_is_noop_when_rotation_weight_zero(capsys) -> None:
 
     # Warning should have been printed at __init__.
     out = capsys.readouterr().out
-    assert "wrist op-quat offsets requested" in out, out
+    assert "wrist op-quat offsets" in out, out
     assert "rotation_weight is 0" in out, out
 
     # Arm joints must be byte-identical (position-only IK ignores quat target).

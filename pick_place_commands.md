@@ -8,13 +8,16 @@
     --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
     --lock-head-straight
 
+### stop sonic
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
+
 ### run teleop stack with recording enabled
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
     --pc2-host 192.168.86.32 \
     --with-record \
     --head-cameras \
-    --output-dir data/lerobot/x2_grab_a_drink \
-    --task "grab a drink"
+    --output-dir data/lerobot/x2_pick_and_place_soda_can \
+    --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
 
 ### camera access on PC2
 gear_sonic_deploy/scripts/x2_pc2_cameras.sh status --host 192.168.86.32
@@ -36,8 +39,12 @@ gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal --host 192.168.86.32
     --motion-token-decoder $HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
     --prompt "grab the can from the table"
 
-### stop sonic
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
+### pure IK kinematic teleop - no planner, no sonic
+.venv/bin/python -m gear_sonic.scripts.teleop_x2_kinematic     --output-dir /tmp/ik_debug_20260607     --task "ik debug"     --rate 50
+
+### operator calibration
+.venv/bin/python -m gear_sonic.scripts.vr_operator_calibrate --operator-id default
+
 
 
 =============== end of pure manual notes section ===============
