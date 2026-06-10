@@ -106,6 +106,19 @@ from pathlib import Path
 import numpy as np
 import zmq
 
+# msgpack is the wire format the quest3_manager_x2 uses for its
+# ``stream_mode`` topic. Importing it lazily so the proxy still runs
+# on a deployment that doesn't ship msgpack -- in that case the
+# mode-SUB feature stays off and the proxy falls back to the legacy
+# motion-hysteresis engage path (which is exactly what operators
+# without the manager get anyway).
+try:
+    import msgpack as _msgpack
+    _HAS_MSGPACK = True
+except ImportError:
+    _msgpack = None  # type: ignore[assignment]
+    _HAS_MSGPACK = False
+
 
 # ---------------------------------------------------------------------------
 # Wire-format constants (must mirror gear_sonic/scripts/live_vla_publish_motion_token.py
@@ -211,6 +224,151 @@ def decode_x2_debug_base_quat(
     return None  # field absent from this frame
 
 
+def rebuild_msg_with_field_overrides(
+    msg: bytes,
+    topic: str,
+    overrides: dict[str, np.ndarray],
+) -> bytes | None:
+    """Surgically overwrite one or more f32 fields in a packed pose frame.
+
+    Preserves every other field (root_quat, hand joints, motion_token,
+    frame_index, ...) because the v4 header layout encodes each field
+    as a fixed-length blob at a known cursor position. Same shape +
+    same dtype = same byte count, so we splice the new bytes into
+    the existing payload in place without re-packing the header or
+    rewriting field order.
+
+    ``overrides`` maps field names to numpy arrays. Each array must
+    match the field's declared dtype + shape in the header (we
+    enforce f32 here -- all jpos/jvel/quat fields are f32 on the
+    wire). Returns ``None`` if any override mismatches or the
+    header is malformed; callers should fall back to forwarding
+    the original ``msg`` verbatim in that case so a corrupt frame
+    never silently steals the wire.
+
+    Used by the LIVE -> OVERRIDE engagement ramp (2026-06-10
+    follow-up 9): the proxy clamps the operator's first few
+    override frames to a slow per-tick step relative to the LAST
+    FORWARDED jpos so the deploy doesn't see a single-tick step
+    from VLA-pose to operator-pose. **Follow-up 9b extends this
+    to also flatten ``joint_pos_mj_future`` to the clamped current
+    jpos and zero ``joint_vel_mj_future``** -- without that, the
+    deploy's window-mode policy reads the operator's untouched
+    future window (which still encodes "go all the way to
+    operator-pose in 0.9 s") and slams the body to follow the
+    future even though the current frame is properly rate-limited.
+    """
+    topic_bytes = topic.encode("utf-8")
+    if not msg.startswith(topic_bytes):
+        return None
+    body_start = len(topic_bytes)
+    body = msg[body_start:]
+    if len(body) < HEADER_SIZE:
+        return None
+    header_blob = body[:HEADER_SIZE].rstrip(b"\x00")
+    payload_start = body_start + HEADER_SIZE
+    payload_len = len(msg) - payload_start
+    try:
+        header = json.loads(header_blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    fields = header.get("fields")
+    if not isinstance(fields, list):
+        return None
+    # Collect (abs_start, abs_end, new_bytes) tuples in one pass so
+    # we can splice them all in a single buffer build at the end.
+    splices: list[tuple[int, int, bytes]] = []
+    matched: set[str] = set()
+    cursor = 0
+    for f in fields:
+        try:
+            fname = str(f["name"])
+            dtype = str(f["dtype"])
+            shape = tuple(int(s) for s in f["shape"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        bpe = _DTYPE_BPE.get(dtype)
+        if bpe is None:
+            return None
+        nelem = 1
+        for s in shape:
+            nelem *= s
+        nbytes = nelem * bpe
+        if cursor + nbytes > payload_len:
+            return None
+        if fname in overrides:
+            if dtype != "f32":
+                return None
+            arr = np.asarray(overrides[fname], dtype=np.float32)
+            if arr.shape != shape:
+                return None
+            if not arr.flags["C_CONTIGUOUS"]:
+                arr = np.ascontiguousarray(arr)
+            new_bytes = arr.tobytes()
+            if len(new_bytes) != nbytes:
+                return None
+            abs_start = payload_start + cursor
+            splices.append((abs_start, abs_start + nbytes, new_bytes))
+            matched.add(fname)
+        cursor += nbytes
+    # Require all overrides matched at least one field; silently
+    # ignoring an unmatched key would mask typos.
+    if matched != set(overrides):
+        return None
+    if not splices:
+        return msg
+    splices.sort(key=lambda s: s[0])
+    out = bytearray()
+    cur = 0
+    for start, end, blob in splices:
+        out.extend(msg[cur:start])
+        out.extend(blob)
+        cur = end
+    out.extend(msg[cur:])
+    return bytes(out)
+
+
+def rebuild_msg_with_jpos_override(
+    msg: bytes, topic: str, new_jpos: np.ndarray
+) -> bytes | None:
+    """Back-compat single-field wrapper around the multi-field helper.
+
+    Kept so the regression pin (``test_rebuild_msg_with_jpos_override_
+    preserves_other_fields``) and any future callers that only need
+    to clamp the current jpos keep working. Internally delegates to
+    ``rebuild_msg_with_field_overrides`` so both code paths share the
+    same byte-splice logic.
+    """
+    return rebuild_msg_with_field_overrides(
+        msg, topic, {"joint_pos_mj": new_jpos}
+    )
+
+
+def _clamp_vector_step_f32(
+    target: np.ndarray,
+    prev: np.ndarray | None,
+    max_step: float,
+) -> np.ndarray:
+    """Per-element ``|target - prev| <= max_step`` rate clamp.
+
+    Mirrors ``live_vla_publish_motion_token._clamp_vector_step``
+    semantics: caps each element's step from ``prev`` to
+    ``max_step`` while preserving the direction vector (so a large
+    multi-joint step shrinks proportionally rather than slicing
+    individual joints). Returns ``target`` unchanged when
+    ``max_step <= 0`` or ``prev is None`` (cold-start tick).
+    """
+    tgt = np.asarray(target, dtype=np.float32)
+    if max_step <= 0.0 or prev is None:
+        return tgt.copy()
+    prv = np.asarray(prev, dtype=np.float32)
+    delta = tgt - prv
+    peak = float(np.abs(delta).max())
+    if peak <= max_step:
+        return tgt.copy()
+    return (prv + delta * (max_step / peak)).astype(np.float32)
+
+
 def decode_pose_joint_pos_mj(
     msg: bytes, topic: str = "pose"
 ) -> np.ndarray | None:
@@ -227,6 +385,46 @@ def decode_pose_joint_pos_mj(
     recent operator-commanded joint targets. When upstream goes silent
     the snapshot is reused as (a) the byte payload to re-publish during
     HOLD and (b) the lerp anchor for BLEND.
+    """
+    return _decode_pose_field_f32(
+        msg, topic, name="joint_pos_mj", expected_shape=(NUM_BODY_DOFS,)
+    )
+
+
+def decode_pose_left_hand(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``left_hand_joints`` (f32, shape (DEFAULT_HAND_DOF,))."""
+    return _decode_pose_field_f32(
+        msg, topic, name="left_hand_joints",
+        expected_shape=(DEFAULT_HAND_DOF,),
+    )
+
+
+def decode_pose_right_hand(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``right_hand_joints`` (f32, shape (DEFAULT_HAND_DOF,))."""
+    return _decode_pose_field_f32(
+        msg, topic, name="right_hand_joints",
+        expected_shape=(DEFAULT_HAND_DOF,),
+    )
+
+
+def _decode_pose_field_f32(
+    msg: bytes,
+    topic: str,
+    *,
+    name: str,
+    expected_shape: tuple[int, ...],
+) -> np.ndarray | None:
+    """Generic packed-pose field extractor for f32 vectors.
+
+    Walks the v4 header field list cursor-by-cursor (same scheme as
+    the deploy's ZmqPoseInputSource) and returns the named field as
+    a copied numpy array when the dtype + shape match, else ``None``.
+    Tolerates header decode errors so the publish thread can survive
+    a malformed cached frame.
     """
     topic_bytes = topic.encode("utf-8")
     if not msg.startswith(topic_bytes):
@@ -246,7 +444,7 @@ def decode_pose_joint_pos_mj(
     cursor = 0
     for f in fields:
         try:
-            name = str(f["name"])
+            fname = str(f["name"])
             dtype = str(f["dtype"])
             shape = tuple(int(s) for s in f["shape"])
         except (KeyError, TypeError, ValueError):
@@ -260,14 +458,14 @@ def decode_pose_joint_pos_mj(
         nbytes = nelem * bpe
         if cursor + nbytes > len(payload):
             return None
-        if name == "joint_pos_mj":
-            if dtype != "f32" or len(shape) != 1 or shape[0] != NUM_BODY_DOFS:
+        if fname == name:
+            if dtype != "f32" or shape != expected_shape:
                 return None
             return np.frombuffer(
                 payload[cursor:cursor + nbytes], dtype="<f4"
             ).copy()
         cursor += nbytes
-    return None  # joint_pos_mj absent (e.g. token-only side-channel frame)
+    return None  # named field absent (e.g. token-only side-channel frame)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +756,14 @@ STATE_HOLD: str = "HOLD"
 STATE_BLEND: str = "BLEND"
 STATE_IDLE_CLIP: str = "IDLE_CLIP"
 STATE_GAP: str = "GAP"  # silent < stale_s; don't publish (deploy holds last)
+# Operator override (e.g. VR teleop nudging the arm out of a stuck VLA
+# pose). When --override-port is enabled and the override SUB has a fresh
+# frame, the proxy forwards override bytes verbatim instead of primary.
+# On the OVERRIDE -> LIVE edge a one-shot "override_released" event is
+# emitted on the optional control PUB so the VLA bridge can cold-restart
+# its ramp-in from the current measured pose. See 2026-06-10 manual-
+# takeover milestone for the design.
+STATE_OVERRIDE: str = "OVERRIDE"
 
 IDLE_MODE_BLEND: str = "blend"
 IDLE_MODE_HOLD_LAST: str = "hold-last"
@@ -754,6 +960,237 @@ def main(argv: list[str] | None = None) -> int:
              "(spawn heading) on every IDLE entry. Regression-test "
              "escape for the diagnostic baseline; never use in prod.",
     )
+
+    # ----- Operator override SUB (Phase 1 of manual-takeover) ----------
+    # When --override-port is set, the proxy subscribes to a SECOND
+    # upstream (typically the teleop wire publisher on a different port)
+    # and prefers it over --upstream-port whenever the override SUB has
+    # a fresh frame within --override-stale-ms. Disabled by default so
+    # existing single-source deployments are byte-for-byte unchanged.
+    p.add_argument(
+        "--override-host",
+        default=None,
+        help="Host for the operator-override pose PUB (e.g. the laptop "
+             "running the teleop recorder). Defaults to --upstream-host.",
+    )
+    p.add_argument(
+        "--override-port",
+        type=int,
+        default=-1,
+        help="Operator-override pose PUB port. Set to a positive int "
+             "(e.g. 5558) to enable manual-takeover arbitration. "
+             "Default -1 = DISABLED (legacy single-source behaviour).",
+    )
+    p.add_argument(
+        "--override-topic",
+        default=None,
+        help="Topic prefix on the override PUB. Defaults to "
+             "--upstream-topic.",
+    )
+    p.add_argument(
+        "--override-stale-ms",
+        type=int,
+        default=200,
+        help="Treat the override source as gone after this many ms of "
+             "silence (default 200 = 10 ticks @ 50Hz). Acts as a "
+             "debounce so a single dropped teleop frame doesn't flip "
+             "the proxy back to primary and trigger a spurious VLA "
+             "cold-restart.",
+    )
+    # ---- Frozen-frame release (2026-06-10 follow-up) ------------------
+    # The quest3_manager publishes the FROZEN last commanded pose every
+    # tick when teleop mode is OFF or LOCOMOTION (see manager lines
+    # 1221-1229). That means the recorder's PUB on the override port
+    # NEVER goes silent across an A+B+X+Y "drop teleop" gesture, so the
+    # silence-based release above only fires when the operator Ctrl-C's
+    # the entire stack. Frame-equality detection catches this: when N
+    # consecutive override frames have ‖Δjpos‖₂ <= tol, treat the
+    # override as released even though bytes are still arriving on the
+    # wire. Reset on any frame above tol so re-engagement is automatic
+    # when the operator starts driving again. Set ticks to 0 to disable
+    # and fall back to the silence-only behaviour.
+    p.add_argument(
+        "--override-frozen-ticks",
+        type=int,
+        default=10,
+        help="Fire override_released after this many consecutive "
+             "override frames within --override-frozen-l2-tol of the "
+             "previous one (default 10 = 200ms @ 50Hz, matching "
+             "--override-stale-ms semantics). The Quest3 manager "
+             "publishes a frozen pose every tick in OFF/LOCOMOTION "
+             "mode, so this is what actually fires release after the "
+             "operator hits the A+B+X+Y disengage chord. Set to 0 to "
+             "disable and rely on silence-based release only.",
+    )
+    p.add_argument(
+        "--override-frozen-l2-tol",
+        type=float,
+        default=5e-3,
+        help="L2 distance tolerance (rad) for two override frames to "
+             "be considered 'frozen' (default 5e-3 ~ 0.3 deg of total "
+             "joint-space motion). Small enough that any intentional "
+             "teleop push trips above tol within one tick; large "
+             "enough to absorb (a) controller-rest jitter when the "
+             "operator is holding the Quest 3 still, (b) planner-side "
+             "body_pose float noise that may leak through the "
+             "recorder's merge, and (c) IK retargeting flicker when "
+             "the operator brushes a thumbstick. Bumped from the "
+             "original 1e-4 on 2026-06-10 after observing repeated "
+             "single-frame engage/release cycles in sim from sub-deg "
+             "controller drift while the manager was in OFF; the new "
+             "default still catches the bytes-identical frozen pose "
+             "the manager publishes in OFF/LOCOMOTION. Lower (e.g. "
+             "1e-4) for strict bytes-match detection only.",
+    )
+    p.add_argument(
+        "--override-engage-motion-ticks",
+        type=int,
+        default=10,
+        help="Require this many consecutive override frames with "
+             "L2 delta ABOVE --override-frozen-l2-tol before firing "
+             "override_engaged (default 10 = 200ms @ 50Hz, symmetric "
+             "with --override-frozen-ticks). Prevents brief jitter "
+             "from spurious engage/release cycles (each cycle "
+             "triggers a heavy VLA cold-restart). Set to 0 for the "
+             "legacy single-frame-engage behaviour used by older "
+             "smoke tests; the launcher defaults to 10 in real and "
+             "sim runs.",
+    )
+    p.add_argument(
+        "--engagement-max-wire-step",
+        type=float,
+        default=0.012,
+        help="Per-element max joint-position step (rad) applied to "
+             "the override frames forwarded right AFTER the LIVE -> "
+             "OVERRIDE transition. Default 0.012 rad/tick (~36 deg/s "
+             "per joint at 50 Hz). The proxy snapshots the last "
+             "forwarded VLA pose at engagement, then clamps each "
+             "subsequent operator frame's joint_pos_mj per-element "
+             "relative to the previously forwarded pose, linearly "
+             "relaxing the clamp back to --engagement-steady-wire-"
+             "step over --engagement-step-ramp-ticks ticks. Without "
+             "this, the operator's first OVERRIDE frame can step "
+             "the wire ~3 rad away from VLA's last command in one "
+             "tick and the deploy slams the body across the delta "
+             "(2026-06-10 follow-up 9). Set to 0 (or equal to "
+             "--engagement-steady-wire-step) to disable the slow "
+             "engagement ramp.",
+    )
+    p.add_argument(
+        "--engagement-steady-wire-step",
+        type=float,
+        default=0.035,
+        help="Per-element steady-state max joint-position step (rad) "
+             "the engagement ramp converges to. Default 0.035 rad/tick "
+             "(~100 deg/s per joint at 50 Hz, matches the bridge's "
+             "--vla-max-wire-step default). After the engagement ramp "
+             "completes the proxy stops clamping override frames "
+             "entirely -- the operator's controller motion is the "
+             "rate limit. The clamp is ONLY active for the first "
+             "--engagement-step-ramp-ticks ticks of an OVERRIDE "
+             "window; subsequent ticks forward verbatim.",
+    )
+    p.add_argument(
+        "--engagement-step-ramp-ticks",
+        type=int,
+        default=250,
+        help="Number of ticks over which to linearly ramp the "
+             "engagement rate clamp from --engagement-max-wire-step "
+             "(slow, applied at engagement) to --engagement-steady-"
+             "wire-step (normal). Default 250 @ 50Hz = 5.0 s -- "
+             "matches the bridge's --vla-handoff-step-ramp-ticks "
+             "default for symmetry. Set to 0 to disable engagement "
+             "clamping (operator frames forwarded verbatim from the "
+             "very first OVERRIDE tick -- pre-2026-06-10 behaviour, "
+             "produces the slam this guard exists to prevent).",
+    )
+
+    # ----- vla_control PUB (Phase 1 of manual-takeover) ----------------
+    # Edge-triggered control plane for the VLA bridge. Emits
+    # ``override_engaged`` on PRIMARY/IDLE -> OVERRIDE and
+    # ``override_released`` on OVERRIDE -> PRIMARY/IDLE. The VLA bridge
+    # subscribes and uses the released edge to cold-restart its ramp-in
+    # from the current measured pose (clearing stale action chunks).
+    # Disabled by default; only meaningful when --override-port is set.
+    p.add_argument(
+        "--vla-control-bind-host",
+        default="127.0.0.1",
+        help="Bind interface for the vla_control PUB (default "
+             "127.0.0.1; bridge is colocated on the laptop).",
+    )
+    p.add_argument(
+        "--vla-control-port",
+        type=int,
+        default=-1,
+        help="Bind port for the vla_control edge-event PUB. Set to a "
+             "positive int (e.g. 5559) to enable. Default -1 = "
+             "DISABLED.",
+    )
+    p.add_argument(
+        "--vla-control-topic",
+        default="vla_control",
+        help="Topic prefix on the vla_control PUB (default "
+             "'vla_control').",
+    )
+
+    # ----- Operator mode SUB (stream_mode, 2026-06-10 follow-up) -----
+    # When --teleop-mode-port > 0, subscribe to the quest3_manager's
+    # ``stream_mode`` PUB (port 5564 by default, msgpack payload with
+    # ``mode``: "OFF" | "LOCOMOTION" | "ARM_MANIPULATION"). This is the
+    # deterministic A+B+X+Y signal driven by the operator's actual
+    # button presses, so the proxy can gate engagement DIRECTLY on
+    # ``mode != "OFF"`` instead of guessing via per-tick pose deltas
+    # on the override SUB. The latter is intrinsically fragile because
+    # the manager keeps publishing FROZEN arm/hand vectors in OFF and
+    # LOCOMOTION (see manager lines 1221-1229) so the recorder never
+    # goes silent across an A+B+X+Y disengage, and the operator holding
+    # the controller still in ARM_MANIPULATION looks identical to
+    # "operator dropped to OFF" from a pose-delta perspective.
+    #
+    # When --teleop-mode-port <= 0 (default), the proxy falls back to
+    # the legacy motion-hysteresis path -- which still works for older
+    # deployments that don't run the manager (e.g. dataset replay) but
+    # WILL flicker when the operator holds still. The legacy path is
+    # the only one available pre-2026-06-10.
+    p.add_argument(
+        "--teleop-mode-host",
+        default="127.0.0.1",
+        help="Host where the manager's stream_mode PUB lives "
+             "(default 127.0.0.1; on PC2 + laptop split set this to "
+             "the laptop's address).",
+    )
+    p.add_argument(
+        "--teleop-mode-port",
+        type=int,
+        default=-1,
+        help="Port of the manager's stream_mode PUB. Default is the "
+             "manager's --recorder-pub-port (typically 5564). Set to "
+             "a positive int to enable mode-gated engagement; set to "
+             "-1 (default) to fall back to motion-hysteresis. STRICT "
+             "MODE: when enabled and the mode signal goes stale "
+             "(--teleop-mode-stale-ms), engagement is BLOCKED -- the "
+             "operator's poses are ignored until the manager is back "
+             "or --teleop-mode-port is removed.",
+    )
+    p.add_argument(
+        "--teleop-mode-topic",
+        default="stream_mode",
+        help="Topic prefix on the manager's PUB (default "
+             "'stream_mode'; matches the manager's "
+             "--stream-mode-topic).",
+    )
+    p.add_argument(
+        "--teleop-mode-stale-ms",
+        type=int,
+        default=1000,
+        help="Treat the mode signal as gone after this many ms of "
+             "silence (default 1000 = 50 ticks @ 50Hz, comfortably "
+             "longer than any manager scheduler hiccup but short "
+             "enough that a dead manager fails closed within a "
+             "second). When stale, engagement is BLOCKED in strict "
+             "mode (see --teleop-mode-port).",
+    )
+
     args = p.parse_args(argv)
 
     if args.hold_last_secs < 0.0:
@@ -821,10 +1258,122 @@ def main(argv: list[str] | None = None) -> int:
             zmq.SUBSCRIBE, args.x2_debug_topic.encode("utf-8")
         )
 
+    # ----- Manual-takeover dual-source: optional override SUB ----------
+    # If --override-port > 0, subscribe to a second pose stream and
+    # prefer its frames over --upstream-port whenever fresh. The override
+    # bytes are forwarded verbatim to downstream (same wire format as
+    # primary), so no decoding overhead on the hot path.
+    override_sub: zmq.Socket | None = None
+    override_enabled = int(args.override_port) > 0
+    override_host = args.override_host or args.upstream_host
+    override_topic = args.override_topic or args.upstream_topic
+    override_stale_s = max(args.override_stale_ms, 1) / 1000.0
+    if override_enabled:
+        override_sub = ctx.socket(zmq.SUB)
+        override_sub.setsockopt(zmq.RCVHWM, 100)
+        override_url = f"tcp://{override_host}:{args.override_port}"
+        override_sub.connect(override_url)
+        override_sub.setsockopt(
+            zmq.SUBSCRIBE, override_topic.encode("utf-8")
+        )
+
+    # ----- Operator mode SUB (stream_mode, 2026-06-10 follow-up) ------
+    # Connect to the manager's recorder PUB (port 5564 by default) and
+    # subscribe to ``stream_mode``. The payload is a msgpack dict
+    # ``{ "mode": "OFF" | "LOCOMOTION" | "ARM_MANIPULATION", "tick":
+    # ..., "ts": ... }`` published every manager tick. When the
+    # incoming mode is non-OFF, the proxy treats the operator as
+    # actively driving and forwards override frames verbatim; when
+    # mode flips to OFF the proxy releases override on the EDGE and
+    # the bridge cold-restarts. The mode-gated path is STRICT: when
+    # --teleop-mode-port is set and the signal goes stale, engagement
+    # is BLOCKED -- a dead manager fails closed within
+    # --teleop-mode-stale-ms (default 1 s).
+    teleop_mode_sub: zmq.Socket | None = None
+    teleop_mode_enabled = int(args.teleop_mode_port) > 0 and _HAS_MSGPACK
+    teleop_mode_stale_s = max(args.teleop_mode_stale_ms, 1) / 1000.0
+    if int(args.teleop_mode_port) > 0 and not _HAS_MSGPACK:
+        print(
+            "[pose_proxy] WARN: --teleop-mode-port is set but msgpack "
+            "is not installed in this venv; falling back to legacy "
+            "motion-hysteresis engagement (pip install msgpack to "
+            "enable strict mode-gated engagement).",
+            flush=True,
+        )
+    if teleop_mode_enabled:
+        teleop_mode_sub = ctx.socket(zmq.SUB)
+        teleop_mode_sub.setsockopt(zmq.RCVHWM, 32)
+        teleop_mode_url = (
+            f"tcp://{args.teleop_mode_host}:{args.teleop_mode_port}"
+        )
+        teleop_mode_sub.connect(teleop_mode_url)
+        teleop_mode_sub.setsockopt(
+            zmq.SUBSCRIBE, args.teleop_mode_topic.encode("utf-8")
+        )
+
+    # ----- Manual-takeover edge-event PUB (vla_control) ----------------
+    # If --vla-control-port > 0, bind a PUB socket and emit one-shot
+    # JSON events on the OVERRIDE engage/release edges. The bridge SUBs
+    # this and cold-restarts on the released edge.
+    vla_control_pub: zmq.Socket | None = None
+    vla_control_enabled = int(args.vla_control_port) > 0
+    if vla_control_enabled:
+        vla_control_pub = ctx.socket(zmq.PUB)
+        vla_control_pub.setsockopt(zmq.SNDHWM, 32)
+        vla_control_url = (
+            f"tcp://{args.vla_control_bind_host}:{args.vla_control_port}"
+        )
+        vla_control_pub.bind(vla_control_url)
+
     print(
         f"[pose_proxy] upstream SUB:   {upstream_url} topic={args.upstream_topic!r}",
         flush=True,
     )
+    if override_enabled:
+        print(
+            f"[pose_proxy] override SUB:   "
+            f"tcp://{override_host}:{args.override_port} "
+            f"topic={override_topic!r} "
+            f"(stale_ms={args.override_stale_ms})",
+            flush=True,
+        )
+    else:
+        print(
+            "[pose_proxy] override SUB:   DISABLED "
+            "(--override-port not set; legacy single-source mode)",
+            flush=True,
+        )
+    if teleop_mode_enabled:
+        print(
+            f"[pose_proxy] teleop_mode SUB: "
+            f"tcp://{args.teleop_mode_host}:{args.teleop_mode_port} "
+            f"topic={args.teleop_mode_topic!r} "
+            f"(stale_ms={args.teleop_mode_stale_ms}) "
+            f"-- STRICT mode-gated engage (motion-hysteresis bypassed)",
+            flush=True,
+        )
+    elif override_enabled:
+        print(
+            "[pose_proxy] teleop_mode SUB: DISABLED "
+            "(--teleop-mode-port not set; falling back to motion-"
+            "hysteresis engage path which will flicker if operator "
+            "holds the controller still in ARM_MANIPULATION)",
+            flush=True,
+        )
+    if vla_control_enabled:
+        print(
+            f"[pose_proxy] vla_control PUB: "
+            f"tcp://{args.vla_control_bind_host}:{args.vla_control_port} "
+            f"topic={args.vla_control_topic!r}",
+            flush=True,
+        )
+    elif override_enabled:
+        print(
+            "[pose_proxy] vla_control PUB: DISABLED "
+            "(--vla-control-port not set; bridge won't cold-restart "
+            "automatically on override release)",
+            flush=True,
+        )
     print(
         f"[pose_proxy] downstream PUB: {bind_url} topic={args.downstream_topic!r}",
         flush=True,
@@ -904,6 +1453,103 @@ def main(argv: list[str] | None = None) -> int:
     # crash the publish thread.
     last_upstream_msg: bytes | None = None
     last_upstream_jpos: np.ndarray | None = None
+    # Manual-takeover override tracking. ``last_override_s = -1`` means
+    # "never seen an override frame"; the arbitration logic treats this
+    # as "override is silent / not engaged" so the proxy behaves like
+    # the legacy single-source proxy until the first override frame
+    # arrives. Edge tracking happens via ``override_active`` flips.
+    last_override_s = -1.0
+    override_frames = 0
+    override_engage_events = 0
+    override_release_events = 0
+    override_active = False
+    # ----- Frozen-frame release state -------------------------------
+    # ``prev_override_jpos`` is the most recently decoded override
+    # joint_pos_mj; ``override_frozen_count`` is the running streak of
+    # consecutive override frames within --override-frozen-l2-tol of
+    # ``prev_override_jpos``. When the streak hits
+    # --override-frozen-ticks, ``override_frozen_detected`` latches
+    # True and forces ``override_fresh = False`` on the next loop --
+    # which routes through the SAME edge handler that emits
+    # override_released, so downstream consumers (bridge cold-restart)
+    # see no behavioural difference vs the silence-based release.
+    # The latch clears the moment we see motion above tol so the
+    # operator's next ARM_MANIPULATION push re-engages without any
+    # extra UX. release_count tracks how many releases were fired by
+    # the frozen detector vs the silence detector (status line only).
+    prev_override_jpos: np.ndarray | None = None
+    override_frozen_count = 0
+    override_frozen_detected = False
+    override_frozen_release_events = 0
+    frozen_ticks_threshold = max(int(args.override_frozen_ticks), 0)
+    frozen_l2_tol = max(float(args.override_frozen_l2_tol), 0.0)
+    # ----- Engagement ramp state (2026-06-10 follow-up 9) ----------
+    # Symmetric to the bridge's post-handoff slow-step ramp: when
+    # the proxy fires the LIVE -> OVERRIDE edge, the operator's
+    # commanded body pose can be ~3 rad (L_inf) from VLA's last
+    # decoded pose. Without this clamp the proxy forwarded
+    # ``latest_override`` VERBATIM on the first OVERRIDE tick and
+    # the deploy saw a single-tick joint-space step that visibly
+    # slammed the body across the delta (the user at 13:29
+    # confirmed this on the real robot).
+    #
+    # ``engagement_clamp_remaining`` is the countdown of remaining
+    # ticks in the ramp window. ``engagement_last_forwarded_jpos``
+    # is the running anchor for the per-element step clamp; it
+    # starts at the last VLA pose forwarded before the engagement
+    # edge, then updates to the just-forwarded (clamped) operator
+    # pose every tick. Linear interpolation of ``effective_max_step``
+    # from ``engagement_max_wire_step`` (slow) -> ``engagement_
+    # steady_wire_step`` (normal) across ``engagement_step_ramp_
+    # ticks`` ticks; when the countdown hits 0 the clamp deactivates
+    # and override frames pass through verbatim (operator's
+    # controller motion is the rate limit at that point).
+    engagement_max_wire_step = max(float(args.engagement_max_wire_step), 0.0)
+    engagement_steady_wire_step = max(float(args.engagement_steady_wire_step), 0.0)
+    engagement_step_ramp_ticks = max(int(args.engagement_step_ramp_ticks), 0)
+    engagement_clamp_remaining = 0
+    engagement_last_forwarded_jpos: np.ndarray | None = None
+    # ----- Engage hysteresis (2026-06-10 follow-up) ------------------
+    # Symmetric to the frozen-release logic: count consecutive override
+    # frames whose joint-space delta is ABOVE frozen_l2_tol and require
+    # the streak to cross engage_motion_threshold before tripping
+    # override_engaged. When threshold == 0, engage on the first
+    # non-frozen frame (legacy behaviour, kept for older smoke tests).
+    # The motion + frozen counters are stateful mirrors: any single
+    # frame increments exactly one of them and zeros the other, so a
+    # mid-engage pause doesn't immediately release nor does a
+    # mid-release flicker immediately re-engage.
+    override_motion_count = 0
+    engage_motion_threshold = max(
+        int(getattr(args, "override_engage_motion_ticks", 0)), 0
+    )
+    # ----- Operator-pose handoff (2026-06-10 follow-up) --------------
+    # Snapshot the operator's last commanded body + hand joints from
+    # every override frame so the override_released event can carry
+    # them downstream. The VLA bridge uses these to hold the wire at
+    # the operator's exact pose during its cold-restart bridging
+    # window instead of stepping back to x2_debug's measured pose
+    # (which lags due to motor / contact / gravity sag and produces
+    # the visible "pose reset" the operator sees when handing off
+    # from ARM_MANIPULATION to LOCOMOTION). All three are reset only
+    # when the engage_motion / frozen streaks are reset, so a stale
+    # snapshot from a previous session is never sent.
+    last_override_left_hand: np.ndarray | None = None
+    last_override_right_hand: np.ndarray | None = None
+    # ----- Operator mode (stream_mode, 2026-06-10 follow-up) ---------
+    # ``current_teleop_mode`` mirrors the manager's last published
+    # ``mode`` field ("OFF" | "LOCOMOTION" | "ARM_MANIPULATION");
+    # ``last_teleop_mode_s`` is the monotonic clock at which we
+    # received it. When teleop_mode_enabled is True, these drive the
+    # engage gate directly -- motion-hysteresis and frozen-detection
+    # are BYPASSED (the operator's button press is the truth, not
+    # pose deltas). ``teleop_mode_msgs`` counts received messages,
+    # ``teleop_mode_decode_failures`` counts msgpack / topic decode
+    # failures for the status line.
+    current_teleop_mode: str | None = None
+    last_teleop_mode_s = -1.0
+    teleop_mode_msgs = 0
+    teleop_mode_decode_failures = 0
     cur_state = STATE_COLD_IDLE
     prev_state = STATE_COLD_IDLE
     tick = 0
@@ -954,6 +1600,64 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         yaw_decode_failures += 1
 
+            # ----- Drain operator mode SUB (stream_mode) ---------------
+            # Pull the latest mode message from the manager's recorder
+            # PUB so the engage gate below has fresh truth. We only
+            # need the LATEST mode -- intermediate frames are dropped
+            # (mode doesn't accumulate). Decode failures bump a
+            # counter but don't crash; the gate falls into the
+            # "stale" branch and blocks engagement until the next
+            # good frame.
+            if teleop_mode_sub is not None and _msgpack is not None:
+                latest_mode_msg: list[bytes] | None = None
+                while True:
+                    try:
+                        latest_mode_msg = teleop_mode_sub.recv_multipart(
+                            zmq.NOBLOCK
+                        )
+                    except zmq.Again:
+                        break
+                if latest_mode_msg is not None:
+                    # Manager publishes [topic_bytes, msgpack_payload].
+                    # Tolerate a single-part frame too in case some
+                    # future publisher omits the topic prefix.
+                    payload_bytes: bytes | None = None
+                    if len(latest_mode_msg) >= 2:
+                        payload_bytes = latest_mode_msg[1]
+                    elif len(latest_mode_msg) == 1:
+                        payload_bytes = latest_mode_msg[0]
+                    decoded_mode: str | None = None
+                    if payload_bytes is not None:
+                        try:
+                            payload = _msgpack.unpackb(
+                                payload_bytes, raw=False
+                            )
+                            if isinstance(payload, dict):
+                                m = payload.get("mode")
+                                if isinstance(m, str):
+                                    decoded_mode = m
+                        except Exception:
+                            decoded_mode = None
+                    if decoded_mode is not None:
+                        current_teleop_mode = decoded_mode
+                        last_teleop_mode_s = now
+                        teleop_mode_msgs += 1
+                    else:
+                        teleop_mode_decode_failures += 1
+
+            # ----- Drain operator override SUB (manual takeover) ------
+            # Drain override BEFORE primary so the freshest override
+            # frame wins on ties. Forward override bytes verbatim --
+            # the wire format is identical to primary, so the deploy
+            # decodes the operator's pose with zero extra work.
+            latest_override = None
+            if override_sub is not None:
+                while True:
+                    try:
+                        latest_override = override_sub.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+
             # Drain upstream queue. We forward the latest frame each tick,
             # not every frame -- if the laptop publishes faster than we
             # tick, intermediate frames are intentionally dropped (the
@@ -965,19 +1669,11 @@ def main(argv: list[str] | None = None) -> int:
                 except zmq.Again:
                     break
 
+            # Always cache the primary frame even when override is the
+            # forwarded source -- the HOLD fallback ladder still needs
+            # a fresh primary cache for the moment we hand back to VLA
+            # and the bridge's cold-restart hold-frame hasn't landed yet.
             if latest is not None:
-                # Got fresh upstream this tick -- forward raw bytes.
-                try:
-                    pub.send(latest, zmq.NOBLOCK)
-                    fwd_frames += 1
-                except zmq.Again:
-                    pass
-                # Cache for the upstream-silent fallback. Raw bytes are
-                # used verbatim in HOLD; the decoded joint_pos_mj slice
-                # is the lerp anchor in BLEND. A decode miss isn't fatal
-                # -- HOLD still works (we re-publish raw bytes), only
-                # BLEND degrades to "snap to idle" once the hold window
-                # expires.
                 last_upstream_msg = latest
                 jpos = decode_pose_joint_pos_mj(
                     latest, args.upstream_topic
@@ -988,8 +1684,451 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if jpos is not None:
                     last_upstream_jpos = jpos
-                cur_state = STATE_LIVE
                 last_upstream_s = now
+
+            # Override-active iff we received an override frame this
+            # tick OR within the debounce window since the last one. The
+            # debounce prevents flipping back to primary on a single
+            # dropped 20ms tick at 50Hz (would trigger spurious VLA
+            # cold-restarts mid-takeover).
+            if latest_override is not None:
+                last_override_s = now
+
+            # ----- Frozen-frame release detection ----------------------
+            # The quest3_manager publishes the frozen last commanded
+            # pose every tick in OFF/LOCOMOTION (see manager lines
+            # 1221-1229), so the override SUB never goes silent across
+            # an A+B+X+Y "drop teleop" gesture. Detect the freeze by
+            # tracking consecutive override frames whose joint_pos_mj
+            # delta from the previous frame is within tolerance. When
+            # the streak crosses the threshold, latch
+            # override_frozen_detected so the existing edge handler
+            # fires override_released exactly once (NOT every tick),
+            # giving downstream consumers the same one-shot signal
+            # they'd see on silence-based release. Disabled when
+            # frozen_ticks_threshold == 0.
+            if (
+                latest_override is not None
+                and override_sub is not None
+            ):
+                ojpos_new = decode_pose_joint_pos_mj(
+                    latest_override, args.upstream_topic
+                )
+                if ojpos_new is None:
+                    ojpos_new = decode_pose_joint_pos_mj(
+                        latest_override, args.downstream_topic
+                    )
+                # Cache operator-commanded hand joints alongside body.
+                # Both fields are optional in the wire format -- legacy
+                # token-only frames omit them -- so we keep whichever
+                # we got and leave the rest at the last seen value
+                # (initially None). The release-event packer falls
+                # back to omission when None.
+                olh = decode_pose_left_hand(
+                    latest_override, args.upstream_topic
+                )
+                if olh is None:
+                    olh = decode_pose_left_hand(
+                        latest_override, args.downstream_topic
+                    )
+                if olh is not None:
+                    last_override_left_hand = olh
+                orh = decode_pose_right_hand(
+                    latest_override, args.upstream_topic
+                )
+                if orh is None:
+                    orh = decode_pose_right_hand(
+                        latest_override, args.downstream_topic
+                    )
+                if orh is not None:
+                    last_override_right_hand = orh
+                if ojpos_new is not None:
+                    delta = 0.0
+                    if prev_override_jpos is None:
+                        # No baseline yet -- neither streak applies.
+                        override_frozen_count = 0
+                        override_motion_count = 0
+                    else:
+                        # L2 in joint space. Cheap (31 DoF body
+                        # vector; hands ship as separate fields) and
+                        # matches the manager's frozen-pose semantics
+                        # exactly: numpy .copy() of the last commanded
+                        # body vector means bytes are identical when
+                        # frozen. The tolerance (default 5e-3 rad)
+                        # absorbs sub-degree controller-rest jitter
+                        # AND IK retargeting flicker; intentional
+                        # teleop pushes trip well above on the first
+                        # tick.
+                        delta = float(np.linalg.norm(
+                            ojpos_new.astype(np.float64)
+                            - prev_override_jpos.astype(np.float64)
+                        ))
+                        if delta <= frozen_l2_tol:
+                            override_frozen_count += 1
+                            override_motion_count = 0
+                        else:
+                            # Operator is moving again. Clear the
+                            # frozen latch so future frozen streaks
+                            # can re-fire release; bump the motion
+                            # streak so the engage-hysteresis can
+                            # eventually trip.
+                            override_frozen_count = 0
+                            override_frozen_detected = False
+                            override_motion_count += 1
+                    prev_override_jpos = ojpos_new
+
+                    if (
+                        frozen_ticks_threshold > 0
+                        and not override_frozen_detected
+                        and override_frozen_count >= frozen_ticks_threshold
+                    ):
+                        override_frozen_detected = True
+                        override_frozen_release_events += 1
+                        print(
+                            f"[pose_proxy] override frozen detected "
+                            f"(streak={override_frozen_count} ticks "
+                            f">= threshold={frozen_ticks_threshold}, "
+                            f"L2={delta:.6f} <= tol={frozen_l2_tol:g}); "
+                            f"forcing release without waiting for SUB "
+                            f"silence",
+                            flush=True,
+                        )
+
+            # Engage gate. Two paths:
+            #
+            #   STRICT (teleop_mode_enabled): the manager's stream_mode
+            #     topic is the source of truth -- engage iff the mode
+            #     signal is FRESH and the reported mode is NOT "OFF"
+            #     (i.e. operator has pressed A+B+X+Y into LOCOMOTION
+            #     or ARM_MANIPULATION). When the signal goes stale
+            #     (--teleop-mode-stale-ms) engagement BLOCKS; a dead
+            #     manager fails closed within ~1 s. Motion-hysteresis
+            #     and frozen-detection are BYPASSED here because the
+            #     operator holding still in ARM_MANIPULATION looks
+            #     identical to "operator dropped to OFF" through the
+            #     pose-delta lens (the bug the user just hit).
+            #
+            #   LEGACY (--teleop-mode-port not set, or msgpack
+            #     missing): silence-debounced AND not frozen-latched
+            #     AND (legacy: immediate, OR new: sustained motion).
+            #     This is the pre-2026-06-10 behaviour and WILL flicker
+            #     when the operator holds the controller still; keep
+            #     it so older deployments / replay tests still work.
+            teleop_mode_fresh = (
+                last_teleop_mode_s >= 0
+                and (now - last_teleop_mode_s) <= teleop_mode_stale_s
+            )
+            if teleop_mode_enabled:
+                teleop_engaged = (
+                    teleop_mode_fresh
+                    and current_teleop_mode is not None
+                    and current_teleop_mode != "OFF"
+                )
+                override_fresh = (
+                    override_sub is not None
+                    and last_override_s >= 0
+                    and (now - last_override_s) <= override_stale_s
+                    and teleop_engaged
+                )
+                # Status-line helpers don't need motion/frozen booleans
+                # here -- they'd be misleading in strict mode. Keep
+                # the counters running anyway (they're updated by the
+                # frozen/motion detector blocks above) so an operator
+                # debugging a hung mode SUB can still see whether the
+                # override stream has motion under the hood.
+                override_motion_sustained = teleop_engaged
+            else:
+                override_motion_sustained = (
+                    engage_motion_threshold == 0
+                    or override_motion_count >= engage_motion_threshold
+                )
+                override_fresh = (
+                    override_sub is not None
+                    and last_override_s >= 0
+                    and (now - last_override_s) <= override_stale_s
+                    and not override_frozen_detected
+                    and override_motion_sustained
+                )
+
+            # ----- Edge: PRIMARY/IDLE -> OVERRIDE ---------------------
+            # Fire the "engaged" event ASAP so the VLA bridge can stop
+            # publishing chunks (avoids stale-chunk wire fights with the
+            # operator's pose during the takeover window).
+            if override_fresh and not override_active:
+                override_active = True
+                override_engage_events += 1
+                # 2026-06-10 follow-up 9: arm the engagement slow-step
+                # ramp. Anchor the clamp at the last successfully
+                # forwarded pose (which under LIVE is the most
+                # recent VLA frame and under HOLD/BLEND/IDLE is the
+                # last cached or idle-clip pose). When ramp_ticks
+                # is 0 we skip the arm entirely (legacy verbatim-
+                # forward behaviour for smoke tests).
+                if (
+                    engagement_step_ramp_ticks > 0
+                    and engagement_max_wire_step > 0.0
+                ):
+                    engagement_clamp_remaining = engagement_step_ramp_ticks
+                    if last_upstream_jpos is not None:
+                        engagement_last_forwarded_jpos = (
+                            np.asarray(last_upstream_jpos, dtype=np.float32)
+                            .copy()
+                        )
+                    else:
+                        engagement_last_forwarded_jpos = None
+                    print(
+                        f"[pose_proxy] engagement slow-step ramp armed "
+                        f"(window={engagement_step_ramp_ticks} ticks; "
+                        f"max_step {engagement_max_wire_step:.3f} -> "
+                        f"{engagement_steady_wire_step:.3f} rad/tick; "
+                        f"anchor="
+                        f"{'last_VLA_pose' if engagement_last_forwarded_jpos is not None else 'NONE (will forward operator frame 0 verbatim)'}"
+                        f")",
+                        flush=True,
+                    )
+                if vla_control_pub is not None:
+                    try:
+                        evt = json.dumps({
+                            "event": "override_engaged",
+                            "ts": now,
+                            "tick": tick,
+                        }).encode("utf-8")
+                        vla_control_pub.send_multipart(
+                            [args.vla_control_topic.encode("utf-8"),
+                             evt],
+                            zmq.NOBLOCK,
+                        )
+                    except zmq.Again:
+                        pass
+
+            # ----- Edge: OVERRIDE -> PRIMARY/IDLE ---------------------
+            # Fire the "released" event the moment the override SUB
+            # falls past its stale window, regardless of whether
+            # primary is fresh or both are silent. The VLA bridge uses
+            # this to cold-restart its ramp-in from the current
+            # measured pose (clearing stale action chunks).
+            if (not override_fresh) and override_active:
+                override_active = False
+                override_release_events += 1
+                # 2026-06-10 follow-up 9: tear down the engagement
+                # ramp state on release so the next engage edge
+                # re-arms cleanly from a fresh VLA anchor. Without
+                # this, a rapid release+re-engage within the ramp
+                # window would inherit the previous anchor (= stale
+                # operator pose) and skip the slow-step bridge from
+                # VLA's new pose.
+                engagement_clamp_remaining = 0
+                engagement_last_forwarded_jpos = None
+                if vla_control_pub is not None:
+                    try:
+                        # Pack the operator's last commanded pose
+                        # (body + hands) into the event so the bridge
+                        # can hold the wire at THIS exact pose during
+                        # its cold-restart bridging window instead of
+                        # snapping to x2_debug's measured pose, which
+                        # lags by motor / contact / gravity sag and
+                        # produces the observable "pose reset" on
+                        # ARM_MANIPULATION -> LOCOMOTION handoff.
+                        # Each field is optional -- when the source
+                        # frame omits it (or proxy decode failed),
+                        # the key is left out and the bridge falls
+                        # back to its legacy measured-pose hold.
+                        release_pose: dict[str, list[float]] = {}
+                        if prev_override_jpos is not None:
+                            release_pose["joint_pos_mj"] = (
+                                prev_override_jpos.astype(float).tolist()
+                            )
+                        if last_override_left_hand is not None:
+                            release_pose["left_hand_joints"] = (
+                                last_override_left_hand.astype(float)
+                                .tolist()
+                            )
+                        if last_override_right_hand is not None:
+                            release_pose["right_hand_joints"] = (
+                                last_override_right_hand.astype(float)
+                                .tolist()
+                            )
+                        evt_payload: dict[str, object] = {
+                            "event": "override_released",
+                            "ts": now,
+                            "tick": tick,
+                        }
+                        if release_pose:
+                            evt_payload["release_pose"] = release_pose
+                        evt = json.dumps(evt_payload).encode("utf-8")
+                        vla_control_pub.send_multipart(
+                            [args.vla_control_topic.encode("utf-8"),
+                             evt],
+                            zmq.NOBLOCK,
+                        )
+                    except zmq.Again:
+                        pass
+
+            if override_fresh:
+                # Override owns the wire this tick. Forward the freshest
+                # override frame (if we got one); else republish the
+                # last one cached on the override path so the deploy
+                # keeps tracking the operator's hold pose between SUB
+                # ticks. Also overwrite the primary cache so a
+                # subsequent HOLD fallback replays the operator's pose
+                # (not the stale pre-override VLA frame).
+                if latest_override is not None:
+                    # 2026-06-10 follow-up 9: clamp the operator's
+                    # joint_pos_mj per-element relative to the last
+                    # forwarded pose during the engagement ramp.
+                    # Without the clamp the first OVERRIDE frame
+                    # steps the wire across the full VLA -> operator
+                    # delta in one tick (~3 rad L_inf in the 13:05
+                    # run) and the deploy slams the body.
+                    fwd_msg = latest_override
+                    op_jpos = decode_pose_joint_pos_mj(
+                        latest_override, args.upstream_topic
+                    )
+                    if op_jpos is None:
+                        op_jpos = decode_pose_joint_pos_mj(
+                            latest_override, args.downstream_topic
+                        )
+                    if (
+                        engagement_clamp_remaining > 0
+                        and op_jpos is not None
+                        and engagement_last_forwarded_jpos is not None
+                    ):
+                        # Linear interpolation of the per-element
+                        # step clamp from slow -> steady across the
+                        # ramp window. Mirrors the bridge's
+                        # follow-up 6 formula so the two sides of
+                        # the takeover handshake have symmetric
+                        # rate-limit behaviour.
+                        ramp_progress = 1.0 - float(
+                            engagement_clamp_remaining
+                        ) / float(max(engagement_step_ramp_ticks, 1))
+                        ramp_progress = min(max(ramp_progress, 0.0), 1.0)
+                        effective_max_step = (
+                            (1.0 - ramp_progress) * engagement_max_wire_step
+                            + ramp_progress * engagement_steady_wire_step
+                        )
+                        # The original engagement edge log already
+                        # documented anchor presence; for per-tick
+                        # diagnostics rely on the operator's status
+                        # line + the bridge's body_Δ telemetry.
+                        clamped_jpos = _clamp_vector_step_f32(
+                            op_jpos,
+                            engagement_last_forwarded_jpos,
+                            effective_max_step,
+                        )
+                        # Follow-up 9b: ALSO flatten the future
+                        # window. The deploy's window-mode policy
+                        # uses joint_pos_mj_future (9 slots,
+                        # 0.1 s apart) to predict the next 0.9 s
+                        # of motion. The operator's untouched
+                        # future encodes "go all the way to
+                        # operator-pose in 0.9 s" -- ~3 rad delta
+                        # over 9 slots ~ 0.33 rad/slot, which
+                        # the policy slams to follow even when
+                        # the current jpos is properly rate-
+                        # limited (the failure mode the user just
+                        # reported). Broadcasting the clamped
+                        # current jpos to all 9 slots tells the
+                        # policy "operator wants to hold here";
+                        # zeroing joint_vel_mj_future cancels
+                        # the velocity prediction. After the
+                        # engagement ramp completes the operator's
+                        # actual future window flows through.
+                        flat_future = np.broadcast_to(
+                            clamped_jpos, (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS)
+                        ).astype(np.float32, copy=True)
+                        zero_future_vel = _ZERO_QVEL_FUTURE.copy()
+                        overrides_for_clamp = {
+                            "joint_pos_mj": clamped_jpos,
+                            "joint_pos_mj_future": flat_future,
+                            "joint_vel_mj_future": zero_future_vel,
+                        }
+                        rebuilt = rebuild_msg_with_field_overrides(
+                            latest_override,
+                            args.upstream_topic,
+                            overrides_for_clamp,
+                        )
+                        if rebuilt is None:
+                            # Try downstream topic; some pose
+                            # producers use it instead. If both
+                            # fail, fall back to forwarding the
+                            # original frame verbatim (slam-risk
+                            # but preserves the operator's intent
+                            # better than dropping the frame).
+                            rebuilt = rebuild_msg_with_field_overrides(
+                                latest_override,
+                                args.downstream_topic,
+                                overrides_for_clamp,
+                            )
+                        if rebuilt is None:
+                            # The override frame likely doesn't
+                            # carry the full v5 future window
+                            # (e.g. a v4 token-only frame from a
+                            # legacy publisher). Fall back to
+                            # clamping just the current jpos --
+                            # still better than verbatim forward,
+                            # and most callers DO publish the
+                            # full window.
+                            rebuilt = rebuild_msg_with_jpos_override(
+                                latest_override,
+                                args.upstream_topic,
+                                clamped_jpos,
+                            )
+                            if rebuilt is None:
+                                rebuilt = rebuild_msg_with_jpos_override(
+                                    latest_override,
+                                    args.downstream_topic,
+                                    clamped_jpos,
+                                )
+                        if rebuilt is not None:
+                            fwd_msg = rebuilt
+                            engagement_last_forwarded_jpos = (
+                                clamped_jpos.copy()
+                            )
+                            op_jpos = clamped_jpos
+                        # ELSE: no-op, fwd_msg stays as the
+                        # original operator frame. The slam risk
+                        # is back but only when the frame header
+                        # is corrupt -- decode_pose_joint_pos_mj
+                        # above already returned non-None so the
+                        # rebuild SHOULD succeed; this is purely
+                        # defensive.
+                        engagement_clamp_remaining -= 1
+                    elif (
+                        engagement_clamp_remaining > 0
+                        and op_jpos is not None
+                        and engagement_last_forwarded_jpos is None
+                    ):
+                        # First override tick of the engagement
+                        # ramp with NO anchor (LIVE never ran on
+                        # the bridge, so we don't have a VLA pose
+                        # to clamp toward). Seed the anchor from
+                        # this operator pose and forward verbatim;
+                        # subsequent ticks will clamp relative to
+                        # this anchor. This is the cold-start
+                        # smoke-test path; in production the anchor
+                        # is always seeded at the engage edge from
+                        # last_upstream_jpos.
+                        engagement_last_forwarded_jpos = op_jpos.copy()
+                        engagement_clamp_remaining -= 1
+                    try:
+                        pub.send(fwd_msg, zmq.NOBLOCK)
+                        override_frames += 1
+                    except zmq.Again:
+                        pass
+                    last_upstream_msg = fwd_msg
+                    if op_jpos is not None:
+                        last_upstream_jpos = op_jpos
+                    last_upstream_s = now
+                cur_state = STATE_OVERRIDE
+            elif latest is not None:
+                # Got fresh primary this tick -- forward raw bytes.
+                try:
+                    pub.send(latest, zmq.NOBLOCK)
+                    fwd_frames += 1
+                except zmq.Again:
+                    pass
+                cur_state = STATE_LIVE
             else:
                 # No upstream this tick. Decide what to fill in with via
                 # the staged fallback ladder (LIVE -> HOLD -> BLEND ->
@@ -1133,6 +2272,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 elif cur_state == STATE_COLD_IDLE:
                     msg_txt = f"{prev_state} -> COLD_IDLE"
+                elif cur_state == STATE_OVERRIDE:
+                    msg_txt = (
+                        f"{prev_state} -> OVERRIDE (operator teleop "
+                        f"override engaged; forwarding override port "
+                        f"frames with engagement slow-step clamp "
+                        f"active for the first "
+                        f"{engagement_step_ramp_ticks} ticks)"
+                    )
                 else:
                     msg_txt = f"{prev_state} -> {cur_state}"
                 print(f"[pose_proxy] state: {msg_txt}", flush=True)
@@ -1188,9 +2335,71 @@ def main(argv: list[str] | None = None) -> int:
                         f"yaw={math.degrees(last_measured_yaw_rad):+.1f}deg "
                         f"age={yaw_age_ms:.0f}ms"
                     )
+                if override_enabled:
+                    if last_override_s < 0:
+                        ovr_age_str = "never"
+                    else:
+                        ovr_age_str = (
+                            f"{(now - last_override_s) * 1000:.0f}ms"
+                        )
+                    if teleop_mode_enabled:
+                        # Strict mode: surface the manager's last
+                        # reported mode + how long ago it landed,
+                        # plus a one-shot "stale" hint when we'd
+                        # block engagement. Motion/frozen counters
+                        # are intentionally hidden -- they're noise
+                        # in this path and operators kept reading
+                        # them as the engage signal.
+                        if last_teleop_mode_s < 0:
+                            mode_age_str = "never"
+                        else:
+                            mode_age_str = (
+                                f"{(now - last_teleop_mode_s) * 1000:.0f}ms"
+                            )
+                        if not teleop_mode_fresh:
+                            stale_tag = " STALE"
+                        elif current_teleop_mode == "OFF":
+                            stale_tag = " OFF"
+                        else:
+                            stale_tag = ""
+                        gate_str = (
+                            f" gate(mode={current_teleop_mode} "
+                            f"age={mode_age_str} "
+                            f"msgs={teleop_mode_msgs} "
+                            f"fail={teleop_mode_decode_failures}"
+                            f"{stale_tag})"
+                        )
+                    else:
+                        if frozen_ticks_threshold > 0:
+                            frz_str = (
+                                f" frozen(det={override_frozen_detected} "
+                                f"streak={override_frozen_count}/"
+                                f"{frozen_ticks_threshold} "
+                                f"rel={override_frozen_release_events})"
+                            )
+                        else:
+                            frz_str = " frozen(disabled)"
+                        if engage_motion_threshold > 0:
+                            mot_str = (
+                                f" moving(streak={override_motion_count}/"
+                                f"{engage_motion_threshold} "
+                                f"sustained={override_motion_sustained})"
+                            )
+                        else:
+                            mot_str = " moving(legacy:immediate)"
+                        gate_str = f"{frz_str}{mot_str}"
+                    ovr_str = (
+                        f" override(active={override_active} "
+                        f"age={ovr_age_str} fwd={override_frames} "
+                        f"eng={override_engage_events} "
+                        f"rel={override_release_events})"
+                        f"{gate_str}"
+                    )
+                else:
+                    ovr_str = ""
                 print(
                     f"[pose_proxy] tick={tick} state={state_str} "
-                    f"mode={idle_mode} upstream_age={age_str} "
+                    f"mode={idle_mode} upstream_age={age_str}{ovr_str} "
                     f"fwd={fwd_frames} hold={hold_frames} "
                     f"blend={blend_frames} idle={idle_frames} "
                     f"idle_rebased={idle_frames_with_rebase} "
@@ -1215,12 +2424,27 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         sub.close(linger=0)
         pub.close(linger=0)
+        if override_sub is not None:
+            override_sub.close(linger=0)
+        if teleop_mode_sub is not None:
+            teleop_mode_sub.close(linger=0)
+        if yaw_sub is not None:
+            yaw_sub.close(linger=0)
+        if vla_control_pub is not None:
+            vla_control_pub.close(linger=0)
         ctx.term()
 
+    ovr_done = ""
+    if override_enabled:
+        ovr_done = (
+            f" override_fwd={override_frames} "
+            f"override_engaged={override_engage_events} "
+            f"override_released={override_release_events}"
+        )
     print(
         f"[pose_proxy] done. total_ticks={tick} fwd={fwd_frames} "
         f"hold={hold_frames} blend={blend_frames} idle={idle_frames} "
-        f"gap_skip={gap_skips}",
+        f"gap_skip={gap_skips}{ovr_done}",
         flush=True,
     )
     return 0

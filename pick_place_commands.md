@@ -60,11 +60,6 @@ gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal --host 192.168.86.32
     --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right" \
     --vla-raw
 
-### run vla on x2-sim (default empty x2_ultra.xml scene)
-./gear_sonic/scripts/run_x2_vla_runtime.sh \
-    --model /home/stickbot/Projects/GR00T-WholeBodyControl/data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
-    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
-    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
 
 ### run vla on x2-sim (robocasa scene: X2PickPlaceApple|X2PickPlaceBowl|X2PickPlaceCube)
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
@@ -99,6 +94,51 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
 ### diagnose: FK raw policy intent vs delivered wire from chunk dumps
 .venv-viewer/bin/python -m gear_sonic.scripts.diagnose_vla_chunk_fk \
     --chunk-dir /tmp/x2_vla_runtime-LATEST/vla_chunks
+
+
+### human-in-loop commands (sim)
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --vla-control-port 5559 \
+    --pose-proxy-override-port 5560 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --robocasa-env X2PickPlaceCube \
+    --prompt "pick up the red cube and drop it into the blue bowl"
+
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --no-deploy \
+    --pose-port 5560 \
+    --no-x2-debug-bridge --preserve-arms-on-engage
+
+
+### human-in-loop commands (real)
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
+    --lock-head-straight
+
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --pc2-host 192.168.86.32 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right" \
+    --vla-max-wire-dev-from-body 1.5 \
+    --vla-target-lpf-hz 5.0 \
+    --vla-future-lpf-hz 5.0 \
+    --vla-hand-lpf-hz 10.0 \
+    --vla-max-wire-step 0.07 \
+    --with-record \
+    --output-dir data/lerobot/x2_pick_and_place_soda_can_n17_50k_v1_rollouts \
+    --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
+
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --no-deploy \
+    --pose-port 5560 \
+    --preserve-arms-on-engage
+
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
+
 
 =============== end of pure manual notes section ===============
 
@@ -266,6 +306,436 @@ inference modes without restarting SONIC):
 ./gear_sonic/scripts/run_x2_vla_runtime.sh stop \
     --run-dir /tmp/x2_vla_runtime-YYYYMMDD_HHMMSS
 ```
+
+---
+
+## Manual takeover during VLA (operator nudges, no restart)
+
+If VLA gets stuck (e.g. arm hovers forward-up and refuses to descend
+on the soda can), the operator can grab the wire via VR teleop,
+re-position the arm, then let go — the proxy emits an edge event
+that triggers a bridge cold-restart so the next decoded chunk
+ramps in from the operator's hand-off pose. No process restarts.
+
+**Wire topology** (2026-06-10 milestone). Two upstreams feed the
+PC2 pose proxy; the proxy arbitrates and emits a control event on
+the override edge:
+
+```text
+┌──────────────────────────────┐
+│ live_vla_publish_motion_token│──── tcp://laptop:5556 ─┐
+│   (autonomous bridge)        │       (primary)        │
+└──────────────────────────────┘                        ▼
+                                          ┌──────────────────┐
+                                          │  x2_pose_proxy   │── tcp://localhost:5558 ─▶ C++ deploy
+                                          │  (PC2)           │
+┌──────────────────────────────┐          │  arbitrates      │
+│ record_x2_dataset.py (teleop │── tcp://laptop:5560 ─┘ │  primary / override │
+│   --pub-port 5560)           │       (override)        └────────┬─────────┘
+└──────────────────────────────┘                                  │
+                                          tcp://0.0.0.0:5559      │
+                                          (vla_control PUB)       │
+                                              ▲                   │
+                                              │ override_engaged /
+                                              │ override_released  ▼
+                                          ┌──────────────────────────────┐
+                                          │ live_vla_publish_motion_token│
+                                          │ --vla-control-port 5559      │
+                                          │ (cold-restart on release)    │
+                                          └──────────────────────────────┘
+```
+
+### One-time PC2 daemon setup
+
+Set the proxy override + control ports in the environment **before**
+`x2_pc2_daemons.sh start`. These propagate to the proxy's tmux
+session and persist across deploy restarts. The
+`POSE_PROXY_TELEOP_MODE_*` env vars enable strict mode-gated
+engagement (2026-06-10 follow-up) — point `POSE_PROXY_TELEOP_MODE_HOST`
+at the laptop that runs the Quest3 manager:
+
+```sh
+export POSE_PROXY_OVERRIDE_PORT=5560                 # teleop recorder wire
+export POSE_PROXY_OVERRIDE_STALE_MS=200              # debounce (default)
+export POSE_PROXY_CONTROL_PORT=5559                  # vla_control PUB
+export POSE_PROXY_TELEOP_MODE_HOST=192.168.86.22     # laptop manager
+export POSE_PROXY_TELEOP_MODE_PORT=5564              # manager --recorder-pub-port
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
+    --lock-head-straight
+```
+
+Proxy log should show on startup:
+
+```text
+[pose_proxy] override SUB:   tcp://192.168.86.22:5560 topic='pose' (stale_ms=200)
+[pose_proxy] teleop_mode SUB: tcp://192.168.86.22:5564 topic='stream_mode' (stale_ms=1000) -- STRICT mode-gated engage (motion-hysteresis bypassed)
+[pose_proxy] vla_control PUB: tcp://0.0.0.0:5559 topic='vla_control'
+```
+
+If you skip the `POSE_PROXY_TELEOP_MODE_*` exports the proxy falls back
+to motion-hysteresis and you'll see this instead:
+
+```text
+[pose_proxy] teleop_mode SUB: DISABLED (--teleop-mode-port not set; falling back to motion-hysteresis engage path which will flicker if operator holds controller still in ARM_MANIPULATION)
+```
+
+### Start the VLA bridge with cold-restart on override
+
+```sh
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --pc2-host 192.168.86.32 \
+    --vla-control-port 5559 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
+```
+
+`--vla-control-port > 0` enables the bridge's vla_control SUB. The
+host defaults to `--pc2-host`, so no extra flag is needed for the
+typical split topology. (Env-var form `VLA_CONTROL_PORT=5559 ...`
+still works as a fallback.) Bridge log should show:
+
+```text
+[live-VLA] vla_control SUB connected: tcp://192.168.86.32:5559 topic='vla_control'
+[live-VLA] vla_control SUB enabled (host=192.168.86.32 port=5559 ...)
+```
+
+### Start the teleop stack alongside (publishes operator wire on :5560)
+
+The Quest3 manager + planner + recorder run as a separate process
+group. Pass `--pose-port 5560` so the recorder PUBs the operator's
+wire on the override port instead of fighting the bridge for :5556.
+Pass `--no-deploy` so we don't spawn a competing C++ deploy.
+
+```sh
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --pc2-host 192.168.86.32 \
+    --pose-port 5560 \
+    --no-deploy
+```
+
+### Operator workflow
+
+1. VLA runs autonomously; arm gets stuck.
+2. Operator engages teleop the **usual** way — press `A+B+X+Y` on the
+   Quest 3 controllers to enter `LOCOMOTION`, or just hold trigger
+   to enter `ARM_MANIPULATION`. The Quest3 manager is unchanged; it
+   just publishes its arm/finger commands as always, which the
+   recorder packs into pose frames on :5560.
+3. The proxy detects fresh frames on the override port and **prefers
+   them** over the bridge's frames. The deploy commands the operator's
+   pose. The proxy emits `override_engaged` on the vla_control PUB;
+   the bridge stops sending decoded chunks (it ships the measured
+   pose instead so the wire stays alive).
+4. Operator hand-positions the arm and **releases** by pressing
+   `A+B+X+Y` again to drop the manager back to `OFF` (or kills the
+   teleop stack as a backstop).
+5. The proxy detects the disengage from the manager's **`stream_mode`
+   broadcast** (the canonical, 2026-06-10-follow-up path):
+   - **Mode-gated engagement** (recommended; default in sim, opt-in
+     on real robot via `POSE_PROXY_TELEOP_MODE_PORT`). The proxy SUBs
+     to the Quest3 manager's `stream_mode` topic (manager's
+     `--recorder-pub-port`, default `5564`, msgpack payload with
+     `mode: "OFF" | "LOCOMOTION" | "ARM_MANIPULATION"`). Engagement
+     is **STRICT**: override frames are forwarded iff the mode signal
+     is fresh AND `mode != "OFF"`. Motion-hysteresis / frozen
+     detection are bypassed entirely, so **holding the controller
+     still in ARM_MANIPULATION no longer flickers release** (the
+     2026-06-10 user bug). On `mode == "OFF"`, the proxy fires
+     `override_released` on the **next tick** — no debounce, the
+     operator's button press IS the truth.
+   - **Fail-closed semantics**: if the mode signal goes stale past
+     `--teleop-mode-stale-ms` (default 1 s = ~50 manager ticks @
+     50 Hz), engagement is **BLOCKED** — a dead manager hands the
+     wire back to VLA within ~1 s instead of silently falling back
+     to flicker-prone heuristics.
+   - **Legacy motion-hysteresis path** (only when
+     `--teleop-mode-port` is unset or msgpack is missing): see the
+     pre-2026-06-10 `--override-frozen-ticks` /
+     `--override-engage-motion-ticks` flags below. Kept for replay
+     smoke tests and for older deployments that don't run the
+     manager. **This path WILL flicker** when the operator holds
+     the controller still — use mode-gating in production.
+   - **Silence backstop**: if the entire teleop stack dies (Ctrl-C,
+     kernel panic, network drop), the override SUB stops receiving
+     frames and `--override-stale-ms` (default 200 ms) triggers
+     release. Acts as the catastrophic-loss escape hatch, NOT the
+     normal disengage path.
+
+   Either release path emits the same `override_released` JSON event,
+   which now carries an optional `release_pose` field with the
+   operator's last commanded body + hand joints (`joint_pos_mj`,
+   `left_hand_joints`, `right_hand_joints`). The bridge consumes
+   the released edge, triggers a cold restart (clears ramp / LPF /
+   chunk-blend state, pins the chunk-id baseline so any in-flight
+   pre-override chunk is discarded), seeds the chunk blend's "from"
+   anchors from the operator pose, and holds the wire **at the
+   operator's last commanded pose** for `--vla-cold-restart-hold-ticks`
+   ticks (default 25 = 500 ms). Falls back to x2_debug's measured
+   pose only if the proxy didn't ship a payload (legacy proxy or
+   smoke test with `--override-engage-motion-ticks 0`).
+6. The next freshly decoded chunk ramps in from the operator's
+   hand-off pose. VLA continues autonomously.
+
+### What to look for in the logs
+
+Proxy (with `--teleop-mode-port 5564` — the canonical 2026-06-10
+follow-up path):
+
+```text
+[pose_proxy] teleop_mode SUB: tcp://127.0.0.1:5564 topic='stream_mode' (stale_ms=1000) -- STRICT mode-gated engage (motion-hysteresis bypassed)
+[pose_proxy] tick=2401 state=LIVE mode=blend upstream_age=20ms override(active=False age=2ms fwd=0 eng=0 rel=0) gate(mode=OFF age=18ms msgs=1183 fail=0 OFF)
+[pose_proxy] state: LIVE -> OVERRIDE (operator teleop override engaged; forwarding override port frames verbatim)
+[pose_proxy] tick=2440 state=OVERRIDE mode=blend upstream_age=20ms override(active=True age=2ms fwd=39 eng=1 rel=0) gate(mode=ARM_MANIPULATION age=18ms msgs=1222 fail=0)
+[pose_proxy] state: OVERRIDE -> LIVE (upstream pose frames flowing again after 0 ms gap)
+[pose_proxy] tick=2490 state=LIVE mode=blend upstream_age=20ms override(active=False age=2ms fwd=89 eng=1 rel=1) gate(mode=OFF age=18ms msgs=1272 fail=0 OFF)
+```
+
+The `gate(mode=…)` field on the status line is the smoking gun for
+mode-gated engagement: `mode=OFF` ⇒ proxy refuses to engage,
+`mode=ARM_MANIPULATION`/`LOCOMOTION` ⇒ proxy engaged. If you see
+`STALE` in the tag (e.g. `gate(mode=OFF age=2400ms msgs=42 fail=0 STALE)`)
+the manager has gone silent for `> --teleop-mode-stale-ms` and the
+proxy is refusing to engage — fail-closed.
+
+Legacy path (no `--teleop-mode-port`) instead emits the frame-equality
+detector lines:
+
+```text
+[pose_proxy] override frozen detected (streak=10 ticks >= threshold=10, L2=0.000000 <= tol=0.0001); forcing release without waiting for SUB silence
+```
+
+If you see `gate(...)` instead of `frozen(...)`/`moving(...)` the
+strict mode path is active. Only fall back to the frozen detector
+for replay smoke tests where no manager is running.
+
+Bridge:
+
+```text
+[live-VLA] vla_control: override_engaged (proxy_ts=12345.678) -- pausing decoded chunks, holding measured pose on wire
+[live-VLA] vla_control: override_released (proxy_ts=12347.890) -- cold restart armed; clearing ramp / LPF / chunk state on next tick; release_pose has joint_pos_mj+left_hand_joints+right_hand_joints; bridge will hold at operator pose
+[live-VLA] cold-restart fired tick=11234 baseline_chunk=47 hold_ticks=25; will hold wire at operator's last commanded pose (body+left_hand+right_hand) before any decoded chunk re-engages
+```
+
+If the bridge log instead shows `release_pose: no release_pose; bridge
+will hold at x2_debug measured pose (legacy)` followed by `will hold
+wire at x2_debug measured pose (legacy fallback)`, the proxy didn't
+ship a release_pose payload — either you're running an older proxy
+binary or the override-port chain is mis-wired so the proxy never
+saw the operator's frames. Either case will cause the visible
+"pose reset" the engage hysteresis was added to address; check that
+the recorder is publishing on the proxy's `--override-port` and that
+the proxy reports `eng >= 1` in its status line.
+
+### Disabling without uninstalling
+
+Drop `--vla-control-port` (or pass `--vla-control-port -1`) to keep
+the autonomous-only flow byte-for-byte unchanged on the bridge side;
+drop `--pose-proxy-override-port` (sim) or unset
+`POSE_PROXY_OVERRIDE_PORT` env var (real-robot, consumed by
+`x2_pc2_daemons.sh`) to do the same on the proxy. The new code paths
+are all gated on positive port numbers, so a quiet config flip back
+to single-source is one removed flag.
+
+### Sim-only variant (no PC2, no real robot)
+
+The 2026-06-10 sim-launcher extension spawns the same `x2_pose_proxy`
+on **loopback** when `SIM_MODE=1` AND (`VLA_CONTROL_PORT > 0` OR
+`POSE_PROXY_OVERRIDE_PORT > 0`). Wire topology mirrors the real-robot
+diagram above with `127.0.0.1` everywhere; the local sim deploy SUBs
+from the proxy's downstream port (default `:5558`) instead of the
+bridge's :5556. Legacy autonomous-only sim runs (with the new env
+vars unset) are byte-for-byte unchanged.
+
+**Terminal A — VLA runtime + sim deploy + sim proxy (one command):**
+
+```sh
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --vla-control-port 5559 \
+    --pose-proxy-override-port 5560 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --robocasa-env X2PickPlaceCube \
+    --prompt "pick up the red cube and drop it into the blue bowl"
+```
+
+(The MuJoCo passive viewer + OmniHand compose are sim defaults. Add
+`--no-sim-viewer` for headless runs or `--no-sim-with-omnihand` to fall
+back to the bare X2 stub fingers. When `--sim-with-omnihand` is on
+AND the proxy is in the wire, the launcher also redirects the
+OmniHand ZMQ subscriber from its default `localhost:5556` to the
+proxy's downstream port — so operator finger commands ride the
+same arbitrated wire as the body joints. Without this redirect the
+OmniHand SUB would stay pinned to the bridge's :5556 and always
+show VLA fingers regardless of override engagement.)
+
+**Wrist bypass (OFF by default — default flipped to `ik` and reverted on 2026-06-10
+evening).** The launcher defaults `--wrist-bypass off`. This means the
+SONIC tracker drives the wrist actuators directly, which per
+`wrist_bypass.hpp` pins `*_wrist_pitch` at a near-static comfort pose
+and `*_wrist_roll` at the asymmetric joint-range tight side
+**regardless** of what the IK reference (operator command, VLA chunk)
+asks for. This is intentional after the 12:26 incident: setting
+`--wrist-bypass ik` makes the deploy force-write
+`target_pos_mj[{20,21,27,28}]` to the wire's `joint_pos_mj` BEFORE the
+safety stack, but the launcher's default wire content (idle_stand clip
+wrists at startup, VLA chunk wrists during inference) is ~1.8 rad
+(~103°) away from SONIC's natural pinned pose. Without
+`--max-target-dev` configured (launcher default: empty), the only
+per-tick rate limit is the soft-start blend, and you'll see a wrist
+swing on startup that the operator on 2026-06-10 12:26 correctly
+reported as "the hand slammed into the table".
+
+If you want the wrist to actually respond to the operator's VR wrist
+gesture (or VLA wrist tokens), pass BOTH flags together:
+
+```
+--wrist-bypass ik \
+  --deploy-extra-arg --max-target-dev --deploy-extra-arg 0.05
+```
+
+(0.05 rad/tick at 50 Hz = 2.5 rad/s ≈ 1.3 s for a full wrist swing —
+aggressive enough to keep up with hand gestures, slow enough to not
+slam.) The launcher banner shows DANGER text when `ik` is selected so
+you can't miss it. See the 2026-06-10 milestone document
+(`docs/source/user_guide/milestones/2026-06-10_vla_manual_takeover.md`,
+follow-up 4) for the full postmortem and the path back to a safe `ik`
+default.
+
+**Smooth handoff guard (ON by default since 2026-06-10 evening).** When
+override releases (mode → OFF), the bridge does NOT immediately ramp
+back to the idle clip. Instead it holds the wire at the operator's
+hand-off pose for a MINIMUM of `--vla-cold-restart-hold-ticks` (default
+25 = 500 ms, bridges the proxy's HOLD ladder seamlessly) and a MAXIMUM
+of `--vla-handoff-max-hold-ticks` (default 200 = 4 s, safety cap). In
+between, the hold releases as soon as the first **eligible** chunk
+arrives (`chunk_id > cold_restart_baseline`, i.e. a chunk the model
+decoded AFTER the operator released the wire). When that first chunk
+fires, the ramp + body LPF + both hand LPFs are seeded from the
+operator's hand-off pose — so the wire interpolates `operator →
+decoded` over `--vla-ramp-in-ticks` (default 75 = 1.5 s) without an
+idle-clip detour. Watch the bridge log for:
+
+```text
+[live-VLA] cold-restart fired tick=… min_hold_ticks=25 max_hold_ticks=200; will hold wire at operator's last commanded pose (body+left_hand+right_hand) until first eligible chunk (chunk_id > K) decodes, capped by max-hold safety
+[live-VLA] cold-restart handoff: first eligible chunk decoded (chunk_id=K+1 > baseline=K); releasing wire hold at tick=…, ramping into VLA from operator pose
+[live-VLA] cold-restart handoff: ramp + LPF seeded from operator pose (ramp_ticks=75); VLA wire re-engaging from hand-off pose without idle-clip detour
+```
+
+If you ever see `WARNING: cold-restart handoff safety cap reached`, the
+decoder is wedged (stuck inference, proprio starvation, or only
+zero-token chunks). The wire releases to idle to avoid sitting at the
+operator pose forever; investigate the inference thread.
+
+Tuning: bump `VLA_HANDOFF_MAX_HOLD_TICKS=400` (or pass
+`--vla-handoff-max-hold-ticks 400`) if you have a slower inference
+setup. Setting it to `0` disables the guard entirely and reverts to
+the legacy 2026-06-10 behaviour (snap to idle on minimum-hold expiry;
+not recommended).
+
+**Finger telemetry.** The recorder's subscribe-mode status line now
+shows `hand|L|=N.NNN(manager|zero-fallback) hand|R|=…` so you can tell
+"manager publishes zero hand_q because the operator hasn't pulled
+triggers" apart from "the wire is broken". If you see
+`hand|L|=0.000(manager)` while in ARM_MANIPULATION, **the operator
+isn't pulling the triggers** — the manager's retargeter only emits
+non-zero finger curls in response to the VR controller's analog
+triggers. If you see `hand|L|=0.000(zero-fallback)`, the manager hasn't
+yet published `hand_finger_cmd` (still in startup, or you haven't
+entered ARM_MANIPULATION yet — `arm_targets` and `hand_finger_cmd` only
+flow once you've engaged arm IK via the A button after B → ARM_MAN).
+
+Engage / release tuning (all optional; defaults are tuned for the
+ARM_MANIPULATION ↔ OFF gesture workflow).
+
+**Strict mode-gated engagement (canonical 2026-06-10 follow-up;
+ON by default in sim):**
+- `--pose-proxy-teleop-mode-port PORT` — port of the Quest3 manager's
+  `stream_mode` PUB (default `5564`, matches the manager's
+  `--recorder-pub-port`). When > 0 the proxy uses the operator's
+  button presses as the engagement source of truth and **bypasses**
+  motion-hysteresis entirely. Set to `-1` to fall back to the legacy
+  motion-hysteresis path (only useful for replay smoke tests where
+  no manager is running — will flicker if operator holds controller
+  still in ARM_MANIPULATION).
+- `--pose-proxy-teleop-mode-host HOST` — manager host (default
+  `127.0.0.1`). Set to the laptop's address when the manager and
+  proxy are on different machines.
+- `--pose-proxy-teleop-mode-topic TOPIC` — ZMQ topic prefix
+  (default `stream_mode`; matches the manager's
+  `--stream-mode-topic`).
+- `--pose-proxy-teleop-mode-stale-ms MS` — fail-closed window
+  (default 1000 = ~50 manager ticks @ 50 Hz). When the mode signal
+  has been silent longer than this, **engagement is BLOCKED** — a
+  dead manager hands the wire back to VLA within ~1 s.
+
+**Legacy motion-hysteresis flags (ignored when
+`--pose-proxy-teleop-mode-port > 0`):**
+- `--pose-proxy-override-engage-motion-ticks N` — symmetric engage
+  hysteresis. Require N consecutive moving frames before engage
+  (default 10 = 200 ms @ 50 Hz, mirrors `--override-frozen-ticks`).
+  Set to 0 for the legacy single-frame engage.
+- `--pose-proxy-override-frozen-l2-tol R` — joint-space tolerance
+  for "frozen" frames (default `5e-3` rad ≈ 0.3° total motion;
+  bumped from `1e-4` on 2026-06-10).
+- `--pose-proxy-override-frozen-ticks N` — number of consecutive
+  frozen frames before fire `override_released` (default 10).
+
+Available robocasa scenes (built into `gear_sonic/data/assets/robocasa_scenes/`):
+`X2PickPlaceCube` (cube → bowl, canonical), `X2PickPlaceApple` (apple → bowl),
+`X2PickPlaceBowl` (bowl → target). None match the soda-can training data, so
+the VLA's task success will be poor — that's expected and **fine for testing
+the takeover loop**: we only need graspable-object chunks flowing so the
+operator can engage teleop on top. To add a new scene, see
+`gear_sonic/scripts/build_x2_robocasa_scene_xml.py`'s `_KNOWN_ENVS` registry.
+
+(Env-var form `VLA_CONTROL_PORT=5559 POSE_PROXY_OVERRIDE_PORT=5560 ./run_x2_vla_runtime.sh ...` still works as a fallback for tmux-env propagation; the CLI flags take precedence when both are set.)
+
+(Omit `--pc2-host` → SIM mode. The launcher spawns: bridge → proxy on
+loopback → sim deploy SUBing from the proxy. The banner shows
+`Sim pose proxy: ON (loopback) bridge :5556 -> proxy -> deploy :5558`
+when it took effect; check `${RUN_DIR}/sim_proxy.log` for the
+`override SUB` / `vla_control PUB` confirmation lines.)
+
+**Terminal B — Quest 3 teleop without spawning a competing sim deploy:**
+
+```sh
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --no-deploy \
+    --pose-port 5560 \
+    --no-x2-debug-bridge
+```
+
+Why each flag is required:
+- `--no-deploy` → terminal A already owns the sim deploy on `:5558` SUB; without this we'd spawn a competing one.
+- `--pose-port 5560` → recorder PUBs the operator wire to the proxy's
+  override SUB instead of fighting the bridge for `:5556`.
+- `--no-x2-debug-bridge` → the sim deploy's `x2_mujoco_ros_bridge.py`
+  already binds `:5570` for `robot_pose` natively. Spawning the
+  planner stack's `x2_debug → robot_pose` bridge would clash on
+  `:5570` (`Address already in use`). The kplanner's pose-feedback
+  SUB still connects to `:5570` (default) and gets `robot_pose`
+  from the sim deploy directly.
+
+(On the **real robot**, replace `--no-x2-debug-bridge` with
+`--x2-debug-bridge-host <PC2_IP>` because the C++ deploy on PC2 does
+NOT run the MuJoCo Python bridge; the planner stack's
+`x2_debug → robot_pose` translator IS needed there.)
+
+The recorder PUBs the operator's wire on `tcp://localhost:5560`, the
+loopback proxy SUBs there, arbitrates against the bridge's :5556, and
+emits the `vla_control` events the bridge cold-restarts on. Operator
+workflow + log markers are identical to the real-robot section above
+(just `127.0.0.1` instead of `192.168.86.32`).
+
+Tear-down: Ctrl-C in terminal B (recorder saves the episode), then
+Ctrl-C in terminal A — `stop_all` kills the sim proxy after the sim
+deploy is down so the loopback ports come back cleanly for the next
+run. `kill_stale_sim_processes` also `fuser -k`'s 5558/5559/5560 if
+anything leaks.
 
 ---
 

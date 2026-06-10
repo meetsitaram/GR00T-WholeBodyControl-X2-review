@@ -83,7 +83,7 @@ import threading
 import time
 import warnings
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 # Silence the three cosmetic UserWarnings the vendored Isaac-GR00T
 # ``image_augmentations`` module emits the first time each augmentation
@@ -101,6 +101,7 @@ warnings.filterwarnings(
 )
 
 import joblib
+import json
 import numpy as np
 import zmq
 
@@ -1082,6 +1083,232 @@ class _LatestWireDebug:
             )
 
 
+class _VlaControlSignal:
+    """Thread-safe shared state for the optional ``vla_control`` SUB.
+
+    Drives the bridge's manual-takeover cold-restart flow without
+    racing the publisher thread:
+
+    * ``override_engaged`` -> ``engage()`` sets ``override_active=True``;
+      the publisher stops emitting decoded VLA chunks and instead
+      ships the operator's current measured pose so the wire stays
+      alive (the proxy ignores these frames -- override wins -- but
+      this prevents a deploy starvation watchdog trip if the proxy
+      were to drop both inputs simultaneously).
+    * ``override_released`` -> ``release()`` clears
+      ``override_active`` AND sets ``cold_restart_pending=True``. The
+      publisher consumes the pending flag at the top of its next
+      tick, clears all smoothing state (ramp / LPF / chunk blend),
+      sets a chunk-id baseline so any stale chunk decoded against
+      pre-override observations is ignored, and arms a brief
+      "hold at measured pose" window so the proxy's HOLD -> LIVE
+      handoff doesn't see a step change from the operator's pose to
+      the bridge's idle-clip pose.
+
+    The publisher reads ``snapshot()`` (atomic) at the top of each
+    tick and ``consume_cold_restart()`` (atomic read-and-clear) once
+    per pending-edge. ``stats()`` is used only for the periodic
+    status print and never modifies state.
+
+    See 2026-06-10 manual-takeover milestone for the full design.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._override_active = False
+        self._cold_restart_pending = False
+        self._engage_count = 0
+        self._release_count = 0
+        self._last_event_ts: float = -1.0
+        # 2026-06-10: operator-pose handoff. ``release_pose`` snaps
+        # the body + hand joints the operator was commanding the
+        # instant override_released fired, so the bridge can hold
+        # the wire at THAT pose during its cold-restart bridging
+        # window (avoids the visible "pose reset" from snapping to
+        # x2_debug's lagged measured pose). Cleared atomically by
+        # ``consume_cold_restart()`` so a second release that has
+        # no payload (older proxy, smoke test, ...) doesn't replay
+        # the previous handoff. Empty dict / None both indicate
+        # "fall back to legacy measured-pose hold".
+        self._release_pose: Optional[Dict[str, np.ndarray]] = None
+
+    def engage(self, ts: float = 0.0) -> None:
+        with self._lock:
+            self._override_active = True
+            self._engage_count += 1
+            self._last_event_ts = float(ts)
+
+    def release(
+        self,
+        ts: float = 0.0,
+        release_pose: Optional[Dict[str, np.ndarray]] = None,
+    ) -> None:
+        with self._lock:
+            self._override_active = False
+            self._cold_restart_pending = True
+            self._release_count += 1
+            self._last_event_ts = float(ts)
+            self._release_pose = release_pose
+
+    def snapshot(self) -> tuple[bool, bool]:
+        """Return (override_active, cold_restart_pending) atomically."""
+        with self._lock:
+            return self._override_active, self._cold_restart_pending
+
+    def consume_cold_restart(
+        self,
+    ) -> tuple[bool, Optional[Dict[str, np.ndarray]]]:
+        """Atomically test-and-clear the cold-restart pending flag.
+
+        Returns ``(pending, release_pose)``. ``release_pose`` is the
+        body + hand joints the operator was commanding the instant
+        the proxy fired override_released, or ``None`` when no pose
+        snapshot was provided (legacy proxy, smoke tests). Callers
+        should treat ``None`` as "use measured pose for the
+        cold-restart bridging window" -- matches the pre-2026-06-10
+        behaviour exactly.
+        """
+        with self._lock:
+            pending = self._cold_restart_pending
+            release_pose = self._release_pose
+            self._cold_restart_pending = False
+            self._release_pose = None
+            return pending, release_pose
+
+    def stats(self) -> tuple[int, int, float]:
+        """Return (engage_count, release_count, last_event_ts)."""
+        with self._lock:
+            return (
+                self._engage_count,
+                self._release_count,
+                self._last_event_ts,
+            )
+
+
+def _run_vla_control_sub(
+    *,
+    host: str,
+    port: int,
+    topic: str,
+    signal: _VlaControlSignal,
+    stop_event: threading.Event,
+    poll_ms: int = 100,
+) -> None:
+    """Background SUB worker that translates proxy-emitted control
+    events into ``_VlaControlSignal`` state flips.
+
+    Lives in its own thread so the publisher's 50 Hz loop never has to
+    poll the SUB itself (the SUB attaches to a remote PUB and could
+    block on connect; we'd rather absorb that in a dedicated thread
+    than risk skipping publisher ticks). The thread exits cleanly on
+    ``stop_event.set()``; tearing down the SUB socket via
+    ``close(linger=0)`` is safe because PUB/SUB has no in-flight
+    acknowledgements.
+
+    Unknown / malformed events are logged once and otherwise ignored
+    so a future control-plane extension can't crash the bridge.
+    """
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.RCVHWM, 16)
+    url = f"tcp://{host}:{port}"
+    sock.connect(url)
+    sock.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+    poller = zmq.Poller()
+    poller.register(sock, zmq.POLLIN)
+    print(
+        f"[live-VLA] vla_control SUB connected: {url} topic={topic!r}",
+        flush=True,
+    )
+    warned_unknown_events: set[str] = set()
+    try:
+        while not stop_event.is_set():
+            evs = dict(poller.poll(int(poll_ms)))
+            if sock not in evs:
+                continue
+            try:
+                parts = sock.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+            if len(parts) < 2:
+                continue
+            try:
+                evt = json.loads(parts[1].decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            kind = evt.get("event")
+            ts = float(evt.get("ts", 0.0))
+            if kind == "override_engaged":
+                signal.engage(ts=ts)
+                print(
+                    f"[live-VLA] vla_control: override_engaged "
+                    f"(proxy_ts={ts:.3f}) -- pausing decoded chunks, "
+                    f"holding measured pose on wire",
+                    flush=True,
+                )
+            elif kind == "override_released":
+                # 2026-06-10: optional release_pose payload (proxy
+                # snapshot of operator's last commanded body + hand
+                # joints) so the cold-restart bridging window can
+                # hold the wire at the operator's pose instead of
+                # x2_debug's lagged measured pose. Missing / bad
+                # payload falls back to legacy behaviour with no
+                # warning -- older proxies and smoke tests never
+                # set it.
+                release_pose: Optional[Dict[str, np.ndarray]] = None
+                raw_release = evt.get("release_pose")
+                if isinstance(raw_release, dict):
+                    parsed: Dict[str, np.ndarray] = {}
+                    for fname, expected_dim in (
+                        ("joint_pos_mj", NUM_BODY_DOFS),
+                        ("left_hand_joints", DEFAULT_HAND_DOF),
+                        ("right_hand_joints", DEFAULT_HAND_DOF),
+                    ):
+                        raw = raw_release.get(fname)
+                        if raw is None:
+                            continue
+                        try:
+                            arr = np.asarray(raw, dtype=np.float32)
+                        except (TypeError, ValueError):
+                            continue
+                        if arr.shape != (expected_dim,):
+                            continue
+                        parsed[fname] = arr
+                    if parsed:
+                        release_pose = parsed
+                signal.release(ts=ts, release_pose=release_pose)
+                rp_summary = (
+                    "no release_pose; bridge will hold at "
+                    "x2_debug measured pose (legacy)"
+                    if release_pose is None
+                    else (
+                        "release_pose has " +
+                        "+".join(sorted(release_pose.keys())) +
+                        "; bridge will hold at operator pose"
+                    )
+                )
+                print(
+                    f"[live-VLA] vla_control: override_released "
+                    f"(proxy_ts={ts:.3f}) -- cold restart armed; "
+                    f"clearing ramp / LPF / chunk state on next "
+                    f"tick; {rp_summary}",
+                    flush=True,
+                )
+            else:
+                if kind not in warned_unknown_events:
+                    warned_unknown_events.add(str(kind))
+                    print(
+                        f"[live-VLA] vla_control: unknown event "
+                        f"{kind!r}; ignoring (will not warn again).",
+                        flush=True,
+                    )
+    finally:
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+
 def _build_observation(
     *,
     body_q_mj: np.ndarray,
@@ -1842,6 +2069,11 @@ def _publisher(
     decoder_loaded: bool = False,
     freeze_groups_override: str = "",
     wire_debug: Optional[_LatestWireDebug] = None,
+    vla_control_signal: Optional[_VlaControlSignal] = None,
+    cold_restart_hold_ticks: int = 25,
+    handoff_max_hold_ticks: int = 200,
+    handoff_max_wire_step: float = 0.012,
+    handoff_step_ramp_ticks: int = 250,
 ) -> int:
     """Thread C (= main thread): publish action[step] at ``rate_hz``.
 
@@ -1957,6 +2189,68 @@ def _publisher(
     yaw_rebase_logged = False
     bootstrap_publish_logged = False
     bootstrap_first_publish_logged = False
+    # Manual-takeover (vla_control) cold-restart bookkeeping. When the
+    # proxy emits ``override_engaged`` the bridge suppresses decoded
+    # chunks and ships the operator's current measured pose so the
+    # wire stays alive (the proxy ignores it but a SAFE_IDLE trip is
+    # avoided if the proxy itself were to fall over mid-takeover).
+    # ``override_released`` arms a cold restart which on the next tick
+    # clears all smoothing state, bumps the chunk-id baseline so any
+    # stale chunk decoded against pre-override observations is
+    # ignored, and starts a brief "hold at operator pose" window to
+    # bridge the proxy's HOLD -> LIVE handoff without a step change.
+    #
+    # 2026-06-10 follow-up: ``operator_hold_pose`` caches the body +
+    # hand joints the proxy snapshotted at the moment of release. The
+    # hold window uses these instead of x2_debug's measured pose to
+    # avoid the visible "pose reset" on ARM_MANIPULATION -> LOCOMOTION
+    # handoff -- measured lags actuated by motor / contact / gravity
+    # sag, so the wire stepped from operator-commanded to
+    # measured-pose for the 25-tick hold then ramped to VLA, which
+    # produced two visible discontinuities. Falls back to measured
+    # when the release event carries no payload (legacy proxy /
+    # smoke tests with --override-engage-motion-ticks 0).
+    override_active_now = False
+    cold_restart_chunk_baseline = -1
+    hold_at_measured_remaining = 0
+    cold_restart_log_done_at_tick = -1
+    operator_hold_pose: Optional[Dict[str, np.ndarray]] = None
+    # 2026-06-10 (PM follow-up 3): smooth-handoff guard. The 25-tick
+    # cold-restart hold is the MINIMUM dwell at the operator pose;
+    # ``cold_restart_awaiting_first_chunk`` keeps the wire pinned at
+    # the operator pose AFTER the minimum hold expires until the
+    # first eligible decoded chunk (``chunk_id > cold_restart_chunk_
+    # baseline``) arrives. Without this, the post-hold tick sees no
+    # eligible chunk yet (inference cadence ~15 Hz vs wire 50 Hz means
+    # up to 3 wire ticks between chunks; first-chunk decode time is
+    # ~480 ms), and the publisher falls through to
+    # ``cur_jpos = idle_loop_pose`` which is a hard step from the
+    # operator's hand-off pose to the idle_stand clip.
+    # ``cold_restart_max_hold_remaining`` is the SAFETY CAP that
+    # forces a release after ``handoff_max_hold_ticks`` even if the
+    # decoder never produces an eligible chunk (e.g. zero-token /
+    # decoder crash / proprio starvation). When the safety cap fires
+    # we fall through to the idle wire with a clear warning so
+    # operators don't silently sit at the operator pose forever.
+    cold_restart_awaiting_first_chunk = False
+    cold_restart_max_hold_remaining = 0
+    # 2026-06-10 follow-up 6: post-handoff per-tick wire-step ramp.
+    # ``max_wire_step`` is a per-element rate clamp on the wire. The
+    # default 0.035 rad/tick at 50 Hz = 1.75 rad/s per joint; with
+    # ~31 joints all moving toward a VLA chunk that's ~3.7 rad away
+    # from the operator pose, the L_inf bound becomes a coordinated
+    # whole-body swing that the operator reports as a slam (terminal
+    # 2 of session 73f3d2a2 at tick 16000: raw_Δ=3.720, body_Δ=0.247
+    # = 14deg of tracking error sustained over the ramp). We instead
+    # start the wire at ``handoff_max_wire_step`` (default 0.012
+    # rad/tick = ~36deg/s per joint, ~3x slower) right after the
+    # handoff and LINEARLY ramp back to ``max_wire_step`` over
+    # ``handoff_step_ramp_ticks`` ticks (default 250 = 5 s @ 50 Hz).
+    # The countdown arms when ``cold_restart_awaiting_first_chunk``
+    # transitions to False on the success path; the safety-cap path
+    # also arms it so the post-cap ramp from operator pose toward
+    # idle_stand uses the same slow step.
+    handoff_step_remaining = 0
     active_body_mode = body_mode
     _freeze_idx, decode_body = _body_mode_wire_settings(
         active_body_mode,
@@ -1994,6 +2288,123 @@ def _publisher(
             chunk_step = 0
             last_chunk_id = chunk_id
 
+        # ---- vla_control: manual-takeover signal processing ---------
+        # Drain the signal once per tick. ``override_active_now``
+        # gates the decode path (we never want to ship VLA chunks
+        # while the operator is in control). A cold-restart pending
+        # flag (set on the released edge) clears all per-tick
+        # smoothing state and arms the "hold at measured pose"
+        # bridging window. Both no-ops when vla_control is disabled.
+        if vla_control_signal is not None:
+            override_active_now, _ = vla_control_signal.snapshot()
+            pending, pending_release_pose = (
+                vla_control_signal.consume_cold_restart()
+            )
+            if pending:
+                ramp_from = None
+                ramp_remaining = 0
+                lpf_state = None
+                lpf_future_state = None
+                hand_lpf_left = None
+                hand_lpf_right = None
+                chunk_blend_from = None
+                chunk_blend_remaining = 0
+                hand_blend_from_left = None
+                hand_blend_from_right = None
+                hand_chunk_blend_remaining = 0
+                last_wire_chunk_id = -1
+                last_wire_hand_chunk_id = -1
+                decoded_was_active = False
+                # Cache the operator-pose snapshot so the next 25
+                # ticks hold the wire at exactly THAT pose (not
+                # x2_debug's lagged measured pose). Seed prev_wire_*
+                # from the same snapshot so the post-hold chunk
+                # blend interpolates FROM operator pose TO the first
+                # decoded chunk -- otherwise prev_wire_* would be
+                # None and the chunk blend would blend from zeros
+                # (visible step on the body / fingers).
+                operator_hold_pose = pending_release_pose
+                if (
+                    operator_hold_pose is not None
+                    and "joint_pos_mj" in operator_hold_pose
+                ):
+                    prev_wire_jpos = operator_hold_pose[
+                        "joint_pos_mj"
+                    ].astype(np.float32, copy=True)
+                else:
+                    prev_wire_jpos = None
+                if (
+                    operator_hold_pose is not None
+                    and "left_hand_joints" in operator_hold_pose
+                ):
+                    prev_wire_left = operator_hold_pose[
+                        "left_hand_joints"
+                    ].astype(np.float32, copy=True)
+                else:
+                    prev_wire_left = None
+                if (
+                    operator_hold_pose is not None
+                    and "right_hand_joints" in operator_hold_pose
+                ):
+                    prev_wire_right = operator_hold_pose[
+                        "right_hand_joints"
+                    ].astype(np.float32, copy=True)
+                else:
+                    prev_wire_right = None
+                # Pin the chunk-id baseline so any in-flight chunk
+                # decoded against pre-override observations is
+                # ignored; only chunks produced AFTER the operator
+                # released the wire are eligible to be decoded onto
+                # the wire post-restart.
+                cold_restart_chunk_baseline = int(chunk_id)
+                hold_at_measured_remaining = max(
+                    int(cold_restart_hold_ticks), 0
+                )
+                # Arm the smooth-handoff guard. The wire stays at the
+                # operator pose for at LEAST ``cold_restart_hold_ticks``
+                # (the minimum dwell, set above) and at MOST
+                # ``handoff_max_hold_ticks`` (the safety cap, set here);
+                # in between, the gate releases as soon as the first
+                # eligible chunk arrives (``chunk_id > baseline``). Set
+                # ``handoff_max_hold_ticks = 0`` to disable the
+                # await-first-chunk behaviour entirely (legacy 2026-06-10
+                # behaviour: snap to idle on hold expiry).
+                cold_restart_awaiting_first_chunk = (
+                    int(handoff_max_hold_ticks) > 0
+                )
+                cold_restart_max_hold_remaining = max(
+                    int(handoff_max_hold_ticks), 0
+                )
+                cold_restart_log_done_at_tick = tick
+                hold_target = (
+                    "operator's last commanded pose (body"
+                    + ("+left_hand" if (
+                        operator_hold_pose is not None
+                        and "left_hand_joints" in operator_hold_pose
+                    ) else "")
+                    + ("+right_hand" if (
+                        operator_hold_pose is not None
+                        and "right_hand_joints" in operator_hold_pose
+                    ) else "")
+                    + ")"
+                ) if (
+                    operator_hold_pose is not None
+                    and "joint_pos_mj" in operator_hold_pose
+                ) else "x2_debug measured pose (legacy fallback)"
+                print(
+                    f"[live-VLA] cold-restart fired tick={tick} "
+                    f"baseline_chunk={cold_restart_chunk_baseline} "
+                    f"min_hold_ticks={hold_at_measured_remaining} "
+                    f"max_hold_ticks={cold_restart_max_hold_remaining}; "
+                    f"will hold wire at {hold_target} "
+                    f"until first eligible chunk (chunk_id > "
+                    f"{cold_restart_chunk_baseline}) decodes, "
+                    f"capped by max-hold safety",
+                    flush=True,
+                )
+        else:
+            override_active_now = False
+
         step = min(chunk_step, horizon - 1)
         if idle_loop is not None:
             cur_jpos, cur_quat = idle_loop.current(tick)
@@ -2007,6 +2418,165 @@ def _publisher(
         # Capture the unmodified idle pose for the ramp-in baseline
         # BEFORE the decoder potentially overwrites cur_jpos.
         idle_baseline = np.asarray(cur_jpos, dtype=np.float32).copy()
+
+        # ---- vla_control: hold at operator / measured pose ---------
+        # When override is ACTIVE or we're in the cold-restart bridge
+        # window, replace the idle-clip pose with a stationary hold
+        # pose AND repeat it across the future window. Two sources
+        # in priority order:
+        #   1. ``operator_hold_pose["joint_pos_mj"]`` -- snapshotted
+        #      by the proxy at the instant override_released fired.
+        #      Matches what the deploy was being COMMANDED, so the
+        #      handoff is bit-identical at the proxy / deploy seam.
+        #   2. ``body_q_mj_now`` (x2_debug measured pose) -- legacy
+        #      fallback when the release event carried no payload
+        #      (older proxy / smoke tests with engage_motion_ticks 0).
+        #      Visibly lags the commanded pose under motor / contact
+        #      / gravity sag, which is the "pose reset" the operator
+        #      reports when the bridge takes back from teleop.
+        # The proxy ignores these frames during OVERRIDE; during the
+        # post-release HOLD bridging window the proxy is in
+        # STATE_HOLD replaying the operator frame anyway -- this
+        # just makes sure our frames don't compete with them.
+        # Decoded chunks are gated off via ``in_hold_window`` below.
+        # ``cold_restart_awaiting_first_chunk`` extends the hold past
+        # the minimum 25-tick dwell until the first eligible chunk
+        # arrives (``chunk_id > cold_restart_chunk_baseline``); the
+        # safety cap (``cold_restart_max_hold_remaining``) bounds
+        # that wait. Resolve the await-state BEFORE computing
+        # ``in_hold_window`` so a chunk that arrives exactly at the
+        # transition tick releases the hold this same tick (else
+        # we'd publish one extra "stuck at operator pose" frame
+        # after the chunk became available).
+        if (
+            cold_restart_awaiting_first_chunk
+            and not override_active_now
+            and hold_at_measured_remaining == 0
+        ):
+            # 2026-06-10 follow-up 5: original gate was ``chunk_id >
+            # baseline and chunk_id > 0``, which released the wire on
+            # ANY new chunk -- even chunks whose token vector was zero.
+            # Empirical: terminal 2 of session 73f3d2a2 showed
+            # every chunk in the run with ``|token|=0.000 |left|=0.000
+            # idle-pose``, the gate released as soon as
+            # ``chunk_id=503 > baseline=499``, the decoder below
+            # immediately failed its OWN ``np.linalg.norm(token[step])
+            # > 1e-3`` guard, ``cur_jpos`` fell through to
+            # ``idle_loop.current(tick)`` (= idle_stand pose), and the
+            # wire snapped from operator pose to idle_stand pose. The
+            # operator reported "the hand slammed into the table".
+            # Mirror the decoder's token-magnitude guard here so the
+            # gate stays armed until VLA is actually producing usable
+            # output -- if VLA never produces useful tokens, the
+            # safety cap below trips after ``handoff_max_hold_ticks``
+            # and the always-on per-tick wire rate clamp (fix 2 below)
+            # ramps the wire from operator pose to idle gracefully
+            # instead of snapping.
+            current_token_norm = float(np.linalg.norm(token[step]))
+            first_eligible_chunk_ready = (
+                chunk_id > cold_restart_chunk_baseline
+                and chunk_id > 0
+                and current_token_norm > 1e-3
+            )
+            if first_eligible_chunk_ready:
+                cold_restart_awaiting_first_chunk = False
+                # 2026-06-10 follow-up 6: arm the post-handoff
+                # per-tick wire-step ramp so the wire walks from
+                # operator pose toward the VLA target slowly for
+                # the first few seconds, then accelerates back to
+                # the steady-state ``max_wire_step``. Set unconditionally
+                # because the success path's L_inf delta to VLA can
+                # be ~3.7 rad (terminal 2 / 13:05 run) -- a single-
+                # tick 75-step LPF ramp at full max_wire_step still
+                # produced visible coordinated whole-body swings.
+                handoff_step_remaining = max(int(handoff_step_ramp_ticks), 0)
+                print(
+                    f"[live-VLA] cold-restart handoff: first eligible "
+                    f"chunk decoded (chunk_id={chunk_id} > baseline="
+                    f"{cold_restart_chunk_baseline}, "
+                    f"|token|={current_token_norm:.3f} > 1e-3); "
+                    f"releasing wire hold at tick={tick}, ramping into "
+                    f"VLA from operator pose (slow-step window: "
+                    f"{handoff_step_remaining} ticks from "
+                    f"{handoff_max_wire_step:.3f} -> "
+                    f"{max_wire_step:.3f} rad/tick)",
+                    flush=True,
+                )
+            elif cold_restart_max_hold_remaining > 0:
+                cold_restart_max_hold_remaining -= 1
+                if cold_restart_max_hold_remaining == 0:
+                    cold_restart_awaiting_first_chunk = False
+                    # Same slow-step window on the safety-cap path:
+                    # the wire still has to walk from operator pose
+                    # toward idle_stand_pose, and that delta can be
+                    # comparable in magnitude. Avoids snap-to-idle
+                    # being slower than snap-to-VLA.
+                    handoff_step_remaining = max(int(handoff_step_ramp_ticks), 0)
+                    print(
+                        f"[live-VLA] WARNING: cold-restart handoff "
+                        f"safety cap reached at tick={tick} "
+                        f"(handoff_max_hold_ticks elapsed; latest "
+                        f"chunk_id={chunk_id} baseline="
+                        f"{cold_restart_chunk_baseline} "
+                        f"|token|={current_token_norm:.3f}); releasing "
+                        f"wire to idle with slow-step ramp ("
+                        f"{handoff_step_remaining} ticks from "
+                        f"{handoff_max_wire_step:.3f} -> "
+                        f"{max_wire_step:.3f} rad/tick). Check decoder "
+                        f"(stuck inference? proprio starvation? "
+                        f"zero-token chunks?).",
+                        flush=True,
+                    )
+        in_hold_window = (
+            override_active_now
+            or hold_at_measured_remaining > 0
+            or cold_restart_awaiting_first_chunk
+        )
+        if in_hold_window and deploy_fresh:
+            if (
+                operator_hold_pose is not None
+                and "joint_pos_mj" in operator_hold_pose
+            ):
+                hold_jpos = operator_hold_pose["joint_pos_mj"].astype(
+                    np.float32, copy=True
+                )
+            else:
+                hold_jpos = np.asarray(
+                    body_q_mj_now, dtype=np.float32
+                ).copy()
+            cur_jpos = hold_jpos
+            if "joint_pos_mj_future" in future_fields:
+                future_fields = {
+                    **future_fields,
+                    "joint_pos_mj_future": np.broadcast_to(
+                        hold_jpos[None, :],
+                        (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+                    ).copy(),
+                    "joint_vel_mj_future": np.zeros(
+                        (_NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+                        dtype=np.float32,
+                    ),
+                }
+            idle_baseline = hold_jpos.copy()
+            if (
+                hold_at_measured_remaining > 0
+                and not override_active_now
+            ):
+                hold_at_measured_remaining -= 1
+                # Keep operator_hold_pose alive while the smooth-handoff
+                # guard is still waiting for the first eligible chunk;
+                # the ramp-init block below seeds ``ramp_from`` and
+                # ``lpf_state`` from this snapshot so the first
+                # decoded tick interpolates operator->VLA instead of
+                # snapping to ``idle_baseline``. Only clear it once
+                # BOTH the minimum-dwell countdown AND the await flag
+                # have released the wire -- after that any stale
+                # snapshot would belong to a previous handoff cycle.
+                if (
+                    hold_at_measured_remaining == 0
+                    and not cold_restart_awaiting_first_chunk
+                ):
+                    operator_hold_pose = None
 
         # --- Live 990-D proprio assembly --------------------------------
         # Even when we won't actually decode this tick (cold start,
@@ -2059,6 +2629,8 @@ def _publisher(
             and tick >= decode_delay_ticks
             and proprio_ready
             and chunk_id > 0
+            and chunk_id > cold_restart_chunk_baseline
+            and not in_hold_window
             and np.linalg.norm(token[step]) > 1e-3
         ):
             decoded = _build_vla_decoded_pose_payload(
@@ -2087,15 +2659,86 @@ def _publisher(
                 # the SONIC body-only decoder doesn't predict root.
 
                 # ---- B: ramp-in on idle -> VLA transition ----------
+                # When the cold-restart handoff guard is still holding
+                # the operator pose snapshot, seed the ramp + LPF + hand
+                # LPF from THAT pose so the wire interpolates
+                # operator -> decoded (smooth) instead of
+                # idle_baseline -> decoded (visible idle-clip-shaped
+                # bump at the seam). Once we use the snapshot here, we
+                # also clear ``operator_hold_pose`` and the await flag
+                # so subsequent ticks fall through to the regular
+                # decoded path. The snapshot has already been
+                # broadcast onto the wire for the full hold + await
+                # window, so ramp progress 0 == prev_wire_jpos by
+                # construction.
+                handoff_seed_from = None
+                if (
+                    operator_hold_pose is not None
+                    and "joint_pos_mj" in operator_hold_pose
+                ):
+                    handoff_seed_from = operator_hold_pose[
+                        "joint_pos_mj"
+                    ].astype(np.float32, copy=True)
                 if not decoded_was_active and ramp_in_ticks > 0:
-                    ramp_from = idle_baseline.copy()
+                    ramp_from = (
+                        handoff_seed_from.copy()
+                        if handoff_seed_from is not None
+                        else idle_baseline.copy()
+                    )
                     ramp_remaining = int(ramp_in_ticks)
                     # Reset LPF state so the filter doesn't lag the
-                    # ramp; we re-prime it at idle_baseline.
-                    lpf_state = idle_baseline.copy() if lpf_alpha > 0.0 else None
+                    # ramp; we re-prime it at the same seed pose as
+                    # the ramp (operator pose on cold-restart handoff,
+                    # idle_baseline on the normal idle->VLA transition).
+                    if lpf_alpha > 0.0:
+                        lpf_state = (
+                            handoff_seed_from.copy()
+                            if handoff_seed_from is not None
+                            else idle_baseline.copy()
+                        )
+                    else:
+                        lpf_state = None
                     lpf_future_state = None
-                    hand_lpf_left = None
-                    hand_lpf_right = None
+                    # Hand LPF: when the handoff carries operator hands
+                    # in the snapshot, seed both LPFs there so the first
+                    # filtered finger frame is the operator's, not the
+                    # in-flight VLA chunk's. Falls back to "let the LPF
+                    # re-prime from the first hand sample" when no
+                    # handoff snapshot is available (legacy idle->VLA
+                    # transition).
+                    if (
+                        operator_hold_pose is not None
+                        and "left_hand_joints" in operator_hold_pose
+                    ):
+                        hand_lpf_left = operator_hold_pose[
+                            "left_hand_joints"
+                        ].astype(np.float32, copy=True)
+                    else:
+                        hand_lpf_left = None
+                    if (
+                        operator_hold_pose is not None
+                        and "right_hand_joints" in operator_hold_pose
+                    ):
+                        hand_lpf_right = operator_hold_pose[
+                            "right_hand_joints"
+                        ].astype(np.float32, copy=True)
+                    else:
+                        hand_lpf_right = None
+                    # Snapshot was used to seed the ramp + LPFs; drop
+                    # it now so subsequent cold restarts don't see a
+                    # stale snapshot if the proxy ever omits the
+                    # ``release_pose`` payload on the next release.
+                    if handoff_seed_from is not None:
+                        operator_hold_pose = None
+                        cold_restart_awaiting_first_chunk = False
+                        print(
+                            f"[live-VLA] cold-restart handoff: ramp + "
+                            f"LPF seeded from operator pose "
+                            f"(ramp_ticks={int(ramp_in_ticks)}); "
+                            f"VLA wire re-engaging from hand-off pose "
+                            f"without idle-clip detour",
+                            flush=True,
+                        )
 
                 if ramp_remaining > 0 and ramp_from is not None:
                     progress = float(ramp_in_ticks - ramp_remaining + 1) / float(ramp_in_ticks)
@@ -2162,7 +2805,33 @@ def _publisher(
                     }
 
                 # ---- E: rate + anchor clamps (anti-jitter) ------------
-                cur_jpos = _clamp_vector_step(cur_jpos, prev_wire_jpos, max_wire_step)
+                # 2026-06-10 follow-up 6: use the slow-step value
+                # during the post-handoff ramp window. Linearly
+                # interpolate handoff_max_wire_step (slow) -> max_wire_step
+                # (normal) over handoff_step_ramp_ticks so the first
+                # ticks after handoff move at ~handoff_max_wire_step
+                # (0.012 rad/tick = ~36 deg/s/joint by default) and
+                # the wire accelerates back to normal as the body
+                # catches up. The countdown is decremented at the
+                # end of this tick path so the FIRST tick after
+                # release gets the slowest step (which is when
+                # raw_Δ is largest and the body has the most to
+                # cover).
+                if handoff_step_remaining > 0:
+                    ramp_progress = 1.0 - float(handoff_step_remaining) / float(
+                        max(handoff_step_ramp_ticks, 1)
+                    )
+                    ramp_progress = min(max(ramp_progress, 0.0), 1.0)
+                    effective_max_step = (
+                        (1.0 - ramp_progress) * float(handoff_max_wire_step)
+                        + ramp_progress * float(max_wire_step)
+                    )
+                    handoff_step_remaining -= 1
+                else:
+                    effective_max_step = float(max_wire_step)
+                cur_jpos = _clamp_vector_step(
+                    cur_jpos, prev_wire_jpos, effective_max_step
+                )
                 cur_jpos = _clamp_vector_deviation(
                     cur_jpos,
                     np.asarray(body_q_mj_now, dtype=np.float32),
@@ -2180,6 +2849,48 @@ def _publisher(
                 lpf_state = None
                 lpf_future_state = None
             decoded_was_active = False
+            # 2026-06-10 follow-up 5: apply the per-tick wire rate
+            # clamp HERE too. Previously this clamp only ran inside
+            # the decoder-succeeded branch above, so when (a) the
+            # cold-restart hold released due to chunk_id advancing
+            # but (b) the chunk's token was zero (decoder gate
+            # ``np.linalg.norm(token[step]) > 1e-3`` failed), the
+            # decoder branch was skipped, we fell here, and
+            # ``cur_jpos = idle_loop.current(tick)`` set the wire
+            # straight from operator-pose (prev_wire_jpos) to
+            # idle_stand_pose. That's the "slam" the operator
+            # reported when the handoff guard from follow-up 3 lost
+            # to a zero-token VLA. Fix 1 above tightened the gate
+            # so the hold no longer releases on zero-token chunks,
+            # but this clamp is the defense-in-depth: if the
+            # ``handoff_max_hold_ticks`` safety cap DOES expire
+            # (VLA still zero-token after 4s) the wire ramps from
+            # operator-pose toward idle_stand at the slow handoff
+            # step (until ``handoff_step_remaining`` elapses) then
+            # at ``max_wire_step`` rad/tick instead of snapping.
+            # Cheap (numpy abs+max) so we accept the cost on normal
+            # idle frames where peak < max_step is a no-op (returns
+            # tgt unchanged per ``_clamp_vector_step``). 2026-06-10
+            # follow-up 6: the slow-step uses the same handoff
+            # countdown as the decoder branch above so the body
+            # transitions from operator-pose at a bounded rate
+            # regardless of whether VLA succeeded or the safety
+            # cap fired.
+            if handoff_step_remaining > 0:
+                ramp_progress = 1.0 - float(handoff_step_remaining) / float(
+                    max(handoff_step_ramp_ticks, 1)
+                )
+                ramp_progress = min(max(ramp_progress, 0.0), 1.0)
+                effective_max_step = (
+                    (1.0 - ramp_progress) * float(handoff_max_wire_step)
+                    + ramp_progress * float(max_wire_step)
+                )
+                handoff_step_remaining -= 1
+            else:
+                effective_max_step = float(max_wire_step)
+            cur_jpos = _clamp_vector_step(
+                cur_jpos, prev_wire_jpos, effective_max_step,
+            )
 
         # ---- F: optional partial-body freeze (legs/waist hold idle_stand) ---
         # Freeze the selected DOFs to the ``idle_stand`` clip (with its
@@ -2275,6 +2986,26 @@ def _publisher(
         else:
             left_step = _ZERO_HAND_STEP
             right_step = _ZERO_HAND_STEP
+        # 2026-06-10: hand override during cold-restart hold window.
+        # The body path above swaps cur_jpos for operator pose, but
+        # hands are driven by the last decoded chunk's
+        # ``left[step]`` / ``right[step]``. Without this override
+        # the fingers visibly snap to the in-flight VLA chunk during
+        # the 25-tick hold (which is what produced the "only VLA
+        # controls fingers" symptom). We DON'T skip the LPF / clamp
+        # above: those are seeded from the operator-pose snapshot at
+        # cold-restart so re-running them on the operator pose is a
+        # no-op, and keeping them in the path means the post-hold
+        # transition to decoded hands inherits warm LPF state.
+        if in_hold_window and operator_hold_pose is not None:
+            if "left_hand_joints" in operator_hold_pose:
+                left_step = operator_hold_pose[
+                    "left_hand_joints"
+                ].astype(np.float32, copy=True)
+            if "right_hand_joints" in operator_hold_pose:
+                right_step = operator_hold_pose[
+                    "right_hand_joints"
+                ].astype(np.float32, copy=True)
         hand_delta_tick = 0.0
         if deploy_fresh:
             if prev_wire_left is not None and prev_wire_right is not None:
@@ -2599,6 +3330,92 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sub-host", default="localhost", help="Host of the deploy's x2_debug PUB.")
     parser.add_argument("--sub-port", type=int, default=5557, help="Port of the deploy's x2_debug PUB (matches --vla-debug-port).")
     parser.add_argument("--sub-topic", default="x2_debug")
+
+    # ----- vla_control SUB (manual-takeover cold restart) ----------
+    # Optional edge-event SUB driven by x2_pose_proxy.py when running
+    # alongside a teleop wire publisher on the override port. When
+    # ``--vla-control-port`` > 0 the bridge subscribes for
+    # ``override_engaged`` / ``override_released`` events and uses
+    # the released edge to clear all smoothing state + drop any
+    # in-flight chunk decoded against pre-override observations.
+    # Disabled by default so existing autonomous-only runs are
+    # byte-for-byte unchanged. See 2026-06-10 milestone.
+    parser.add_argument(
+        "--vla-control-host", default="127.0.0.1",
+        help="Host of the x2_pose_proxy vla_control PUB (default "
+             "127.0.0.1; proxy runs on PC2, bridge on laptop -- "
+             "override to the PC2 IP for split topology).",
+    )
+    parser.add_argument(
+        "--vla-control-port", type=int, default=-1,
+        help="Port of the x2_pose_proxy vla_control PUB. Set to a "
+             "positive int (e.g. 5559) to enable manual-takeover "
+             "cold restarts. Default -1 = DISABLED.",
+    )
+    parser.add_argument(
+        "--vla-control-topic", default="vla_control",
+        help="Topic prefix on the vla_control PUB (default "
+             "'vla_control'; must match the proxy's "
+             "--vla-control-topic).",
+    )
+    parser.add_argument(
+        "--vla-cold-restart-hold-ticks", type=int, default=25,
+        help="Ticks (at --rate) to ship the operator's MEASURED "
+             "pose on the wire after a cold restart, before any "
+             "newly-decoded chunk is allowed to engage. Default 25 "
+             "@ 50Hz = 500 ms -- long enough for the proxy's HOLD "
+             "ladder to hand the wire back without a step change "
+             "from the operator's pose to the idle clip's pose, "
+             "short enough that VLA re-engagement feels prompt.",
+    )
+    parser.add_argument(
+        "--vla-handoff-max-wire-step", type=float, default=0.012,
+        help="Per-element max joint-position step on the wire DURING "
+             "the post-handoff slow window. Default 0.012 rad/tick = "
+             "~36 deg/s/joint at 50 Hz (vs --vla-max-wire-step default "
+             "0.035 rad/tick = ~100 deg/s/joint). Applies for "
+             "--vla-handoff-step-ramp-ticks ticks after the cold-restart "
+             "hold releases, then linearly ramps back to "
+             "--vla-max-wire-step. Motivation: the operator hand-off "
+             "pose can be ~3.7 rad (L_inf) away from VLA's first "
+             "decoded chunk; the existing 75-tick LPF + 0.035 rad/tick "
+             "rate clamp lets the wire move all 31 joints at once "
+             "at 1.75 rad/s coordinated, which the operator visually "
+             "reports as a slam even though no single joint exceeds "
+             "the limit (see 2026-06-10 follow-up 6). Set equal to "
+             "--vla-max-wire-step to disable the slow-step window.",
+    )
+    parser.add_argument(
+        "--vla-handoff-step-ramp-ticks", type=int, default=250,
+        help="Number of ticks over which to linearly ramp the wire "
+             "step from --vla-handoff-max-wire-step (slow, applied "
+             "right after handoff) back to --vla-max-wire-step "
+             "(normal steady-state). Default 250 @ 50Hz = 5.0 s. "
+             "Set to 0 to disable the slow-step window (the rate "
+             "clamp jumps to --vla-max-wire-step immediately).",
+    )
+    parser.add_argument(
+        "--vla-handoff-max-hold-ticks", type=int, default=200,
+        help="Safety cap on how long the bridge will keep the wire "
+             "pinned at the operator's hand-off pose WHILE WAITING "
+             "for the first eligible decoded chunk after a cold "
+             "restart. The hold window (set by --vla-cold-restart-"
+             "hold-ticks) is the MINIMUM wait; this cap is the "
+             "MAXIMUM. Between them the bridge stays at the operator "
+             "pose until chunk_id > cold_restart_chunk_baseline "
+             "(= the first chunk the model decoded AFTER the "
+             "operator released the wire). Default 200 @ 50Hz = "
+             "4.0 s. Without this, when the post-hold tick hits and "
+             "no eligible chunk has arrived yet (inference cadence "
+             "~15Hz vs wire 50Hz means up to 3 wire ticks between "
+             "chunks; first-chunk decode time is ~480 ms), the wire "
+             "snaps from the operator's pose to the idle_stand clip "
+             "for the gap. Setting this below --vla-cold-restart-"
+             "hold-ticks is a CONFIG ERROR (the launcher catches it). "
+             "Set to 0 to disable the wait-for-first-chunk behaviour "
+             "(legacy 2026-06-10 behaviour: snap to idle on hold "
+             "expiry; not recommended).",
+    )
     parser.add_argument("--rate", type=float, default=DEFAULT_PUB_RATE_HZ, help="Publish rate (Hz). 50 matches the deploy control loop.")
     parser.add_argument(
         "--duration", type=float, default=0.0,
@@ -3523,6 +4340,71 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
+    # ---- Optional vla_control SUB worker (manual-takeover) ---------
+    # Only spawned when --vla-control-port > 0. The worker runs in a
+    # daemon thread; it doesn't block the publisher even if the proxy
+    # never publishes anything (poll-with-timeout loop). The shared
+    # signal object is read at the top of every publisher tick.
+    # CLI-level validation: a max-hold smaller than the minimum hold would
+    # mean the bridge releases the wire BEFORE the proxy's HOLD ladder
+    # finishes replaying the operator pose, defeating the whole point of
+    # the handoff guard. Fail at startup, not at the first cold restart.
+    if (
+        int(args.vla_handoff_max_hold_ticks) > 0
+        and int(args.vla_handoff_max_hold_ticks)
+            < int(args.vla_cold_restart_hold_ticks)
+    ):
+        print(
+            f"[live-VLA] FATAL: --vla-handoff-max-hold-ticks "
+            f"({int(args.vla_handoff_max_hold_ticks)}) must be >= "
+            f"--vla-cold-restart-hold-ticks "
+            f"({int(args.vla_cold_restart_hold_ticks)}). The max-hold "
+            f"is the safety cap on the await-first-chunk wait; "
+            f"shorter than the minimum hold would release the wire "
+            f"to idle_stand mid-proxy-HOLD.",
+            flush=True,
+        )
+        sys.exit(2)
+
+    vla_control_signal: Optional[_VlaControlSignal] = None
+    vla_control_thread: Optional[threading.Thread] = None
+    if int(args.vla_control_port) > 0:
+        vla_control_signal = _VlaControlSignal()
+
+        def _run_vla_control_sub_thread() -> None:
+            _run_vla_control_sub(
+                host=str(args.vla_control_host),
+                port=int(args.vla_control_port),
+                topic=str(args.vla_control_topic),
+                signal=vla_control_signal,
+                stop_event=stop_event,
+            )
+
+        vla_control_thread = threading.Thread(
+            target=_run_vla_control_sub_thread,
+            name="vla-control-sub",
+            daemon=True,
+        )
+        vla_control_thread.start()
+        print(
+            f"[live-VLA] vla_control SUB enabled "
+            f"(host={args.vla_control_host} "
+            f"port={args.vla_control_port} "
+            f"topic={args.vla_control_topic!r}; "
+            f"cold_restart_hold_ticks="
+            f"{int(args.vla_cold_restart_hold_ticks)}; "
+            f"handoff_max_hold_ticks="
+            f"{int(args.vla_handoff_max_hold_ticks)})",
+            flush=True,
+        )
+    else:
+        print(
+            "[live-VLA] vla_control SUB DISABLED "
+            "(--vla-control-port not set; manual-takeover cold "
+            "restart inactive)",
+            flush=True,
+        )
+
     n_ticks_holder: list[int] = [0]
 
     def _run_publisher() -> None:
@@ -3551,6 +4433,11 @@ def main(argv: list[str] | None = None) -> int:
             decoder_loaded=decoder_loaded,
             freeze_groups_override=freeze_groups_override,
             wire_debug=wire_debug,
+            vla_control_signal=vla_control_signal,
+            cold_restart_hold_ticks=int(args.vla_cold_restart_hold_ticks),
+            handoff_max_hold_ticks=int(args.vla_handoff_max_hold_ticks),
+            handoff_max_wire_step=float(args.vla_handoff_max_wire_step),
+            handoff_step_ramp_ticks=int(args.vla_handoff_step_ramp_ticks),
         )
 
     publisher_thread = threading.Thread(

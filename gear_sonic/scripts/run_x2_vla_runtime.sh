@@ -175,6 +175,130 @@ BOLD=$'\033[1m'
 : "${PC2_DEBUG_PORT:=5557}"
 : "${PC2_CAMERAS_PORT:=5555}"
 : "${LAPTOP_POSE_PORT:=5556}"
+# ---- Manual-takeover (vla_control) plumbing (2026-06-10 milestone) ----
+# When VLA_CONTROL_PORT > 0, the bridge subscribes to a remote
+# vla_control PUB (the x2_pose_proxy on PC2) and cold-restarts on
+# the override_released edge so the operator can teleop-nudge the
+# arm out of a stuck pose without restarting any process. Default
+# disabled so existing autonomous-only runs are byte-for-byte
+# unchanged. Set both VLA_CONTROL_PORT and (typically) VLA_CONTROL_HOST
+# to the proxy's bind address.
+: "${VLA_CONTROL_HOST:=}"
+: "${VLA_CONTROL_PORT:=-1}"
+: "${VLA_CONTROL_TOPIC:=vla_control}"
+: "${VLA_COLD_RESTART_HOLD_TICKS:=25}"
+# Smooth-handoff guard: maximum ticks the bridge will keep the wire at
+# the operator hand-off pose AFTER the minimum hold above, while
+# waiting for the first eligible decoded chunk (chunk_id > cold-restart
+# baseline). The minimum (above) is the proxy HOLD ladder bridge; this
+# is the safety cap on the await-first-chunk wait that prevents an
+# abrupt snap to the idle_stand clip when the inference cadence
+# (~15 Hz) trails the wire (50 Hz). Default 200 @ 50 Hz = 4 s. Set to
+# 0 to disable the guard (legacy 2026-06-10 behaviour). MUST be >=
+# VLA_COLD_RESTART_HOLD_TICKS or live_vla_publish_motion_token.py
+# refuses to start.
+: "${VLA_HANDOFF_MAX_HOLD_TICKS:=200}"
+
+# Post-handoff slow-step window for the wire's per-element rate clamp.
+# Defaults reflect 2026-06-10 follow-up 6: ``handoff_max_wire_step``
+# (0.012 rad/tick = ~36 deg/s/joint) applies for the first
+# ``handoff_step_ramp_ticks`` (250 = 5 s @ 50 Hz) after the cold-restart
+# hold releases, then linearly ramps back to ``vla_max_wire_step``
+# (0.035 rad/tick = ~100 deg/s/joint). Motivation: VLA's first decoded
+# chunk after a long teleop window is often ~3.7 rad (L_inf) from the
+# operator's pose -- the existing 75-tick LPF + 0.035 rad/tick rate
+# clamp lets the wire move all 31 joints at once at 1.75 rad/s
+# coordinated, which the operator visually reports as a slam even
+# though no single joint exceeds the limit (terminal 2 of session
+# 73f3d2a2 at tick 16000: raw_Δ=3.720 rad, body_Δ=0.247 rad sustained
+# over the ramp). Set HANDOFF_MAX_WIRE_STEP == VLA_MAX_WIRE_STEP to
+# disable the slow window; set HANDOFF_STEP_RAMP_TICKS=0 to apply the
+# slow step indefinitely (rarely useful -- operator usually wants the
+# wire back to normal speed once VLA stabilises).
+: "${VLA_HANDOFF_MAX_WIRE_STEP:=0.012}"
+: "${VLA_HANDOFF_STEP_RAMP_TICKS:=250}"
+
+# ---- Sim-mode pose proxy plumbing (2026-06-10 milestone, sim path) -----
+# When SIM_MODE=1 AND (VLA_CONTROL_PORT > 0 OR POSE_PROXY_OVERRIDE_PORT > 0),
+# this launcher spawns a LOCAL x2_pose_proxy on loopback between the
+# bridge and the sim deploy so the manual-takeover loop works in pure
+# sim without any PC2 daemons. The bridge keeps publishing to
+# LAPTOP_POSE_PORT (5556); the proxy SUBs there, arbitrates against
+# the override SUB, and PUBs the merged wire to POSE_PROXY_DOWNSTREAM_PORT
+# (5558) where the sim deploy reads from.
+#
+# Defaults match x2_pc2_daemons.sh so the same operator runbook works
+# in sim and real-robot mode. Override via env vars.
+: "${POSE_PROXY_DOWNSTREAM_HOST:=127.0.0.1}"
+: "${POSE_PROXY_DOWNSTREAM_PORT:=5558}"
+: "${POSE_PROXY_OVERRIDE_HOST:=127.0.0.1}"
+: "${POSE_PROXY_OVERRIDE_PORT:=-1}"   # default disabled
+: "${POSE_PROXY_OVERRIDE_TOPIC:=pose}"
+: "${POSE_PROXY_OVERRIDE_STALE_MS:=200}"
+# Frozen-frame release: the Quest3 manager publishes the FROZEN last
+# commanded pose every tick in OFF/LOCOMOTION mode, so the override
+# SUB never goes silent across an A+B+X+Y disengage gesture. Frame-
+# equality detection in the proxy catches this and fires
+# override_released exactly once after N consecutive identical
+# frames. Default 10 ticks @ 50Hz = 200ms (matches stale-ms). Set
+# POSE_PROXY_OVERRIDE_FROZEN_TICKS=0 to disable and fall back to
+# silence-only release (legacy behaviour, only fires when the
+# operator Ctrl-C's the entire teleop stack).
+: "${POSE_PROXY_OVERRIDE_FROZEN_TICKS:=10}"
+# Bumped from 1e-4 on 2026-06-10 after observing repeated single-tick
+# engage/release cycles in sim from sub-degree controller-rest drift
+# while the manager was in OFF (each cycle fires a heavy VLA cold-
+# restart). 5e-3 rad ~ 0.3 deg total joint-space motion is well above
+# resting jitter and well below intentional teleop motion. Lower to
+# 1e-4 only for strict bytes-match detection.
+: "${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL:=5e-3}"
+# Symmetric engage-side hysteresis: require N consecutive override
+# frames with joint-space delta ABOVE --override-frozen-l2-tol before
+# firing override_engaged. Same default as frozen-ticks (10 = 200ms
+# @ 50Hz). Together with the higher tolerance above this prevents
+# brief controller jitter from spurious engage / release / cold-restart
+# cycles (each cycle is heavy: bridge wipes chunk + LPF + ramp state).
+# Set to 0 for legacy single-frame-engage behaviour (used only by
+# older smoke tests, not the operator runbook).
+: "${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS:=10}"
+# Engagement slow-step ramp (2026-06-10 follow-up 9). Symmetric to
+# the bridge's --vla-handoff-max-wire-step / --vla-handoff-step-ramp-
+# ticks: when the proxy fires LIVE -> OVERRIDE the operator's first
+# OVERRIDE frame can be ~3 rad (L_inf) away from VLA's last
+# commanded body pose, and forwarding it verbatim made the deploy
+# slam the body across the delta in one tick. The proxy now clamps
+# the operator's joint_pos_mj per-element from the last forwarded
+# (VLA) pose, linearly relaxing the clamp back to the steady-state
+# step over the ramp window. Defaults match the bridge's handoff
+# defaults so the two takeover directions feel symmetric.
+: "${POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP:=0.012}"
+: "${POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP:=0.035}"
+: "${POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS:=250}"
+# Operator-mode SUB (2026-06-10 follow-up). The Quest3 manager
+# publishes its current ``stream_mode`` ("OFF" | "LOCOMOTION" |
+# "ARM_MANIPULATION") on the recorder PUB every tick. When this
+# port is set, the proxy uses mode != "OFF" as the STRICT engage
+# gate -- motion-hysteresis / frozen-detection are bypassed and the
+# operator holding the controller still no longer flicker-releases
+# the wire (the bug the user hit on 2026-06-10). 5564 matches the
+# manager's --recorder-pub-port default; override here when the
+# manager binds elsewhere.
+: "${POSE_PROXY_TELEOP_MODE_HOST:=127.0.0.1}"
+: "${POSE_PROXY_TELEOP_MODE_PORT:=5564}"
+: "${POSE_PROXY_TELEOP_MODE_TOPIC:=stream_mode}"
+: "${POSE_PROXY_TELEOP_MODE_STALE_MS:=1000}"
+: "${POSE_PROXY_IDLE_STALE_MS:=300}"
+: "${POSE_PROXY_IDLE_MODE:=blend}"
+: "${POSE_PROXY_HOLD_LAST_SECS:=10.0}"
+: "${POSE_PROXY_BLEND_SECS:=3.0}"
+# Baked idle clip the proxy falls back to. Repo ships
+# gear_sonic_deploy/data/idle_stand.x2m2 (regenerate via
+# `python -m gear_sonic_deploy.scripts.bake_idle_stand_x2m2`).
+: "${POSE_PROXY_IDLE_X2M2:=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/gear_sonic_deploy/data/idle_stand.x2m2}"
+# Python interpreter for the proxy. pyzmq + numpy are the only deps;
+# the bridge venv has both. We default to the bridge's interpreter
+# so we don't introduce a second venv requirement.
+: "${POSE_PROXY_PY:=}"
 : "${MODALITY_CONFIG:=gear_sonic/data/x2_modality_config_omnihand_stereo.py}"
 : "${MOTION_TOKEN_DECODER:=}"
 : "${SONIC_CHECKPOINT:=}"
@@ -240,6 +364,51 @@ BOLD=$'\033[1m'
 : "${SIM_WITH_OMNIHAND:=1}"
 : "${SIM_MAX_TARGET_DEV:=}"
 : "${SIM_DEPLOY_TARGET_LPF_HZ:=}"
+# Wrist bypass forwarded to the C++ deploy binary via --wrist-bypass {off,ik}.
+# Default ``ik`` so the operator's wrist gestures AND VLA wrist tokens
+# actually move the robot's wrist (per wrist_bypass.hpp, the SONIC
+# tracker pins ``*_wrist_pitch``/``*_wrist_roll`` at a comfort pose
+# regardless of what the IK reference says -- the operator on
+# 2026-06-10 13:12 confirmed "wrist not responding. we need the wrist
+# ik enabled i think"). Wrist slam mitigation lives ENTIRELY on the
+# bridge side (see follow-up 8 below + follow-up 6's slow-step ramp):
+# the wire's per-element rate clamp (``--vla-max-wire-step``, default
+# 0.035 rad/tick) implicitly rate-limits the bypassed wrist target
+# because ``wrist_bypass=ik`` force-writes ``target_pos_mj`` from the
+# wire's ``joint_pos_mj``. Right after a handoff, the slow-step ramp
+# (``--vla-handoff-max-wire-step`` default 0.012 rad/tick for the
+# first 5 s) bounds the transition further. To run without the
+# bypass (SONIC pins wrist pitch/roll at comfort pose; gestures
+# unresponsive), pass ``--wrist-bypass off``.
+: "${WRIST_BYPASS:=ik}"
+# DO NOT auto-pair with ``--max-target-dev``. The 13:21 run on
+# 2026-06-10 proved why: ``--max-target-dev`` is a GLOBAL absolute
+# clamp ``|target - default_angles| <= N`` applied to ALL joint
+# groups (leg + waist + arm + head per the deploy startup log),
+# NOT a per-tick rate limit. Setting 0.05 pinned every joint to
+# +/-2.9 deg of default_angles -- the robot couldn't bend its
+# knees enough to stand and collapsed forward onto the table
+# (act_clip_ticks=916/1000 = 92% of policy outputs clamped while
+# the safety stack fought the policy on every tick).
+#
+# Wrist slam mitigation now lives entirely on the bridge side:
+# the wire's per-element rate clamp (``--vla-max-wire-step``,
+# default 0.035 rad/tick) limits how fast the wire's wrist values
+# can change, and follow-up 6's slow-step ramp
+# (``--vla-handoff-max-wire-step``, default 0.012 rad/tick for the
+# first 5 s after a handoff) bounds the post-takeover transition.
+# Because ``wrist_bypass=ik`` force-writes ``target_pos_mj`` from
+# the wire's ``joint_pos_mj``, those bridge-side clamps implicitly
+# rate-limit the bypassed wrist target without needing any
+# deploy-side clamp.
+#
+# Operators who still want a deploy-side wrist-specific clamp
+# should pass per-group overrides (``--max-target-dev-arm``)
+# via ``--deploy-extra-arg`` -- but note that "arm" covers MJ
+# joints 15..28 = shoulder/elbow/wrist_yaw too, so 0.05 rad
+# would also break shoulder/elbow tracking. There's no
+# ``--max-target-dev-wrist`` group in the C++ deploy today;
+# adding one is a separate fix tracked in the next-session TODO.
 # Robocasa scene override for sim mode. Empty -> deploy default (x2_ultra.xml,
 # empty world). Set to a short name like "X2PickPlaceApple" and the launcher
 # resolves it to gear_sonic/data/assets/robocasa_scenes/<name>.xml and passes
@@ -294,7 +463,34 @@ Flags (preferred over env vars):
                                default. NAME is a short id (e.g. X2PickPlaceApple)
                                resolved against gear_sonic/data/assets/robocasa_scenes/.
                                Sim-only; rejected when --pc2-host is set.
-  --no-sim-viewer              Disable MuJoCo passive viewer (sim)
+  --sim-viewer                 Enable MuJoCo passive viewer in sim (default).
+  --no-sim-viewer              Disable MuJoCo passive viewer (sim).
+  --sim-with-omnihand          Compose X2 + OmniHand in sim (default).
+  --no-sim-with-omnihand       Use bare X2 (no OmniHand) in sim.
+  --wrist-bypass MODE          {off, ik} -- forwarded to the C++ deploy as
+                               --wrist-bypass. Default 'ik'. With 'ik',
+                               the deploy force-writes target_pos_mj for
+                               MJ indices {20,21,27,28} (left + right
+                               wrist pitch + roll) to the wire's
+                               joint_pos_mj BEFORE the safety stack, so
+                               operator wrist gestures and VLA wrist
+                               tokens actually move the wrist. SONIC
+                               otherwise pins those 4 DOFs at a comfort
+                               pose regardless of the IK reference (see
+                               wrist_bypass.hpp). The launcher does NOT
+                               auto-pair this with --max-target-dev:
+                               that flag is a GLOBAL deviation clamp on
+                               ALL joint groups, not a wrist-specific
+                               rate clamp, and pinning legs+waist+arm to
+                               +/-2.9 deg of default makes the robot
+                               collapse (2026-06-10 follow-up 8). Wrist
+                               slam mitigation lives on the bridge side
+                               via --vla-max-wire-step (steady-state
+                               rate clamp) and --vla-handoff-max-wire-
+                               step (slow-step ramp right after handoff).
+                               Set 'off' for SONIC-pinned wrist (wrist
+                               will NOT respond to operator/VLA wrist
+                               commands).
   --vla-ramp-in-ticks N        Bridge ramp-in ticks (default: 75)
   --vla-target-lpf-hz HZ       Body wire LPF (default: 2.0)
   --vla-future-lpf-hz HZ       Future-window LPF (default: 2.0)
@@ -345,6 +541,175 @@ Flags (preferred over env vars):
   --recorder-py PATH           Python interpreter for record_x2_dataset
                                (default .venv/bin/python so the LeRobot deps
                                install path is hit, not env_isaaclab).
+
+  --- Manual-takeover plumbing (2026-06-10 milestone) ---
+  Enables the operator to teleop-nudge the arm out of a stuck VLA pose
+  without restarting the bridge. CLI flags override matching env vars.
+  In sim mode, setting either of the two PORTs > 0 also spawns a local
+  x2_pose_proxy on loopback so the same loop works without PC2.
+
+  --vla-control-port PORT      Bridge SUB port for vla_control events
+                               (proxy emits override_engaged/released
+                               edges here). Default -1 = disabled.
+  --vla-control-host HOST      Host for the vla_control SUB. Defaults to
+                               --pc2-host in real mode, 127.0.0.1 in sim.
+  --vla-control-topic TOPIC    Topic prefix on the vla_control SUB
+                               (default 'vla_control').
+  --vla-cold-restart-hold-ticks N
+                               Bridge hold-at-measured-pose duration on
+                               override_released (default 25 = 500 ms).
+                               This is the MINIMUM dwell.
+  --vla-handoff-max-hold-ticks N
+                               Safety cap on the smooth-handoff guard
+                               (default 200 = 4 s). The bridge keeps
+                               the wire at the operator hand-off pose
+                               between --vla-cold-restart-hold-ticks
+                               and this cap, releasing as soon as the
+                               first eligible decoded chunk arrives.
+                               Without this guard, the post-hold tick
+                               can land before the next chunk decodes
+                               (inference cadence ~15 Hz vs wire
+                               50 Hz) and the wire snaps from the
+                               operator pose to the idle_stand clip.
+                               MUST be >= --vla-cold-restart-hold-ticks.
+                               Set 0 to disable.
+  --vla-handoff-max-wire-step RAD
+                               Per-element max joint-position step on
+                               the wire during the post-handoff slow
+                               window (default 0.012 rad/tick = ~36
+                               deg/s/joint at 50 Hz, vs the steady-
+                               state --vla-max-wire-step default of
+                               0.035 rad/tick = ~100 deg/s/joint).
+                               Linearly ramps back to --vla-max-wire-
+                               step over --vla-handoff-step-ramp-ticks
+                               ticks after the cold-restart hold
+                               releases. Set equal to --vla-max-wire-
+                               step to disable the slow window.
+                               2026-06-10 follow-up 6.
+  --vla-handoff-step-ramp-ticks N
+                               Ticks over which to ramp the wire step
+                               from --vla-handoff-max-wire-step (slow,
+                               applied right after handoff) back to
+                               --vla-max-wire-step (normal). Default
+                               250 @ 50 Hz = 5 s. Set 0 to skip the
+                               slow window entirely.
+  --pose-proxy-override-port PORT
+                               Sim-only: proxy override SUB port (where
+                               the teleop recorder PUBs). Default -1 =
+                               disabled. Real-robot mode uses the env var
+                               consumed by x2_pc2_daemons.sh instead.
+  --pose-proxy-override-host HOST
+                               Sim-only: override SUB host (default
+                               127.0.0.1).
+  --pose-proxy-override-topic TOPIC
+                               Sim-only: override SUB topic prefix
+                               (default 'pose').
+  --pose-proxy-override-stale-ms MS
+                               Sim-only: silence debounce before the
+                               proxy fires override_released (default
+                               200 ms). Only fires if the operator
+                               kills the teleop stack, since the
+                               Quest3 manager keeps publishing frozen
+                               frames in OFF/LOCOMOTION. See
+                               --pose-proxy-override-frozen-ticks for
+                               the gesture-friendly release path.
+  --pose-proxy-override-frozen-ticks N
+                               Sim-only: fire override_released after N
+                               consecutive identical override frames
+                               (within --frozen-l2-tol). Default 10 =
+                               200ms @ 50Hz. Catches the manager's
+                               freeze-on-disengage pattern so A+B+X+Y
+                               actually releases. Set to 0 to disable
+                               (fall back to silence-only).
+  --pose-proxy-override-frozen-l2-tol R
+                               Sim-only: L2 distance tolerance (rad)
+                               for two override frames to count as
+                               frozen (default 5e-3 ~ 0.3 deg total
+                               joint motion; bumped from 1e-4 on
+                               2026-06-10 to absorb controller-rest
+                               jitter that was causing repeated
+                               single-frame engage/release cycles).
+                               Lower to 1e-4 for strict bytes-match
+                               detection only.
+  --pose-proxy-override-engage-motion-ticks N
+                               Sim-only: symmetric engage-side
+                               hysteresis. Require N consecutive
+                               override frames with joint-space delta
+                               ABOVE --override-frozen-l2-tol before
+                               firing override_engaged (default 10 =
+                               200ms @ 50Hz, mirrors frozen-ticks).
+                               Prevents brief jitter from spurious
+                               engage/release cold-restart cycles.
+                               Set to 0 for the legacy single-frame
+                               engage used by older smoke tests. IGNORED
+                               when --pose-proxy-teleop-mode-port > 0
+                               (mode-gated engagement bypasses motion
+                               hysteresis entirely).
+  --pose-proxy-engagement-max-wire-step R
+                               Sim-only: per-element max joint step
+                               (rad) applied at the LIVE -> OVERRIDE
+                               edge so the operator's first override
+                               frame doesn't slam the body across the
+                               full VLA -> operator delta in one tick.
+                               Default 0.012 rad/tick (~36 deg/s @
+                               50 Hz; matches the bridge's --vla-
+                               handoff-max-wire-step). The proxy
+                               clamps each forwarded override frame
+                               relative to the previously forwarded
+                               pose, linearly relaxing back to --pose-
+                               proxy-engagement-steady-wire-step over
+                               --pose-proxy-engagement-step-ramp-ticks
+                               ticks. Set to 0 (or equal to the steady
+                               value) to disable the engagement ramp.
+  --pose-proxy-engagement-steady-wire-step R
+                               Sim-only: per-element steady-state
+                               max joint step (rad) the engagement
+                               ramp converges to. Default 0.035
+                               rad/tick (matches bridge --vla-max-
+                               wire-step). After the ramp completes
+                               the proxy stops clamping override
+                               frames entirely.
+  --pose-proxy-engagement-step-ramp-ticks N
+                               Sim-only: ticks to linearly ramp the
+                               engagement clamp from slow -> steady
+                               (default 250 @ 50Hz = 5.0 s, matches
+                               bridge --vla-handoff-step-ramp-ticks).
+                               Set to 0 to disable engagement
+                               clamping (forwards verbatim from the
+                               very first OVERRIDE tick -- pre-2026-
+                               06-10 behaviour, produces the slam
+                               this guard prevents).
+  --pose-proxy-teleop-mode-host HOST
+                               Sim-only: host of the Quest3 manager's
+                               stream_mode PUB (default 127.0.0.1).
+                               When manager runs on a different machine
+                               point this at it.
+  --pose-proxy-teleop-mode-port PORT
+                               Sim-only: port of the Quest3 manager's
+                               stream_mode PUB (default 5564, matches
+                               the manager's --recorder-pub-port).
+                               When > 0, the proxy gates engagement
+                               STRICTLY on the manager's broadcast
+                               mode (mode != "OFF") and BYPASSES the
+                               motion-hysteresis / frozen-detection
+                               heuristics. Set to -1 to fall back to
+                               the legacy heuristic path (will flicker
+                               if operator holds controller still in
+                               ARM_MANIPULATION; pre-2026-06-10
+                               behaviour).
+  --pose-proxy-teleop-mode-topic TOPIC
+                               Sim-only: ZMQ topic prefix for the
+                               manager's mode PUB (default
+                               'stream_mode').
+  --pose-proxy-teleop-mode-stale-ms MS
+                               Sim-only: treat mode signal as gone
+                               after this many ms of silence (default
+                               1000). When stale, strict mode BLOCKS
+                               engagement -- a dead manager fails
+                               closed within ~1 s.
+  --pose-proxy-downstream-port PORT
+                               Sim-only: port the proxy PUBs to and the
+                               sim deploy SUBs from (default 5558).
   -h, --help                   Show this help
 
 Commands:
@@ -373,7 +738,21 @@ while [[ $# -gt 0 ]]; do
         --sim-profile)      SIM_PROFILE="$2"; shift 2 ;;
         --sim-rsi-pkl)      SIM_RSI_PKL="$2"; shift 2 ;;
         --robocasa-env)     ROBOCASA_ENV="$2"; shift 2 ;;
+        --sim-viewer)       SIM_VIEWER=1; shift ;;
         --no-sim-viewer)    SIM_VIEWER=0; shift ;;
+        --sim-with-omnihand)    SIM_WITH_OMNIHAND=1; shift ;;
+        --no-sim-with-omnihand) SIM_WITH_OMNIHAND=0; shift ;;
+        --wrist-bypass)
+            case "$2" in
+                off|ik) ;;
+                *)
+                    log "[FATAL] --wrist-bypass must be {off, ik}; got '$2'"
+                    exit 2
+                    ;;
+            esac
+            WRIST_BYPASS="$2"
+            shift 2
+            ;;
         --autostart-after)  SIM_AUTOSTART_AFTER="$2"; shift 2 ;;
         --max-target-dev)   SIM_MAX_TARGET_DEV="$2"; shift 2 ;;
         --deploy-target-lpf-hz) SIM_DEPLOY_TARGET_LPF_HZ="$2"; shift 2 ;;
@@ -434,6 +813,32 @@ while [[ $# -gt 0 ]]; do
         --encoder-config)   ENCODER_CONFIG="$2"; shift 2 ;;
         --sonic-tokenizer-device) SONIC_TOKENIZER_DEVICE="$2"; shift 2 ;;
         --recorder-py)      RECORDER_PY="$2"; shift 2 ;;
+        # --- manual-takeover plumbing (2026-06-10 milestone) -----------
+        # These CLI flags take precedence over the matching env vars,
+        # which remain as fallbacks so the existing x2_pc2_daemons.sh
+        # tmux-env propagation path keeps working.
+        --vla-control-port) VLA_CONTROL_PORT="$2"; shift 2 ;;
+        --vla-control-host) VLA_CONTROL_HOST="$2"; shift 2 ;;
+        --vla-control-topic) VLA_CONTROL_TOPIC="$2"; shift 2 ;;
+        --vla-cold-restart-hold-ticks) VLA_COLD_RESTART_HOLD_TICKS="$2"; shift 2 ;;
+        --vla-handoff-max-hold-ticks) VLA_HANDOFF_MAX_HOLD_TICKS="$2"; shift 2 ;;
+        --vla-handoff-max-wire-step) VLA_HANDOFF_MAX_WIRE_STEP="$2"; shift 2 ;;
+        --vla-handoff-step-ramp-ticks) VLA_HANDOFF_STEP_RAMP_TICKS="$2"; shift 2 ;;
+        --pose-proxy-override-port) POSE_PROXY_OVERRIDE_PORT="$2"; shift 2 ;;
+        --pose-proxy-override-host) POSE_PROXY_OVERRIDE_HOST="$2"; shift 2 ;;
+        --pose-proxy-override-topic) POSE_PROXY_OVERRIDE_TOPIC="$2"; shift 2 ;;
+        --pose-proxy-override-stale-ms) POSE_PROXY_OVERRIDE_STALE_MS="$2"; shift 2 ;;
+        --pose-proxy-override-frozen-ticks) POSE_PROXY_OVERRIDE_FROZEN_TICKS="$2"; shift 2 ;;
+        --pose-proxy-override-frozen-l2-tol) POSE_PROXY_OVERRIDE_FROZEN_L2_TOL="$2"; shift 2 ;;
+        --pose-proxy-override-engage-motion-ticks) POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS="$2"; shift 2 ;;
+        --pose-proxy-engagement-max-wire-step) POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP="$2"; shift 2 ;;
+        --pose-proxy-engagement-steady-wire-step) POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP="$2"; shift 2 ;;
+        --pose-proxy-engagement-step-ramp-ticks) POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS="$2"; shift 2 ;;
+        --pose-proxy-teleop-mode-host) POSE_PROXY_TELEOP_MODE_HOST="$2"; shift 2 ;;
+        --pose-proxy-teleop-mode-port) POSE_PROXY_TELEOP_MODE_PORT="$2"; shift 2 ;;
+        --pose-proxy-teleop-mode-topic) POSE_PROXY_TELEOP_MODE_TOPIC="$2"; shift 2 ;;
+        --pose-proxy-teleop-mode-stale-ms) POSE_PROXY_TELEOP_MODE_STALE_MS="$2"; shift 2 ;;
+        --pose-proxy-downstream-port) POSE_PROXY_DOWNSTREAM_PORT="$2"; shift 2 ;;
         -h|--help)          usage ;;
         *)                  ARGS+=("$1"); shift ;;
     esac
@@ -551,6 +956,26 @@ PID_FILE_DEPLOY="${RUN_DIR}/deploy.pid"
 LOG_FILE_DEPLOY="${RUN_DIR}/deploy.log"
 PID_FILE_RECORDER="${RUN_DIR}/recorder.pid"
 LOG_FILE_RECORDER="${RUN_DIR}/recorder.log"
+PID_FILE_SIM_PROXY="${RUN_DIR}/sim_proxy.pid"
+LOG_FILE_SIM_PROXY="${RUN_DIR}/sim_proxy.log"
+
+# Sim-mode pose proxy is in the loop iff the operator opted into
+# manual-takeover by enabling either VLA_CONTROL_PORT (edge events
+# for the bridge cold restart) or POSE_PROXY_OVERRIDE_PORT (dual-
+# source arbitration). Either alone is a valid use case, so we OR
+# them. Only takes effect when SIM_MODE=1; real-robot runs always
+# rely on the PC2-side proxy spawned by x2_pc2_daemons.sh and
+# SIM_PROXY_ENABLED stays 0 so the launcher doesn't try to bind
+# loopback sockets that conflict with the laptop's bridge PUB.
+SIM_PROXY_ENABLED=0
+if [[ "${SIM_MODE}" -eq 1 ]]; then
+    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+        SIM_PROXY_ENABLED=1
+    fi
+    if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
+        SIM_PROXY_ENABLED=1
+    fi
+fi
 # Bridge<->recorder ready-file handshake. Always defined so the bridge
 # CLI is stable, but only wired into BRIDGE_ARGS / recorder_args below
 # when WITH_RECORD=1 (otherwise the bridge starts inference immediately
@@ -705,6 +1130,26 @@ stop_dump() {
     fi
 }
 
+stop_sim_proxy() {
+    # Tear down the sim-mode pose proxy if it was spawned. Order
+    # matters in stop_all: the sim deploy SUBs from the proxy's
+    # downstream port, so stopping deploy FIRST avoids the deploy
+    # logging "input went silent" right before we kill it anyway.
+    # The proxy holds no operator state (no parquet flush, no model
+    # weights), so a 2 s SIGTERM window is plenty.
+    if [[ -f "$PID_FILE_SIM_PROXY" ]]; then
+        local ppid
+        ppid="$(cat "$PID_FILE_SIM_PROXY")"
+        if kill -0 "$ppid" 2>/dev/null; then
+            log "SIGTERM sim pose proxy pid=$ppid …"
+            kill -TERM "$ppid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$ppid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE_SIM_PROXY"
+    fi
+}
+
 stop_recorder() {
     # Drain ordering matters: SIGTERM the recorder FIRST so the
     # finally-block in _run_subscribe_mode auto-saves the open episode
@@ -746,10 +1191,15 @@ kill_stale_sim_processes() {
     pkill -TERM -f "live_vla_publish_motion_token" 2>/dev/null || true
     pkill -TERM -f "gear_sonic.scripts.dump_x2_debug" 2>/dev/null || true
     pkill -TERM -f "deploy_x2.sh.*sim" 2>/dev/null || true
+    # Sim-mode pose proxy spawned by spawn_sim_proxy. Match the full
+    # script path to avoid killing a PC2-side proxy that may be
+    # running under a different python in a remote session.
+    pkill -TERM -f "gear_sonic_deploy/scripts/x2_pose_proxy.py" 2>/dev/null || true
     sleep 2
     pkill -KILL -f "live_vla_publish_motion_token" 2>/dev/null || true
     pkill -KILL -f "gear_sonic.scripts.dump_x2_debug" 2>/dev/null || true
     pkill -KILL -f "deploy_x2.sh.*sim" 2>/dev/null || true
+    pkill -KILL -f "gear_sonic_deploy/scripts/x2_pose_proxy.py" 2>/dev/null || true
     # deploy_x2.sh uses gr00t-x2sim:latest (host networking). Older
     # docs referenced ancestor=x2sim; match both image + name patterns.
     local cid=""
@@ -766,11 +1216,30 @@ kill_stale_sim_processes() {
         docker kill $cid 2>/dev/null || true
         sleep 3
     fi
-    if ss -tln 2>/dev/null | grep -qE ":${LAPTOP_POSE_PORT}\b|:${PC2_DEBUG_PORT}\b"; then
+    # Build a list of ports the proxy + bridge + deploy may have left
+    # bound. Override + control entries only included when the operator
+    # opted into them (else they're -1 and would expand to nonsense).
+    local cleanup_ports=("${LAPTOP_POSE_PORT}" "${PC2_DEBUG_PORT}")
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        cleanup_ports+=("${POSE_PROXY_DOWNSTREAM_PORT}")
+        if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
+            cleanup_ports+=("${POSE_PROXY_OVERRIDE_PORT}")
+        fi
+        if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+            cleanup_ports+=("${VLA_CONTROL_PORT}")
+        fi
+    fi
+    local port_re=""
+    local port
+    for port in "${cleanup_ports[@]}"; do
+        [[ -z "${port_re}" ]] && port_re=":${port}\b" || port_re+="|:${port}\b"
+    done
+    if ss -tln 2>/dev/null | grep -qE "${port_re}"; then
         if command -v fuser >/dev/null 2>&1; then
-            warn "ZMQ ports still bound; fuser -k on :${LAPTOP_POSE_PORT} and :${PC2_DEBUG_PORT}"
-            fuser -k "${LAPTOP_POSE_PORT}/tcp" 2>/dev/null || true
-            fuser -k "${PC2_DEBUG_PORT}/tcp" 2>/dev/null || true
+            warn "ZMQ ports still bound; fuser -k on ${cleanup_ports[*]}"
+            for port in "${cleanup_ports[@]}"; do
+                fuser -k "${port}/tcp" 2>/dev/null || true
+            done
             sleep 2
         fi
     fi
@@ -785,6 +1254,9 @@ stop_all() {
     stop_recorder
     stop_bridge
     stop_deploy
+    # Sim proxy LAST: bridge + deploy both touch its sockets, so we
+    # let them exit cleanly first. No-op when SIM_PROXY_ENABLED=0.
+    stop_sim_proxy
     stop_dump
     kill_stale_sim_processes
 }
@@ -1226,15 +1698,115 @@ print_sim_artifacts() {
     log "  or: python -c \"import pandas as pd; df=pd.read_csv('${RUN_DIR}/x2_debug_trace.csv'); print(df.describe())\""
 }
 
+spawn_sim_proxy() {
+    # Spawn the pose proxy on loopback so the sim deploy gets dual-
+    # source arbitration + the same fallback ladder the PC2-side proxy
+    # provides on the real robot. The bridge keeps publishing to
+    # LAPTOP_POSE_PORT; the proxy SUBs there and republishes to
+    # POSE_PROXY_DOWNSTREAM_PORT (where the sim deploy reads from).
+    # No-op when SIM_PROXY_ENABLED=0.
+    local proxy_py="$POSE_PROXY_PY"
+    if [[ -z "$proxy_py" ]]; then
+        proxy_py="$BRIDGE_PY"
+    fi
+    local proxy_script="${REPO_ROOT}/gear_sonic_deploy/scripts/x2_pose_proxy.py"
+    if [[ ! -f "$proxy_script" ]]; then
+        err "sim pose proxy script missing: $proxy_script"
+        return 1
+    fi
+    if [[ ! -f "$POSE_PROXY_IDLE_X2M2" ]]; then
+        err "POSE_PROXY_IDLE_X2M2 missing: $POSE_PROXY_IDLE_X2M2"
+        err "  Regenerate via: python -m gear_sonic_deploy.scripts.bake_idle_stand_x2m2"
+        return 1
+    fi
+    local proxy_args=(
+        "$proxy_script"
+        --upstream-host 127.0.0.1
+        --upstream-port "$LAPTOP_POSE_PORT"
+        --upstream-topic pose
+        --downstream-host "$POSE_PROXY_DOWNSTREAM_HOST"
+        --downstream-port "$POSE_PROXY_DOWNSTREAM_PORT"
+        --downstream-topic pose
+        --idle-x2m2 "$POSE_PROXY_IDLE_X2M2"
+        --idle-stale-ms "$POSE_PROXY_IDLE_STALE_MS"
+        --idle-mode "$POSE_PROXY_IDLE_MODE"
+        --hold-last-secs "$POSE_PROXY_HOLD_LAST_SECS"
+        --blend-secs "$POSE_PROXY_BLEND_SECS"
+        # Sim has no x2_debug PUB on the deploy side until the deploy
+        # boots and binds :5557. Yaw rebase is a real-robot affordance
+        # (IMU pelvis quat). Disable so the proxy doesn't spam decode
+        # warnings during the deploy warmup window.
+        --no-x2-debug-yaw-track
+    )
+    if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
+        proxy_args+=(
+            --override-host "$POSE_PROXY_OVERRIDE_HOST"
+            --override-port "$POSE_PROXY_OVERRIDE_PORT"
+            --override-topic "$POSE_PROXY_OVERRIDE_TOPIC"
+            --override-stale-ms "$POSE_PROXY_OVERRIDE_STALE_MS"
+            --override-frozen-ticks "$POSE_PROXY_OVERRIDE_FROZEN_TICKS"
+            --override-frozen-l2-tol "$POSE_PROXY_OVERRIDE_FROZEN_L2_TOL"
+            --override-engage-motion-ticks "$POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS"
+            --engagement-max-wire-step "$POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP"
+            --engagement-steady-wire-step "$POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP"
+            --engagement-step-ramp-ticks "$POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS"
+        )
+        # Mode-gated engagement (2026-06-10). When the manager's
+        # stream_mode PUB is reachable, hand the proxy its address so
+        # engagement keys on operator button presses instead of pose
+        # deltas. Setting POSE_PROXY_TELEOP_MODE_PORT <= 0 (or
+        # --pose-proxy-teleop-mode-port -1) falls back to the legacy
+        # motion-hysteresis path -- only useful for replay smoke
+        # tests where no manager is running.
+        if [[ "${POSE_PROXY_TELEOP_MODE_PORT}" =~ ^-?[0-9]+$ ]] && \
+           [[ "${POSE_PROXY_TELEOP_MODE_PORT}" -gt 0 ]]; then
+            proxy_args+=(
+                --teleop-mode-host "$POSE_PROXY_TELEOP_MODE_HOST"
+                --teleop-mode-port "$POSE_PROXY_TELEOP_MODE_PORT"
+                --teleop-mode-topic "$POSE_PROXY_TELEOP_MODE_TOPIC"
+                --teleop-mode-stale-ms "$POSE_PROXY_TELEOP_MODE_STALE_MS"
+            )
+        fi
+    fi
+    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+        proxy_args+=(
+            # In sim we bind on loopback only; the bridge SUBs from
+            # 127.0.0.1 via the VLA_CONTROL_HOST_RESOLVED fallback.
+            --vla-control-bind-host 127.0.0.1
+            --vla-control-port "$VLA_CONTROL_PORT"
+            --vla-control-topic "$VLA_CONTROL_TOPIC"
+        )
+    fi
+    log "spawning sim pose proxy -> ${LOG_FILE_SIM_PROXY}"
+    log "  CMD: ${proxy_py} ${proxy_args[*]}"
+    nohup "$proxy_py" -u "${proxy_args[@]}" \
+        > "$LOG_FILE_SIM_PROXY" 2>&1 &
+    echo $! > "$PID_FILE_SIM_PROXY"
+    ok "sim_proxy.pid = $(cat "$PID_FILE_SIM_PROXY")"
+    # Brief settle so the bind completes before the sim deploy SUBs.
+    # PUB/SUB on loopback is forgiving but a SUB attaching mid-bind
+    # silently drops the first few frames.
+    sleep 0.5
+}
+
 spawn_sim_deploy() {
+    # When the sim proxy is in the loop, point the deploy at the
+    # proxy's downstream port instead of LAPTOP_POSE_PORT. The bridge
+    # still publishes to LAPTOP_POSE_PORT; the proxy bridges the two.
+    local deploy_pose_host="127.0.0.1"
+    local deploy_pose_port="$LAPTOP_POSE_PORT"
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        deploy_pose_host="$POSE_PROXY_DOWNSTREAM_HOST"
+        deploy_pose_port="$POSE_PROXY_DOWNSTREAM_PORT"
+    fi
     local deploy_args=(
         sim --vla
         --model "$SIM_MODEL"
         --autostart-after "$SIM_AUTOSTART_AFTER"
         --max-duration "$MAX_DURATION"
         --no-confirm
-        --vla-zmq-host 127.0.0.1
-        --vla-zmq-port "$LAPTOP_POSE_PORT"
+        --vla-zmq-host "$deploy_pose_host"
+        --vla-zmq-port "$deploy_pose_port"
         --vla-zmq-topic pose
         --vla-debug-port "$PC2_DEBUG_PORT"
         --vla-debug-topic x2_debug
@@ -1244,6 +1816,53 @@ spawn_sim_deploy() {
         # do the same). Without this the robot collapses before SONIC loads.
         --deploy-extra-arg --disable-pose-ref-watchdog
     )
+    # Wrist bypass: forwarded verbatim to the C++ deploy binary via
+    # ``deploy_x2.sh --deploy-extra-arg``. Two extras because the C++
+    # CLI is ``--wrist-bypass <mode>`` (value separated). With ``ik``
+    # the deploy overwrites ``target_pos_mj[{20,21,27,28}]`` (left +
+    # right wrist pitch + roll) with the IK reference from the latest
+    # ZMQ pose frame; the policy outputs for those slots are
+    # discarded. ``wrist_yaw`` is left under SONIC because v2
+    # telemetry shows it tracks the reference cleanly (corr ~0.8).
+    # See ``gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/
+    # wrist_bypass.hpp`` for the full empirical justification and the
+    # unit test that pins the MJ indices against
+    # ``policy_parameters.hpp::mujoco_joint_names`` ordering.
+    if [[ -n "${WRIST_BYPASS:-}" ]] && [[ "${WRIST_BYPASS}" != "off" ]]; then
+        deploy_args+=(
+            --deploy-extra-arg --wrist-bypass
+            --deploy-extra-arg "$WRIST_BYPASS"
+        )
+        # 2026-06-10 follow-up 8: DO NOT auto-pair with
+        # ``--max-target-dev``. The 13:21 run proved it the hard
+        # way -- ``--max-target-dev`` is a GLOBAL absolute clamp
+        # ``|target - default_angles| <= N rad`` applied to ALL
+        # joint groups (leg/waist/arm/head), NOT a per-tick step
+        # clamp. The deploy startup log spells it out:
+        #
+        #   SAFETY: per-joint target clamp ENABLED. Effective per-group
+        #   |target - default| limits: leg=0.050 rad (2.9 deg),
+        #   waist=0.050 rad (2.9 deg), arm=0.050 rad (2.9 deg),
+        #   head=0.050 rad (2.9 deg) (global default --max-target-dev=
+        #   0.050 rad (2.9 deg); per-group overrides win when > 0)
+        #
+        # 0.05 rad pinned leg + waist + arm + head joints to +/-2.9
+        # deg of default_angles -- the robot couldn't bend its
+        # knees more than 2.9 deg to stand, and it collapsed
+        # forward onto the table. act_clip_ticks=916/1000 = 92%
+        # of policy outputs clamped because the safety clamp was
+        # fighting the policy on every tick.
+        #
+        # The deploy DOES have per-group overrides (per the log,
+        # "per-group overrides win when > 0"), but until we wire
+        # them through deploy_x2.sh + verify the override names
+        # match what the C++ binary expects, leave the auto-pair
+        # OFF. wrist_bypass=ik without max-target-dev is the
+        # condition that produced the 12:26 wrist slam; operators
+        # who want both safe wrist tracking AND standing legs
+        # need a wrist-only clamp. Documented as a follow-up.
+        :
+    fi
     if [[ "$SIM_PROFILE" == "parity" ]]; then
         deploy_args+=(--motion "$SIM_RSI_PKL")
     fi
@@ -1252,6 +1871,30 @@ spawn_sim_deploy() {
     fi
     if [[ "$SIM_WITH_OMNIHAND" -eq 1 ]]; then
         deploy_args+=(--sim-with-omnihand)
+        # When the manual-takeover proxy is in the wire, the OmniHand
+        # ZMQ subscriber MUST go through the same proxy as the body
+        # joints -- otherwise the override path looks like this:
+        #
+        #   Operator A+B+X+Y -> recorder :5560 -> proxy :5558
+        #       -> sim deploy body SUB  -> body joints applied  ✓
+        #       -> OmniHand SUB still pinned at :5556 (bridge)  ✗
+        #
+        # The bridge keeps publishing VLA hand chunks throughout, so
+        # without this redirect the operator's finger commands are
+        # silently dropped and only VLA controls the fingers
+        # regardless of override engagement state. This is the
+        # 2026-06-10 late-afternoon "fingers still not responding"
+        # symptom even after the stream_mode gate landed. Routing
+        # the OmniHand SUB through the proxy means the same
+        # arbitration (mode-gated when teleop_mode is configured)
+        # decides body and fingers together -- they can never
+        # disagree about which source is driving.
+        if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+            deploy_args+=(
+                --sim-hand-zmq-host "$deploy_pose_host"
+                --sim-hand-zmq-port "$deploy_pose_port"
+            )
+        fi
     fi
     if [[ -n "$ROBOCASA_SCENE_XML" ]]; then
         deploy_args+=(--sim-mjcf "$ROBOCASA_SCENE_XML")
@@ -1337,6 +1980,14 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
   ${BOLD}x2_debug SUB    ${NC}: tcp://localhost:${PC2_DEBUG_PORT}
   ${BOLD}Cameras         ${NC}: ghost MuJoCo renderer (modality-driven stereo keys)
 EOF
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        cat <<EOF
+  ${BOLD}Sim pose proxy  ${NC}: ON (loopback) bridge :${LAPTOP_POSE_PORT} -> proxy -> deploy :${POSE_PROXY_DOWNSTREAM_PORT}
+$( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms" || echo "  ${BOLD}Override SUB    ${NC}: disabled (set POSE_PROXY_OVERRIDE_PORT > 0)" )
+$( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (bridge SUBs here)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
+  ${BOLD}Handoff guard   ${NC}: cold_restart_hold=${VLA_COLD_RESTART_HOLD_TICKS}t max_hold=${VLA_HANDOFF_MAX_HOLD_TICKS}t slow_step=${VLA_HANDOFF_MAX_WIRE_STEP}rad/t for ${VLA_HANDOFF_STEP_RAMP_TICKS}t (wire stays at operator pose until first eligible chunk, then ramps via slow-step to normal max_wire_step)
+EOF
+    fi
 else
     cat <<EOF
   ${BOLD}PC2 host        ${NC}: ${PC2_HOST}
@@ -1351,6 +2002,7 @@ cat <<EOF
   ${BOLD}Token decoder   ${NC}: ${MOTION_TOKEN_DECODER:-DISABLED (body will track idle_stand only)}
   ${BOLD}Wire safety     ${NC}: ramp ${VLA_RAMP_IN_TICKS}t bodyLPF ${VLA_TARGET_LPF_HZ}Hz futLPF ${VLA_FUTURE_LPF_HZ}Hz handLPF ${VLA_HAND_LPF_HZ}Hz handBlend ${VLA_HAND_CHUNK_BLEND_TICKS}t handStep≤${VLA_MAX_HAND_STEP} bodyStep≤${VLA_MAX_WIRE_STEP} body≤${VLA_MAX_WIRE_DEV_FROM_BODY} blend ${VLA_CHUNK_BLEND_TICKS}t actionIL≤${VLA_MAX_ACTION_IL}$( [[ "$VLA_RAW" -eq 1 ]] && echo "  ${RED}${BOLD}[--vla-raw: WIRE FILTERS OFF; action-IL clamp KEPT to prevent proprio runaway]${NC}" )
   ${BOLD}Deploy clamp    ${NC}: max-target-dev ${SIM_MAX_TARGET_DEV:-off} deploy-LPF ${SIM_DEPLOY_TARGET_LPF_HZ:-off} Hz (sim)
+  ${BOLD}Wrist bypass    ${NC}: ${WRIST_BYPASS:-off}$( [[ "${WRIST_BYPASS:-off}" == "ik" ]] && echo "  (deploy force-writes target_pos_mj[{20,21,27,28}] to wire IK; rate-limited via bridge max_wire_step + follow-up 6 slow-step ramp; NO global max-target-dev auto-pair after the 13:21 leg-collapse regression)" || echo "  ${RED}WARNING: wrist pitch/roll pinned at SONIC comfort -- will NOT respond to operator/VLA wrist commands. Set --wrist-bypass ik to enable.${NC}" )
   ${BOLD}Rate            ${NC}: ${RATE} Hz publisher, ${INFERENCE_MIN_PERIOD_S}s min inference period
   ${BOLD}Max duration    ${NC}: ${MAX_DURATION} s
 EOF
@@ -1468,6 +2120,38 @@ if [[ "$WITH_RECORD" -eq 1 ]]; then
         --wait-for-ready-file-timeout-s 120
     )
 fi
+# ----- Manual-takeover (vla_control) wiring ---------------------------
+# Opt-in: only forward the vla_control SUB args when an operator has
+# explicitly set VLA_CONTROL_PORT > 0 in the environment. We resolve
+# the host default LATE (after PC2_HOST has been validated) so the
+# common "proxy runs on PC2, bridge on laptop" topology Just Works
+# without an extra env var. Pass VLA_CONTROL_HOST explicitly to point
+# the bridge at a different vla_control PUB (e.g. a proxy running on
+# a third box).
+if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+    if [[ -z "${VLA_CONTROL_HOST}" ]]; then
+        if [[ -n "${PC2_HOST}" ]]; then
+            VLA_CONTROL_HOST_RESOLVED="${PC2_HOST}"
+        else
+            VLA_CONTROL_HOST_RESOLVED="127.0.0.1"
+        fi
+    else
+        VLA_CONTROL_HOST_RESOLVED="${VLA_CONTROL_HOST}"
+    fi
+    BRIDGE_ARGS+=(
+        --vla-control-host "${VLA_CONTROL_HOST_RESOLVED}"
+        --vla-control-port "${VLA_CONTROL_PORT}"
+        --vla-control-topic "${VLA_CONTROL_TOPIC}"
+        --vla-cold-restart-hold-ticks "${VLA_COLD_RESTART_HOLD_TICKS}"
+        --vla-handoff-max-hold-ticks "${VLA_HANDOFF_MAX_HOLD_TICKS}"
+        --vla-handoff-max-wire-step "${VLA_HANDOFF_MAX_WIRE_STEP}"
+        --vla-handoff-step-ramp-ticks "${VLA_HANDOFF_STEP_RAMP_TICKS}"
+    )
+    log "vla_control SUB enabled: tcp://${VLA_CONTROL_HOST_RESOLVED}:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (cold_restart_hold_ticks=${VLA_COLD_RESTART_HOLD_TICKS} handoff_max_hold_ticks=${VLA_HANDOFF_MAX_HOLD_TICKS} handoff_max_wire_step=${VLA_HANDOFF_MAX_WIRE_STEP} handoff_step_ramp_ticks=${VLA_HANDOFF_STEP_RAMP_TICKS})"
+else
+    log "vla_control SUB disabled (set VLA_CONTROL_PORT > 0 to enable manual-takeover cold restarts)"
+fi
+
 # Forward any unrecognised CLI tail as passthrough to the bridge.
 if [[ ${#ARGS[@]} -gt 0 ]]; then
     BRIDGE_ARGS+=("${ARGS[@]}")
@@ -1526,6 +2210,19 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
     if ! ensure_parity_rsi_pkl; then
         stop_all
         exit 1
+    fi
+
+    # Manual-takeover plumbing (sim path): spawn the local pose proxy
+    # BEFORE the deploy so :5558 is already bound when the deploy SUBs.
+    # No-op when SIM_PROXY_ENABLED=0; legacy autonomous-only sim runs
+    # remain byte-for-byte unchanged (bridge ↔ deploy direct on :5556).
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        log "sim manual-takeover plumbing ON: bridge :${LAPTOP_POSE_PORT} -> proxy -> deploy :${POSE_PROXY_DOWNSTREAM_PORT}"
+        if ! spawn_sim_proxy; then
+            err "sim pose proxy failed to spawn — see $LOG_FILE_SIM_PROXY"
+            stop_all
+            exit 1
+        fi
     fi
 
     spawn_sim_deploy

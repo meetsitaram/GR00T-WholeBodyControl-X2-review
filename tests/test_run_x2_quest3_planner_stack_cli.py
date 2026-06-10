@@ -53,7 +53,7 @@ WRAPPER = REPO_ROOT / "gear_sonic" / "scripts" / "run_x2_quest3_planner_stack.sh
 def _run_wrapper(
     args: list[str], *, timeout_s: float = 30.0,
     extra_default_args: tuple[str, ...] = (
-        "--no-deploy", "--no-sonic-checkpoint",
+        "--no-deploy", "--no-sonic-checkpoint", "--no-x2-debug-bridge",
     ),
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the wrapper with ``args`` and capture stdout/stderr.
@@ -63,9 +63,13 @@ def _run_wrapper(
     can't depend on in a unit test. We also default to
     ``--no-sonic-checkpoint`` so the SONIC tokenizer preflight (which
     requires the cloud-mirrored .pt next to the deploy ONNX) doesn't
-    fail on hosts without the checkpoint. Tests that specifically
-    exercise SONIC plumbing override ``extra_default_args`` to drop
-    the opt-out flag and supply their own checkpoint path.
+    fail on hosts without the checkpoint. And we default to
+    ``--no-x2-debug-bridge`` so the split-topology bridge-host gate
+    (introduced 2026-06-10 alongside ``--pc2-host``) doesn't short-
+    circuit the validation paths these tests actually pin. Tests that
+    specifically exercise SONIC plumbing or the bridge-host gate
+    override ``extra_default_args`` to drop the opt-out flag and
+    supply their own checkpoint / bridge-host arg.
 
     The validation paths exercised in most tests all happen *after*
     these short-circuits, so the omissions are invisible to the test.
@@ -403,8 +407,9 @@ def test_missing_sonic_checkpoint_in_auto_mode_is_rejected() -> None:
             "--validate-only",
         ],
         # Drop the default --no-sonic-checkpoint so the preflight
-        # actually fires.
-        extra_default_args=("--no-deploy",),
+        # actually fires. Keep --no-x2-debug-bridge so the
+        # split-topology bridge-host gate doesn't intercept first.
+        extra_default_args=("--no-deploy", "--no-x2-debug-bridge"),
     )
     assert res.returncode != 0, (
         "wrapper must reject auto-resolved .pt that doesn't exist; "
@@ -477,4 +482,117 @@ def test_wrapper_forwards_sonic_flags_to_recorder() -> None:
         "rewritten; double-check both --sonic-checkpoint AND "
         "--sonic-tokenizer-device still ride together so the device "
         "override isn't silently dropped."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Engage-pose preservation plumbing (2026-06-10 follow-up 10).
+#
+# When ENGAGE_POSE_SUB_PORT is set (env var OR --engage-pose-sub-port
+# CLI flag), the wrapper MUST forward --engage-pose-sub-{port,host,
+# topic,max-age-ms} (and optionally --engage-preserve-hands) to the
+# manager so OFF -> non-OFF mid-VLA snaps the arm freeze to the wire's
+# current pose instead of X2 neutral. The forwarding MUST exist in
+# BOTH the non-VLA branch (planner+manager+recorder) AND the VLA
+# branch (manager+bridge+recorder); the latter is the primary user of
+# the feature (shared-autonomy takeover) but the non-VLA branch needs
+# it too for the "run VLA in T2, run planner stack in T1" topology
+# the operator actually uses.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_accepts_preserve_arms_on_engage_cli_flag() -> None:
+    """``--preserve-arms-on-engage`` MUST reach ``--validate-only``
+    without falling into the unknown-arg branch.
+
+    This is the single operator-facing boolean for the follow-up 10
+    UX. Catches a regression where the case statement entry is
+    dropped or its spelling drifts; the operator would then see
+    ``unknown arg: --preserve-arms-on-engage`` and silently lose
+    the arm + hand preservation behaviour for the rest of the
+    session (the wrapper bails before reaching the manager).
+    """
+    res = _run_wrapper([
+        "--preserve-arms-on-engage",
+        "--no-x2-debug-bridge",
+        "--validate-only",
+    ])
+    assert res.returncode == 0, (
+        f"wrapper rejected --preserve-arms-on-engage; got exit "
+        f"{res.returncode}.\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    assert "unknown arg" not in res.stderr, (
+        f"wrapper case statement dropped --preserve-arms-on-engage.\n"
+        f"stderr:\n{res.stderr}"
+    )
+
+
+def test_wrapper_forwards_preserve_arms_args_to_manager_in_both_branches() -> None:
+    """Source-level pin: the wrapper MUST forward
+    ``--preserve-arms-on-engage`` (plus the four advanced overrides)
+    to BOTH manager spawn paths (non-VLA and VLA).
+
+    The non-VLA branch is the primary one (the operator runs VLA in
+    a sibling terminal); the VLA branch is the in-process VLA-bridge
+    mode (less common but supported). If either branch loses the
+    forwarding the operator's --preserve-arms-on-engage silently
+    no-ops for that mode -- exactly the kind of "looks like it
+    worked" failure the wrapper preflight is supposed to make
+    impossible.
+    """
+    src = WRAPPER.read_text()
+
+    # The gate is "PRESERVE_ARMS_ON_ENGAGE -eq 1" (env var or CLI
+    # flag flipping it on); the port is auto-defaulted to 5558.
+    # Pin that the gate string survives any future refactor.
+    assert "PRESERVE_ARMS_ON_ENGAGE}\" -eq 1 ]]; then" in src, (
+        "wrapper no longer gates the engage-pose forwarding behind "
+        "PRESERVE_ARMS_ON_ENGAGE=1; the single-boolean UX would "
+        "regress to needing a port number again."
+    )
+
+    # The numeric guard must still reject non-int / non-positive
+    # port overrides so a typo'd ENGAGE_POSE_SUB_PORT env var bails
+    # at the wrapper instead of the manager argparse.
+    assert "ENGAGE_POSE_SUB_PORT}\" =~ ^[0-9]+$" in src, (
+        "wrapper no longer numeric-guards ENGAGE_POSE_SUB_PORT; "
+        "a typo'd env value would be passed verbatim to the manager "
+        "and crash argparse with an unhelpful error."
+    )
+
+    # The two branches sit at different nesting depths (the VLA branch
+    # is inside ``if VLA_MODE -eq 1; then``) so the indentation
+    # differs. Normalize whitespace to a tight form and count
+    # occurrences of the canonical 6-arg body.
+    normalized = " ".join(src.split())
+    expect_body = (
+        "MANAGER_ARGS+=( "
+        "--preserve-arms-on-engage "
+        "--engage-pose-sub-host \"${ENGAGE_POSE_SUB_HOST}\" "
+        "--engage-pose-sub-port \"${ENGAGE_POSE_SUB_PORT}\" "
+        "--engage-pose-sub-topic \"${ENGAGE_POSE_SUB_TOPIC}\" "
+        "--engage-pose-sub-max-age-ms \"${ENGAGE_POSE_SUB_MAX_AGE_MS}\" "
+        ")"
+    )
+    occurrences = normalized.count(expect_body)
+    assert occurrences == 2, (
+        f"preserve-arms MANAGER_ARGS forwarding block must appear in BOTH "
+        f"the non-VLA branch AND the VLA branch (expected 2, got "
+        f"{occurrences}). If only one branch has it, the manager will "
+        f"silently fall back to X2-neutral snapping in the missing mode."
+    )
+
+    # Pin the single-flag UX: the separate --engage-preserve-hands
+    # flag was retired. If a refactor re-introduces it as a separate
+    # opt-in the operator gets back the confusing two-flag surface.
+    assert "--engage-preserve-hands" not in src, (
+        "wrapper resurfaced --engage-preserve-hands as a separate "
+        "opt-in; hands now ride along with --preserve-arms-on-engage "
+        "(single-flag UX). Either remove the flag or update this "
+        "pin if the two-flag surface is intentional."
+    )
+    assert "ENGAGE_PRESERVE_HANDS" not in src, (
+        "wrapper resurfaced the ENGAGE_PRESERVE_HANDS env var; the "
+        "single-flag UX retired this opt-in. Update this pin if the "
+        "env var is intentional."
     )

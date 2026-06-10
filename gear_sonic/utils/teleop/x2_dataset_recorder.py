@@ -889,6 +889,7 @@ def _subscribe_mode_thread(
                     parts = sub_planner.recv_multipart(flags=zmq.NOBLOCK)
                     _handle_body_pose_msg(
                         parts, state, expected_topic=body_pose_topic,
+                        vla_mode=vla_mode,
                     )
                 except zmq.error.Again:
                     pass
@@ -919,7 +920,7 @@ def _subscribe_mode_thread(
 
 def _handle_body_pose_msg(
     parts: list[bytes], state: _SubscribeModeState,
-    *, expected_topic: str,
+    *, expected_topic: str, vla_mode: bool = False,
 ) -> None:
     """Decode the planner's body_pose payload and update state.
 
@@ -934,6 +935,20 @@ def _handle_body_pose_msg(
     the policy gets a frozen future window (10 copies of the current
     pose), which is exactly the "legs animate but body doesn't
     translate" symptom we hit in Phase 0 smoke testing.
+
+    ``vla_mode`` gates the embedded-hand-joints update (see lines
+    988-1008 below). In VLA mode the bridge is the sole producer of
+    hand state and stamps :func:`left_hand_joints` / :func:`right_
+    hand_joints` into the unified ``pose`` payload, so we MUST
+    forward them onto the state slot the manager would normally
+    write. In teleop mode the planner ALSO publishes the same
+    fields but always-zero (legacy wire-format compat); without
+    the flag the always-zero update would race the manager's
+    ``hand_finger_cmd`` writes and silently win at 50 Hz, which
+    is exactly the 2026-06-10 follow-up 5b "fingers not
+    responding" symptom -- recorder log shows ``hand|L|=0.000
+    (manager)`` even though the manager log shows ``published
+    hand_q|L|=3.519`` for the same tick window.
     """
     from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (
         unpack_message,
@@ -994,7 +1009,22 @@ def _handle_body_pose_msg(
     # we forward them onto the same state slot the manager would
     # normally write. We only update when BOTH are present + correctly
     # shaped so a partial / mid-rollover frame can't corrupt a side.
-    if "left_hand_joints" in fields and "right_hand_joints" in fields:
+    #
+    # 2026-06-10 follow-up 5b: GATED on ``vla_mode`` because in
+    # teleop mode the planner also stamps both fields (as zeros, for
+    # legacy wire-format compatibility) at 50 Hz on every body_pose
+    # tick. The race-condition winner against the manager's 50 Hz
+    # hand_finger_cmd writes was the planner's always-zero update,
+    # so the recorder silently dropped the operator's finger
+    # commands and the OmniHand never saw a non-zero target. The
+    # ``vla_mode`` flag short-circuits the embedded-hand-joints
+    # update in teleop mode so the manager's hand_finger_cmd writes
+    # are the sole source of truth for finger state then.
+    if (
+        vla_mode
+        and "left_hand_joints" in fields
+        and "right_hand_joints" in fields
+    ):
         lh = np.asarray(
             fields["left_hand_joints"], dtype=np.float64,
         ).reshape(-1)
@@ -2776,11 +2806,33 @@ class X2DatasetRecorder:
                         >= self._cfg.status_log_period_s
                 ):
                     self._last_status_log_t = now_log
+                    # Operator-hand diag: surfaces what's actually flowing
+                    # downstream when the operator is in ARM_MANIPULATION.
+                    # Diagnoses the 2026-06-10 "fingers not responding"
+                    # symptom: if |L_hand|/|R_hand| are zero throughout an
+                    # override window the manager isn't producing
+                    # non-zero hand_q (operator hasn't pulled triggers),
+                    # NOT a wiring bug. Conversely, non-zero norms here
+                    # paired with VLA-looking fingers in MuJoCo means the
+                    # OmniHand SUB isn't reading the proxy downstream
+                    # (regression on the spawn_sim_deploy wiring).
+                    l_norm = (
+                        0.0 if left_hand is None
+                        else float(np.linalg.norm(left_hand))
+                    )
+                    r_norm = (
+                        0.0 if right_hand is None
+                        else float(np.linalg.norm(right_hand))
+                    )
+                    l_src = "manager" if left_hand is not None else "zero-fallback"
+                    r_src = "manager" if right_hand is not None else "zero-fallback"
                     print(
                         f"[recorder] subscribe-mode status: tick={tick} "
                         f"mode={snap['stream_mode']} "
                         f"recording={self._is_recording} "
-                        f"buffered={len(self._episode_buffer)} frames",
+                        f"buffered={len(self._episode_buffer)} frames "
+                        f"hand|L|={l_norm:.3f}({l_src}) "
+                        f"hand|R|={r_norm:.3f}({r_src})",
                         flush=True,
                     )
 

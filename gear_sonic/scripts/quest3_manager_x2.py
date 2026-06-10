@@ -112,6 +112,9 @@ from gear_sonic.utils.teleop.x2_retarget_pipeline import (  # noqa: E402
     Retargeter,
     RetargetTickInput,
 )
+from gear_sonic.utils.teleop.zmq.zmq_packed_message_decoder import (  # noqa: E402
+    unpack_message,
+)
 
 
 log = logging.getLogger("quest3_manager_x2")
@@ -185,6 +188,42 @@ class ManagerConfig:
     motor_monitor_sub_host: str = ""
     motor_monitor_sub_port: int = 5567
     motor_monitor_sub_topic: str = "motor_monitor"
+
+    # --- Engage-pose SUB (2026-06-10 follow-up 10) -----------------------
+    # When ``preserve_arms_on_engage`` is True, the manager spawns a SUB
+    # that subscribes to the wire driving the deploy (the pose-proxy's
+    # downstream PUB -- ``tcp://127.0.0.1:5558`` in SIM-on-PC1, or
+    # ``tcp://<PC2_IP>:5558`` for split topology). A background thread
+    # caches the latest decoded ``joint_pos_mj`` + ``left_hand_joints``
+    # + ``right_hand_joints`` at ~50 Hz with negligible CPU cost (one
+    # 1280-byte JSON header parse + a few np.frombuffer calls per
+    # frame).
+    #
+    # On every OFF -> non-OFF transition, the snap-to-neutral default is
+    # REPLACED by a snap-to-wire-pose: the manager extracts the arm
+    # AND hand slices from the cached jpos and uses those as the new
+    # ``_frozen_*_arm_q`` / ``_frozen_*_hand_q`` so the very next
+    # ``arm_targets`` + ``hand_finger_cmd`` publish carries the
+    # robot's CURRENT commanded arms AND hands. The recorder then
+    # merges those into its ``pose`` PUB, the proxy engages override,
+    # and the deploy sees a continuous wire from VLA's last pose to
+    # the operator's first override pose (= the same VLA pose, by
+    # construction). No jump on arms, no surprise drop / squeeze on
+    # hands.
+    #
+    # The port + host + topic + freshness window are settable but
+    # default to "the proxy's downstream on loopback" so the common
+    # SIM-on-PC1 flow only needs ``--preserve-arms-on-engage``.
+    #
+    # ``engage_pose_sub_max_age_ms`` caps how stale a cached pose
+    # can be before we fall back to the neutral snap. 200 ms (10
+    # ticks at 50 Hz) tolerates a brief wire stall without
+    # silently freezing arms at the prior session's last pose.
+    preserve_arms_on_engage: bool = False
+    engage_pose_sub_host: str = "127.0.0.1"
+    engage_pose_sub_port: int = 5558
+    engage_pose_sub_topic: str = "pose"
+    engage_pose_sub_max_age_ms: int = 200
 
     # IntentDecoder
     intent_stick_deadzone: float = 0.30
@@ -799,6 +838,59 @@ class Quest3ManagerX2:
                 self._motor_monitor_sock = None
                 self._motor_monitor_thread = None
 
+        # --- Engage-pose SUB (2026-06-10 follow-up 10) -------------------
+        # Caches the latest decoded joint_pos_mj from the wire so
+        # OFF -> non-OFF can snap the operator's freeze to "wherever
+        # the robot currently is" instead of the legacy X2 neutral
+        # stand pose. See ManagerConfig docstring for the why.
+        self._engage_pose_sock = None
+        self._engage_pose_thread = None
+        self._engage_pose_lock = threading.Lock()
+        self._engage_pose_jpos: Optional[np.ndarray] = None
+        self._engage_pose_left_hand: Optional[np.ndarray] = None
+        self._engage_pose_right_hand: Optional[np.ndarray] = None
+        self._engage_pose_last_ts: float = -1.0
+        self._engage_pose_msg_count = 0
+        if (
+            cfg.preserve_arms_on_engage
+            and cfg.engage_pose_sub_port > 0
+        ):
+            try:
+                self._engage_pose_sock = self._ctx.socket(zmq.SUB)
+                self._engage_pose_sock.setsockopt(zmq.LINGER, 0)
+                self._engage_pose_sock.setsockopt(zmq.RCVHWM, 4)
+                self._engage_pose_sock.setsockopt_string(
+                    zmq.SUBSCRIBE, cfg.engage_pose_sub_topic,
+                )
+                self._engage_pose_sock.connect(
+                    f"tcp://{cfg.engage_pose_sub_host}:"
+                    f"{cfg.engage_pose_sub_port}"
+                )
+                self._engage_pose_thread = threading.Thread(
+                    target=self._engage_pose_loop,
+                    name="engage_pose_sub",
+                    daemon=True,
+                )
+                self._engage_pose_thread.start()
+                log.info(
+                    "[engage-pose] SUB connected to tcp://%s:%d "
+                    "(topic=%s, max_age=%dms). On OFF->non-OFF the "
+                    "arm + hand freeze will snap to the wire's last "
+                    "commanded pose instead of X2 neutral / fingers-open.",
+                    cfg.engage_pose_sub_host, cfg.engage_pose_sub_port,
+                    cfg.engage_pose_sub_topic,
+                    cfg.engage_pose_sub_max_age_ms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[engage-pose] failed to start SUB on tcp://%s:%d: "
+                    "%s. OFF->non-OFF will fall back to neutral snap.",
+                    cfg.engage_pose_sub_host, cfg.engage_pose_sub_port,
+                    exc,
+                )
+                self._engage_pose_sock = None
+                self._engage_pose_thread = None
+
     # -- lifecycle ------------------------------------------------------------
 
     def _resolve_calibration(self) -> OperatorCalibration:
@@ -847,6 +939,16 @@ class Quest3ManagerX2:
         if self._motor_monitor_thread is not None:
             try:
                 self._motor_monitor_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self._engage_pose_sock is not None:
+            try:
+                self._engage_pose_sock.close(linger=0)
+            except Exception:
+                pass
+        if self._engage_pose_thread is not None:
+            try:
+                self._engage_pose_thread.join(timeout=1.0)
             except Exception:
                 pass
         if self._resume_sock is not None:
@@ -1241,6 +1343,44 @@ class Quest3ManagerX2:
                 )
                 self._publish_stream_mode(tick)
 
+                # 2026-06-10 follow-up 5: periodic per-input telemetry
+                # for the "fingers not responding" diagnosis. The
+                # recorder telemetry (``hand|L|=0.000(manager)``)
+                # tells us what the manager is PUBLISHING, but not
+                # whether the operator's triggers reached the
+                # manager. This log line closes that gap:
+                #   - ``triggers=lt rt lg rg``: post-Quest3Reader,
+                #     pre-retargeter operator input. If these are
+                #     zero while the operator believes they're
+                #     pulling triggers, the issue is upstream
+                #     (controller battery, occluded sensor, wrong
+                #     axis mapping, XRHand vs controller mode).
+                #   - ``hand_q|L| |R|``: post-retargeter, what we
+                #     just put on hand_finger_cmd. If triggers are
+                #     non-zero but hand_q is ~0, the retargeter or
+                #     calibration is broken. If triggers are
+                #     non-zero AND hand_q is non-zero AND the
+                #     OmniHand still doesn't move, the wire is
+                #     broken (proxy override forwarding, OmniHand
+                #     SUB host/port wiring).
+                # Gated on ARM_MAN so it doesn't spam during
+                # LOCOMOTION / OFF where the published hand_q is
+                # the frozen last value and the recorder telemetry
+                # is the better diagnostic anyway.
+                if (
+                    tick % 250 == 0
+                    and self._intent.mode == StreamMode.ARM_MANIPULATION
+                ):
+                    lt, rt, lg, rg = triggers
+                    lh_norm = float(np.linalg.norm(publish_left_hand))
+                    rh_norm = float(np.linalg.norm(publish_right_hand))
+                    log.info(
+                        "[manager-x2] tick=%d ARM_MAN triggers="
+                        "lt=%.2f rt=%.2f lg=%.2f rg=%.2f "
+                        "published hand_q|L|=%.3f |R|=%.3f",
+                        tick, lt, rt, lg, rg, lh_norm, rh_norm,
+                    )
+
                 tick += 1
                 next_tick += period
                 self._sleep_until(next_tick)
@@ -1352,15 +1492,68 @@ class Quest3ManagerX2:
             # Safety: the C++ deploy slews PD targets via its soft-
             # start ramp + per-tick step clamp, so this neutral target
             # blends in smoothly rather than commanding an instant jump.
-            self._frozen_left_arm_q = self._retargeter._teleop.left_neutral_q
-            self._frozen_right_arm_q = self._retargeter._teleop.right_neutral_q
-            self._frozen_left_hand_q = np.zeros(10, dtype=np.float64)
-            self._frozen_right_hand_q = np.zeros(10, dtype=np.float64)
-            log.info(
-                "[manager-x2] OFF -> %s: snap arm + hand freeze to neutral "
-                "(arms=X2 stand pose, fingers=open)",
-                transition.current.name,
+            # 2026-06-10 follow-up 10: when --preserve-arms-on-engage
+            # is set AND a fresh wire frame is cached, snap arms + hands
+            # to "wherever the robot currently is" instead of X2 neutral
+            # / fingers-open. This is the VLA-takeover smoothness fix:
+            # VLA was driving the arms to pose X just before the
+            # operator chord; without this, the manager would publish
+            # arm_targets at neutral, the recorder would forward those
+            # into ``pose``, and the proxy's engagement ramp
+            # (follow-up 9b) would then slowly walk the wire from
+            # VLA's X down to neutral over ~5 s. Snapping the freeze
+            # to the wire's current jpos collapses the operator's
+            # first override frame onto VLA's last commanded pose --
+            # the engagement ramp absorbs the residual delta and the
+            # deploy sees a continuous wire. Hands ride along so a
+            # mid-grasp doesn't get force-released across the
+            # boundary; the operator can still open fingers normally
+            # via the VR trigger once engaged.
+            wire_left, wire_right, wire_lhand, wire_rhand, src = (
+                self._resolve_engage_freeze()
             )
+            if src == "wire" and wire_left is not None and wire_right is not None:
+                self._frozen_left_arm_q = wire_left
+                self._frozen_right_arm_q = wire_right
+                self._frozen_left_hand_q = (
+                    wire_lhand if wire_lhand is not None
+                    else np.zeros(10, dtype=np.float64)
+                )
+                self._frozen_right_hand_q = (
+                    wire_rhand if wire_rhand is not None
+                    else np.zeros(10, dtype=np.float64)
+                )
+                hands_kind = (
+                    "from-wire"
+                    if (wire_lhand is not None and wire_rhand is not None)
+                    else "partial-wire+fingers=open-fallback"
+                    if (wire_lhand is not None or wire_rhand is not None)
+                    else "fingers=open-fallback"
+                )
+                log.info(
+                    "[manager-x2] OFF -> %s: snap arm+hand freeze to WIRE pose "
+                    "(arms=jpos[15:29], hands=%s)",
+                    transition.current.name,
+                    hands_kind,
+                )
+            else:
+                self._frozen_left_arm_q = self._retargeter._teleop.left_neutral_q
+                self._frozen_right_arm_q = self._retargeter._teleop.right_neutral_q
+                self._frozen_left_hand_q = np.zeros(10, dtype=np.float64)
+                self._frozen_right_hand_q = np.zeros(10, dtype=np.float64)
+                if self._cfg.preserve_arms_on_engage:
+                    log.info(
+                        "[manager-x2] OFF -> %s: engage-pose SUB stale/empty, "
+                        "falling back to NEUTRAL snap "
+                        "(arms=X2 stand pose, fingers=open)",
+                        transition.current.name,
+                    )
+                else:
+                    log.info(
+                        "[manager-x2] OFF -> %s: snap arm + hand freeze to neutral "
+                        "(arms=X2 stand pose, fingers=open)",
+                        transition.current.name,
+                    )
 
         # ----- LOCOMOTION <-> ARM_MANIPULATION transitions ---------------
         # Going INTO ARM_MANIPULATION: latch whatever pitch / roll / yaw
@@ -1922,6 +2115,139 @@ class Quest3ManagerX2:
                     )
                     err_logged = True
 
+    # ------------------------------------------------------------------
+    # Engage-pose SUB (2026-06-10 follow-up 10)
+    # ------------------------------------------------------------------
+    def _engage_pose_loop(self) -> None:
+        """Background loop caching the latest packed-pose frame from the wire.
+
+        The SUB connects to the proxy's downstream PUB (or any compatible
+        pose stream). For every frame we decode the JSON header, extract
+        the ``joint_pos_mj`` payload (plus ``left_hand_joints`` /
+        ``right_hand_joints`` when present), and stash a copy under
+        ``self._engage_pose_lock``. ``_resolve_engage_freeze`` consumes
+        the cache on OFF -> non-OFF transitions; everything else in the
+        manager ignores it.
+
+        Errors are logged once at WARN; subsequent failures are dropped
+        to avoid spamming an operator who's running with a flaky SUB.
+        """
+        err_logged = False
+        sock = self._engage_pose_sock
+        if sock is None:
+            return
+        topic = self._cfg.engage_pose_sub_topic or "pose"
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        while not self._stop.is_set():
+            try:
+                events = dict(poller.poll(200))
+                if sock not in events:
+                    continue
+                raw = sock.recv(flags=zmq.NOBLOCK)
+                decoded = unpack_message(raw, expected_topic=topic)
+            except zmq.Again:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not err_logged:
+                    log.warning(
+                        "[engage-pose] decode error: %s. "
+                        "Subsequent errors suppressed.", exc,
+                    )
+                    err_logged = True
+                continue
+            jpos = decoded.fields.get("joint_pos_mj")
+            if jpos is None or jpos.size == 0:
+                continue
+            left_hand = decoded.fields.get("left_hand_joints")
+            right_hand = decoded.fields.get("right_hand_joints")
+            now = time.time()
+            with self._engage_pose_lock:
+                self._engage_pose_jpos = np.asarray(jpos, dtype=np.float64).copy()
+                if left_hand is not None and left_hand.size > 0:
+                    self._engage_pose_left_hand = np.asarray(
+                        left_hand, dtype=np.float64,
+                    ).copy()
+                if right_hand is not None and right_hand.size > 0:
+                    self._engage_pose_right_hand = np.asarray(
+                        right_hand, dtype=np.float64,
+                    ).copy()
+                self._engage_pose_last_ts = now
+                self._engage_pose_msg_count += 1
+                first = self._engage_pose_msg_count == 1
+            if first:
+                log.info(
+                    "[engage-pose] first pose frame received "
+                    "(jpos_dim=%d, has_left_hand=%s, has_right_hand=%s).",
+                    int(jpos.size),
+                    left_hand is not None and left_hand.size > 0,
+                    right_hand is not None and right_hand.size > 0,
+                )
+
+    def _resolve_engage_freeze(
+        self,
+    ) -> tuple[
+        Optional[np.ndarray], Optional[np.ndarray],
+        Optional[np.ndarray], Optional[np.ndarray],
+        str,
+    ]:
+        """Return (left_arm, right_arm, left_hand, right_hand, source).
+
+        Reads the engage-pose cache and slices out the arm + hand
+        sub-vectors using the canonical MJ layout (the same one the
+        recorder uses to write arms back into ``body_q_mj``):
+        ``left_arm = jpos[15:22]``, ``right_arm = jpos[22:29]`` (7 DOF
+        each). Hands come from the dedicated ``*_hand_joints`` fields
+        published alongside ``joint_pos_mj``.
+
+        Returns all-``None`` (and ``source="neutral"``) when:
+        * preserve_arms_on_engage is False,
+        * no frame has been received yet,
+        * the latest frame is older than ``engage_pose_sub_max_age_ms``,
+        * the jpos vector is too short to slice the arm joints.
+
+        Hands ride along with arms: when the snap-to-wire path fires,
+        we always return the cached hand joints (when present). The
+        operator's reasoning is "I want the robot to stay exactly
+        where it is across the takeover boundary" -- preserving the
+        arms but force-opening the fingers would BREAK that promise
+        on every transition where VLA was holding something. A
+        hand-side cache miss (e.g., the wire frame omitted the
+        ``*_hand_joints`` fields) silently falls back to fingers-open
+        on a per-side basis; the caller fills in zeros for any None
+        returned here.
+
+        ``source`` is ``"wire"`` on success and ``"neutral"`` otherwise;
+        the caller logs both branches so the operator can tell at a
+        glance whether the snap-to-wire path actually fired.
+        """
+        if not self._cfg.preserve_arms_on_engage:
+            return None, None, None, None, "neutral"
+        max_age_s = max(0.0, float(self._cfg.engage_pose_sub_max_age_ms) / 1000.0)
+        with self._engage_pose_lock:
+            jpos = self._engage_pose_jpos
+            left_hand_cached = self._engage_pose_left_hand
+            right_hand_cached = self._engage_pose_right_hand
+            last_ts = self._engage_pose_last_ts
+            msg_count = self._engage_pose_msg_count
+        if jpos is None or msg_count == 0:
+            return None, None, None, None, "neutral"
+        now = time.time()
+        if last_ts < 0.0 or (now - last_ts) > max_age_s:
+            return None, None, None, None, "neutral"
+        # Canonical MJ layout: 15..22 = left arm, 22..29 = right arm.
+        if jpos.shape[0] < 29:
+            return None, None, None, None, "neutral"
+        left_arm = jpos[15:22].astype(np.float64, copy=True)
+        right_arm = jpos[22:29].astype(np.float64, copy=True)
+        left_hand = None
+        right_hand = None
+        if left_hand_cached is not None and left_hand_cached.size >= 10:
+            left_hand = left_hand_cached[:10].astype(np.float64, copy=True)
+        if right_hand_cached is not None and right_hand_cached.size >= 10:
+            right_hand = right_hand_cached[:10].astype(np.float64, copy=True)
+        return left_arm, right_arm, left_hand, right_hand, "wire"
+
     @staticmethod
     def _sleep_until(deadline_mono: float) -> None:
         rem = deadline_mono - time.monotonic()
@@ -2275,6 +2601,72 @@ def _build_parser() -> argparse.ArgumentParser:
         default="motor_monitor",
     )
 
+    # --- Engage-pose preservation (2026-06-10 follow-up 10) ----------
+    # Solves the "operator activates teleop mid-VLA-run and the arms
+    # snap to default" UX. One boolean flag turns it on; the SUB
+    # defaults to the canonical proxy-downstream wire on loopback
+    # (tcp://127.0.0.1:5558), so the common SIM-on-PC1 case only
+    # needs --preserve-arms-on-engage. Advanced overrides (host /
+    # port / topic / freshness window) live in the same group but
+    # rarely need to be touched.
+    eng_grp = p.add_argument_group("engage-pose preservation")
+    eng_grp.add_argument(
+        "--preserve-arms-on-engage", dest="preserve_arms_on_engage",
+        action="store_true", default=False,
+        help=(
+            "On every OFF -> non-OFF (A+B+X+Y chord) snap the arm + "
+            "hand freeze to the robot's CURRENT commanded pose "
+            "instead of X2 neutral / fingers-open. Use this when the "
+            "operator takes over a live VLA run so the robot stays "
+            "exactly where it is across the boundary (no arm drift "
+            "to a parking pose, no surprise drop / squeeze if VLA "
+            "was holding something). Hands ride along with arms; the "
+            "operator can still open fingers normally via the VR "
+            "trigger once engaged. SUBs to the proxy's downstream "
+            "wire at tcp://127.0.0.1:5558 by default; pass "
+            "--engage-pose-sub-host / --engage-pose-sub-port to "
+            "override for split-topology / non-default ports."
+        ),
+    )
+    eng_grp.add_argument(
+        "--engage-pose-sub-host", dest="engage_pose_sub_host",
+        default="127.0.0.1",
+        help=(
+            "Host the engage-pose SUB connects to. Default 127.0.0.1 "
+            "for the SIM-on-one-machine setup; pass PC2's IP for "
+            "split-topology / real-robot. No effect unless "
+            "--preserve-arms-on-engage is set."
+        ),
+    )
+    eng_grp.add_argument(
+        "--engage-pose-sub-port", dest="engage_pose_sub_port",
+        type=int, default=5558,
+        help=(
+            "Port the engage-pose SUB connects to. Default 5558 = the "
+            "x2_pose_proxy downstream PUB the deploy listens on; pass "
+            "an override only if the proxy was started with a "
+            "non-default --downstream-port. No effect unless "
+            "--preserve-arms-on-engage is set."
+        ),
+    )
+    eng_grp.add_argument(
+        "--engage-pose-sub-topic", dest="engage_pose_sub_topic",
+        default="pose",
+        help=(
+            "ZMQ topic name on the engage-pose SUB. Default 'pose'. "
+            "No effect unless --preserve-arms-on-engage is set."
+        ),
+    )
+    eng_grp.add_argument(
+        "--engage-pose-sub-max-age-ms", dest="engage_pose_sub_max_age_ms",
+        type=int, default=200,
+        help=(
+            "Max age (ms) for a cached pose frame to count as 'fresh' "
+            "for the OFF -> non-OFF snap. Older frames trigger the "
+            "neutral-snap fallback. Default 200 ms (10 ticks @ 50 Hz)."
+        ),
+    )
+
     # Episode lifecycle audio cues
     rec_grp = p.add_argument_group("recorder audio cues")
     rec_grp.add_argument(
@@ -2420,6 +2812,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         motor_monitor_sub_host=args.motor_monitor_sub_host,
         motor_monitor_sub_port=args.motor_monitor_sub_port,
         motor_monitor_sub_topic=args.motor_monitor_sub_topic,
+        preserve_arms_on_engage=bool(args.preserve_arms_on_engage),
+        engage_pose_sub_host=args.engage_pose_sub_host,
+        engage_pose_sub_port=int(args.engage_pose_sub_port),
+        engage_pose_sub_topic=args.engage_pose_sub_topic,
+        engage_pose_sub_max_age_ms=int(args.engage_pose_sub_max_age_ms),
         stick_filter_config=stick_filter_cfg,
         verbose=args.verbose,
     )

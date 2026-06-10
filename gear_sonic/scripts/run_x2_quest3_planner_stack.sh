@@ -95,6 +95,20 @@
 #       [--pc2-host HOST]    # recommended one-arg split-topology
 #       [--remote-deploy HOST [--resume-pub-port PORT]
 #                              [--motor-monitor-port PORT]]   # legacy alias
+#       [--preserve-arms-on-engage]        # 2026-06-10 follow-up 10:
+#                                          # keep the arms + hands
+#                                          # where they are when
+#                                          # A+B+X+Y goes OFF -> ON
+#                                          # during a VLA run (no
+#                                          # "snap to neutral / open
+#                                          # fingers"). SUBs to the
+#                                          # proxy's downstream wire
+#                                          # at tcp://127.0.0.1:5558
+#                                          # by default; --pc2-host
+#                                          # auto-targets PC2.
+#                                          # Override host / port via
+#                                          # --engage-pose-sub-{host,
+#                                          # port,topic,max-age-ms}.
 #
 # Defaults to --teleop-only (no dataset writes). Pass --with-record
 # (along with --output-dir and --task) to capture a LeRobot v2.1
@@ -263,10 +277,15 @@ ALT_PLANNER_PID_FILE="/tmp/x2_heuristic_planner.pid"
 # 4 processes; bumping any of these means bumping every consumer too.
 # --------------------------------------------------------------------------
 
-POSE_PORT=5556          # recorder PUB -> deploy SUB
+POSE_PORT=5556          # recorder PUB -> deploy SUB (override w/ --pose-port)
 POSE_TOPIC="pose"
 DEBUG_PORT=5557         # deploy PUB -> recorder SUB
 DEBUG_TOPIC="x2_debug"
+# When set non-empty, override POSE_PORT after CLI parsing. Used by the
+# 2026-06-10 manual-takeover wiring: the teleop recorder publishes the
+# operator's wire on :5558 so the PC2 x2_pose_proxy can arbitrate
+# between it and the autonomous VLA bridge on :5556.
+POSE_PORT_OVERRIDE=""
 PLANNER_CMD_PORT=5563   # manager PUB -> planner SUB
 PLANNER_CMD_TOPIC="planner_cmd"
 ARM_HANDS_PORT=5564     # manager PUB -> recorder SUB (4 multiplexed topics)
@@ -592,6 +611,30 @@ RESUME_PUB_TOPIC="pose_resume"
 MOTOR_MONITOR_TOPIC="motor_monitor"
 
 # --------------------------------------------------------------------------
+# Engage-pose preservation (2026-06-10 follow-up 10)
+# --------------------------------------------------------------------------
+# When PRESERVE_ARMS_ON_ENGAGE=1, the manager SUBs to the wire driving
+# the deploy (the x2_pose_proxy downstream PUB) and snaps BOTH the
+# arm freeze AND the hand freeze to whatever the wire is publishing
+# at the moment the operator enters LOCOMOTION / ARM_MANIPULATION
+# from OFF via A+B+X+Y. This keeps the robot in place across a
+# VLA -> teleop takeover -- no arm drift to X2 neutral, no surprise
+# finger release if VLA was mid-grasp. The operator can still open
+# fingers normally via the VR trigger once engaged.
+#
+# Defaults: PRESERVE_ARMS_ON_ENGAGE=0 (off). The SUB host / port /
+# topic default to the canonical proxy-downstream wire on loopback
+# (tcp://127.0.0.1:5558) so the common SIM-on-PC1 flow only needs
+# PRESERVE_ARMS_ON_ENGAGE=1 (or --preserve-arms-on-engage on the
+# CLI). For split-topology / real-robot --pc2-host auto-targets
+# PC2's IP for the host; you don't need to set it manually.
+PRESERVE_ARMS_ON_ENGAGE="${PRESERVE_ARMS_ON_ENGAGE:-0}"
+ENGAGE_POSE_SUB_HOST="${ENGAGE_POSE_SUB_HOST:-127.0.0.1}"
+ENGAGE_POSE_SUB_PORT="${ENGAGE_POSE_SUB_PORT:-5558}"
+ENGAGE_POSE_SUB_TOPIC="${ENGAGE_POSE_SUB_TOPIC:-pose}"
+ENGAGE_POSE_SUB_MAX_AGE_MS="${ENGAGE_POSE_SUB_MAX_AGE_MS:-200}"
+
+# --------------------------------------------------------------------------
 # Canonical "where is the X2 robot" flag. One arg, everything else
 # implied. Specifically, setting --pc2-host HOST is equivalent to:
 #   * --no-deploy               (the deploy is on HOST, not laptop)
@@ -759,6 +802,14 @@ while [[ $# -gt 0 ]]; do
         --episode-seed) EPISODE_SEED="$2"; shift 2 ;;
         --scene-state-port) SCENE_STATE_PORT="$2"; shift 2 ;;
         --scene-reset-port) SCENE_RESET_PORT="$2"; shift 2 ;;
+        --pose-port)
+            # Wire OUT port for the recorder's merged `pose` PUB. Used
+            # by the 2026-06-10 manual-takeover workflow to route the
+            # teleop wire to a separate port (e.g. :5558) so the
+            # x2_pose_proxy on PC2 can arbitrate it against the
+            # autonomous VLA bridge on :5556. Default 5556 (legacy
+            # autonomous-or-teleop-only wiring).
+            POSE_PORT_OVERRIDE="$2"; shift 2 ;;
         --log-dir) LOG_DIR="$2"; shift 2 ;;
         --sidecar-log) SIDECAR_LOG="$2"; shift 2 ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
@@ -831,10 +882,29 @@ while [[ $# -gt 0 ]]; do
         --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
         --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
         --motor-monitor-port) MOTOR_MONITOR_PORT="$2"; shift 2 ;;
+        --preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=1; shift ;;
+        --no-preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=0; shift ;;
+        --engage-pose-sub-host) ENGAGE_POSE_SUB_HOST="$2"; shift 2 ;;
+        --engage-pose-sub-port) ENGAGE_POSE_SUB_PORT="$2"; shift 2 ;;
+        --engage-pose-sub-topic) ENGAGE_POSE_SUB_TOPIC="$2"; shift 2 ;;
+        --engage-pose-sub-max-age-ms) ENGAGE_POSE_SUB_MAX_AGE_MS="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
 done
+
+# Apply --pose-port override AFTER arg parsing so a non-empty
+# POSE_PORT_OVERRIDE replaces the hardcoded 5556 default everywhere
+# downstream (recorder --pub-port, port checks, free_port cleanup,
+# operator-visible banner). Numeric guard rejects bare strings before
+# they reach lsof / ss.
+if [[ -n "${POSE_PORT_OVERRIDE}" ]]; then
+    if ! [[ "${POSE_PORT_OVERRIDE}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --pose-port must be a positive integer; got '${POSE_PORT_OVERRIDE}'" >&2
+        exit 1
+    fi
+    POSE_PORT="${POSE_PORT_OVERRIDE}"
+fi
 
 # Convenience boolean: set iff --vla-bridge MODEL_DIR was passed OR
 # --vla-no-policy was passed (latter is a deploy-sequence smoke test
@@ -897,6 +967,16 @@ if [[ -n "${PC2_HOST}" ]]; then
     if [[ -z "${X2_DEBUG_BRIDGE_HOST}" ]]; then
         X2_DEBUG_BRIDGE_HOST="${PC2_HOST}"
         WITH_X2_DEBUG_BRIDGE=1
+    fi
+    # 2026-06-10 follow-up 10: engage-pose preservation SUBs to the
+    # x2_pose_proxy's downstream PUB. The proxy runs on PC2 (started
+    # by x2_pc2_daemons.sh inside its tmux), so when --pc2-host is
+    # set we want the SUB to connect to PC2 instead of loopback. Only
+    # auto-override when the operator left ENGAGE_POSE_SUB_HOST at
+    # its default; an explicit --engage-pose-sub-host (or env var
+    # other than 127.0.0.1) still wins.
+    if [[ "${ENGAGE_POSE_SUB_HOST}" == "127.0.0.1" ]]; then
+        ENGAGE_POSE_SUB_HOST="${PC2_HOST}"
     fi
 fi
 
@@ -2382,6 +2462,28 @@ if [[ -n "${REMOTE_DEPLOY_HOST}" ]]; then
         --motor-monitor-topic "${MOTOR_MONITOR_TOPIC}"
     )
 fi
+# Engage-pose preservation: when PRESERVE_ARMS_ON_ENGAGE=1 the manager
+# SUBs to the wire driving the deploy and uses the cached jpos + hand
+# joints to seed the OFF -> non-OFF arm + hand freeze. Host / port /
+# topic default to the canonical proxy-downstream on loopback so most
+# operators only need the single boolean. See the
+# PRESERVE_ARMS_ON_ENGAGE block near the top of this script for the
+# why/when.
+if [[ "${PRESERVE_ARMS_ON_ENGAGE}" -eq 1 ]]; then
+    if ! [[ "${ENGAGE_POSE_SUB_PORT}" =~ ^[0-9]+$ \
+            && "${ENGAGE_POSE_SUB_PORT}" -gt 0 ]]; then
+        echo "ERROR: --engage-pose-sub-port must be a positive integer; got '${ENGAGE_POSE_SUB_PORT}'" >&2
+        exit 1
+    fi
+    MANAGER_ARGS+=(
+        --preserve-arms-on-engage
+        --engage-pose-sub-host "${ENGAGE_POSE_SUB_HOST}"
+        --engage-pose-sub-port "${ENGAGE_POSE_SUB_PORT}"
+        --engage-pose-sub-topic "${ENGAGE_POSE_SUB_TOPIC}"
+        --engage-pose-sub-max-age-ms "${ENGAGE_POSE_SUB_MAX_AGE_MS}"
+    )
+    log "  engage-pose preservation ON -> tcp://${ENGAGE_POSE_SUB_HOST}:${ENGAGE_POSE_SUB_PORT} (topic=${ENGAGE_POSE_SUB_TOPIC}; arms+hands snap to wire on OFF->non-OFF)"
+fi
 # Finger-curl / thumb-oppose compensations live on the MANAGER in
 # subscribe-mode (the manager owns the Retargeter; the recorder just
 # forwards what arrives on hand_finger_cmd). Forwarding these flags
@@ -2804,6 +2906,26 @@ if [[ "${VLA_MODE}" -eq 1 ]]; then
         MANAGER_ARGS+=(--recorder-enabled)
     else
         MANAGER_ARGS+=(--no-recorder-enabled)
+    fi
+    # Engage-pose preservation (mirrors the non-VLA branch). The
+    # VLA-bridge runs typically benefit from this MORE than non-VLA
+    # because the whole point is shared-autonomy takeover -- if the
+    # operator engages teleop mid-VLA-run we want the robot to stay
+    # put (arms + hands), not snap to X2 neutral / fingers-open.
+    if [[ "${PRESERVE_ARMS_ON_ENGAGE}" -eq 1 ]]; then
+        if ! [[ "${ENGAGE_POSE_SUB_PORT}" =~ ^[0-9]+$ \
+                && "${ENGAGE_POSE_SUB_PORT}" -gt 0 ]]; then
+            echo "ERROR: --engage-pose-sub-port must be a positive integer; got '${ENGAGE_POSE_SUB_PORT}'" >&2
+            exit 1
+        fi
+        MANAGER_ARGS+=(
+            --preserve-arms-on-engage
+            --engage-pose-sub-host "${ENGAGE_POSE_SUB_HOST}"
+            --engage-pose-sub-port "${ENGAGE_POSE_SUB_PORT}"
+            --engage-pose-sub-topic "${ENGAGE_POSE_SUB_TOPIC}"
+            --engage-pose-sub-max-age-ms "${ENGAGE_POSE_SUB_MAX_AGE_MS}"
+        )
+        log "  engage-pose preservation ON -> tcp://${ENGAGE_POSE_SUB_HOST}:${ENGAGE_POSE_SUB_PORT} (topic=${ENGAGE_POSE_SUB_TOPIC}; arms+hands snap to wire on OFF->non-OFF)"
     fi
     # See the matching block in the non-VLA branch (~line 2049) for the
     # rationale. Re-checked here so VLA-mode runs can also produce the

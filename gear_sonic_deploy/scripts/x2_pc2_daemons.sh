@@ -244,6 +244,65 @@ POSE_PROXY_IDLE_X2M2="${POSE_PROXY_IDLE_X2M2:-${PC2_PREFIX}/data/idle_stand.x2m2
 POSE_PROXY_IDLE_MODE="${POSE_PROXY_IDLE_MODE:-blend}"
 POSE_PROXY_HOLD_LAST_SECS="${POSE_PROXY_HOLD_LAST_SECS:-10.0}"
 POSE_PROXY_BLEND_SECS="${POSE_PROXY_BLEND_SECS:-3.0}"
+# ---- Manual-takeover dual-source arbitration (2026-06-10 milestone) ----
+# When POSE_PROXY_OVERRIDE_PORT > 0, the proxy SUBs to a second pose
+# stream (typically the teleop recorder publishing the operator's wire
+# on :5560) and prefers it over the primary VLA stream whenever the
+# operator is active. POSE_PROXY_CONTROL_PORT > 0 makes the proxy
+# emit override_engaged / override_released edge events on a control
+# PUB that the VLA bridge SUBs to (vla_control), driving its cold-
+# restart on operator release. Both default disabled so existing
+# autonomous deployments are byte-for-byte unchanged.
+#
+# Conventional ports:
+#   override   = LAPTOP_HOST:5560 (teleop recorder PUB)
+#   control    = 0.0.0.0:5559 (proxy PUB; bridge SUBs from laptop)
+POSE_PROXY_OVERRIDE_HOST="${POSE_PROXY_OVERRIDE_HOST:-${LAPTOP_HOST}}"
+POSE_PROXY_OVERRIDE_PORT="${POSE_PROXY_OVERRIDE_PORT:--1}"
+POSE_PROXY_OVERRIDE_TOPIC="${POSE_PROXY_OVERRIDE_TOPIC:-pose}"
+POSE_PROXY_OVERRIDE_STALE_MS="${POSE_PROXY_OVERRIDE_STALE_MS:-200}"
+# Frozen-frame release (2026-06-10 follow-up). The Quest3 manager
+# publishes the frozen last commanded pose every tick when teleop
+# mode is OFF or LOCOMOTION, so the override SUB never goes silent
+# across an A+B+X+Y disengage gesture. Frame-equality detection in
+# the proxy catches this and fires override_released exactly once
+# after N consecutive identical frames. Default 10 ticks @ 50Hz =
+# 200ms (matches stale-ms semantics). Set to 0 to disable and
+# rely on silence-only release (legacy, only fires on full Ctrl-C
+# of the teleop stack).
+POSE_PROXY_OVERRIDE_FROZEN_TICKS="${POSE_PROXY_OVERRIDE_FROZEN_TICKS:-10}"
+# Bumped from 1e-4 on 2026-06-10 after sim repros showed repeated
+# single-frame engage/release cycles from sub-degree controller-rest
+# drift while the manager was in OFF (each cycle fires a heavy bridge
+# cold-restart). 5e-3 rad ~ 0.3 deg total joint-space motion is well
+# above resting jitter and well below intentional teleop motion. Set
+# to 1e-4 only for paranoid bytes-match detection.
+POSE_PROXY_OVERRIDE_FROZEN_L2_TOL="${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL:-5e-3}"
+# Symmetric engage-side hysteresis: require N consecutive override
+# frames with joint-space delta ABOVE --override-frozen-l2-tol before
+# firing override_engaged. Same default as frozen-ticks (10 = 200ms
+# @ 50Hz). Together with the higher tolerance above this prevents
+# brief controller jitter from spurious engage/release cycles. Set
+# to 0 for the legacy single-frame engage behaviour (only used by
+# older smoke tests, not the operator runbook).
+POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS="${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS:-10}"
+# Operator-mode SUB (2026-06-10 follow-up). When the laptop's Quest3
+# manager is on a known host:port, the proxy gates engagement on the
+# manager's stream_mode broadcast (mode != "OFF") and BYPASSES
+# motion-hysteresis. Default port matches the manager's
+# --recorder-pub-port default (5564). Set TELEOP_MODE_PORT to -1 to
+# disable -- the legacy heuristic path is the only one available in
+# that case and WILL flicker if the operator holds the controller
+# still in ARM_MANIPULATION. Real-robot operators MUST set
+# TELEOP_MODE_HOST to the laptop's address (PC2 cannot reach
+# 127.0.0.1's manager).
+POSE_PROXY_TELEOP_MODE_HOST="${POSE_PROXY_TELEOP_MODE_HOST:-127.0.0.1}"
+POSE_PROXY_TELEOP_MODE_PORT="${POSE_PROXY_TELEOP_MODE_PORT:-5564}"
+POSE_PROXY_TELEOP_MODE_TOPIC="${POSE_PROXY_TELEOP_MODE_TOPIC:-stream_mode}"
+POSE_PROXY_TELEOP_MODE_STALE_MS="${POSE_PROXY_TELEOP_MODE_STALE_MS:-1000}"
+POSE_PROXY_CONTROL_BIND="${POSE_PROXY_CONTROL_BIND:-0.0.0.0}"
+POSE_PROXY_CONTROL_PORT="${POSE_PROXY_CONTROL_PORT:--1}"
+POSE_PROXY_CONTROL_TOPIC="${POSE_PROXY_CONTROL_TOPIC:-vla_control}"
 # Auto-disable the proxy if the X2M2 file isn't staged (operators on an
 # older bringup; failure mode is just "no idle fallback, behave like before").
 NO_POSE_PROXY=0
@@ -831,6 +890,35 @@ cmd_start() {
     if [[ "${pose_proxy_enabled}" -eq 1 ]]; then
         local proxy_log="${PC2_LOG_ROOT}/pose_proxy_${now_tag}.log"
         local proxy_script="${PC2_PREFIX}/gear_sonic_deploy/scripts/x2_pose_proxy.py"
+        # Optional manual-takeover args. Only forwarded when the
+        # operator has opted in by setting POSE_PROXY_OVERRIDE_PORT
+        # and/or POSE_PROXY_CONTROL_PORT to a positive integer in
+        # the environment / via systemd unit overrides.
+        local proxy_takeover_args=""
+        if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
+            proxy_takeover_args+=" --override-host ${POSE_PROXY_OVERRIDE_HOST}"
+            proxy_takeover_args+=" --override-port ${POSE_PROXY_OVERRIDE_PORT}"
+            proxy_takeover_args+=" --override-topic ${POSE_PROXY_OVERRIDE_TOPIC}"
+            proxy_takeover_args+=" --override-stale-ms ${POSE_PROXY_OVERRIDE_STALE_MS}"
+            proxy_takeover_args+=" --override-frozen-ticks ${POSE_PROXY_OVERRIDE_FROZEN_TICKS}"
+            proxy_takeover_args+=" --override-frozen-l2-tol ${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL}"
+            proxy_takeover_args+=" --override-engage-motion-ticks ${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS}"
+            if [[ "${POSE_PROXY_TELEOP_MODE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_TELEOP_MODE_PORT}" -gt 0 ]]; then
+                proxy_takeover_args+=" --teleop-mode-host ${POSE_PROXY_TELEOP_MODE_HOST}"
+                proxy_takeover_args+=" --teleop-mode-port ${POSE_PROXY_TELEOP_MODE_PORT}"
+                proxy_takeover_args+=" --teleop-mode-topic ${POSE_PROXY_TELEOP_MODE_TOPIC}"
+                proxy_takeover_args+=" --teleop-mode-stale-ms ${POSE_PROXY_TELEOP_MODE_STALE_MS}"
+                log "  pose proxy: override SUB enabled tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} stale_ms=${POSE_PROXY_OVERRIDE_STALE_MS} frozen_ticks=${POSE_PROXY_OVERRIDE_FROZEN_TICKS} frozen_l2_tol=${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL} engage_motion_ticks=${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS} (engage gate: STRICT stream_mode tcp://${POSE_PROXY_TELEOP_MODE_HOST}:${POSE_PROXY_TELEOP_MODE_PORT} topic=${POSE_PROXY_TELEOP_MODE_TOPIC} stale_ms=${POSE_PROXY_TELEOP_MODE_STALE_MS}; motion-hysteresis IGNORED)"
+            else
+                log "  pose proxy: override SUB enabled tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} stale_ms=${POSE_PROXY_OVERRIDE_STALE_MS} frozen_ticks=${POSE_PROXY_OVERRIDE_FROZEN_TICKS} frozen_l2_tol=${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL} engage_motion_ticks=${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS} (engage gate: LEGACY motion-hysteresis; will flicker if operator holds controller still -- set POSE_PROXY_TELEOP_MODE_PORT to enable strict mode)"
+            fi
+        fi
+        if [[ "${POSE_PROXY_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_CONTROL_PORT}" -gt 0 ]]; then
+            proxy_takeover_args+=" --vla-control-bind-host ${POSE_PROXY_CONTROL_BIND}"
+            proxy_takeover_args+=" --vla-control-port ${POSE_PROXY_CONTROL_PORT}"
+            proxy_takeover_args+=" --vla-control-topic ${POSE_PROXY_CONTROL_TOPIC}"
+            log "  pose proxy: vla_control PUB enabled tcp://${POSE_PROXY_CONTROL_BIND}:${POSE_PROXY_CONTROL_PORT} topic=${POSE_PROXY_CONTROL_TOPIC}"
+        fi
         local proxy_cmd="${python_env} && \
             ${python_bin} ${proxy_script} \
                 --upstream-host ${LAPTOP_HOST} \
@@ -842,7 +930,7 @@ cmd_start() {
                 --idle-stale-ms ${POSE_PROXY_STALE_MS} \
                 --idle-mode ${POSE_PROXY_IDLE_MODE} \
                 --hold-last-secs ${POSE_PROXY_HOLD_LAST_SECS} \
-                --blend-secs ${POSE_PROXY_BLEND_SECS} \
+                --blend-secs ${POSE_PROXY_BLEND_SECS}${proxy_takeover_args} \
                 2>&1 | tee -a ${proxy_log}"
         tmux_start_session "${POSE_PROXY_SESSION}" "${proxy_cmd}"
     fi

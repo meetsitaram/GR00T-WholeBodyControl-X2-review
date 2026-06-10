@@ -926,6 +926,15 @@ def test_publish_pose_arm_overlay_in_future_window_zeros_arm_jvel() -> None:
 
 
 def test_handle_body_pose_msg_extracts_vla_hand_joints() -> None:
+    """VLA mode: the bridge embeds hands in the ``pose`` payload and the
+    recorder MUST forward them onto the state slot.
+
+    2026-06-10 follow-up 5b: requires ``vla_mode=True`` to gate the
+    update. In teleop mode the planner ALSO emits the same fields
+    (as zeros, for legacy wire-format compat) and forwarding those
+    would race the manager's ``hand_finger_cmd`` writes at 50 Hz
+    and silently zero out finger commands -- the bug that
+    motivated the gate."""
     state = _SubscribeModeState()
     left = np.linspace(0.0, 1.0, NUM_HAND_DOF_PER_SIDE, dtype=np.float32)
     right = np.linspace(1.0, 0.0, NUM_HAND_DOF_PER_SIDE, dtype=np.float32)
@@ -942,7 +951,9 @@ def test_handle_body_pose_msg_extracts_vla_hand_joints() -> None:
         "frame_index": np.array([7], dtype=np.int64),
     }
     msg = pack_pose_message(payload, topic="pose", version=4)
-    _handle_body_pose_msg([msg], state, expected_topic="pose")
+    _handle_body_pose_msg(
+        [msg], state, expected_topic="pose", vla_mode=True,
+    )
 
     snap = state.snapshot()
     assert snap["left_hand_q"] is not None, "VLA hand never written"
@@ -956,7 +967,14 @@ def test_handle_body_pose_msg_planner_payload_leaves_hands_untouched() -> None:
     each); the existing teleop pipeline gets real hand commands from
     the manager's separate ``hand_finger_cmd`` topic. Decoding the
     planner payload must NOT touch the existing hand slot (since the
-    manager's hand frame is the source of truth in that pipeline)."""
+    manager's hand frame is the source of truth in that pipeline).
+
+    2026-06-10 follow-up 5b: this is now ENFORCED by the
+    ``vla_mode=False`` (default) gate in ``_handle_body_pose_msg``.
+    Before the gate, this test was inconsistent with its own
+    docstring -- the assertion verified the planner's zeros
+    OVERWROTE the seeded hand, which was the bug that caused
+    finger commands to silently disappear at 50 Hz."""
     state = _SubscribeModeState()
     # Seed with a "manager-supplied" hand pose so we can prove the
     # decoder doesn't overwrite it.
@@ -970,28 +988,66 @@ def test_handle_body_pose_msg_planner_payload_leaves_hands_untouched() -> None:
             [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
         ),
         "motion_token": np.zeros(64, dtype=np.float32),
-        # Planner publishes zeros here -- still valid shape, so the
-        # decoder DOES forward them. This is fine in planner mode (no
-        # one is reading hand from body_pose), but in VLA mode the
-        # bridge always sends real values. We just assert the shape
-        # gate behaves predictably.
         "left_hand_joints": np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float32),
         "right_hand_joints": np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float32),
+        "frame_index": np.array([0], dtype=np.int64),
+    }
+    msg = pack_pose_message(payload, topic="body_pose", version=4)
+    # Default ``vla_mode=False`` -- planner mode. Hand fields in the
+    # planner's body_pose payload must be IGNORED so the manager's
+    # hand_finger_cmd writes are the sole source of truth.
+    _handle_body_pose_msg([msg], state, expected_topic="body_pose")
+
+    snap = state.snapshot()
+    # Seeded "manager-supplied" hand must survive the planner-mode
+    # body_pose update. If this assertion ever flips back to "zeros",
+    # the gate was lost and the 2026-06-10 fingers-disappearing bug
+    # is back.
+    np.testing.assert_allclose(
+        snap["left_hand_q"], seeded_left, rtol=0, atol=0,
+    )
+    np.testing.assert_allclose(
+        snap["right_hand_q"], seeded_right, rtol=0, atol=0,
+    )
+
+
+def test_handle_body_pose_msg_planner_mode_ignores_nonzero_hands_too() -> None:
+    """Symmetric pin: even when the planner publishes NON-zero hand
+    joints (e.g. a future planner that decides to drive hands too),
+    teleop mode (``vla_mode=False``) must STILL leave the manager's
+    hand_finger_cmd writes as the source of truth.
+
+    Without this gate, ANY non-zero hand in the planner payload
+    would race the manager's writes. The current planner publishes
+    zeros, but pinning the ``vla_mode=False`` behaviour against
+    non-zero hand input prevents a future planner change from
+    silently re-introducing the bug."""
+    state = _SubscribeModeState()
+    seeded_left = np.full(NUM_HAND_DOF_PER_SIDE, 0.42, dtype=np.float64)
+    seeded_right = np.full(NUM_HAND_DOF_PER_SIDE, -0.13, dtype=np.float64)
+    state.update_hand_finger_cmd(seeded_left, seeded_right)
+
+    fake_planner_hands = np.full(
+        NUM_HAND_DOF_PER_SIDE, 0.77, dtype=np.float32,
+    )
+    payload = {
+        "joint_pos_mj": np.zeros(NUM_BODY_DOFS, dtype=np.float32),
+        "root_quat_xyzw": np.array(
+            [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
+        ),
+        "motion_token": np.zeros(64, dtype=np.float32),
+        "left_hand_joints": fake_planner_hands,
+        "right_hand_joints": fake_planner_hands,
         "frame_index": np.array([0], dtype=np.int64),
     }
     msg = pack_pose_message(payload, topic="body_pose", version=4)
     _handle_body_pose_msg([msg], state, expected_topic="body_pose")
 
     snap = state.snapshot()
-    # Zero-shaped hand was forwarded (since planner does include the
-    # field, even at zeros). This matches the existing fan-in behaviour;
-    # the loop then merges with manager hand if it arrives later.
-    np.testing.assert_allclose(
-        snap["left_hand_q"], np.zeros(NUM_HAND_DOF_PER_SIDE), rtol=0, atol=0,
-    )
-    np.testing.assert_allclose(
-        snap["right_hand_q"], np.zeros(NUM_HAND_DOF_PER_SIDE), rtol=0, atol=0,
-    )
+    # Manager's seeded values still win in teleop mode -- planner's
+    # hand fields are ignored regardless of their content.
+    np.testing.assert_allclose(snap["left_hand_q"], seeded_left)
+    np.testing.assert_allclose(snap["right_hand_q"], seeded_right)
 
 
 def test_handle_body_pose_msg_drops_wrong_shape_vla_hands() -> None:
