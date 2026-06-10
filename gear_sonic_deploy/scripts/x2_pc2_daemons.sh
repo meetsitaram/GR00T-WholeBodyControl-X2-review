@@ -11,15 +11,23 @@
 #                          tcp://localhost:${PC2_POSE_PROXY_PORT}
 #                          (default 5558). When the upstream wire is
 #                          flowing, frames are forwarded byte-for-byte.
-#                          When the laptop is silent > 100 ms (wifi
+#                          When the laptop is silent > 300 ms (wifi
 #                          drop, laptop crash, planner stack not yet
-#                          started), the proxy switches to publishing
-#                          idle_stand frames from
-#                          ${PC2_PREFIX}/data/idle_stand.x2m2 so the
-#                          deploy never sees a silent wire (and so the
-#                          C++ pose-ref starvation watchdog -- and its
-#                          known SAFE_IDLE whir bug -- can stay
-#                          disabled in split-topology mode).
+#                          started), the proxy runs the staged
+#                          fallback ladder (HOLD -> BLEND -> IDLE_CLIP)
+#                          keyed by POSE_PROXY_IDLE_MODE -- by default
+#                          it re-publishes the LAST forwarded upstream
+#                          frame for POSE_PROXY_HOLD_LAST_SECS, then
+#                          lerps into the baked idle_stand clip from
+#                          ${PC2_PREFIX}/data/idle_stand.x2m2 over
+#                          POSE_PROXY_BLEND_SECS. This keeps the
+#                          deploy's wire alive (so its pose-ref
+#                          starvation watchdog stays disabled in
+#                          split-topology mode) WITHOUT stepping the
+#                          commanded reference -- the pre-2026-06-08
+#                          behaviour (immediate snap to default-stand)
+#                          slammed arms into tables on every WiFi
+#                          hiccup.
 #
 #     x2_deploy         -- the agi_x2_deploy_onnx_ref process, launched
 #                          via ``deploy_x2.sh onbot`` so the operator
@@ -219,6 +227,23 @@ PC2_POSE_PROXY_PORT="${PC2_POSE_PROXY_PORT:-5558}"
 # SONIC's tracking policy expects an uninterrupted reference stream.
 POSE_PROXY_STALE_MS="${POSE_PROXY_STALE_MS:-300}"
 POSE_PROXY_IDLE_X2M2="${POSE_PROXY_IDLE_X2M2:-${PC2_PREFIX}/data/idle_stand.x2m2}"
+# Upstream-silent fallback ladder (see x2_pose_proxy.py --idle-mode).
+#
+# The 2026-06-08 default is 'blend': HOLD the last forwarded upstream
+# frame for POSE_PROXY_HOLD_LAST_SECS (default 10s), then lerp into the
+# baked idle clip over POSE_PROXY_BLEND_SECS (default 3s). This soaks
+# up WiFi blips / laptop GC stalls without changing the commanded
+# reference at all, and only glides toward default-stand if the wire
+# stays silent for genuinely long periods (laptop crash, operator
+# walked away). The pre-2026-06-08 behaviour (immediate snap to
+# default-stand on the first stale tick -- which slammed arms into
+# tables during WiFi hiccups) is still available via
+# POSE_PROXY_IDLE_MODE=idle-stand for diagnostics / regression
+# baselines. POSE_PROXY_IDLE_MODE=hold-last is the operator-
+# responsibility mode (HOLD forever; cut power to recover).
+POSE_PROXY_IDLE_MODE="${POSE_PROXY_IDLE_MODE:-blend}"
+POSE_PROXY_HOLD_LAST_SECS="${POSE_PROXY_HOLD_LAST_SECS:-10.0}"
+POSE_PROXY_BLEND_SECS="${POSE_PROXY_BLEND_SECS:-3.0}"
 # Auto-disable the proxy if the X2M2 file isn't staged (operators on an
 # older bringup; failure mode is just "no idle fallback, behave like before").
 NO_POSE_PROXY=0
@@ -268,6 +293,9 @@ Per-command flags (after the subcommand):
              [--no-confirm] [--no-monitor] [--no-hand] [--no-pose-proxy]
              [--pose-proxy-port N] [--pose-proxy-stale-ms MS]
              [--pose-proxy-idle-x2m2 PATH]
+             [--pose-proxy-idle-mode {blend,hold-last,idle-stand}]
+             [--pose-proxy-hold-last-secs SEC]
+             [--pose-proxy-blend-secs SEC]
              [--attach] [--attach-settle-seconds N]
              [--extra-deploy-arg ARG]...
     stop     [--pc2-host H] [--pc2-user U]
@@ -365,6 +393,9 @@ while [[ $# -gt 0 ]]; do
         --pose-proxy-idle-x2m2) POSE_PROXY_IDLE_X2M2="$2"; shift 2 ;;
         --pose-proxy-stale-ms) POSE_PROXY_STALE_MS="$2"; shift 2 ;;
         --pose-proxy-port) PC2_POSE_PROXY_PORT="$2"; shift 2 ;;
+        --pose-proxy-idle-mode) POSE_PROXY_IDLE_MODE="$2"; shift 2 ;;
+        --pose-proxy-hold-last-secs) POSE_PROXY_HOLD_LAST_SECS="$2"; shift 2 ;;
+        --pose-proxy-blend-secs) POSE_PROXY_BLEND_SECS="$2"; shift 2 ;;
         --no-mc-restart) NO_MC_RESTART=1; shift ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
         --yes|-y) STOP_YES=1; shift ;;
@@ -441,8 +472,31 @@ tmux_start_session() {
     local name="$1"; shift
     local cmd="$*"
     if tmux_session_exists "${name}"; then
-        log "  tmux session ${name}: already exists -- skipping"
-        return 0
+        # The _keep_alive trap keeps the tmux pane attachable after the
+        # daemon body crashes (via `exec bash -l`), which is great for
+        # post-mortem debugging but TERRIBLE for the start-skip-if-
+        # exists logic below: a zombie pane (daemon already exited,
+        # interactive shell still attached) looks identical to a
+        # healthy session from `tmux has-session`'s point of view, so
+        # we'd silently re-use the corpse instead of launching the
+        # new code that pc2_bringup.sh just rsynced. This is exactly
+        # how 2026-06-08's stale-proxy debugging session ate an hour:
+        # every `start` was a no-op because the proxy had crashed on
+        # an argparse mismatch and left its pane behind as a bash -l.
+        #
+        # Detect the post-mortem state by looking for the _keep_alive
+        # banner in the pane's recent scrollback and force-kill it if
+        # found. Healthy sessions never print this line.
+        local pane_tail=""
+        pane_tail="$(ssh_pc2 "tmux capture-pane -p -t ${name} -S -200" 2>/dev/null || true)"
+        if grep -q '\[tmux-launch\] cmd exited with status=' <<<"${pane_tail}"; then
+            warn "  tmux session ${name}: existing pane is a post-mortem (daemon already exited)"
+            warn "    killing and re-launching so the new code actually runs"
+            ssh_pc2 "tmux kill-session -t ${name} 2>/dev/null || true"
+        else
+            log "  tmux session ${name}: already exists -- skipping"
+            return 0
+        fi
     fi
     local script_path="${PC2_LOG_ROOT}/start_${name}.sh"
     # Build a self-contained script: print banner, run cmd, then via an
@@ -467,8 +521,12 @@ tmux_start_session() {
         "# autogenerated by x2_pc2_daemons.sh for tmux session: ${name}" \
         "# regenerated on every 'start'; edit the daemon script, not this file" \
         '_keep_alive() {' \
+        '    local rc=$?' \
         '    echo' \
-        '    echo "[tmux-launch] cmd exited with status=$?"' \
+        '    echo "[tmux-launch] cmd exited with status=${rc}"' \
+        '    if [[ "${rc}" -ne 0 ]]; then' \
+        '        echo "[tmux-launch] NON-ZERO EXIT -- inspect scrollback above for the real error."' \
+        '    fi' \
         '    echo "[tmux-launch] keeping pane alive (read scrollback above; Ctrl-D to close)"' \
         '    exec bash -l' \
         '}' \
@@ -575,6 +633,20 @@ cmd_start() {
             log "    downstream  = tcp://localhost:${PC2_POSE_PROXY_PORT} (deploy SUBs here)"
             log "    idle x2m2   = ${POSE_PROXY_IDLE_X2M2}"
             log "    stale_ms    = ${POSE_PROXY_STALE_MS}"
+            case "${POSE_PROXY_IDLE_MODE}" in
+                blend)
+                    log "    idle_mode   = blend (HOLD ${POSE_PROXY_HOLD_LAST_SECS}s, BLEND ${POSE_PROXY_BLEND_SECS}s)"
+                    ;;
+                hold-last)
+                    log "    idle_mode   = hold-last (republish last upstream frame indefinitely)"
+                    ;;
+                idle-stand)
+                    warn "    idle_mode   = idle-stand (LEGACY; arms snap to default on first stale tick)"
+                    ;;
+                *)
+                    warn "    idle_mode   = ${POSE_PROXY_IDLE_MODE} (unrecognised; proxy will reject and exit)"
+                    ;;
+            esac
         else
             warn "pose proxy idle X2M2 missing on PC2: ${POSE_PROXY_IDLE_X2M2}"
             warn "  -> proxy DISABLED; deploy will SUB directly to laptop."
@@ -768,6 +840,9 @@ cmd_start() {
                 --downstream-topic pose \
                 --idle-x2m2 ${POSE_PROXY_IDLE_X2M2} \
                 --idle-stale-ms ${POSE_PROXY_STALE_MS} \
+                --idle-mode ${POSE_PROXY_IDLE_MODE} \
+                --hold-last-secs ${POSE_PROXY_HOLD_LAST_SECS} \
+                --blend-secs ${POSE_PROXY_BLEND_SECS} \
                 2>&1 | tee -a ${proxy_log}"
         tmux_start_session "${POSE_PROXY_SESSION}" "${proxy_cmd}"
     fi

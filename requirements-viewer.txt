@@ -61,6 +61,15 @@ pyarrow>=18
 # emitting EncodedImage instead of AssetVideo).
 pillow>=8
 
+# MuJoCo runs forward kinematics on the canonical x2_ultra.xml so the
+# viewer can plot the *end-effector* trajectory (e.g. left/right wrist
+# 3-D position pelvis-relative) from the 31-dim joint vector in the
+# parquet. We deliberately pin >=3.2 because that's the first release
+# that ships numpy-2 compatible wheels (rerun-sdk 0.31 pulls numpy>=2).
+# Pure pip wheel, no system libs needed -- safe to install in the
+# viewer venv without touching the planner stack.
+mujoco>=3.2
+
 # NOTE: ``numpy`` and ``typing-extensions`` and ``attrs`` are
 # transitive deps of rerun-sdk and pyarrow. We deliberately do NOT
 # pin them here -- rerun-sdk 0.31.4 will resolve them to numpy>=2

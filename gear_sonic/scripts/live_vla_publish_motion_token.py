@@ -1012,6 +1012,15 @@ class _LatestWireDebug:
     right_hand_joints: np.ndarray = field(
         default_factory=lambda: np.zeros(DEFAULT_HAND_DOF, dtype=np.float32)
     )
+    # ``raw_joint_pos_mj`` is the policy's decoded body intent for the
+    # CURRENT tick (post-SONIC-decode, pre-clamp / pre-LPF / pre-ramp /
+    # pre-chunk-blend). Recorded so chunk dumps can FK both the raw
+    # intent and the delivered wire and tell apart "policy never
+    # targeted descend" from "bridge clamped the descend away". Mirrors
+    # ``joint_pos_mj`` (the wire) when no clamp/LPF is active.
+    raw_joint_pos_mj: np.ndarray = field(
+        default_factory=lambda: np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32).copy()
+    )
     raw_delta_idle: float = 0.0
     wire_delta_idle: float = 0.0
     wire_delta_body: float = 0.0
@@ -1026,6 +1035,7 @@ class _LatestWireDebug:
         joint_pos_mj: np.ndarray,
         left_hand_joints: np.ndarray,
         right_hand_joints: np.ndarray,
+        raw_joint_pos_mj: np.ndarray,
         raw_delta_idle: float,
         wire_delta_idle: float,
         wire_delta_body: float,
@@ -1041,6 +1051,9 @@ class _LatestWireDebug:
             self.right_hand_joints = np.asarray(
                 right_hand_joints, dtype=np.float32
             ).copy()
+            self.raw_joint_pos_mj = np.asarray(
+                raw_joint_pos_mj, dtype=np.float32
+            ).copy()
             self.raw_delta_idle = float(raw_delta_idle)
             self.wire_delta_idle = float(wire_delta_idle)
             self.wire_delta_body = float(wire_delta_body)
@@ -1050,12 +1063,16 @@ class _LatestWireDebug:
 
     def snapshot(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, int, int]:
+    ) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        float, float, float, float, int, int,
+    ]:
         with self.lock:
             return (
                 self.joint_pos_mj.copy(),
                 self.left_hand_joints.copy(),
                 self.right_hand_joints.copy(),
+                self.raw_joint_pos_mj.copy(),
                 self.raw_delta_idle,
                 self.wire_delta_idle,
                 self.wire_delta_body,
@@ -1392,6 +1409,8 @@ def _inference_worker(
     verbose: bool = False,
     dump_chunks_dir: str | None = None,
     dump_chunks_every: int = 5,
+    wait_for_ready_file: str | None = None,
+    wait_for_ready_file_timeout_s: float = 120.0,
 ) -> None:
     """Thread B: render or grab frames + run VLA continuously, post fresh chunks.
 
@@ -1449,10 +1468,69 @@ def _inference_worker(
             flush=True,
         )
 
+    # Optional ready-file gate: wait until a co-spawned recorder signals
+    # it is subscribed before producing the first VLA chunk. The publisher
+    # thread continues streaming idle stand at 50 Hz throughout the wait,
+    # so the deploy never sees a wire gap. See ``--wait-for-ready-file``
+    # for the rationale (capturing the arm rise from idle in the
+    # recording, not the post-warm-up freeze).
+    if wait_for_ready_file:
+        ready_path = Path(wait_for_ready_file)
+        print(
+            f"[live-VLA] inference thread: holding at idle stand until "
+            f"recorder ready-file appears at {ready_path} "
+            f"(timeout={wait_for_ready_file_timeout_s:.0f}s; "
+            f"publisher keeps streaming idle stand meanwhile)",
+            flush=True,
+        )
+        wait_t0 = time.monotonic()
+        warned_long_wait = False
+        while not stop_event.is_set():
+            if ready_path.exists():
+                elapsed = time.monotonic() - wait_t0
+                print(
+                    f"[live-VLA] inference thread: ready-file detected "
+                    f"after {elapsed:.1f}s -- starting VLA inference",
+                    flush=True,
+                )
+                break
+            elapsed = time.monotonic() - wait_t0
+            if (
+                wait_for_ready_file_timeout_s > 0
+                and elapsed >= wait_for_ready_file_timeout_s
+            ):
+                print(
+                    f"[live-VLA] inference thread: WARNING ready-file "
+                    f"{ready_path} did not appear within "
+                    f"{wait_for_ready_file_timeout_s:.0f}s -- proceeding "
+                    "without recorder handshake (rise may not be "
+                    "captured if a recorder is still warming up)",
+                    flush=True,
+                )
+                break
+            if elapsed >= 30.0 and not warned_long_wait:
+                print(
+                    f"[live-VLA] inference thread: still waiting for "
+                    f"ready-file {ready_path} after {elapsed:.0f}s "
+                    "(recorder slow to warm up?)",
+                    flush=True,
+                )
+                warned_long_wait = True
+            time.sleep(0.1)
+        if stop_event.is_set():
+            return
+
     last_revision = -1
     n_inferences = 0
     n_dropped_stale_cam = 0
     last_stale_log_t = 0.0
+    # Counter for "policy returned malformed output" rejections. We use a
+    # dedicated counter (rather than `n_inferences`, which only ticks on
+    # SUCCESSFUL chunks) so we can bound the per-chunk BAD_chunk_*.npz dump
+    # to the first few failures -- enough for offline NaN postmortem
+    # without blowing up disk if every chunk is bad.
+    n_bad_chunks = 0
+    _MAX_BAD_CHUNK_DUMPS = 5
     dump_dir_path: Path | None = None
     if dump_chunks_dir:
         dump_dir_path = Path(dump_chunks_dir)
@@ -1568,11 +1646,61 @@ def _inference_worker(
             and np.isfinite(right).all()
         )
         if not horizon_ok:
+            # Diagnostic detail: surface WHICH of the 9 horizon_ok checks
+            # tripped so the operator doesn't have to instrument the bridge
+            # to debug "100% bad chunks" runs. Cheap (~few hundred ns of
+            # numpy reductions per failure) and only fires on the safety
+            # path. Print shapes + finite counts + value ranges of the
+            # finite slice (printing min/max of an all-NaN array is
+            # useless).
+            def _safe_range(a: np.ndarray) -> str:
+                finite_mask = np.isfinite(a)
+                if not finite_mask.any():
+                    return "all non-finite"
+                sub = a[finite_mask]
+                return f"min={float(sub.min()):.3g} max={float(sub.max()):.3g}"
+
+            diag = (
+                f"token=shape{tuple(token.shape)}/finite"
+                f"{int(np.isfinite(token).sum())}of{token.size} "
+                f"left=shape{tuple(left.shape)}/finite"
+                f"{int(np.isfinite(left).sum())}of{left.size} "
+                f"right=shape{tuple(right.shape)}/finite"
+                f"{int(np.isfinite(right).sum())}of{right.size}"
+            )
+            ranges = (
+                f"token[{_safe_range(token)}] "
+                f"left[{_safe_range(left)}] "
+                f"right[{_safe_range(right)}]"
+            )
             print(
-                "[live-VLA] invalid policy output (shape or non-finite) "
-                "→ zero-token safe chunk posted",
+                f"[live-VLA] invalid policy output ({diag}) "
+                f"→ zero-token safe chunk posted",
                 flush=True,
             )
+            print(f"[live-VLA]   ranges: {ranges}", flush=True)
+
+            # Bounded npz dump of the first few bad chunks so we can
+            # re-inspect offline without re-running the whole live stack.
+            # The successful-chunk dumper at line ~1602 keys off
+            # `chunk_NNNNN.npz`; we use a separate `BAD_chunk_NNNN.npz`
+            # prefix so the postmortem tools (e.g. inspect_vla_chunks)
+            # don't try to parse these as valid chunks.
+            if dump_dir_path is not None and n_bad_chunks < _MAX_BAD_CHUNK_DUMPS:
+                try:
+                    np.savez(
+                        dump_dir_path / f"BAD_chunk_{n_bad_chunks:04d}.npz",
+                        token=token,
+                        left=left,
+                        right=right,
+                        elapsed_ms=np.array([elapsed_ms], dtype=np.float32),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[live-VLA]   (warn) BAD_chunk dump failed: {exc}",
+                        flush=True,
+                    )
+            n_bad_chunks += 1
             _post_safe_idle_chunk(
                 chunk,
                 state=state,
@@ -1614,6 +1742,7 @@ def _inference_worker(
                     wire_jpos,
                     wire_left,
                     wire_right,
+                    raw_jpos,
                     raw_delta_idle,
                     wire_delta_idle,
                     wire_delta_body,
@@ -1633,6 +1762,7 @@ def _inference_worker(
                     wire_joint_pos_mj=wire_jpos.astype(np.float32),
                     wire_left_hand=wire_left.astype(np.float32),
                     wire_right_hand=wire_right.astype(np.float32),
+                    raw_joint_pos_mj=raw_jpos.astype(np.float32),
                     raw_delta_idle_rad=np.array([raw_delta_idle], dtype=np.float32),
                     wire_delta_idle_rad=np.array([wire_delta_idle], dtype=np.float32),
                     wire_delta_body_rad=np.array([wire_delta_body], dtype=np.float32),
@@ -2233,10 +2363,21 @@ def _publisher(
                     - np.asarray(body_q_mj_now, dtype=np.float32)
                 ).max()
             )
+            # ``raw_joint_pos_mj`` is the policy's decoded body intent
+            # before any wire-shaping (clamp / LPF / ramp / chunk-blend).
+            # When the policy hasn't produced a decoded chunk yet
+            # (idle window) we fall back to the wire so chunk-dump
+            # diagnostics still get a finite 31-D vector.
+            raw_jpos_now = (
+                decoded_now
+                if decoded_now is not None
+                else np.asarray(cur_jpos, dtype=np.float32)
+            )
             wire_debug.update(
                 joint_pos_mj=cur_jpos,
                 left_hand_joints=left_step,
                 right_hand_joints=right_step,
+                raw_joint_pos_mj=raw_jpos_now,
                 raw_delta_idle=raw_d_met,
                 wire_delta_idle=wire_d_idle,
                 wire_delta_body=wire_d_body,
@@ -2467,6 +2608,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--inference-min-period-s", type=float, default=0.4,
         help="Lower bound on time between successive inferences (s). The "
              "publisher always advances at --rate; this just throttles the GPU.",
+    )
+    parser.add_argument(
+        "--wait-for-ready-file", type=str, default=None,
+        help="Path to a sentinel file written by a co-spawned recorder "
+             "(via --ready-file). When set, the inference thread holds at "
+             "idle stand AFTER 'policy ready' until this file appears, so "
+             "the recorder captures the arm rise from idle instead of "
+             "missing the first ~8 s while the recorder warms up. The "
+             "publisher thread keeps streaming idle stand the whole time, "
+             "so the deploy never sees a gap. No effect when unset.",
+    )
+    parser.add_argument(
+        "--wait-for-ready-file-timeout-s", type=float, default=120.0,
+        help="Max seconds the inference thread will block on the "
+             "--wait-for-ready-file gate before logging a warning and "
+             "proceeding anyway. 0 disables the timeout (wait forever). "
+             "Default 120 s is enough for cold cameras + MuJoCo renderer "
+             "init on a 4090-class laptop.",
     )
     parser.add_argument(
         "--idle-stand-pkl", type=str,
@@ -3613,6 +3772,10 @@ def main(argv: list[str] | None = None) -> int:
                 min_period_s=args.inference_min_period_s, verbose=not args.quiet,
                 dump_chunks_dir=args.dump_chunks_dir,
                 dump_chunks_every=args.dump_chunks_every,
+                wait_for_ready_file=args.wait_for_ready_file,
+                wait_for_ready_file_timeout_s=(
+                    args.wait_for_ready_file_timeout_s
+                ),
             ),
             name="vla-inference",
             daemon=True,

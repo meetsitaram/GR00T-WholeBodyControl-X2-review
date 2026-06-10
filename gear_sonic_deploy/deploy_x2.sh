@@ -2258,6 +2258,30 @@ else:
 PYEOF
 }
 
+dump_pose_proxy_log_tail() {
+    # When the wire probe fails in split-topology (onbot) mode, the most
+    # likely cause is that x2_pose_proxy.py died at startup -- e.g.
+    # because the laptop-side daemons wrapper passed a flag the PC2-side
+    # proxy doesn't recognise (stale pc2_bringup), a Python import
+    # error, or a port collision. The operator-facing failure banner
+    # tells them WHERE the log lives, but they still have to leave the
+    # tmux pane to read it. Inlining the last few lines of the proxy
+    # log into the same scrollback makes the actual error obvious in
+    # one place. Idempotent and safe to call even when no proxy log
+    # exists (e.g. local-mode deploy with no proxy in the loop).
+    local log_root="${PC2_LOG_ROOT:-/home/run/getsolo/log}"
+    local newest
+    newest="$(ls -t "${log_root}"/pose_proxy_*.log 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$newest" || ! -r "$newest" ]]; then
+        echo -e "${YELLOW}  (no pose_proxy_*.log found under ${log_root}; proxy may never have started)${NC}"
+        return 0
+    fi
+    echo ""
+    echo -e "${YELLOW}── last 30 lines of ${newest} ──────────────────────${NC}"
+    tail -n 30 "$newest" | sed 's/^/    /'
+    echo -e "${YELLOW}── end of proxy log tail ────────────────────────────${NC}"
+}
+
 mc_em_post() {
     # $1 = action ("stop_app" or "start_app")
     #
@@ -3649,8 +3673,16 @@ else
         # ────────────────────────────────────────────────────────────────
         if ! $NO_WIRE_PROBE; then
             echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
-            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
-            probe_rc=$?
+            # NOTE: capture the substitution rc via `|| probe_rc=$?` so
+            # `set -e` doesn't yank us out of the script at the
+            # assignment line on probe failure -- otherwise the
+            # diagnostic banner + proxy log tail below NEVER print and
+            # the operator sees only a bare "status=1" with zero clues
+            # about what actually went wrong (the symptom that ate
+            # 2026-06-08 morning's debug session).
+            probe_out=""
+            probe_rc=0
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")" || probe_rc=$?
             if [[ $probe_rc -ne 0 ]]; then
                 echo ""
                 echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -3667,6 +3699,11 @@ else
                     echo -e "${YELLOW}      x2_pc2_daemons.sh logs proxy --pc2-host <pc2_ip>${NC}"
                     echo -e "${YELLOW}      x2_pc2_daemons.sh status --pc2-host <pc2_ip>${NC}"
                     echo -e "${YELLOW}    If the proxy session exited, look in ${PC2_LOG_ROOT:-/home/run/getsolo/log}/pose_proxy_*.log${NC}"
+                    # Inline the actual proxy log tail so the operator
+                    # doesn't have to leave the pane to figure out WHY
+                    # the proxy died (argparse error from a stale
+                    # bringup is the most common culprit).
+                    dump_pose_proxy_log_tail
                 else
                     echo -e "${YELLOW}    The laptop pose publisher is not running on ${VLA_ZMQ_HOST}. Start:${NC}"
                     echo -e "${YELLOW}      ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --no-deploy${NC}"
@@ -3830,10 +3867,16 @@ else
         # Wire-freshness probe (same rationale as the STANDBY path).
         if ! $NO_WIRE_PROBE; then
             echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
-            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
-            probe_rc=$?
+            # `|| probe_rc=$?`: suppress set -e on the failing
+            # substitution so the diagnostic block below actually runs.
+            probe_out=""
+            probe_rc=0
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")" || probe_rc=$?
             if [[ $probe_rc -ne 0 ]]; then
                 echo -e "${RED}wire probe FAILED (${probe_out}): no frames on ${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}. Aborting before MC-stop.${NC}"
+                if [[ "${VLA_ZMQ_HOST}" == "localhost" || "${VLA_ZMQ_HOST}" == "127.0.0.1" ]]; then
+                    dump_pose_proxy_log_tail
+                fi
                 echo -e "${YELLOW}Re-run with --no-wire-probe to override (NOT recommended on a live robot).${NC}"
                 exit 1
             fi
@@ -3870,10 +3913,16 @@ else
         # Wire-freshness probe (same rationale as the STANDBY path).
         if ! $NO_WIRE_PROBE; then
             echo -e "$(ts) ${BLUE}[handoff]${NC} probing pose wire on tcp://${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT} (topic=${VLA_ZMQ_TOPIC}, ${WIRE_PROBE_SECS}s) ..."
-            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")"
-            probe_rc=$?
+            # `|| probe_rc=$?`: suppress set -e on the failing
+            # substitution so the diagnostic block below actually runs.
+            probe_out=""
+            probe_rc=0
+            probe_out="$(probe_pose_wire "$VLA_ZMQ_HOST" "$VLA_ZMQ_PORT" "$VLA_ZMQ_TOPIC" "$WIRE_PROBE_SECS")" || probe_rc=$?
             if [[ $probe_rc -ne 0 ]]; then
                 echo -e "${RED}wire probe FAILED (${probe_out}): no frames on ${VLA_ZMQ_HOST}:${VLA_ZMQ_PORT}. Aborting before MC-stop.${NC}"
+                if [[ "${VLA_ZMQ_HOST}" == "localhost" || "${VLA_ZMQ_HOST}" == "127.0.0.1" ]]; then
+                    dump_pose_proxy_log_tail
+                fi
                 echo -e "${YELLOW}Re-run with --no-wire-probe to override (NOT recommended on a live robot).${NC}"
                 exit 1
             fi

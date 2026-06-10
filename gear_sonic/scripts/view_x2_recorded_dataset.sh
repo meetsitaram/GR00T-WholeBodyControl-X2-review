@@ -52,4 +52,9 @@ if [[ ! -x "${VIEWER_PY}" ]]; then
 fi
 
 cd "${REPO_ROOT}"
+# Prepend .venv-viewer/bin so `rr.init(spawn=True)` finds the matching
+# rerun GUI binary (v0.31.4). Without this, an active `.venv/` (planner
+# stack) shadows PATH with rerun-cli v0.21.0, which silently fails to
+# decode the v0.31.4 wire format and shows an empty welcome screen.
+export PATH="$(dirname "${VIEWER_PY}"):${PATH}"
 exec "${VIEWER_PY}" -m gear_sonic.scripts.view_x2_recorded_dataset "$@"

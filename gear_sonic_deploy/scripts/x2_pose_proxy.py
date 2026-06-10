@@ -12,13 +12,36 @@ When upstream is fresh:
     bytes the laptop sent.
 
 When upstream is silent for > --idle-stale-ms (default 100):
-    Synthesise idle_stand frames from the locally-staged X2M2 binary
-    and publish those at --rate-hz (default 50). The idle clip is the
-    same one ``live_vla_publish_motion_token.py --no-policy`` would
-    publish on the laptop in idle mode (baked via
-    ``bake_idle_stand_x2m2.py``), so the policy sees one consistent
-    reference distribution whether teleop is active or the proxy is
-    filling in.
+    Run the staged fallback ladder (LIVE -> HOLD -> BLEND -> IDLE_CLIP)
+    keyed by ``--idle-mode``. The 2026-06-08 default is ``blend``:
+
+      * HOLD (default 10 s): re-publish the LAST forwarded upstream
+        frame BYTE-FOR-BYTE. The deploy sees zero kinematic surprise
+        (identical bytes -> identical joint_pos -> jvel = 0) and keeps
+        commanding the operator's last pose. Soaks up WiFi blips /
+        laptop GC pauses / Cursor reloads of up to ``--hold-last-secs``
+        with no observable effect on the robot.
+      * BLEND (default 3 s): lerp joint_pos_mj from the cached upstream
+        frame toward the baked idle clip. Smooth glide rather than a
+        step, so the arms drift to default over seconds rather than
+        slamming through their full ROM in 200 ms.
+      * IDLE_CLIP: after the hold + blend window expires, publish
+        baked idle_stand frames indefinitely (the legacy destination
+        behaviour, reached gradually).
+
+    ``--idle-mode hold-last`` skips BLEND / IDLE_CLIP entirely and
+    holds the cached upstream frame forever (operator owns recovery).
+
+    ``--idle-mode idle-stand`` reproduces pre-2026-06-08 behaviour:
+    jump to IDLE_CLIP on the first stale tick. Regression escape only
+    -- known to slam tables when the operator has arms extended during
+    a WiFi hiccup.
+
+    The baked idle clip is the same one
+    ``live_vla_publish_motion_token.py --no-policy`` publishes in idle
+    mode (built by ``bake_idle_stand_x2m2.py``), so the policy sees one
+    consistent reference distribution wherever the wire happens to
+    come from.
 
     YAW REBASE (default ON): the baked idle_stand clip is yaw-aligned
     to ``R_z(0)`` for every frame. Publishing those frames verbatim
@@ -48,7 +71,17 @@ Why this exists:
     LAPTOP PROCESS itself dies or wifi drops mid-run, the wire goes
     silent and SAFE_IDLE fires. The proxy guarantees the wire never
     goes silent from the deploy's perspective by sourcing its own
-    idle_stand frames when upstream stops flowing.
+    fallback frames when upstream stops flowing.
+
+    Critically: the proxy must NOT inject a step change in the
+    commanded reference (which is what pre-2026-06-08 did by jumping
+    straight to idle_stand on the first stale tick). The deploy's
+    target LPF + max_target_dev clamps cannot absorb a multi-radian
+    step in joint_pos_mj, so a WiFi hiccup with the operator's arms
+    extended would swing them through their full ROM to default in
+    ~200 ms -- known to slam tables. The staged HOLD -> BLEND -> IDLE
+    ladder above keeps the wire alive while only making per-frame
+    commanded-reference moves the deploy can actually track.
 
 Single-thread design: one zmq.Context, one SUB, one PUB. The 50 Hz
 tick loop polls the SUB non-blockingly, drains the queue (forwards
@@ -176,6 +209,65 @@ def decode_x2_debug_base_quat(
             ).copy()
         cursor += nbytes
     return None  # field absent from this frame
+
+
+def decode_pose_joint_pos_mj(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``joint_pos_mj`` (f32, shape (NUM_BODY_DOFS,)) from a packed
+    pose frame.
+
+    Mirrors ``decode_x2_debug_base_quat``: tolerant of header noise,
+    returns ``None`` on any decode failure rather than raising (the
+    publish thread must survive a malformed cached frame -- the worst
+    case is we lose the HOLD-vs-BLEND lerp anchor and fall back to the
+    baked idle clip, which is no worse than the legacy behaviour).
+
+    Called once per fresh upstream tick (~50 Hz) to snapshot the most
+    recent operator-commanded joint targets. When upstream goes silent
+    the snapshot is reused as (a) the byte payload to re-publish during
+    HOLD and (b) the lerp anchor for BLEND.
+    """
+    topic_bytes = topic.encode("utf-8")
+    if not msg.startswith(topic_bytes):
+        return None
+    body = msg[len(topic_bytes):]
+    if len(body) < HEADER_SIZE:
+        return None
+    header_blob = body[:HEADER_SIZE].rstrip(b"\x00")
+    payload = body[HEADER_SIZE:]
+    try:
+        header = json.loads(header_blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    fields = header.get("fields")
+    if not isinstance(fields, list):
+        return None
+    cursor = 0
+    for f in fields:
+        try:
+            name = str(f["name"])
+            dtype = str(f["dtype"])
+            shape = tuple(int(s) for s in f["shape"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        bpe = _DTYPE_BPE.get(dtype)
+        if bpe is None:
+            return None
+        nelem = 1
+        for s in shape:
+            nelem *= s
+        nbytes = nelem * bpe
+        if cursor + nbytes > len(payload):
+            return None
+        if name == "joint_pos_mj":
+            if dtype != "f32" or len(shape) != 1 or shape[0] != NUM_BODY_DOFS:
+                return None
+            return np.frombuffer(
+                payload[cursor:cursor + nbytes], dtype="<f4"
+            ).copy()
+        cursor += nbytes
+    return None  # joint_pos_mj absent (e.g. token-only side-channel frame)
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +449,7 @@ def build_idle_frame_msg(
     topic: str,
     *,
     yaw_rebase_rad: float | None = None,
+    joint_pos_mj_override: np.ndarray | None = None,
 ) -> bytes:
     """Pack one idle-fallback frame, optionally yaw-rebased.
 
@@ -369,8 +462,26 @@ def build_idle_frame_msg(
     twisting back to world +X. ``None`` falls back to the legacy
     "publish baked yaw verbatim" behaviour (kept for the
     ``--no-x2-debug-yaw-track`` regression escape and the unit tests).
+
+    ``joint_pos_mj_override`` (optional, shape (NUM_BODY_DOFS,) f32) lets
+    the BLEND state machine substitute a lerp between cached-upstream
+    and the baked idle clip for the CURRENT frame's joint targets while
+    reusing the rest of the frame (root_quat with yaw rebase, motion
+    token zeros, hand zeros, future window). The future-window slots
+    are intentionally left on the idle clip -- they are an advisory
+    horizon for the policy, not the immediate command, and treating
+    them as "blend toward idle in the future" matches what the lerped
+    current frame is doing in the present.
     """
     cur_jpos, cur_quat = replay.current(tick)
+    if joint_pos_mj_override is not None:
+        override = np.asarray(joint_pos_mj_override, dtype=np.float32)
+        if override.shape != (NUM_BODY_DOFS,):
+            raise ValueError(
+                "joint_pos_mj_override must have shape "
+                f"({NUM_BODY_DOFS},); got {override.shape}"
+            )
+        cur_jpos = override
     jpos_future, quat_future, jvel_future = replay.future_window(tick)
     if yaw_rebase_rad is not None:
         cur_quat = rebase_quats_xyzw_by_yaw(
@@ -398,6 +509,112 @@ def build_idle_frame_msg(
         "future_dt_s": _FUTURE_DT_FIELD,
     }
     return pack_pose_message(payload, topic=topic, version=4)
+
+
+# ---------------------------------------------------------------------------
+# Upstream-silent fallback state machine.
+#
+# When the laptop's pose stream goes quiet, the proxy must keep the wire
+# alive (the C++ deploy in --input-type=zmq mode expects a continuous
+# pose-ref stream). The naive answer is "republish the baked idle_stand
+# clip the moment the wire stalls" -- which is what the proxy did before
+# 2026-06-08. Failure mode: any WiFi blip during teleop steps the
+# commanded reference from "operator pose, arms up" to "default stand,
+# arms down" in one tick. The deploy's target LPF (8 Hz) plus
+# max_target_dev_arm (1.5 rad) clamps cannot absorb a multi-radian step,
+# so the arms swing through the full ROM in ~200 ms and slam into
+# whatever is in front of the robot. Hence the staged fallback below:
+#
+#   LIVE       -> upstream fresh this tick; forward bytes verbatim.
+#   COLD_IDLE  -> proxy has NEVER seen upstream; publish baked idle clip
+#                 (startup; legacy behaviour preserved).
+#   HOLD       -> upstream silent < hold_last_secs after stale threshold;
+#                 re-publish the LAST forwarded upstream bytes. The
+#                 deploy keeps tracking the operator's last pose with
+#                 jvel=0 (identical bytes, no kinematic surprise).
+#   BLEND      -> upstream silent past hold_last_secs but still within
+#                 blend_secs window; lerp joint_pos_mj from cached
+#                 upstream toward baked idle. The lerp is monotonic so
+#                 the deploy sees a smooth (~3 s) glide rather than a
+#                 step.
+#   IDLE_CLIP  -> upstream silent past hold_last_secs + blend_secs;
+#                 publish baked idle clip indefinitely (legacy
+#                 destination behaviour, just reached gradually rather
+#                 than in one tick).
+#
+# Mode selection via --idle-mode:
+#   blend      -> the full ladder above (NEW DEFAULT; safe).
+#   hold-last  -> HOLD forever; never transitions to BLEND/IDLE_CLIP.
+#                 Operator-responsibility mode; use when you know
+#                 upstream WILL come back (e.g. live VR teleop where a
+#                 stale wire == cut the power).
+#   idle-stand -> skip HOLD/BLEND entirely; jump to IDLE_CLIP on first
+#                 stale tick. Reproduces pre-2026-06-08 behaviour
+#                 exactly. Regression escape for the milestone doc.
+# ---------------------------------------------------------------------------
+STATE_LIVE: str = "LIVE"
+STATE_COLD_IDLE: str = "COLD_IDLE"
+STATE_HOLD: str = "HOLD"
+STATE_BLEND: str = "BLEND"
+STATE_IDLE_CLIP: str = "IDLE_CLIP"
+STATE_GAP: str = "GAP"  # silent < stale_s; don't publish (deploy holds last)
+
+IDLE_MODE_BLEND: str = "blend"
+IDLE_MODE_HOLD_LAST: str = "hold-last"
+IDLE_MODE_IDLE_STAND: str = "idle-stand"
+_IDLE_MODES: tuple[str, ...] = (
+    IDLE_MODE_BLEND,
+    IDLE_MODE_HOLD_LAST,
+    IDLE_MODE_IDLE_STAND,
+)
+
+
+def decide_fallback_state(
+    *,
+    have_upstream: bool,
+    age_s: float,
+    stale_s: float,
+    hold_last_secs: float,
+    blend_secs: float,
+    idle_mode: str,
+) -> tuple[str, float]:
+    """Pure decision function for the no-fresh-upstream branch.
+
+    Returns ``(target_state, blend_alpha)`` where ``blend_alpha`` is
+    only meaningful for ``STATE_BLEND`` (0.0 = cached, 1.0 = idle).
+    Split out as a pure function so the state transitions can be unit
+    tested without spinning up ZMQ sockets.
+
+    The "fallback clock" starts at ``stale_s``: ``HOLD`` runs from
+    ``stale_s`` to ``stale_s + hold_last_secs``, ``BLEND`` from
+    ``stale_s + hold_last_secs`` to ``stale_s + hold_last_secs +
+    blend_secs``, and ``IDLE_CLIP`` afterwards. This way the on-the-wire
+    behaviour matches what an operator would naively expect from the
+    CLI knobs (e.g. ``--hold-last-secs=10`` means 10 s of HOLD, not
+    "10 s minus stale threshold of HOLD").
+    """
+    if not have_upstream:
+        return STATE_COLD_IDLE, 0.0
+    if age_s <= stale_s:
+        return STATE_GAP, 0.0
+    fallback_age = age_s - stale_s
+    if idle_mode == IDLE_MODE_IDLE_STAND:
+        return STATE_IDLE_CLIP, 1.0
+    if idle_mode == IDLE_MODE_HOLD_LAST:
+        return STATE_HOLD, 0.0
+    # blend mode (default).
+    if fallback_age <= hold_last_secs:
+        return STATE_HOLD, 0.0
+    if fallback_age <= hold_last_secs + blend_secs:
+        if blend_secs <= 0.0:
+            return STATE_IDLE_CLIP, 1.0
+        alpha = (fallback_age - hold_last_secs) / blend_secs
+        if alpha < 0.0:
+            alpha = 0.0
+        elif alpha > 1.0:
+            alpha = 1.0
+        return STATE_BLEND, float(alpha)
+    return STATE_IDLE_CLIP, 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +669,42 @@ def main(argv: list[str] | None = None) -> int:
              "silence (default 100).",
     )
     p.add_argument(
+        "--idle-mode",
+        choices=list(_IDLE_MODES),
+        default=IDLE_MODE_BLEND,
+        help="Behaviour when upstream is silent past --idle-stale-ms. "
+             "'blend' (NEW DEFAULT, safe): hold the last forwarded "
+             "upstream frame for --hold-last-secs, then lerp toward the "
+             "baked idle_stand clip over --blend-secs. 'hold-last': "
+             "hold the last forwarded frame indefinitely (operator owns "
+             "recovery -- robot stays in commanded pose forever). "
+             "'idle-stand': pre-2026-06-08 behaviour; switch to the "
+             "baked idle clip on the first stale tick (causes arms to "
+             "slam to default on any wifi hiccup -- regression escape "
+             "only).",
+    )
+    p.add_argument(
+        "--hold-last-secs",
+        type=float,
+        default=10.0,
+        help="How long (s) to hold the last forwarded upstream frame "
+             "before transitioning toward idle (default 10.0). Only "
+             "applies when --idle-mode=blend. Sized to absorb laptop "
+             "GC pauses / Cursor reloads / WiFi outages of up to ~10 s "
+             "without changing the commanded reference at all.",
+    )
+    p.add_argument(
+        "--blend-secs",
+        type=float,
+        default=3.0,
+        help="Duration (s) of the lerp from cached-upstream to baked "
+             "idle_stand at the end of the hold window (default 3.0). "
+             "Only applies when --idle-mode=blend. Bounded by the "
+             "deploy's max_target_dev_arm clamp (1.5 rad / control "
+             "period) -- 3 s is comfortably above the worst-case "
+             "shoulder swing through 180 deg.",
+    )
+    p.add_argument(
         "--rate-hz",
         type=float,
         default=DEFAULT_PUB_RATE_HZ,
@@ -502,6 +755,21 @@ def main(argv: list[str] | None = None) -> int:
              "escape for the diagnostic baseline; never use in prod.",
     )
     args = p.parse_args(argv)
+
+    if args.hold_last_secs < 0.0:
+        print(
+            f"[pose_proxy] ERROR: --hold-last-secs must be >= 0, got "
+            f"{args.hold_last_secs}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.blend_secs < 0.0:
+        print(
+            f"[pose_proxy] ERROR: --blend-secs must be >= 0, got "
+            f"{args.blend_secs}",
+            file=sys.stderr,
+        )
+        return 1
 
     if not args.idle_x2m2.is_file():
         print(
@@ -586,14 +854,37 @@ def main(argv: list[str] | None = None) -> int:
         f"upstream silence)",
         flush=True,
     )
+    if args.idle_mode == IDLE_MODE_BLEND:
+        print(
+            f"[pose_proxy] idle mode: blend "
+            f"(HOLD last frame for {args.hold_last_secs:.1f}s, then "
+            f"BLEND to idle_stand over {args.blend_secs:.1f}s)",
+            flush=True,
+        )
+    elif args.idle_mode == IDLE_MODE_HOLD_LAST:
+        print(
+            "[pose_proxy] idle mode: hold-last (republish last upstream "
+            "frame indefinitely; operator owns recovery)",
+            flush=True,
+        )
+    else:  # idle-stand
+        print(
+            "[pose_proxy] idle mode: idle-stand (LEGACY; arms snap to "
+            "default on the first stale tick -- known to slam tables "
+            "during WiFi hiccups)",
+            flush=True,
+        )
 
     period = 1.0 / max(args.rate_hz, 1e-6)
     stale_s = args.idle_stale_ms / 1000.0
+    hold_last_secs = float(args.hold_last_secs)
+    blend_secs = float(args.blend_secs)
+    idle_mode = str(args.idle_mode)
     yaw_max_age_s = float(args.x2_debug_max_age_s)
     next_tick = time.monotonic()
     # last_upstream_s = -1.0 sentinel for "never received". The age check
     # below treats any negative value as "infinitely stale", so we begin
-    # in IDLE until upstream proves it's alive (single first frame).
+    # in COLD_IDLE until upstream proves it's alive (single first frame).
     last_upstream_s = -1.0
     # Last measured yaw + monotonic timestamp. -1.0 sentinel means
     # "no x2_debug frame ever decoded successfully". When we fall into
@@ -603,17 +894,31 @@ def main(argv: list[str] | None = None) -> int:
     last_measured_yaw_rad = 0.0
     last_measured_yaw_s = -1.0
     yaw_decode_failures = 0
-    in_idle = True
+    # Cache of the last forwarded upstream frame. ``last_upstream_msg``
+    # is re-published verbatim in HOLD (so the deploy sees zero kinematic
+    # surprise -- identical bytes -> identical joint_pos -> jvel = 0).
+    # ``last_upstream_jpos`` is the decoded ``joint_pos_mj`` slice used
+    # as the lerp anchor in BLEND. If decoding fails (malformed cached
+    # frame, side-channel-only message), we still keep the raw bytes for
+    # HOLD and just skip BLEND -- safer to glide a touch later than
+    # crash the publish thread.
+    last_upstream_msg: bytes | None = None
+    last_upstream_jpos: np.ndarray | None = None
+    cur_state = STATE_COLD_IDLE
+    prev_state = STATE_COLD_IDLE
     tick = 0
     idle_tick = 0
     fwd_frames = 0
     idle_frames = 0
     idle_frames_with_rebase = 0
+    hold_frames = 0
+    blend_frames = 0
+    gap_skips = 0  # ticks where stale window not yet crossed
     last_status_s = time.monotonic()
 
     print(
-        "[pose_proxy] starting (initial state: IDLE; will switch to LIVE "
-        "as soon as upstream publishes anything)",
+        "[pose_proxy] starting (initial state: COLD_IDLE; will switch to "
+        "LIVE as soon as upstream publishes anything)",
         flush=True,
     )
 
@@ -667,47 +972,103 @@ def main(argv: list[str] | None = None) -> int:
                     fwd_frames += 1
                 except zmq.Again:
                     pass
-                if in_idle:
-                    if last_upstream_s < 0:
-                        print(
-                            "[pose_proxy] state: IDLE -> LIVE (first upstream "
-                            "frame received)",
-                            flush=True,
-                        )
-                    else:
-                        gap_ms = (now - last_upstream_s) * 1000.0
-                        print(
-                            f"[pose_proxy] state: IDLE -> LIVE (upstream pose "
-                            f"frames flowing again after {gap_ms:.0f} ms gap)",
-                            flush=True,
-                        )
-                    in_idle = False
+                # Cache for the upstream-silent fallback. Raw bytes are
+                # used verbatim in HOLD; the decoded joint_pos_mj slice
+                # is the lerp anchor in BLEND. A decode miss isn't fatal
+                # -- HOLD still works (we re-publish raw bytes), only
+                # BLEND degrades to "snap to idle" once the hold window
+                # expires.
+                last_upstream_msg = latest
+                jpos = decode_pose_joint_pos_mj(
+                    latest, args.upstream_topic
+                )
+                if jpos is None:
+                    jpos = decode_pose_joint_pos_mj(
+                        latest, args.downstream_topic
+                    )
+                if jpos is not None:
+                    last_upstream_jpos = jpos
+                cur_state = STATE_LIVE
                 last_upstream_s = now
             else:
-                # No upstream this tick. Decide whether to fill in.
-                # Treat "never received" (last_upstream_s < 0) as infinitely
-                # stale so we start in IDLE rather than waiting stale_s.
-                age = float("inf") if last_upstream_s < 0 else (now - last_upstream_s)
-                if age > stale_s:
-                    if not in_idle:
-                        print(
-                            f"[pose_proxy] state: LIVE -> IDLE (upstream "
-                            f"silent {age * 1000:.0f} ms > "
-                            f"{args.idle_stale_ms} ms)",
-                            flush=True,
-                        )
-                        in_idle = True
-                        # Reset idle_tick so the looped clip starts at frame 0
-                        # each time we fall into idle. Optional; mostly
-                        # cosmetic since the loop is short and the policy
-                        # tracks whatever phase we send.
-                        idle_tick = 0
-                    # Decide whether to yaw-rebase this idle frame.
-                    # Conditions: yaw tracking is enabled AND we've seen
-                    # at least one decode AND it's within the staleness
-                    # window. Otherwise publish baked yaw (safe fallback;
-                    # no worse than the legacy behaviour).
+                # No upstream this tick. Decide what to fill in with via
+                # the staged fallback ladder (LIVE -> HOLD -> BLEND ->
+                # IDLE_CLIP) so a WiFi blip doesn't step the commanded
+                # reference and slam the arms to default in one tick.
+                age = (
+                    float("inf") if last_upstream_s < 0
+                    else (now - last_upstream_s)
+                )
+                target_state, blend_alpha = decide_fallback_state(
+                    have_upstream=(last_upstream_msg is not None),
+                    age_s=age,
+                    stale_s=stale_s,
+                    hold_last_secs=hold_last_secs,
+                    blend_secs=blend_secs,
+                    idle_mode=idle_mode,
+                )
+                cur_state = target_state
+
+                if target_state == STATE_GAP:
+                    # Still within stale window after the last upstream;
+                    # send nothing this tick. The deploy's input source
+                    # caches the last forwarded frame and Sample()
+                    # returns it at 500 Hz; one missing 20 ms slice is
+                    # invisible to the policy.
+                    gap_skips += 1
+                elif target_state == STATE_HOLD:
+                    if last_upstream_msg is None:
+                        # Belt-and-braces: decide_fallback_state would
+                        # not return HOLD without have_upstream=True.
+                        # If it does, glide gracefully to COLD_IDLE.
+                        cur_state = STATE_COLD_IDLE
+                    else:
+                        try:
+                            pub.send(last_upstream_msg, zmq.NOBLOCK)
+                            hold_frames += 1
+                        except zmq.Again:
+                            pass
+                elif target_state == STATE_BLEND:
                     yaw_rebase: float | None = None
+                    if (
+                        yaw_track_enabled
+                        and last_measured_yaw_s >= 0
+                        and (now - last_measured_yaw_s) <= yaw_max_age_s
+                    ):
+                        yaw_rebase = last_measured_yaw_rad
+                    if last_upstream_jpos is None:
+                        # No decode anchor for the lerp; fall back to
+                        # the baked idle clip rather than blending from
+                        # garbage. Still smoother than the legacy
+                        # behaviour because we only reach BLEND after
+                        # the full hold window already elapsed.
+                        msg = build_idle_frame_msg(
+                            replay,
+                            idle_tick,
+                            args.downstream_topic,
+                            yaw_rebase_rad=yaw_rebase,
+                        )
+                    else:
+                        idle_jpos, _ = replay.current(idle_tick)
+                        lerp = (
+                            (1.0 - blend_alpha) * last_upstream_jpos
+                            + blend_alpha * idle_jpos
+                        ).astype(np.float32)
+                        msg = build_idle_frame_msg(
+                            replay,
+                            idle_tick,
+                            args.downstream_topic,
+                            yaw_rebase_rad=yaw_rebase,
+                            joint_pos_mj_override=lerp,
+                        )
+                    try:
+                        pub.send(msg, zmq.NOBLOCK)
+                        blend_frames += 1
+                    except zmq.Again:
+                        pass
+                    idle_tick += 1
+                elif target_state in (STATE_COLD_IDLE, STATE_IDLE_CLIP):
+                    yaw_rebase = None
                     if (
                         yaw_track_enabled
                         and last_measured_yaw_s >= 0
@@ -728,18 +1089,95 @@ def main(argv: list[str] | None = None) -> int:
                     except zmq.Again:
                         pass
                     idle_tick += 1
-                # else: still within stale window after last upstream;
-                # send nothing this tick. The deploy's input source caches
-                # the last frame we forwarded and Sample() returns it at
-                # 500 Hz; one missing 20 ms slice is invisible to the
-                # policy.
+
+            # Emit a one-line transition log every time the state name
+            # changes. Operators rely on this to correlate "I saw the
+            # robot arm freeze for a few seconds then drift to stand"
+            # with the proxy's own view of upstream availability.
+            if cur_state != prev_state:
+                if cur_state == STATE_LIVE:
+                    if last_upstream_s < 0 or prev_state == STATE_COLD_IDLE:
+                        msg_txt = (
+                            f"{prev_state} -> LIVE (first upstream "
+                            f"frame received)"
+                        )
+                    else:
+                        gap_ms = (now - last_upstream_s) * 1000.0
+                        msg_txt = (
+                            f"{prev_state} -> LIVE (upstream pose "
+                            f"frames flowing again after {gap_ms:.0f} "
+                            f"ms gap)"
+                        )
+                elif cur_state == STATE_GAP:
+                    msg_txt = (
+                        f"{prev_state} -> GAP (upstream silent < "
+                        f"{args.idle_stale_ms} ms; holding deploy "
+                        f"cache)"
+                    )
+                elif cur_state == STATE_HOLD:
+                    msg_txt = (
+                        f"{prev_state} -> HOLD (re-publishing last "
+                        f"upstream frame; will hold for "
+                        f"{hold_last_secs:.1f}s)"
+                    )
+                elif cur_state == STATE_BLEND:
+                    msg_txt = (
+                        f"{prev_state} -> BLEND (lerping cached -> "
+                        f"idle_stand over {blend_secs:.1f}s)"
+                    )
+                elif cur_state == STATE_IDLE_CLIP:
+                    msg_txt = (
+                        f"{prev_state} -> IDLE_CLIP (upstream silent "
+                        f"past hold + blend window; tracking baked "
+                        f"idle clip)"
+                    )
+                elif cur_state == STATE_COLD_IDLE:
+                    msg_txt = f"{prev_state} -> COLD_IDLE"
+                else:
+                    msg_txt = f"{prev_state} -> {cur_state}"
+                print(f"[pose_proxy] state: {msg_txt}", flush=True)
+                # Reset idle_tick when (re-)entering an idle-clip path
+                # so the looped baked clip starts at frame 0. Mostly
+                # cosmetic but keeps logs predictable across restarts
+                # of the fallback ladder.
+                if (
+                    cur_state in (STATE_IDLE_CLIP, STATE_COLD_IDLE, STATE_BLEND)
+                    and prev_state not in (
+                        STATE_IDLE_CLIP, STATE_COLD_IDLE, STATE_BLEND
+                    )
+                ):
+                    idle_tick = 0
+                prev_state = cur_state
 
             tick += 1
 
             if now - last_status_s >= args.status_every_s:
-                age = now - last_upstream_s
-                state = "IDLE" if in_idle else "LIVE"
-                age_str = "never" if last_upstream_s < 0 else f"{age * 1000:.0f}ms"
+                age = (
+                    float("inf") if last_upstream_s < 0
+                    else (now - last_upstream_s)
+                )
+                age_str = (
+                    "never" if last_upstream_s < 0
+                    else f"{age * 1000:.0f}ms"
+                )
+                # Decorate the state with the fallback-clock timer so
+                # operators reading the status line can see "I'm 4.2 s
+                # into a 10 s hold" or "blend alpha=0.41" at a glance.
+                if cur_state == STATE_HOLD and last_upstream_s >= 0:
+                    fb_age = max(0.0, age - stale_s)
+                    state_str = (
+                        f"HOLD t={fb_age:.1f}/{hold_last_secs:.1f}s"
+                    )
+                elif cur_state == STATE_BLEND and last_upstream_s >= 0:
+                    fb_age = max(0.0, age - stale_s)
+                    if blend_secs > 0.0:
+                        alpha = (fb_age - hold_last_secs) / blend_secs
+                        alpha = max(0.0, min(1.0, alpha))
+                    else:
+                        alpha = 1.0
+                    state_str = f"BLEND alpha={alpha:.2f}"
+                else:
+                    state_str = cur_state
                 if not yaw_track_enabled:
                     yaw_str = "off"
                 elif last_measured_yaw_s < 0:
@@ -751,10 +1189,12 @@ def main(argv: list[str] | None = None) -> int:
                         f"age={yaw_age_ms:.0f}ms"
                     )
                 print(
-                    f"[pose_proxy] tick={tick} state={state} "
-                    f"upstream_age={age_str} "
-                    f"fwd={fwd_frames} idle={idle_frames} "
+                    f"[pose_proxy] tick={tick} state={state_str} "
+                    f"mode={idle_mode} upstream_age={age_str} "
+                    f"fwd={fwd_frames} hold={hold_frames} "
+                    f"blend={blend_frames} idle={idle_frames} "
                     f"idle_rebased={idle_frames_with_rebase} "
+                    f"gap_skip={gap_skips} "
                     f"x2_debug=({yaw_str}) "
                     f"yaw_decode_fail={yaw_decode_failures}",
                     flush=True,
@@ -779,7 +1219,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[pose_proxy] done. total_ticks={tick} fwd={fwd_frames} "
-        f"idle={idle_frames}",
+        f"hold={hold_frames} blend={blend_frames} idle={idle_frames} "
+        f"gap_skip={gap_skips}",
         flush=True,
     )
     return 0

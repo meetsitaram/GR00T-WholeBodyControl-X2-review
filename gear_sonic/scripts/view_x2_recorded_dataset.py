@@ -81,6 +81,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import rerun as rr
+import rerun.blueprint as rrb
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -236,6 +237,54 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "flush into the spawned viewer. Ignored when --save is "
         "set (the .rrd sink writes synchronously).",
     )
+    p.add_argument(
+        "--ee-trace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run forward kinematics on the canonical x2_ultra MJCF for "
+        "each frame and log the LEFT + RIGHT wrist 3-D positions "
+        "(pelvis-relative). Adds:\n"
+        "  * 3 scalar series per side (``tcp/<side>_wrist/x|y|z``)\n"
+        "  * 1 animated 3-D point per side (``tcp/<side>_wrist``)\n"
+        "  * 1 static line trail per side (``tcp/<side>_wrist_path``)\n"
+        "This is the real metric for grasping-task progress. The 31-dim "
+        "wire (``action.body_q_mj``) is the source; root is held at "
+        "identity so the path is purely arm-pose driven (invariant to "
+        "walking). Pass --no-ee-trace to skip.",
+    )
+    p.add_argument(
+        "--ee-mjcf",
+        type=Path,
+        default=None,
+        help="Override the MJCF used for end-effector FK. Defaults to "
+        "``gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml``. "
+        "The MJCF must expose the 31 X2 body joints by their canonical "
+        "names plus the ``left_wrist_roll_link`` and "
+        "``right_wrist_roll_link`` bodies.",
+    )
+    p.add_argument(
+        "--blueprint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Send a default Rerun blueprint that arranges the cameras "
+        "in a 2×2 grid (top-left), the 3-D wrist trace in its own pane "
+        "(top-right), and the joint / TCP scalar series in a chart pane "
+        "underneath. Pass --no-blueprint to keep whatever layout the "
+        "viewer already had cached for this recording id (handy if "
+        "you've hand-customised the panes and saved them).",
+    )
+    p.add_argument(
+        "--ee-source",
+        choices=("action", "observation"),
+        default="action",
+        help="Which 31-dim column drives FK. 'action' uses "
+        "``action.body_q_mj`` (the wire delivered by the VLA bridge "
+        "= what we COMMANDED the robot to do). 'observation' uses the "
+        "first 31 dims of ``observation.state`` (what we MEASURED). "
+        "Defaults to 'action' so the trace lines up with policy intent. "
+        "Note: in VLA subscribe-mode the recorder mirrors the wire into "
+        "``observation.state``, so both sources are identical there.",
+    )
     return p.parse_args(argv)
 
 
@@ -294,6 +343,128 @@ def _resolve_episode_paths(
             video_key=key,
         )
     return parquet_path, video_paths
+
+
+# Wrist FK helpers (joint-name table + per-frame FK loop) live in a
+# shared module so the segmentation pipeline and diagnostic CLIs can
+# reuse them. The thin wrapper below preserves the viewer's existing
+# call sites (positional ``mjcf_path``, ``body_q_mj_series``) and
+# routes the prints through the ``[view]`` prefix.
+from gear_sonic.utils.teleop.x2_fk_wrist import (  # noqa: E402
+    X2_BODY_JOINT_NAMES_31 as _X2_BODY_JOINT_NAMES_31,
+    compute_wrist_trajectories as _compute_wrist_trajectories_shared,
+)
+
+
+def _compute_wrist_trajectories(
+    mjcf_path: Path,
+    body_q_mj_series: np.ndarray,
+) -> dict[str, np.ndarray] | None:
+    """Viewer-flavoured wrapper around the shared wrist-FK helper.
+
+    Keeps the existing call signature (``mjcf_path`` positional first,
+    then the joint-pose series) and the ``[view]`` log prefix so the
+    viewer logs are unchanged. See
+    :func:`gear_sonic.utils.teleop.x2_fk_wrist.compute_wrist_trajectories`
+    for the actual implementation.
+    """
+    return _compute_wrist_trajectories_shared(
+        body_q_mj_series,
+        mjcf_path=mjcf_path,
+        log_prefix="[view]",
+    )
+
+
+def _build_default_blueprint(
+    camera_keys: list[str],
+    has_ee_trace: bool,
+) -> "rrb.Blueprint":
+    """Construct a sensible default layout for the viewer.
+
+    Layout:
+
+    .. code-block::
+
+        +-------------------+--------------------+
+        | head_front | ego  |  wrist trajectory  |
+        +------------+------+   (Spatial3D)      |
+        | stereo_L   | st_R |                    |
+        +-------------------+--------------------+
+        |          signals (TimeSeries)          |
+        +----------------------------------------+
+
+    The camera grid auto-collapses to whatever cameras actually exist
+    in the recording (so 1-cam smoketests, 3-cam stereo-only sessions,
+    and the full 4-cam VLA dataset all render cleanly).
+    """
+    # ── Cameras: 2×2 (or smaller) grid of Spatial2DView panes ─────────
+    camera_views: list[rrb.View] = [
+        rrb.Spatial2DView(
+            origin=key,
+            name=key.split(".")[-1],
+        )
+        for key in camera_keys
+    ]
+    if camera_views:
+        n_cols = 2 if len(camera_views) > 1 else 1
+        cameras_container: rrb.Container | rrb.View = rrb.Grid(
+            *camera_views,
+            grid_columns=n_cols,
+            name="cameras",
+        )
+    else:
+        # Degenerate case: parquet has no video tracks. Use an empty
+        # text-doc-style placeholder so the layout still composes.
+        cameras_container = rrb.TextDocumentView(
+            origin="/", name="cameras (none)"
+        )
+
+    # ── Right column: 3-D wrist trace + scalar plots ──────────────────
+    right_top_views: list[rrb.View] = []
+    if has_ee_trace:
+        right_top_views.append(
+            rrb.Spatial3DView(
+                origin="tcp",
+                name="wrist trajectories",
+                line_grid=rrb.LineGrid3D(visible=True),
+            )
+        )
+
+    signals_view = rrb.TimeSeriesView(
+        origin="/",
+        contents=[
+            "observation.state/**",
+            "observation.projected_gravity/**",
+            "action.body_q_mj/**",
+            "action.left_hand_joints/**",
+            "action.right_hand_joints/**",
+            "action.body_q_mj_pre_sonic/**",
+            "action.left_hand_joints_pre_sonic/**",
+            "action.right_hand_joints_pre_sonic/**",
+            "tcp/**/x",
+            "tcp/**/y",
+            "tcp/**/z",
+        ],
+        name="signals",
+    )
+
+    if right_top_views:
+        right_column: rrb.Container = rrb.Vertical(
+            *right_top_views,
+            signals_view,
+            row_shares=[1.0, 1.0],
+            name="right_pane",
+        )
+    else:
+        right_column = signals_view  # type: ignore[assignment]
+
+    layout = rrb.Horizontal(
+        cameras_container,
+        right_column,
+        column_shares=[1.0, 1.0],
+        name="root",
+    )
+    return rrb.Blueprint(layout, collapse_panels=False)
 
 
 def _expand_scalar_columns(
@@ -408,6 +579,23 @@ def main(argv: list[str] | None = None) -> int:
         rr.init(recording_id, spawn=True)
         print("[view] rerun viewer spawned", flush=True)
 
+    # ── 0) Send a default blueprint so the layout is stable across runs.
+    #
+    # Rerun normally derives the default blueprint from the entity tree.
+    # When we add new entities between runs (e.g. when --ee-trace flips
+    # on the ``tcp/`` 3-D ribbons), the auto-generated blueprint reshuffles
+    # the panes, blanks half the camera grid, and pushes the 3-D view
+    # somewhere unhelpful. Sending an explicit blueprint pins the layout:
+    # cameras on the left (2×2 grid), wrist 3-D + signals on the right.
+    # Pass --no-blueprint to opt out (e.g. when iterating on a manual
+    # layout you've saved in the viewer).
+    if args.blueprint:
+        live_cameras = [k for k, p in video_paths.items() if p.is_file()]
+        bp = _build_default_blueprint(
+            live_cameras, has_ee_trace=args.ee_trace
+        )
+        rr.send_blueprint(bp)
+
     # ── 1) Log each video as a static asset ──────────────────────────
     fps = float(info.get("fps", 50))
     nanos_per_frame = int(round(1e9 / fps))
@@ -415,6 +603,13 @@ def main(argv: list[str] | None = None) -> int:
         if not vpath.is_file():
             continue
         rr.log(key, rr.AssetVideo(path=str(vpath)), static=True)
+
+    # Robot frame convention: +x forward, +y left, +z up. Pinning this on
+    # the ``tcp/`` namespace makes the auto-camera in the Spatial3DView
+    # land at a useful eye / target / up triple instead of a top-down
+    # near-orthographic projection.
+    if args.ee_trace:
+        rr.log("tcp", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     # ── 2) Build columnar batches (NOT per-row rr.log) ────────────────
     #
@@ -546,6 +741,130 @@ def main(argv: list[str] | None = None) -> int:
             indexes=time_cols_scalars,
             columns=rr.Scalars.columns(scalars=values),
         )
+
+    # ── 3) End-effector FK trace (left/right wrist 3-D path) ─────────
+    #
+    # The 31-dim ``action.body_q_mj`` (or first 31 of ``observation.state``)
+    # encodes commanded joint angles; what the operator actually cares
+    # about for grasping is *where the wrist ended up in 3-D*. We run
+    # forward kinematics on the canonical x2_ultra MJCF for every frame
+    # and surface the wrist positions as:
+    #
+    #   (a) 3 scalar series per side -> easy to plot alongside the joint
+    #       traces in the existing chart panes.
+    #   (b) An animated ``Points3D`` per side -> shows the current wrist
+    #       position when the playhead moves through a 3-D view.
+    #   (c) A static ``LineStrips3D`` per side -> shows the full
+    #       trajectory as a 3-D ribbon (toggleable independent of the
+    #       timeline).
+    #
+    # Root is held at identity so the path is purely arm + waist pose
+    # driven; walking / base drift do NOT contaminate the trace.
+    if args.ee_trace:
+        src_col = (
+            "action.body_q_mj"
+            if args.ee_source == "action"
+            else "observation.state"
+        )
+        if src_col not in table.column_names:
+            print(
+                f"[view] WARN: --ee-source={args.ee_source} requested "
+                f"but column {src_col!r} is not in the parquet; "
+                "skipping end-effector trace.",
+                flush=True,
+            )
+        else:
+            raw = np.asarray(
+                table.column(src_col).to_pylist(),
+                dtype=np.float64,
+            )
+            if raw.ndim != 2 or raw.shape[1] < 31:
+                print(
+                    f"[view] WARN: {src_col} has shape {raw.shape}, "
+                    "expected (N, >=31); skipping FK trace.",
+                    flush=True,
+                )
+            else:
+                mjcf_path = (
+                    args.ee_mjcf
+                    if args.ee_mjcf is not None
+                    else REPO_ROOT
+                    / "gear_sonic" / "data" / "assets"
+                    / "robot_description" / "mjcf" / "x2_ultra.xml"
+                )
+                if not mjcf_path.is_file():
+                    print(
+                        f"[view] WARN: --ee-mjcf {mjcf_path} not found; "
+                        "skipping end-effector trace.",
+                        flush=True,
+                    )
+                    wrist_paths = None
+                else:
+                    print(
+                        f"[view] running FK on {mjcf_path.name} "
+                        f"(source={src_col}, {raw.shape[0]} frames)…",
+                        flush=True,
+                    )
+                    wrist_paths = _compute_wrist_trajectories(
+                        mjcf_path, raw
+                    )
+
+                if wrist_paths is not None:
+                    for body_name, xyz in wrist_paths.items():
+                        side = (
+                            "left" if "left" in body_name else "right"
+                        )
+                        ee_key = f"tcp/{side}_wrist"
+                        path_key = f"tcp/{side}_wrist_path"
+
+                        # (a) Per-axis scalar series for chart panes
+                        for d, axis in enumerate(("x", "y", "z")):
+                            axis_values = xyz[:, d].astype(np.float64)
+                            if idx_subset is not None:
+                                axis_values = axis_values[idx_subset]
+                            rr.send_columns(
+                                f"{ee_key}/{axis}",
+                                indexes=time_cols_scalars,
+                                columns=rr.Scalars.columns(
+                                    scalars=axis_values
+                                ),
+                            )
+
+                        # (b) Animated Points3D (one point per frame
+                        # so the 3-D view shows the wrist "now"). We
+                        # send one point per frame via the columnar
+                        # API: positions=(N, 1, 3) is interpreted as
+                        # one point per index (N indices, batch of 1).
+                        rr.send_columns(
+                            ee_key,
+                            indexes=time_cols,
+                            columns=rr.Points3D.columns(
+                                positions=xyz.reshape(-1, 3),
+                            ),
+                        )
+
+                        # (c) Full static trajectory ribbon
+                        rr.log(
+                            path_key,
+                            rr.LineStrips3D(
+                                [xyz.tolist()],
+                                colors=[
+                                    [255, 80, 80]
+                                    if side == "left"
+                                    else [80, 200, 255]
+                                ],
+                                radii=[0.004],
+                            ),
+                            static=True,
+                        )
+
+                    print(
+                        f"[view] end-effector trace logged for "
+                        f"{', '.join(wrist_paths.keys())} "
+                        "(see ``tcp/<side>_wrist/{x,y,z}`` chart "
+                        "panes + 3-D ``tcp/`` entities).",
+                        flush=True,
+                    )
 
     # Drain pending TCP sends before the script exits.
     if args.save is None and args.drain_sec > 0:

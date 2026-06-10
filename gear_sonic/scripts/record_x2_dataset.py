@@ -446,22 +446,48 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # manager's arm_targets / hand_finger_cmd / stream_mode /
     # recorder_cmd topics. Mixing the two is rejected at startup.
     parser.add_argument(
-        "--body-pose-source", choices=("internal", "zmq"), default="internal",
+        "--body-pose-source",
+        choices=("internal", "zmq", "vla"),
+        default="internal",
         help=(
             "Where the recorder gets its 31-DOF body_pose reference "
             "from. 'internal' (default): legacy in-process Quest 3 + "
             "VR IK. 'zmq': subscribe to the planner's body_pose topic "
             "(use with --arm-targets-source=zmq for the Phase 0 "
-            "planner-driven stack)."
+            "planner-driven stack). 'vla': subscribe to the live VLA "
+            "bridge's unified 'pose' stream on port 5556 (the bridge "
+            "embeds arms + hands + token in the same payload, so the "
+            "manager SUB is skipped). VLA mode auto-starts a single "
+            "episode on first body_pose and auto-saves on shutdown -- "
+            "use it from run_x2_vla_runtime.sh --with-record."
         ),
     )
     parser.add_argument(
-        "--arm-targets-source", choices=("internal", "zmq"), default="internal",
+        "--arm-targets-source",
+        choices=("internal", "zmq", "vla"),
+        default="internal",
         help=(
             "Where arm_targets + hand_finger_cmd come from. 'internal' "
             "runs IK + finger filter inline; 'zmq' subscribes to the "
             "manager's arm_targets / hand_finger_cmd / stream_mode / "
-            "recorder_cmd topics. Must match --body-pose-source."
+            "recorder_cmd topics; 'vla' takes arms + hands from the "
+            "same VLA bridge pose payload (no separate manager). "
+            "Must match --body-pose-source."
+        ),
+    )
+    parser.add_argument(
+        "--ready-file",
+        type=Path,
+        default=None,
+        help=(
+            "Touch this file the moment the recorder ingests its first "
+            "body_pose (subscribe-mode only). Paired with the VLA "
+            "bridge's --wait-for-ready-file, this prevents the bridge "
+            "from starting inference until the recorder is fully "
+            "subscribed -- so the recording captures the arm rise from "
+            "idle instead of missing the first ~8 s of warm-up. The "
+            "run_x2_vla_runtime.sh launcher wires both ends "
+            "automatically when --with-record is set."
         ),
     )
     parser.add_argument(
@@ -718,6 +744,7 @@ def main(argv: list[str] | None = None) -> int:
         gesture_future_dt_s=args.gesture_future_dt_s,
         gesture_future_window_frames=args.gesture_future_window_frames,
         idle_publish_enabled=(not args.no_idle_publish),
+        ready_file=args.ready_file,
         verbose=(not args.quiet),
     )
 

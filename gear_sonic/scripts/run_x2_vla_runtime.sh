@@ -195,6 +195,22 @@ BOLD=$'\033[1m'
 : "${VLA_CHUNK_BLEND_TICKS:=40}"
 : "${VLA_MAX_ACTION_IL:=8.0}"
 : "${VLA_DECODE_DELAY_TICKS:=150}"
+# When set, --vla-raw zeros every wire-shaping knob added on top of
+# the policy output -- LPFs, per-tick clamps, chunk blends, and the
+# dev-from-body cap. The startup ramp (VLA_RAMP_IN_TICKS) and deploy
+# stabilization delay (VLA_DECODE_DELAY_TICKS) are intentionally LEFT
+# ON because they only affect the first ~0.5-3 s of the run and exist
+# to prevent a step-input shove onto the SONIC tracker at deploy
+# hand-off. CRITICAL: VLA_MAX_ACTION_IL stays at its 8.0 default --
+# it is NOT a wire shaper, it clips the policy's own ``last_action``
+# proprio echo to match the training ``action_clip_value=20``
+# headroom. Disabling it creates a positive-feedback loop (proprio's
+# last_action grows unboundedly -> policy predicts ever-larger
+# action_il -> repeat) that diverges within a few chunks and ends
+# with the wire commanding joints at 90+ rad. PC2's
+# --max-target-dev guard on the SONIC tracker remains active
+# regardless and is the last line of defense for runaway poses.
+: "${VLA_RAW:=0}"
 : "${VLA_BODY_MODE:=manipulation}"
 : "${VLA_MODE_CONTROL_FILE:=}"
 : "${VLA_FREEZE_BODY_GROUPS:=}"
@@ -224,10 +240,39 @@ BOLD=$'\033[1m'
 : "${SIM_WITH_OMNIHAND:=1}"
 : "${SIM_MAX_TARGET_DEV:=}"
 : "${SIM_DEPLOY_TARGET_LPF_HZ:=}"
+# Robocasa scene override for sim mode. Empty -> deploy default (x2_ultra.xml,
+# empty world). Set to a short name like "X2PickPlaceApple" and the launcher
+# resolves it to gear_sonic/data/assets/robocasa_scenes/<name>.xml and passes
+# it to the sim deploy via --sim-mjcf. Ignored on real-robot runs.
+: "${ROBOCASA_ENV:=}"
+ROBOCASA_SCENE_DIR="${REPO_ROOT}/gear_sonic/data/assets/robocasa_scenes"
+ROBOCASA_SCENE_XML=""
 : "${RENDER_WIDTH:=640}"
 : "${RENDER_HEIGHT:=480}"
 : "${VIDEO_OUT:=}"
 : "${VIDEO_FRONT_OUT:=}"
+
+# ── --with-record knobs (mirror the teleop launcher's recording surface).
+# When WITH_RECORD=1 the launcher spawns gear_sonic/scripts/record_x2_dataset
+# in "vla" subscribe mode (one-run = one-episode auto-save) AFTER the bridge
+# logs ``policy ready``. The recorder lives on the laptop alongside the
+# bridge; it subscribes to the bridge's :5556 pose PUB for body + hands +
+# token, the deploy's :5557 x2_debug for proprio, and (in real-robot mode)
+# the PC2 :5555 camera bridge for head_front + stereo_left + stereo_right
+# RGB tracks. ``observation.images.ego_view`` is the MuJoCo render the
+# recorder builds inline; head cams default ON in real-robot mode (we have
+# them) and OFF in sim (no PC2 to fetch from -- pass --head-cameras + a
+# camera host to record sim stereo from a separate publisher if you ever
+# need that).
+: "${WITH_RECORD:=0}"
+: "${OUTPUT_DIR:=}"
+: "${TASK:=}"
+: "${HEAD_CAMERAS:=}"   # default resolved after SIM_MODE is known
+: "${CAMERA_HOST:=}"    # default to PC2_HOST in real mode
+: "${CAMERA_PORT:=${PC2_CAMERAS_PORT:-5555}}"
+: "${ENCODER_CONFIG:=gear_sonic/data/encoder/x2_observation_config.yaml}"
+: "${SONIC_TOKENIZER_DEVICE:=cpu}"
+: "${RECORDER_PY:=${REPO_ROOT}/.venv/bin/python}"
 
 DEPLOY_SH="${REPO_ROOT}/gear_sonic_deploy/deploy_x2.sh"
 
@@ -245,6 +290,10 @@ Flags (preferred over env vars):
   --run-dir PATH               Log output directory
   --onnx PATH                  SONIC ONNX for sim deploy (sim only)
   --sim-profile PROFILE        Sim deploy profile: handoff|parity|gantry (sim)
+  --robocasa-env NAME          Load a Robocasa scene in sim instead of the empty
+                               default. NAME is a short id (e.g. X2PickPlaceApple)
+                               resolved against gear_sonic/data/assets/robocasa_scenes/.
+                               Sim-only; rejected when --pc2-host is set.
   --no-sim-viewer              Disable MuJoCo passive viewer (sim)
   --vla-ramp-in-ticks N        Bridge ramp-in ticks (default: 75)
   --vla-target-lpf-hz HZ       Body wire LPF (default: 2.0)
@@ -255,12 +304,47 @@ Flags (preferred over env vars):
   --vla-max-wire-dev-from-body R Max wire pose deviation from body_q (default: 0.18)
   --vla-max-wire-step R          Max per-tick wire joint step (default: 0.035)
   --vla-decode-delay-ticks N     Idle ticks before VLA decode (default: 150)
+  --vla-raw                      Disable EVERY bridge-side wire-shaping
+                                 knob: LPFs, per-tick clamps, chunk
+                                 blends, dev-from-body cap, and action-il
+                                 clamp are all zeroed. The startup ramp +
+                                 decode delay stay on (they fire once at
+                                 hand-off, not in steady state). PC2's
+                                 --max-target-dev guard on the SONIC
+                                 tracker remains active. Useful for
+                                 visualising raw policy chunks; expect
+                                 jerky motion and use the E-stop.
   --body-mode MODE               manipulation | locomotion (VR analog)
   --mode-control-file PATH       Runtime mode switch file (one word per line)
   --freeze-body-groups LIST      Override manipulation freeze groups (default legs,waist)
   --render-width / --render-height   Ghost camera resolution (sim)
   --video-out PATH             Record ego_view MP4 (sim, ghost mode)
   --video-front-out PATH       Record third-person MP4 (sim)
+  --with-record                Spawn record_x2_dataset alongside the bridge
+                               (one-run = one-episode auto-save). Requires
+                               --output-dir and --task.
+  --output-dir PATH            LeRobot v2.1 dataset directory (required with
+                               --with-record). Convention:
+                               data/lerobot/vla_run_<task>_<checkpoint>/
+  --task TEXT                  Language instruction for every episode in this
+                               dataset (required with --with-record).
+  --head-cameras / --no-head-cameras
+                               Force-enable / force-disable head-camera ingest
+                               by the recorder. Default: ON in real-robot mode
+                               (PC2 :5555 head_front + stereo_left + stereo_right),
+                               OFF in sim mode (no PC2 to fetch from).
+  --camera-host HOST           PC2 host for the camera SUB. Defaults to
+                               --pc2-host in real mode.
+  --camera-port PORT           PC2 camera ZMQ port (default 5555).
+  --encoder-config PATH        Encoder observation YAML for the inline SONIC
+                               tokenizer (default gear_sonic/data/encoder/
+                               x2_observation_config.yaml). Pass '' to fall
+                               back to the deprecated freeze-pose path.
+  --sonic-tokenizer-device DEV cuda:0|cuda:N|cpu for the inline tokenizer
+                               (default cpu so the GR00T policy keeps cuda:0).
+  --recorder-py PATH           Python interpreter for record_x2_dataset
+                               (default .venv/bin/python so the LeRobot deps
+                               install path is hit, not env_isaaclab).
   -h, --help                   Show this help
 
 Commands:
@@ -288,21 +372,23 @@ while [[ $# -gt 0 ]]; do
         --onnx|--sim-model) SIM_MODEL="$2"; shift 2 ;;
         --sim-profile)      SIM_PROFILE="$2"; shift 2 ;;
         --sim-rsi-pkl)      SIM_RSI_PKL="$2"; shift 2 ;;
+        --robocasa-env)     ROBOCASA_ENV="$2"; shift 2 ;;
         --no-sim-viewer)    SIM_VIEWER=0; shift ;;
         --autostart-after)  SIM_AUTOSTART_AFTER="$2"; shift 2 ;;
         --max-target-dev)   SIM_MAX_TARGET_DEV="$2"; shift 2 ;;
         --deploy-target-lpf-hz) SIM_DEPLOY_TARGET_LPF_HZ="$2"; shift 2 ;;
         --vla-ramp-in-ticks) VLA_RAMP_IN_TICKS="$2"; shift 2 ;;
-        --vla-target-lpf-hz) VLA_TARGET_LPF_HZ="$2"; shift 2 ;;
-        --vla-future-lpf-hz) VLA_FUTURE_LPF_HZ="$2"; shift 2 ;;
-        --vla-hand-lpf-hz) VLA_HAND_LPF_HZ="$2"; shift 2 ;;
-        --vla-hand-chunk-blend-ticks) VLA_HAND_CHUNK_BLEND_TICKS="$2"; shift 2 ;;
-        --vla-max-hand-step) VLA_MAX_HAND_STEP="$2"; shift 2 ;;
-        --vla-max-wire-dev-from-body) VLA_MAX_WIRE_DEV_FROM_BODY="$2"; shift 2 ;;
-        --vla-max-wire-step) VLA_MAX_WIRE_STEP="$2"; shift 2 ;;
-        --vla-chunk-blend-ticks) VLA_CHUNK_BLEND_TICKS="$2"; shift 2 ;;
-        --vla-max-action-il) VLA_MAX_ACTION_IL="$2"; shift 2 ;;
+        --vla-target-lpf-hz) VLA_TARGET_LPF_HZ="$2"; VLA_TARGET_LPF_HZ_SET=1; shift 2 ;;
+        --vla-future-lpf-hz) VLA_FUTURE_LPF_HZ="$2"; VLA_FUTURE_LPF_HZ_SET=1; shift 2 ;;
+        --vla-hand-lpf-hz) VLA_HAND_LPF_HZ="$2"; VLA_HAND_LPF_HZ_SET=1; shift 2 ;;
+        --vla-hand-chunk-blend-ticks) VLA_HAND_CHUNK_BLEND_TICKS="$2"; VLA_HAND_CHUNK_BLEND_TICKS_SET=1; shift 2 ;;
+        --vla-max-hand-step) VLA_MAX_HAND_STEP="$2"; VLA_MAX_HAND_STEP_SET=1; shift 2 ;;
+        --vla-max-wire-dev-from-body) VLA_MAX_WIRE_DEV_FROM_BODY="$2"; VLA_MAX_WIRE_DEV_FROM_BODY_SET=1; shift 2 ;;
+        --vla-max-wire-step) VLA_MAX_WIRE_STEP="$2"; VLA_MAX_WIRE_STEP_SET=1; shift 2 ;;
+        --vla-chunk-blend-ticks) VLA_CHUNK_BLEND_TICKS="$2"; VLA_CHUNK_BLEND_TICKS_SET=1; shift 2 ;;
+        --vla-max-action-il) VLA_MAX_ACTION_IL="$2"; VLA_MAX_ACTION_IL_SET=1; shift 2 ;;
         --vla-decode-delay-ticks) VLA_DECODE_DELAY_TICKS="$2"; shift 2 ;;
+        --vla-raw) VLA_RAW=1; shift ;;
         --body-mode)          VLA_BODY_MODE="$2"; shift 2 ;;
         --mode-control-file) VLA_MODE_CONTROL_FILE="$2"; shift 2 ;;
         --hands-only)
@@ -338,6 +424,16 @@ while [[ $# -gt 0 ]]; do
         --fast-abort)       FAST_ABORT=1; shift ;;
         --no-cameras-autostart) CAMERAS_AUTOSTART=0; shift ;;
         --pc2-user)         PC2_USER="$2"; shift 2 ;;
+        --with-record)      WITH_RECORD=1; shift ;;
+        --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
+        --task)             TASK="$2"; shift 2 ;;
+        --head-cameras)     HEAD_CAMERAS=1; shift ;;
+        --no-head-cameras)  HEAD_CAMERAS=0; shift ;;
+        --camera-host)      CAMERA_HOST="$2"; shift 2 ;;
+        --camera-port)      CAMERA_PORT="$2"; shift 2 ;;
+        --encoder-config)   ENCODER_CONFIG="$2"; shift 2 ;;
+        --sonic-tokenizer-device) SONIC_TOKENIZER_DEVICE="$2"; shift 2 ;;
+        --recorder-py)      RECORDER_PY="$2"; shift 2 ;;
         -h|--help)          usage ;;
         *)                  ARGS+=("$1"); shift ;;
     esac
@@ -346,6 +442,49 @@ done
 # ----- defaults derived after parsing -----------------------------------
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="/tmp/x2_vla_runtime-$(date +%Y%m%d_%H%M%S)"
+fi
+
+# --vla-raw overrides every wire-shaping knob to its "disabled" value
+# (the bridge accepts 0 as "off" for each of these per its argparse
+# help text). The startup ramp + decode delay stay on. Operator-set
+# overrides for the same knobs win silently in the loose sense but
+# emit a warn so the operator knows their intent might be in tension
+# with --vla-raw. We snapshot ``*_SET`` markers in the arg-parser
+# above whenever an operator explicitly types one of these flags so
+# the warning fires only on real conflicts, not on env-default
+# values that happen to differ from the raw=0 target.
+if [[ "$VLA_RAW" -eq 1 ]]; then
+    declare -A _VLA_RAW_CONFLICTS=()
+    # NOTE: VLA_MAX_ACTION_IL is NOT in this list and NOT zeroed below.
+    # It clips the policy's own ``last_action`` proprio echo (not the
+    # wire) and disabling it triggers a proprio-feedback runaway that
+    # blows the wire up to 90+ rad within a few chunks (observed in
+    # /tmp/x2_vla_runtime-20260609_090317). Operators who really want
+    # to disable it must pass --vla-max-action-il 0 explicitly.
+    for knob in \
+        VLA_TARGET_LPF_HZ VLA_FUTURE_LPF_HZ VLA_HAND_LPF_HZ \
+        VLA_HAND_CHUNK_BLEND_TICKS VLA_MAX_HAND_STEP \
+        VLA_MAX_WIRE_DEV_FROM_BODY VLA_MAX_WIRE_STEP \
+        VLA_CHUNK_BLEND_TICKS; do
+        setvar="${knob}_SET"
+        if [[ "${!setvar:-0}" -eq 1 ]]; then
+            _VLA_RAW_CONFLICTS["$knob"]="${!knob}"
+        fi
+    done
+    if [[ ${#_VLA_RAW_CONFLICTS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[vla-runtime] --vla-raw overrides these operator-set knobs:${NC}" >&2
+        for k in "${!_VLA_RAW_CONFLICTS[@]}"; do
+            echo -e "${YELLOW}    ${k}=${_VLA_RAW_CONFLICTS[$k]}  ->  0 (disabled by --vla-raw)${NC}" >&2
+        done
+    fi
+    VLA_TARGET_LPF_HZ=0
+    VLA_FUTURE_LPF_HZ=0
+    VLA_HAND_LPF_HZ=0
+    VLA_HAND_CHUNK_BLEND_TICKS=0
+    VLA_MAX_HAND_STEP=0
+    VLA_MAX_WIRE_DEV_FROM_BODY=0
+    VLA_MAX_WIRE_STEP=0
+    VLA_CHUNK_BLEND_TICKS=0
 fi
 
 # Backwards-compat env: if MOTION_TOKEN_DECODER wasn't given but
@@ -383,10 +522,78 @@ else
     DEBUG_SUB_HOST="localhost"
 fi
 
+# --robocasa-env validation (sim-only). Resolve the short name to an absolute
+# MJCF path under gear_sonic/data/assets/robocasa_scenes/<NAME>.xml and fail
+# loud if the scene isn't pre-built. On real-robot runs the flag makes no
+# sense (scene comes from physics, not MuJoCo), so reject early.
+if [[ -n "$ROBOCASA_ENV" ]]; then
+    if [[ "$SIM_MODE" -ne 1 ]]; then
+        echo -e "${RED}[vla-runtime] --robocasa-env is sim-only; remove it or drop --pc2-host${NC}" >&2
+        exit 2
+    fi
+    ROBOCASA_SCENE_XML="${ROBOCASA_SCENE_DIR}/${ROBOCASA_ENV}.xml"
+    if [[ ! -f "$ROBOCASA_SCENE_XML" ]]; then
+        echo -e "${RED}[vla-runtime] no robocasa scene at ${ROBOCASA_SCENE_XML}${NC}" >&2
+        echo -e "${YELLOW}  available envs:${NC}" >&2
+        for xml in "${ROBOCASA_SCENE_DIR}"/*.xml; do
+            [[ -e "$xml" ]] || continue
+            local_name="$(basename "$xml" .xml)"
+            echo -e "${YELLOW}    --robocasa-env ${local_name}${NC}" >&2
+        done
+        echo -e "${YELLOW}  (re-build assets via: python gear_sonic/scripts/build_x2_robocasa_assets.py)${NC}" >&2
+        exit 2
+    fi
+fi
+
 PID_FILE_BRIDGE="${RUN_DIR}/bridge.pid"
 LOG_FILE_BRIDGE="${RUN_DIR}/bridge.log"
 PID_FILE_DEPLOY="${RUN_DIR}/deploy.pid"
 LOG_FILE_DEPLOY="${RUN_DIR}/deploy.log"
+PID_FILE_RECORDER="${RUN_DIR}/recorder.pid"
+LOG_FILE_RECORDER="${RUN_DIR}/recorder.log"
+# Bridge<->recorder ready-file handshake. Always defined so the bridge
+# CLI is stable, but only wired into BRIDGE_ARGS / recorder_args below
+# when WITH_RECORD=1 (otherwise the bridge starts inference immediately
+# the moment policy loads, matching legacy behaviour).
+RECORDER_READY_FILE="${RUN_DIR}/recorder_ready"
+
+# ── --with-record validation + default resolution ─────────────────────────
+# Validate the flag combination NOW (before any subprocess spawns) so a
+# bad command-line fails fast instead of after the bridge is half-up.
+if [[ "$WITH_RECORD" -eq 1 ]]; then
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        echo -e "${RED}[vla-runtime] --with-record requires --output-dir PATH${NC}" >&2
+        echo -e "${YELLOW}  e.g. --output-dir data/lerobot/vla_run_x2_pick_and_place_soda_can_n17_50k_v1${NC}" >&2
+        exit 2
+    fi
+    if [[ -z "$TASK" ]]; then
+        echo -e "${RED}[vla-runtime] --with-record requires --task TEXT${NC}" >&2
+        echo -e "${YELLOW}  e.g. --task \"pick up the mini soda can with your left hand and place it in the open black container on the right\"${NC}" >&2
+        exit 2
+    fi
+    if [[ -z "$MOTION_TOKEN_DECODER" ]]; then
+        echo -e "${RED}[vla-runtime] --with-record requires --motion-token-decoder PATH${NC}" >&2
+        echo -e "${YELLOW}  (the recorder runs the SONIC inline tokenizer to compute action.motion_token labels; without it the column is zeros and the dataset is NOT VLA-trainable)${NC}" >&2
+        exit 2
+    fi
+fi
+# Head-camera default: ON in real-robot mode (we have PC2 stereo), OFF
+# in sim (no PC2). Explicit --head-cameras / --no-head-cameras always
+# wins. Camera host defaults to PC2_HOST in real mode.
+if [[ -z "$HEAD_CAMERAS" ]]; then
+    if [[ "$SIM_MODE" -eq 1 ]]; then
+        HEAD_CAMERAS=0
+    else
+        HEAD_CAMERAS=1
+    fi
+fi
+if [[ -z "$CAMERA_HOST" && -n "$PC2_HOST" ]]; then
+    CAMERA_HOST="$PC2_HOST"
+fi
+if [[ "$WITH_RECORD" -eq 1 && "$HEAD_CAMERAS" -eq 1 && -z "$CAMERA_HOST" ]]; then
+    echo -e "${RED}[vla-runtime] --with-record + head cameras requires --camera-host HOST (or --pc2-host)${NC}" >&2
+    exit 2
+fi
 
 # ----- helpers ----------------------------------------------------------
 
@@ -498,6 +705,38 @@ stop_dump() {
     fi
 }
 
+stop_recorder() {
+    # Drain ordering matters: SIGTERM the recorder FIRST so the
+    # finally-block in _run_subscribe_mode auto-saves the open episode
+    # (auto-started on first body_pose). We wait up to 30 s because
+    # finalising a multi-minute LeRobot episode includes computing
+    # per-track video stats + flushing parquet shards.
+    if [[ ! -f "$PID_FILE_RECORDER" ]]; then
+        return 0
+    fi
+    local rpid
+    rpid="$(cat "$PID_FILE_RECORDER")"
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        log "recorder pid $rpid already dead; cleaning up pidfile."
+        rm -f "$PID_FILE_RECORDER"
+        return 0
+    fi
+    log "SIGTERM recorder pid=$rpid; waiting up to 30s for episode save …"
+    kill -TERM "$rpid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        sleep 1
+        if ! kill -0 "$rpid" 2>/dev/null; then
+            ok "recorder stopped cleanly (episode saved)."
+            rm -f "$PID_FILE_RECORDER"
+            return 0
+        fi
+    done
+    warn "recorder pid=$rpid still alive after 30s; SIGKILL (episode may be partial)"
+    kill -KILL "$rpid" 2>/dev/null || true
+    sleep 1
+    rm -f "$PID_FILE_RECORDER"
+}
+
 # Nuke any leftover sim/VLA processes regardless of which RUN_DIR they
 # were spawned from. The dockerized deploy keeps :5557 bound even after
 # the bridge exits; a second run's preflight must reach here or ports
@@ -538,6 +777,12 @@ kill_stale_sim_processes() {
 }
 
 stop_all() {
+    # Recorder FIRST so its finally-block can drain + save the open
+    # episode before the bridge / deploy disappear out from under it.
+    # The bridge still has time to receive recorder Ctrl-C, finish its
+    # current chunk, and exit cleanly because we wait for the recorder
+    # in stop_recorder.
+    stop_recorder
     stop_bridge
     stop_deploy
     stop_dump
@@ -854,6 +1099,106 @@ PY
     ok "  dump.pid = $(cat "${RUN_DIR}/dump.pid")"
 }
 
+spawn_recorder() {
+    # Spawn gear_sonic.scripts.record_x2_dataset in VLA subscribe mode.
+    # Pre-condition: the bridge has logged "policy ready" (model loaded,
+    # ramp-in clock started). On real-robot mode we also assume the PC2
+    # head-camera bridge is up because the launcher's preflight verified
+    # the :5555 PUB stream is alive.
+    #
+    # Episode lifecycle: one VLA run = one episode. The recorder
+    # auto-starts on first body_pose (no manager publishing
+    # ``recorder_cmd``) and the finally-block in _run_subscribe_mode
+    # auto-saves on SIGTERM. stop_recorder waits up to 30 s for the
+    # parquet/video flush to complete before SIGKILL.
+    if [[ "$WITH_RECORD" -ne 1 ]]; then
+        return 0
+    fi
+    if [[ ! -x "$RECORDER_PY" ]]; then
+        err "recorder python ${RECORDER_PY} not executable; cannot spawn"
+        err "  set --recorder-py to a venv with datasets / av / lerobot"
+        return 1
+    fi
+
+    local recorder_args=(
+        -m gear_sonic.scripts.record_x2_dataset
+        --body-pose-source vla
+        --arm-targets-source vla
+        --body-pose-sub-host localhost
+        --body-pose-sub-port "$LAPTOP_POSE_PORT"
+        --body-pose-sub-topic pose
+        --sub-host "$DEBUG_SUB_HOST"
+        --sub-port "$PC2_DEBUG_PORT"
+        --sub-topic x2_debug
+        --pub-host '*'
+        --pub-port "$LAPTOP_POSE_PORT"
+        --pub-topic pose
+        --rate "$RATE"
+        --output-dir "$OUTPUT_DIR"
+        --task "$TASK"
+        --sonic-checkpoint "$MOTION_TOKEN_DECODER"
+        --sonic-tokenizer-device "$SONIC_TOKENIZER_DEVICE"
+        --ready-file "$RECORDER_READY_FILE"
+    )
+    if [[ -n "$ENCODER_CONFIG" ]]; then
+        recorder_args+=(--encoder-config "$ENCODER_CONFIG")
+    fi
+    if [[ "$HEAD_CAMERAS" -eq 1 ]]; then
+        recorder_args+=(
+            --head-cameras
+            --camera-host "$CAMERA_HOST"
+            --camera-port "$CAMERA_PORT"
+        )
+    fi
+
+    log "spawning recorder -> ${LOG_FILE_RECORDER}"
+    log "  output_dir = ${OUTPUT_DIR}"
+    log "  task       = ${TASK}"
+    log "  head cams  = $([ "$HEAD_CAMERAS" -eq 1 ] && echo "ON (${CAMERA_HOST}:${CAMERA_PORT})" || echo OFF)"
+    log "  encoder    = ${ENCODER_CONFIG:-<deprecated freeze-pose>}"
+    log "  ready-file = ${RECORDER_READY_FILE}"
+    log "    (bridge is holding idle stand via --wait-for-ready-file"
+    log "     until the recorder touches this file; arm rise will land"
+    log "     inside the recorded episode instead of pre-recording)"
+    log "  CMD: ${RECORDER_PY} ${recorder_args[*]}"
+
+    # ``-u`` forces stdout / stderr to be line-buffered so the recorder
+    # log shows progress in real time. Without it Python defaults to
+    # block-buffered when stdout is a file (nohup redirect), and slow
+    # init steps (Pinocchio import, OnlineSonicTokenizer ~400 MB load)
+    # look like a silent hang -- the operator sees only the first
+    # ``flush=True`` print and assumes the process died.
+    # ``PYTHONUNBUFFERED=1`` is belt + suspenders for any subprocess
+    # the recorder spawns later (e.g. ffmpeg via lerobot's
+    # video encoder).
+    PYTHONPATH="${REPO_ROOT}" \
+    PYTHONUNBUFFERED=1 \
+    MUJOCO_GL=egl \
+    TQDM_DISABLE=1 \
+    nohup "$RECORDER_PY" -u "${recorder_args[@]}" \
+        > "$LOG_FILE_RECORDER" 2>&1 &
+    local rpid=$!
+    echo "$rpid" > "$PID_FILE_RECORDER"
+    log "recorder.pid = ${rpid}"
+
+    # Wait for the recorder to either:
+    #   (a) bind its camera SUB and log "first body_pose" once data flows
+    #       (success path), or
+    #   (b) crash during the writer-chain pip install / preflight.
+    # We give it up to 60 s -- pip-installing datasets/av/lerobot on a
+    # cold venv can take 30+ s, and the camera warmup itself is bounded
+    # at 8 s -- then carry on. If the recorder is still alive but
+    # hasn't logged either marker we assume it's working and just
+    # haven't seen body_pose yet.
+    sleep 1
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        err "recorder died immediately; tail of log:"
+        tail -n 40 "$LOG_FILE_RECORDER" >&2 || true
+        return 1
+    fi
+    ok "recorder up (episode will auto-start on first VLA body_pose)"
+}
+
 print_sim_artifacts() {
     echo
     log "=== sim run artifacts (for iteration) ==="
@@ -907,6 +1252,9 @@ spawn_sim_deploy() {
     fi
     if [[ "$SIM_WITH_OMNIHAND" -eq 1 ]]; then
         deploy_args+=(--sim-with-omnihand)
+    fi
+    if [[ -n "$ROBOCASA_SCENE_XML" ]]; then
+        deploy_args+=(--sim-mjcf "$ROBOCASA_SCENE_XML")
     fi
     if [[ -n "${SIM_MAX_TARGET_DEV:-}" ]]; then
         deploy_args+=(--max-target-dev "$SIM_MAX_TARGET_DEV")
@@ -985,6 +1333,7 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
     cat <<EOF
   ${BOLD}Sim ONNX        ${NC}: ${SIM_MODEL}
   ${BOLD}Sim profile     ${NC}: ${SIM_PROFILE} (viewer=$([[ "$SIM_VIEWER" -eq 1 ]] && echo on || echo off))
+  ${BOLD}Sim scene       ${NC}: $([[ -n "$ROBOCASA_SCENE_XML" ]] && echo "robocasa: ${ROBOCASA_ENV} (${ROBOCASA_SCENE_XML})" || echo "default x2_ultra.xml (empty world)")
   ${BOLD}x2_debug SUB    ${NC}: tcp://localhost:${PC2_DEBUG_PORT}
   ${BOLD}Cameras         ${NC}: ghost MuJoCo renderer (modality-driven stereo keys)
 EOF
@@ -1000,13 +1349,24 @@ cat <<EOF
   ${BOLD}Modality config ${NC}: ${MODALITY_CONFIG}
   ${BOLD}Body mode       ${NC}: ${VLA_BODY_MODE}$( [[ -n "$VLA_MODE_CONTROL_FILE" ]] && echo " (runtime switch: ${VLA_MODE_CONTROL_FILE})" )
   ${BOLD}Token decoder   ${NC}: ${MOTION_TOKEN_DECODER:-DISABLED (body will track idle_stand only)}
-  ${BOLD}Wire safety     ${NC}: ramp ${VLA_RAMP_IN_TICKS}t bodyLPF ${VLA_TARGET_LPF_HZ}Hz futLPF ${VLA_FUTURE_LPF_HZ}Hz handLPF ${VLA_HAND_LPF_HZ}Hz handBlend ${VLA_HAND_CHUNK_BLEND_TICKS}t handStep≤${VLA_MAX_HAND_STEP} bodyStep≤${VLA_MAX_WIRE_STEP} body≤${VLA_MAX_WIRE_DEV_FROM_BODY} blend ${VLA_CHUNK_BLEND_TICKS}t
+  ${BOLD}Wire safety     ${NC}: ramp ${VLA_RAMP_IN_TICKS}t bodyLPF ${VLA_TARGET_LPF_HZ}Hz futLPF ${VLA_FUTURE_LPF_HZ}Hz handLPF ${VLA_HAND_LPF_HZ}Hz handBlend ${VLA_HAND_CHUNK_BLEND_TICKS}t handStep≤${VLA_MAX_HAND_STEP} bodyStep≤${VLA_MAX_WIRE_STEP} body≤${VLA_MAX_WIRE_DEV_FROM_BODY} blend ${VLA_CHUNK_BLEND_TICKS}t actionIL≤${VLA_MAX_ACTION_IL}$( [[ "$VLA_RAW" -eq 1 ]] && echo "  ${RED}${BOLD}[--vla-raw: WIRE FILTERS OFF; action-IL clamp KEPT to prevent proprio runaway]${NC}" )
   ${BOLD}Deploy clamp    ${NC}: max-target-dev ${SIM_MAX_TARGET_DEV:-off} deploy-LPF ${SIM_DEPLOY_TARGET_LPF_HZ:-off} Hz (sim)
   ${BOLD}Rate            ${NC}: ${RATE} Hz publisher, ${INFERENCE_MIN_PERIOD_S}s min inference period
   ${BOLD}Max duration    ${NC}: ${MAX_DURATION} s
 EOF
 if [[ "$SIM_MODE" -eq 0 ]]; then
     echo "  ${BOLD}Camera staleness${NC}: ${CAMERAS_STALENESS_S} s"
+fi
+if [[ "$WITH_RECORD" -eq 1 ]]; then
+    cat <<EOF
+  ${BOLD}Recording       ${NC}: ON  -> ${OUTPUT_DIR}
+  ${BOLD}  task          ${NC}: "${TASK}"
+  ${BOLD}  head cams     ${NC}: $([[ "$HEAD_CAMERAS" -eq 1 ]] && echo "ON (${CAMERA_HOST}:${CAMERA_PORT})" || echo "OFF (ego_view + arm/hand proprio only)")
+  ${BOLD}  encoder       ${NC}: ${ENCODER_CONFIG:-DISABLED (deprecated freeze-pose; action.motion_token = zeros)}
+  ${BOLD}  one-episode   ${NC}: auto-start on first VLA body_pose, auto-save on Ctrl-C
+EOF
+else
+    echo "  ${BOLD}Recording       ${NC}: OFF (pass --with-record + --output-dir + --task to capture)"
 fi
 echo
 
@@ -1092,6 +1452,22 @@ if [[ -n "$MOTION_TOKEN_DECODER" ]]; then
 elif [[ "$VLA_BODY_MODE" == "locomotion" && -z "$MOTION_TOKEN_DECODER" ]]; then
     : # no decoder: body tracks idle_stand; hands move only if VLA runs
 fi
+# Recorder ready-file handshake: only when --with-record. Holds the
+# inference thread at idle stand AFTER 'policy ready' until the
+# recorder has subscribed + ingested its first body_pose, so the
+# arm rise from idle is captured in the recording (instead of falling
+# into the ~8 s warm-up window the recorder needs for X2 model,
+# cameras, clock-skew detection, and MuJoCo renderer init).
+if [[ "$WITH_RECORD" -eq 1 ]]; then
+    # Remove any stale sentinel from a previous run in the same
+    # RUN_DIR -- the bridge can't tell a fresh failure from a
+    # leftover, and would immediately bypass the wait.
+    rm -f "$RECORDER_READY_FILE"
+    BRIDGE_ARGS+=(
+        --wait-for-ready-file "$RECORDER_READY_FILE"
+        --wait-for-ready-file-timeout-s 120
+    )
+fi
 # Forward any unrecognised CLI tail as passthrough to the bridge.
 if [[ ${#ARGS[@]} -gt 0 ]]; then
     BRIDGE_ARGS+=("${ARGS[@]}")
@@ -1111,9 +1487,10 @@ log "  CMD: ${BRIDGE_PY} ${BRIDGE_ARGS[*]}"
 # bridge subprocess keeps the log scannable; the operator-facing
 # launcher messages still emit normally.
 PYTHONPATH="${REPO_ROOT}/external_dependencies/Isaac-GR00T:${REPO_ROOT}" \
+PYTHONUNBUFFERED=1 \
 MUJOCO_GL=egl \
 TQDM_DISABLE=1 \
-nohup "$BRIDGE_PY" "${BRIDGE_ARGS[@]}" \
+nohup "$BRIDGE_PY" -u "${BRIDGE_ARGS[@]}" \
     > "$LOG_FILE_BRIDGE" 2>&1 &
 BRIDGE_PID=$!
 echo "$BRIDGE_PID" > "$PID_FILE_BRIDGE"
@@ -1163,6 +1540,28 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
     ok "deploy READY (SONIC sim loaded); settle 2s before telemetry"
     sleep 2
     spawn_sim_telemetry
+elif [[ "$WITH_RECORD" -eq 1 ]]; then
+    # Real-robot recording: we don't spawn a deploy here (PC2 already
+    # runs SONIC), but we still need the bridge's policy to be loaded
+    # before the recorder starts ingesting -- otherwise the dataset's
+    # first ~tens of frames are bootstrap idle_stand rather than VLA
+    # decode output, and the action.motion_token labels would be zeros.
+    log "waiting for bridge model load (policy ready, ≤180s) …"
+    if ! wait_for_log_marker "$LOG_FILE_BRIDGE" "$BRIDGE_PID" \
+            "policy ready" 180 "bridge"; then
+        err "bridge never finished GR00T load — check $LOG_FILE_BRIDGE"
+        stop_all
+        exit 1
+    fi
+    ok "bridge policy ready; spawning recorder"
+fi
+
+# Recording: spawn the LeRobot writer AFTER bridge model load. Sim and
+# real modes share this path; the function is a no-op when WITH_RECORD=0.
+if ! spawn_recorder; then
+    err "recorder failed to spawn — check $LOG_FILE_RECORDER"
+    stop_all
+    exit 1
 fi
 
 ok "bridge live; following logs (Ctrl-C to stop)"
@@ -1197,7 +1596,14 @@ if [[ "$SIM_MODE" -eq 1 && -f "$PID_FILE_DEPLOY" ]]; then
     stop_all
     print_sim_artifacts
 else
-    tail -F --pid="$BRIDGE_PID" "$LOG_FILE_BRIDGE" &
+    # ``-n +1`` makes tail emit the full file from line 1 before following
+    # new appends. Without it, tail defaults to the last 10 lines, which
+    # skips the entire bridge bootstrap (preflight + model load + the
+    # recorder-ready wait + pub ticks 0..~850) -- operators see their first
+    # ``pub tick=`` line at ~900 and wrongly assume the publisher started
+    # late. Showing the full log makes the handshake timeline obvious in
+    # the live terminal too.
+    tail -n +1 -F --pid="$BRIDGE_PID" "$LOG_FILE_BRIDGE" &
     TAIL_PID=$!
     wait "$BRIDGE_PID" 2>/dev/null || true
     EXIT_CODE=$?
@@ -1214,5 +1620,15 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
     log "run dir kept at ${RUN_DIR} for postmortem / iteration"
 else
     log "run dir kept at ${RUN_DIR} for postmortem"
+fi
+if [[ "$WITH_RECORD" -eq 1 ]]; then
+    log "recorder log    : ${LOG_FILE_RECORDER}"
+    if [[ -n "$OUTPUT_DIR" && -d "$OUTPUT_DIR" ]]; then
+        n_episodes="$(find "${OUTPUT_DIR}/data" -name 'episode_*.parquet' 2>/dev/null | wc -l || true)"
+        log "dataset         : ${OUTPUT_DIR} (${n_episodes:-0} episode parquet(s) on disk)"
+        log "replay with     : ./gear_sonic/scripts/view_x2_recorded_dataset.sh --dataset $(basename "$OUTPUT_DIR") --episode <N>"
+    else
+        warn "dataset dir ${OUTPUT_DIR} missing; recorder may have failed before first save"
+    fi
 fi
 exit "$EXIT_CODE"

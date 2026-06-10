@@ -48,7 +48,7 @@ on `tcp://<laptop>:5556`, the downstream path is identical:
 ```mermaid
 flowchart TB
     laptop["LAPTOP &mdash; one of:<br/>quest3_manager_x2 (teleop)<br/>quest3_manager_x2 + recorder (record)<br/>live_vla_publish_motion_token (VLA)"]
-    proxy["x2_pose_proxy.py<br/>SUB tcp://laptop:5556<br/>PUB tcp://localhost:5558<br/>falls back to idle_stand.x2m2 if upstream silent &gt; 300ms"]
+    proxy["x2_pose_proxy.py<br/>SUB tcp://laptop:5556<br/>PUB tcp://localhost:5558<br/>staged fallback if upstream silent &gt; 300ms:<br/>HOLD last frame (10s) -> BLEND (3s) -> idle_stand.x2m2"]
     deploy["agi_x2_deploy_onnx_ref (C++)<br/>SUB tcp://localhost:5558<br/>fused SONIC ONNX (encoder + FSQ + decoder)<br/>re-tokenizes joint_pos_mj_future<br/>IGNORES motion_token field on the wire"]
     hand["x2_hand_bridge.py<br/>SUB tcp://laptop:5556 topic=pose<br/>extracts left/right_hand_joints<br/>publishes /aima/hal/joint/&hellip;/command"]
     motors["motor torques &rarr; aima MC &rarr; robot joints"]
@@ -74,6 +74,17 @@ Two important consequences of this layout:
    makes the "robot stands at idle, only fingers move" failure mode
    from the [VLA decoder reference](x2_vla_motion_token_decoder.md)
    possible — hands bypass SONIC by design.
+
+The proxy's upstream-silent fallback is staged on purpose: a step
+change in the commanded body reference (such as instantly switching
+from operator-IK pose to baked `idle_stand`) cannot be absorbed by the
+deploy's target LPF + `max_target_dev_arm` clamp, and would swing the
+arms through their full ROM in ~200 ms during any WiFi blip. The
+`HOLD -> BLEND -> IDLE_CLIP` ladder (see milestone
+[2026-06-08 — Pose-proxy fallback ladder](../user_guide/milestones/2026-06-08_arm_freeze_on_upstream_stall.md))
+keeps the wire alive while only making per-frame commanded-reference
+moves the deploy can actually track. `POSE_PROXY_IDLE_MODE=idle-stand`
+restores the pre-2026-06-08 behaviour as a regression escape.
 
 ---
 

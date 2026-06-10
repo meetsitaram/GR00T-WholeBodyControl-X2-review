@@ -227,6 +227,15 @@ class RecorderConfig:
 
     teleop_only: bool = False
 
+    ready_file: Optional[Path] = None
+    """When set, the subscribe-mode loop touches this file the moment
+    the first ``body_pose`` arrives (i.e. the recorder is fully
+    initialised AND actively ingesting). The VLA bridge's
+    ``--wait-for-ready-file`` gate watches this path and only starts
+    inference once it appears, so the recording captures the arm
+    rise from idle without missing the first ~8 s of warm-up. Has no
+    effect outside VLA subscribe mode."""
+
     idle_publish_enabled: bool = True
     """When True (default), the subscribe-mode loop calls
     :meth:`X2DatasetRecorder._publish_idle` every tick that no
@@ -343,14 +352,29 @@ class RecorderConfig:
     # buttons (start / save / discard) are forwarded from the manager
     # over ``recorder_cmd``.
     body_pose_source: str = "internal"
-    """``"internal"`` (legacy: run Quest 3 + IK in this process) or
-    ``"zmq"`` (Phase 0: subscribe to the planner's body_pose)."""
+    """One of:
+
+    * ``"internal"`` -- legacy: run Quest 3 + IK in this process.
+    * ``"zmq"`` -- Phase 0: subscribe to the planner's ``body_pose``
+      stream (default port 5565) and the manager's ``arm_targets`` /
+      ``hand_finger_cmd`` streams (port 5564). Episode boundaries
+      come from the manager's ``recorder_cmd`` topic.
+    * ``"vla"`` -- subscribe to the VLA bridge's unified ``pose``
+      stream on port 5556. The bridge emits a superset of the
+      planner payload (body_q + hands + token + future window in
+      one message), so the recorder skips the manager SUB entirely
+      and auto-starts a single episode on first body_pose. Pair
+      with ``--with-record / --output-dir / --task`` so the
+      one-run = one-episode auto-save lands the dataset. The
+      recorder also skips its pose-PUB bind in this mode (the
+      bridge already owns :5556)."""
 
     arm_targets_source: str = "internal"
-    """``"internal"`` or ``"zmq"`` (Phase 0: subscribe to the manager's
-    arm_targets + hand_finger_cmd). Must equal
+    """Mirror of :attr:`body_pose_source`. Allowed values are
+    ``"internal"`` / ``"zmq"`` / ``"vla"``. Must equal
     :attr:`body_pose_source` -- mixing internal IK with external
-    body_pose is intentionally rejected."""
+    body_pose, or splitting body and hands across different sources,
+    is intentionally rejected."""
 
     body_pose_sub_host: str = "localhost"
     body_pose_sub_port: int = 5565
@@ -788,11 +812,27 @@ def _subscribe_mode_thread(
     state: _SubscribeModeState,
     stop_event: threading.Event,
     verbose: bool = False,
+    vla_mode: bool = False,
 ) -> None:
-    """Single SUB thread that fans the manager + planner streams into ``state``.
+    """Single SUB thread that fans the upstream pose streams into ``state``.
 
-    Subscribes to all five topics on the two PUB sockets the planner +
-    manager bind. Polls with a 50 ms RCVTIMEO so shutdown is responsive.
+    Two flavours:
+
+    * Planner-driven (``vla_mode=False``): subscribes to all five topics
+      on the two PUB sockets the planner + manager bind
+      (``body_pose`` on the planner @ :5565, plus ``arm_targets`` /
+      ``hand_finger_cmd`` / ``stream_mode`` / ``recorder_cmd`` on the
+      manager @ :5564).
+    * VLA-driven (``vla_mode=True``): subscribes only to the bridge's
+      unified ``pose`` topic on :5556. Arms and hands are extracted
+      from the same payload by :func:`_handle_body_pose_msg`; the
+      manager URL / topic args are accepted for signature
+      compatibility but never connected. Episode boundaries are NOT
+      driven by ``recorder_cmd`` in this mode -- the bridge has no
+      operator console -- so the recorder loop auto-starts a single
+      episode on first body_pose and auto-saves on shutdown.
+
+    Polls with a 50 ms RCVTIMEO so shutdown is responsive.
     """
     try:
         import msgpack
@@ -806,28 +846,39 @@ def _subscribe_mode_thread(
     sub_planner.setsockopt_string(zmq.SUBSCRIBE, body_pose_topic)
     sub_planner.connect(body_pose_url)
 
-    sub_mgr = ctx.socket(zmq.SUB)
-    sub_mgr.setsockopt(zmq.LINGER, 0)
-    sub_mgr.setsockopt(zmq.RCVTIMEO, 50)
-    for topic in (
-        arm_targets_topic, hand_finger_cmd_topic,
-        stream_mode_topic, recorder_cmd_topic,
-    ):
-        sub_mgr.setsockopt_string(zmq.SUBSCRIBE, topic)
-    sub_mgr.connect(arm_and_hands_url)
+    sub_mgr: Optional[zmq.Socket] = None
+    if not vla_mode:
+        sub_mgr = ctx.socket(zmq.SUB)
+        sub_mgr.setsockopt(zmq.LINGER, 0)
+        sub_mgr.setsockopt(zmq.RCVTIMEO, 50)
+        for topic in (
+            arm_targets_topic, hand_finger_cmd_topic,
+            stream_mode_topic, recorder_cmd_topic,
+        ):
+            sub_mgr.setsockopt_string(zmq.SUBSCRIBE, topic)
+        sub_mgr.connect(arm_and_hands_url)
 
     if verbose:
-        print(
-            f"[recorder] subscribe-mode SUBs:\n"
-            f"  planner   {body_pose_url} topic={body_pose_topic!r}\n"
-            f"  manager   {arm_and_hands_url} topics="
-            f"{[arm_targets_topic, hand_finger_cmd_topic, stream_mode_topic, recorder_cmd_topic]}",
-            flush=True,
-        )
+        if vla_mode:
+            print(
+                f"[recorder] VLA subscribe-mode SUBs:\n"
+                f"  bridge    {body_pose_url} topic={body_pose_topic!r} "
+                f"(arms + hands embedded in payload; manager SUB skipped)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[recorder] subscribe-mode SUBs:\n"
+                f"  planner   {body_pose_url} topic={body_pose_topic!r}\n"
+                f"  manager   {arm_and_hands_url} topics="
+                f"{[arm_targets_topic, hand_finger_cmd_topic, stream_mode_topic, recorder_cmd_topic]}",
+                flush=True,
+            )
 
     poller = zmq.Poller()
     poller.register(sub_planner, zmq.POLLIN)
-    poller.register(sub_mgr, zmq.POLLIN)
+    if sub_mgr is not None:
+        poller.register(sub_mgr, zmq.POLLIN)
 
     try:
         while not stop_event.is_set():
@@ -842,7 +893,7 @@ def _subscribe_mode_thread(
                 except zmq.error.Again:
                     pass
 
-            if sub_mgr in events:
+            if sub_mgr is not None and sub_mgr in events:
                 try:
                     parts = sub_mgr.recv_multipart(flags=zmq.NOBLOCK)
                     _handle_arm_and_hands_msg(
@@ -859,10 +910,11 @@ def _subscribe_mode_thread(
             sub_planner.close(linger=0)
         except Exception:
             pass
-        try:
-            sub_mgr.close(linger=0)
-        except Exception:
-            pass
+        if sub_mgr is not None:
+            try:
+                sub_mgr.close(linger=0)
+            except Exception:
+                pass
 
 
 def _handle_body_pose_msg(
@@ -932,6 +984,28 @@ def _handle_body_pose_msg(
         mt = np.asarray(fields["motion_token"], dtype=np.float32).reshape(-1)
         if mt.shape == (SONIC_MOTION_TOKEN_DIM,):
             wire_mt = mt
+
+    # VLA bridge: left/right hand joints embedded in the unified pose
+    # payload (built by ``_build_vla_decoded_pose_payload`` in
+    # live_vla_publish_motion_token). The teleop planner-driven
+    # pipeline keeps these slots zero on ``body_pose`` and publishes
+    # hand commands on a separate ``hand_finger_cmd`` topic via the
+    # manager; for VLA recording the bridge is the sole producer so
+    # we forward them onto the same state slot the manager would
+    # normally write. We only update when BOTH are present + correctly
+    # shaped so a partial / mid-rollover frame can't corrupt a side.
+    if "left_hand_joints" in fields and "right_hand_joints" in fields:
+        lh = np.asarray(
+            fields["left_hand_joints"], dtype=np.float64,
+        ).reshape(-1)
+        rh = np.asarray(
+            fields["right_hand_joints"], dtype=np.float64,
+        ).reshape(-1)
+        if (
+            lh.shape == (NUM_HAND_DOF_PER_SIDE,)
+            and rh.shape == (NUM_HAND_DOF_PER_SIDE,)
+        ):
+            state.update_hand_finger_cmd(lh, rh)
 
     # Future-window fields are only forwarded when ALL the required
     # parts are present and self-consistent. A partial window would
@@ -1126,23 +1200,31 @@ class X2DatasetRecorder:
 
     def __init__(self, cfg: RecorderConfig) -> None:
         # Validate subscribe-mode coherence early.
-        if cfg.body_pose_source not in ("internal", "zmq"):
+        _allowed_sources = ("internal", "zmq", "vla")
+        if cfg.body_pose_source not in _allowed_sources:
             raise ValueError(
-                f"body_pose_source must be 'internal' or 'zmq'; "
+                f"body_pose_source must be one of {_allowed_sources}; "
                 f"got {cfg.body_pose_source!r}"
             )
-        if cfg.arm_targets_source not in ("internal", "zmq"):
+        if cfg.arm_targets_source not in _allowed_sources:
             raise ValueError(
-                f"arm_targets_source must be 'internal' or 'zmq'; "
+                f"arm_targets_source must be one of {_allowed_sources}; "
                 f"got {cfg.arm_targets_source!r}"
             )
         if cfg.body_pose_source != cfg.arm_targets_source:
             raise ValueError(
                 "Mixing body_pose_source != arm_targets_source is not "
-                "supported in Phase 0. Both must be 'internal' or both "
-                "'zmq'."
+                "supported. Both must take the same value "
+                "('internal', 'zmq', or 'vla')."
             )
-        self._subscribe_mode = (cfg.body_pose_source == "zmq")
+        # ``_subscribe_mode`` is the umbrella "drive everything from
+        # an upstream ZMQ stream" flag; ``_vla_subscribe_mode`` further
+        # narrows to "bridge owns the wire and embeds hands in the
+        # pose payload", which controls whether we bind :5556 ourselves
+        # and whether we wait for the manager's recorder_cmd to start
+        # an episode.
+        self._subscribe_mode = (cfg.body_pose_source in ("zmq", "vla"))
+        self._vla_subscribe_mode = (cfg.body_pose_source == "vla")
 
         self._cfg = cfg
         if cfg.teleop_only:
@@ -1175,21 +1257,63 @@ class X2DatasetRecorder:
         )
 
         self._stop_event = threading.Event()
+        # Re-entrancy guard for ``stop()``. Set the first time stop()
+        # is called; subsequent calls short-circuit so the lerobot
+        # save path can't run twice on the same buffered episode.
+        # See the comment in ``stop()`` for the full failure mode.
+        self._stop_called = False
 
-        # Robot model + dataset features
+        # Robot model + dataset features. Each step prints with
+        # ``flush=True`` so a slow / failing init shows the exact stage
+        # that stalled (was a silent hang before the launcher started
+        # passing ``-u`` to python -- belt + suspenders here in case
+        # someone invokes the recorder directly without the launcher).
+        _init_t0 = time.monotonic()
         print("[recorder] loading X2 robot model + features …", flush=True)
-        self._robot_model = get_x2_robot_model(hand_variant="omnihand_10")
-        self._features = get_features_x2_vla(
-            self._robot_model,
-            hand_dof_per_side=HAND_DOF_OMNI,
-            include_front_cam=cfg.record_front_cam,
-            include_head_cameras=cfg.record_head_cameras,
+        try:
+            self._robot_model = get_x2_robot_model(hand_variant="omnihand_10")
+        except Exception as exc:
+            import traceback
+            print(
+                f"[recorder] FATAL: get_x2_robot_model failed: {exc}\n"
+                + traceback.format_exc(),
+                flush=True,
+            )
+            raise
+        print(
+            f"[recorder]   robot model ready "
+            f"({self._robot_model.num_joints} joints, "
+            f"{time.monotonic() - _init_t0:.1f}s)",
+            flush=True,
         )
-        self._modality_cfg = get_modality_config_x2_vla(
-            self._robot_model,
-            hand_dof_per_side=HAND_DOF_OMNI,
-            include_front_cam=cfg.record_front_cam,
-            include_head_cameras=cfg.record_head_cameras,
+        _features_t0 = time.monotonic()
+        try:
+            self._features = get_features_x2_vla(
+                self._robot_model,
+                hand_dof_per_side=HAND_DOF_OMNI,
+                include_front_cam=cfg.record_front_cam,
+                include_head_cameras=cfg.record_head_cameras,
+            )
+            self._modality_cfg = get_modality_config_x2_vla(
+                self._robot_model,
+                hand_dof_per_side=HAND_DOF_OMNI,
+                include_front_cam=cfg.record_front_cam,
+                include_head_cameras=cfg.record_head_cameras,
+            )
+        except Exception as exc:
+            import traceback
+            print(
+                f"[recorder] FATAL: features / modality config build "
+                f"failed: {exc}\n" + traceback.format_exc(),
+                flush=True,
+            )
+            raise
+        print(
+            f"[recorder]   features + modality ready "
+            f"(front_cam={cfg.record_front_cam}, "
+            f"head_cameras={cfg.record_head_cameras}, "
+            f"{time.monotonic() - _features_t0:.1f}s)",
+            flush=True,
         )
         if self._robot_model.num_joints != NUM_BODY_DOFS:
             raise RuntimeError(
@@ -1238,6 +1362,12 @@ class X2DatasetRecorder:
         #   shot deprecation warning fires on first encode().
         self._tokenizer = None
         if self._cfg.sonic_checkpoint is not None:
+            # NB: the checkpoint is ~400 MB on disk and the load runs
+            # synchronously on CPU (when ``--sonic-tokenizer-device cpu``)
+            # which can take 10-30 s on a cold filesystem cache. Without
+            # a "loading…" + flush=True print the operator sees the
+            # earlier "features ready" line as the last log entry for
+            # tens of seconds and assumes the recorder has hung.
             from gear_sonic.utils.teleop.online_sonic_tokenizer import (
                 OnlineSonicTokenizer,
             )
@@ -1245,19 +1375,45 @@ class X2DatasetRecorder:
                 self._subscribe_mode
                 and self._cfg.sonic_encoder_config is not None
             )
-            if use_subscribe_mode_path:
-                self._tokenizer = (
-                    OnlineSonicTokenizer.from_checkpoint_with_config(
+            _tok_t0 = time.monotonic()
+            print(
+                f"[recorder] loading SONIC tokenizer "
+                f"(checkpoint={self._cfg.sonic_checkpoint.name}, "
+                f"device={self._cfg.sonic_tokenizer_device}, "
+                f"path={'+encoder-config' if use_subscribe_mode_path else 'legacy freeze-pose'}"
+                f") -- this can take 10-30s on cold cache …",
+                flush=True,
+            )
+            try:
+                if use_subscribe_mode_path:
+                    self._tokenizer = (
+                        OnlineSonicTokenizer.from_checkpoint_with_config(
+                            self._cfg.sonic_checkpoint,
+                            self._cfg.sonic_encoder_config,
+                            device=self._cfg.sonic_tokenizer_device,
+                        )
+                    )
+                else:
+                    self._tokenizer = OnlineSonicTokenizer.from_checkpoint(
                         self._cfg.sonic_checkpoint,
-                        self._cfg.sonic_encoder_config,
                         device=self._cfg.sonic_tokenizer_device,
                     )
+            except Exception as exc:
+                import traceback
+                print(
+                    f"[recorder] FATAL: SONIC tokenizer load failed "
+                    f"after {time.monotonic() - _tok_t0:.1f}s: {exc}\n"
+                    + traceback.format_exc(),
+                    flush=True,
                 )
+                raise
+            _tok_dt = time.monotonic() - _tok_t0
+            if use_subscribe_mode_path:
                 builder = self._tokenizer.obs_builder
                 assert builder is not None
                 modes = ", ".join(m.name for m in builder.encoder_modes)
                 print(
-                    f"[recorder] motion_token tokenizer ready "
+                    f"[recorder] motion_token tokenizer ready in {_tok_dt:.1f}s "
                     f"(checkpoint={self._cfg.sonic_checkpoint.name}, "
                     f"device={self._cfg.sonic_tokenizer_device}, "
                     f"encoder_config="
@@ -1266,10 +1422,6 @@ class X2DatasetRecorder:
                     flush=True,
                 )
             else:
-                self._tokenizer = OnlineSonicTokenizer.from_checkpoint(
-                    self._cfg.sonic_checkpoint,
-                    device=self._cfg.sonic_tokenizer_device,
-                )
                 if self._subscribe_mode:
                     # Subscribe mode without --encoder-config. We still
                     # have a real planner snapshot but no YAML to drive
@@ -1344,7 +1496,21 @@ class X2DatasetRecorder:
         self._pub_sock = ctx.socket(zmq.PUB)
         self._pub_sock.setsockopt(zmq.SNDHWM, 10)
         self._pub_sock.setsockopt(zmq.LINGER, 0)
-        self._pub_sock.bind(f"tcp://{cfg.pub_host}:{cfg.pub_port}")
+        # In VLA subscribe-mode the bridge owns ``tcp://*:5556``; if the
+        # recorder bound the same endpoint zmq would fail with
+        # ``Address already in use`` (or silently fight for subscribers
+        # depending on platform). Skip the bind and leave the socket
+        # connect-less: every ``_publish_pose`` / ``_publish_idle`` call
+        # site is also gated below so we never try to send on it.
+        if not self._vla_subscribe_mode:
+            self._pub_sock.bind(f"tcp://{cfg.pub_host}:{cfg.pub_port}")
+        else:
+            print(
+                f"[recorder] VLA subscribe-mode: skipping pose PUB bind on "
+                f"tcp://{cfg.pub_host}:{cfg.pub_port} (VLA bridge owns "
+                f"the wire); recorder is ingest-only",
+                flush=True,
+            )
 
         # ``x2_debug`` SUB lives in its own thread, mutating shared state.
         self._latest_state = _LatestState()
@@ -1390,22 +1556,35 @@ class X2DatasetRecorder:
                     state=self._sub_state,
                     stop_event=self._stop_event,
                     verbose=cfg.verbose,
+                    vla_mode=self._vla_subscribe_mode,
                 ),
                 name="recorder-sub-mode",
                 daemon=True,
             )
-            print(
-                "[recorder] subscribe-mode wired:\n"
-                f"  body_pose  SUB tcp://{cfg.body_pose_sub_host}:"
-                f"{cfg.body_pose_sub_port} topic={cfg.body_pose_sub_topic!r}\n"
-                f"  manager    SUB tcp://{cfg.arm_and_hands_sub_host}:"
-                f"{cfg.arm_and_hands_sub_port} topics="
-                f"[{cfg.arm_targets_topic!r}, "
-                f"{cfg.hand_finger_cmd_topic!r}, "
-                f"{cfg.stream_mode_topic!r}, "
-                f"{cfg.recorder_cmd_topic!r}]",
-                flush=True,
-            )
+            if self._vla_subscribe_mode:
+                print(
+                    "[recorder] VLA subscribe-mode wired:\n"
+                    f"  bridge     SUB tcp://{cfg.body_pose_sub_host}:"
+                    f"{cfg.body_pose_sub_port} "
+                    f"topic={cfg.body_pose_sub_topic!r} "
+                    f"(arms + hands embedded; manager SUB skipped)\n"
+                    f"  episodes   auto-start on first body_pose, "
+                    f"auto-save on shutdown (one run = one episode)",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[recorder] subscribe-mode wired:\n"
+                    f"  body_pose  SUB tcp://{cfg.body_pose_sub_host}:"
+                    f"{cfg.body_pose_sub_port} topic={cfg.body_pose_sub_topic!r}\n"
+                    f"  manager    SUB tcp://{cfg.arm_and_hands_sub_host}:"
+                    f"{cfg.arm_and_hands_sub_port} topics="
+                    f"[{cfg.arm_targets_topic!r}, "
+                    f"{cfg.hand_finger_cmd_topic!r}, "
+                    f"{cfg.stream_mode_topic!r}, "
+                    f"{cfg.recorder_cmd_topic!r}]",
+                    flush=True,
+                )
 
         # ── Gesture playback wiring ────────────────────────────────────
         # Catalog is best-effort: if the file is missing / malformed we
@@ -1843,18 +2022,79 @@ class X2DatasetRecorder:
         return cal
 
     def stop(self) -> None:
+        # Idempotency guard. ``stop()`` is wired into the launcher's
+        # SIGINT + SIGTERM handlers (record_x2_dataset.py registers
+        # ``_on_signal`` for both), so the launcher sending SIGTERM
+        # right after the operator's Ctrl-C produces TWO stop() calls.
+        # Worse, Python delivers signal handlers between bytecode
+        # instructions on the main thread, so the second call can land
+        # mid-flight inside the first call's ``_stop_episode`` (the
+        # lerobot writer's ``save_episode`` releases the GIL while
+        # encoding the mp4). Without this guard the second call
+        # observes ``_is_recording=True`` (the first hasn't reset it
+        # yet) and saves the *same* 380 buffered frames a second time
+        # under episode_000001 -- producing duplicate parquets that
+        # corrupt the dataset's episode counter on the next run.
+        # A simple boolean is safe because (a) all stop() invocations
+        # land on the main thread (signal handlers run there) and
+        # (b) the read-then-set is atomic at the Python bytecode
+        # level so re-entrant calls observe the True state set by the
+        # outer call.
+        if getattr(self, "_stop_called", False):
+            return
+        self._stop_called = True
         self._stop_event.set()
-        # Persist any buffered episode? No -- the recorder requires an
-        # explicit save command. Buffered-but-not-saved frames are
-        # discarded on shutdown so an accidental Ctrl-C doesn't
-        # contaminate the dataset.
+        # Persist any buffered episode?
+        #
+        # Internal / planner-zmq modes: NO -- the recorder requires an
+        # explicit save command (X / Y button) from the operator.
+        # Buffered-but-not-saved frames are discarded on shutdown so an
+        # accidental Ctrl-C doesn't contaminate the dataset with junk.
+        #
+        # VLA subscribe-mode: YES -- there is no operator console, and
+        # the runtime-script wrapper is the only thing that can trigger
+        # ``stop()`` (via SIGTERM on Ctrl-C). The recorder auto-started
+        # the episode on first body_pose, so the buffer at this point
+        # IS the rollout. Dropping it would silently lose every
+        # ``--with-record`` capture. We MUST save here -- the
+        # ``finally`` block in :meth:`_run_subscribe_mode` would also
+        # try, but the signal-handler path calls ``stop()`` BEFORE
+        # ``run()`` returns, so the run-loop's finally never sees
+        # ``_is_recording=True``.
         if self._is_recording:
-            print(
-                f"[recorder] stop: dropping {len(self._episode_buffer)} "
-                "buffered frames (use button X before exiting to save).",
-                flush=True,
-            )
-            self._episode_buffer.reset()
+            n_frames = len(self._episode_buffer)
+            if (
+                getattr(self, "_vla_subscribe_mode", False)
+                and not self._cfg.teleop_only
+            ):
+                print(
+                    f"[recorder] stop: VLA subscribe-mode auto-save: "
+                    f"flushing {n_frames} buffered frames to dataset",
+                    flush=True,
+                )
+                try:
+                    self._stop_episode(save=True)
+                except Exception as exc:  # noqa: BLE001
+                    # If the writer chain explodes mid-save, log loudly
+                    # but never let the recorder hang the launcher's
+                    # 30 s SIGTERM budget. Drop the buffer as a fallback
+                    # so the next stop() call short-circuits.
+                    print(
+                        f"[recorder] stop: VLA auto-save FAILED ({exc}); "
+                        f"dropping {n_frames} frames so shutdown can "
+                        f"complete. Re-run; bridge.log + recorder.log "
+                        f"hold the chunk dumps for postmortem.",
+                        flush=True,
+                    )
+                    self._episode_buffer.reset()
+                    self._is_recording = False
+            else:
+                print(
+                    f"[recorder] stop: dropping {n_frames} buffered "
+                    f"frames (use button X before exiting to save).",
+                    flush=True,
+                )
+                self._episode_buffer.reset()
         try:
             self._sub_thread.join(timeout=1.0)
         except Exception:
@@ -2259,10 +2499,14 @@ class X2DatasetRecorder:
                 # the manager can still start/stop dataset episodes
                 # mid-gesture; runs BEFORE the body_pose-None check so
                 # an operator can fire a gesture even before kplanner
-                # publishes (e.g. on a cold-started stack).
-                self._drain_gesture_commands(snap)
+                # publishes (e.g. on a cold-started stack). Skipped in
+                # VLA mode: the bridge owns the wire and there is no
+                # external gesture trigger surface.
+                if not self._vla_subscribe_mode:
+                    self._drain_gesture_commands(snap)
                 if (
-                    self._active_gesture is not None
+                    not self._vla_subscribe_mode
+                    and self._active_gesture is not None
                     and not self._active_gesture.is_done()
                 ):
                     self._publish_gesture_frame(tick=tick)
@@ -2301,7 +2545,10 @@ class X2DatasetRecorder:
                     next_tick += period
                     self._sleep_until(next_tick)
                     continue
-                if self._gesture_held_frame is not None:
+                if (
+                    not self._vla_subscribe_mode
+                    and self._gesture_held_frame is not None
+                ):
                     # Hold mode: keep the robot parked at the last gesture
                     # frame. We bypass the body_pose-None check on purpose
                     # -- the operator chose to leave the robot here.
@@ -2314,22 +2561,40 @@ class X2DatasetRecorder:
                 body_pose = snap["body_pose_q_mj"]
                 if body_pose is None:
                     if not wait_msg:
-                        suffix = (
-                            ""
-                            if self._cfg.idle_publish_enabled
-                            else "  [no-idle-publish: pose wire stays SILENT]"
-                        )
-                        print(
-                            f"[recorder] subscribe-mode: waiting for first "
-                            f"body_pose on tcp://"
-                            f"{self._cfg.body_pose_sub_host}:"
-                            f"{self._cfg.body_pose_sub_port} topic="
-                            f"{self._cfg.body_pose_sub_topic!r} …"
-                            f"{suffix}",
-                            flush=True,
-                        )
+                        if self._vla_subscribe_mode:
+                            print(
+                                f"[recorder] VLA subscribe-mode: waiting "
+                                f"for first body_pose on tcp://"
+                                f"{self._cfg.body_pose_sub_host}:"
+                                f"{self._cfg.body_pose_sub_port} topic="
+                                f"{self._cfg.body_pose_sub_topic!r} … "
+                                f"(bridge owns wire; no idle publish)",
+                                flush=True,
+                            )
+                        else:
+                            suffix = (
+                                ""
+                                if self._cfg.idle_publish_enabled
+                                else "  [no-idle-publish: pose wire stays SILENT]"
+                            )
+                            print(
+                                f"[recorder] subscribe-mode: waiting for first "
+                                f"body_pose on tcp://"
+                                f"{self._cfg.body_pose_sub_host}:"
+                                f"{self._cfg.body_pose_sub_port} topic="
+                                f"{self._cfg.body_pose_sub_topic!r} …"
+                                f"{suffix}",
+                                flush=True,
+                            )
                         wait_msg = True
-                    if self._cfg.idle_publish_enabled:
+                    # In VLA mode the bridge owns :5556; do NOT publish
+                    # idle here or we'd race the bridge's wire. Without
+                    # idle the recorder simply ingests once the bridge
+                    # starts flowing.
+                    if (
+                        not self._vla_subscribe_mode
+                        and self._cfg.idle_publish_enabled
+                    ):
                         self._publish_idle()
                     next_tick += period
                     self._sleep_until(next_tick)
@@ -2342,6 +2607,45 @@ class X2DatasetRecorder:
                         flush=True,
                     )
                     first_body_pose_logged = True
+                    # VLA mode: there is no manager publishing
+                    # ``recorder_cmd start``; the runtime is "one
+                    # invocation = one episode". Auto-start now so the
+                    # rollout actually lands in the dataset. The
+                    # finally block already auto-saves on shutdown.
+                    if (
+                        self._vla_subscribe_mode
+                        and not self._cfg.teleop_only
+                        and not self._is_recording
+                    ):
+                        print(
+                            "[recorder] VLA subscribe-mode: auto-starting "
+                            "the first (and only) episode for this run",
+                            flush=True,
+                        )
+                        self._start_episode()
+                    # Signal the VLA bridge that we are subscribed + ready
+                    # to record. The bridge's --wait-for-ready-file gate
+                    # is holding its inference thread at idle stand until
+                    # this file appears, so creating it here ensures the
+                    # arm rise lands in the recording instead of in the
+                    # missed warm-up window. Best-effort: failures only
+                    # log so a botched signal can't crash the loop.
+                    if self._cfg.ready_file is not None:
+                        try:
+                            ready_path = Path(self._cfg.ready_file)
+                            ready_path.parent.mkdir(parents=True, exist_ok=True)
+                            ready_path.touch()
+                            print(
+                                f"[recorder] ready-file touched: {ready_path} "
+                                "(bridge may now start VLA inference)",
+                                flush=True,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[recorder] WARNING: failed to touch "
+                                f"ready-file {self._cfg.ready_file}: {exc}",
+                                flush=True,
+                            )
 
                 # Merge: planner-driven legs + waist + head come from
                 # body_pose; arm slices come from the manager IF it is
@@ -2436,20 +2740,25 @@ class X2DatasetRecorder:
                 # enabled across long sessions.
                 self._maybe_dump_recorder_obs(merged_snap)
 
-                self._publish_pose(
-                    body_q_mj=body_q_mj,
-                    motion_token=wire_token,
-                    left_hand_q=left_hand_q,
-                    right_hand_q=right_hand_q,
-                    tick=tick,
-                    root_quat_xyzw=snap["root_quat_xyzw"],
-                    root_xy_world=snap.get("root_xy_world"),
-                    root_z_world=snap.get("root_z_world"),
-                    joint_pos_mj_future=jpos_future_overlaid,
-                    root_quat_xyzw_future=rot_future_planner,
-                    frame_index_future=fidx_future_planner,
-                    future_dt_s=future_dt_s,
-                )
+                # Publish merged pose back onto the deploy wire. Skipped
+                # in VLA mode: the bridge already owns :5556 and the
+                # recorder is ingest-only there; publishing would
+                # spawn a competing PUB on the same endpoint.
+                if not self._vla_subscribe_mode:
+                    self._publish_pose(
+                        body_q_mj=body_q_mj,
+                        motion_token=wire_token,
+                        left_hand_q=left_hand_q,
+                        right_hand_q=right_hand_q,
+                        tick=tick,
+                        root_quat_xyzw=snap["root_quat_xyzw"],
+                        root_xy_world=snap.get("root_xy_world"),
+                        root_z_world=snap.get("root_z_world"),
+                        joint_pos_mj_future=jpos_future_overlaid,
+                        root_quat_xyzw_future=rot_future_planner,
+                        frame_index_future=fidx_future_planner,
+                        future_dt_s=future_dt_s,
+                    )
 
                 if self._is_recording:
                     self._record_frame(

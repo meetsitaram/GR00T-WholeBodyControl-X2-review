@@ -1,5 +1,8 @@
 # Pick and Place Commands
 
+### Action
+the pick and place action sequence is raise left hand sideways to shoulder height, then move forward and up to avoid hitting the table while raising the arm, all while closing the fingers. then open the fingers, and slowlly move the arm to wards the soda can to grab it and place it in the black container. 
+
 =============== do not auto edit this section ===============
 ### start sonic on PC2 : Robogym Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
@@ -25,19 +28,50 @@ gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal --host 192.168.86.32
 
 ### replay episode 
 ./gear_sonic/scripts/view_x2_recorded_dataset.sh --dataset x2_grab_a_drink --episode 6
+./gear_sonic/scripts/view_x2_recorded_dataset.sh --dataset x2_pick_and_place_soda_can --episode 17
 
 ### run vla on x2-real
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
     --pc2-host 192.168.86.32 \
-    --model /home/stickbot/Projects/GR00T-WholeBodyControl/data/checkpoints/x2_grab_a_drink_n17_30k_v1/checkpoint-25000 \
+    --model /home/stickbot/Projects/GR00T-WholeBodyControl/data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
     --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
-    --prompt "grab the can from the table"
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
 
-### run vla on x2-sim
+### run vla on x2-real with record option
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
-    --model data/checkpoints/x2_grab_a_drink_n17_30k_v1/checkpoint-25000 \
-    --motion-token-decoder $HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
-    --prompt "grab the can from the table"
+    --pc2-host 192.168.86.32 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right" \
+    --vla-max-wire-dev-from-body 1.5 \
+    --vla-target-lpf-hz 5.0 \
+    --vla-future-lpf-hz 5.0 \
+    --vla-hand-lpf-hz 10.0 \
+    --vla-max-wire-step 0.07 \
+    --with-record \
+    --output-dir data/lerobot/x2_pick_and_place_soda_can_n17_50k_v1_rollouts \
+    --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
+
+### run vla on x2-real RAW (no bridge wire filters; policy output published as-is)
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --pc2-host 192.168.86.32 \
+    --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right" \
+    --vla-raw
+
+### run vla on x2-sim (default empty x2_ultra.xml scene)
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --model /home/stickbot/Projects/GR00T-WholeBodyControl/data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
+
+### run vla on x2-sim (robocasa scene: X2PickPlaceApple|X2PickPlaceBowl|X2PickPlaceCube)
+./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --robocasa-env X2PickPlaceApple \
+    --model /home/stickbot/Projects/GR00T-WholeBodyControl/data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
+    --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
+    --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
 
 ### pure IK kinematic teleop - no planner, no sonic
 .venv/bin/python -m gear_sonic.scripts.teleop_x2_kinematic     --output-dir /tmp/ik_debug_20260607     --task "ik debug"     --rate 50
@@ -45,9 +79,65 @@ gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal --host 192.168.86.32
 ### operator calibration
 .venv/bin/python -m gear_sonic.scripts.vr_operator_calibrate --operator-id default
 
+### groot training
+conda activate env_isaaclab
+PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
+    external_dependencies/Isaac-GR00T/gr00t/experiment/launch_finetune.py \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path data/lerobot/x2_pick_and_place_soda_can \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path gear_sonic/data/x2_modality_config_omnihand_stereo.py \
+    --num-gpus 1 \
+    --max-steps 50000 \
+    --save-steps 10000 \
+    --output-dir data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
+    --use-wandb \
+    --wandb-project x2-pick-and-place-soda-can \
+    --experiment-name x2_pick_and_place_soda_can_n17_50k_v1
 
+### diagnose: FK raw policy intent vs delivered wire from chunk dumps
+.venv-viewer/bin/python -m gear_sonic.scripts.diagnose_vla_chunk_fk \
+    --chunk-dir /tmp/x2_vla_runtime-LATEST/vla_chunks
 
 =============== end of pure manual notes section ===============
+
+---
+
+## Notes on the manual-section recipes (archived, not used at runtime)
+
+### `run vla on x2-real with record option (v3 LPF balance)` — tuning history
+
+Same checkpoint, three iterations to land on the v3 LPF/step values:
+
+| Variant | `--vla-target-lpf-hz` / `--vla-future-lpf-hz` | `--vla-max-wire-step` | Outcome |
+|---|---|---|---|
+| v1 | 10 | 0.10 | arm rose nicely but a 2.5 Hz limit cycle grew exponentially after ~8 s (run 091517) |
+| v2 | 3  | 0.04 | limit cycle gone (loop gain << 1) but legitimate rise also over-damped — arm never reached forward-up |
+| v3 | 5  | 0.07 | balanced. 5 Hz LPF attenuates the 2.5 Hz limit cycle by -1 dB (factor 0.89); combined with 0.07 rad/tick = 3.5 rad/s velocity cap (vs the limit cycle's 5 rad/s peak) this gives ~2x margin. Legitimate ramps (~0.5 rad/s rise = 0.01 rad/tick) sail through unaffected |
+
+Tuning ladder if v3 misbehaves:
+- Oscillations return → tighten `--vla-max-wire-step` to 0.05 first (preserves phase response of legitimate motion); only drop LPF below 4 Hz if the step cap isn't enough.
+- Rise is still too slow → try `--vla-target-lpf-hz 7` next (back toward 10 incrementally), keep step at 0.07.
+
+### `run vla on x2-real RAW` — what `--vla-raw` actually disables
+
+Disables every wire-shaping knob the bridge layers on top of the policy output: body / future / hand LPFs, per-tick step clamps, chunk-blend windows, and the dev-from-body cap.
+
+Intentionally **kept on** under `--vla-raw`, do NOT remove:
+- `--vla-max-action-il 8.0` (default) — clips the policy's `last_action` proprio echo, NOT the wire. Disabling it triggers a proprio-feedback runaway (`last_action` grows unboundedly → policy predicts ever-larger `action_il` → repeat) that blew the wire to `body_Δ=90+ rad` within 50 chunks in a real run.
+- `--vla-ramp-in-ticks 75` / `--vla-decode-delay-ticks 150` — one-shot hand-off smoothing at the start of the run.
+- `--vla-body-mode manipulation` — pins legs+waist columns of the wire to `idle_stand`. The physical torso can still tilt under inertial reaction from rapidly chasing arm targets, but the *command* for those joints is held.
+
+PC2's `--max-target-dev` guard on the SONIC tracker remains active as the last line of defense. Expect jerky chunk-boundary jumps and keep the E-stop in hand. Add `--with-record / --output-dir / --task` to capture the rollout for offline analysis.
+
+### `run vla on x2-sim (robocasa scene …)` — distribution caveat
+
+This policy was trained on real PC2 head-cam stereo of an actual soda can in your workspace. A robocasa kitchen scene is out-of-distribution visually. Use this as a sanity check of arm motion only, not as a pick-success eval (the can is not in any of these scenes).
+
+### `groot training` — wandb requirement
+
+`--use-wandb` is required to get loss / lr / grad-norm curves on W&B. Without it, HF Trainer sets `report_to="none"` and only the local text log captures progress (painful to monitor for an 11-hour run). `--experiment-name` sets the W&B run name (defaults to `output-dir` basename).
 
 ---
 

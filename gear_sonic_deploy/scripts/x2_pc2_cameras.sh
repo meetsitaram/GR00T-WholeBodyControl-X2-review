@@ -26,7 +26,7 @@
 #     -> Show what publishers exist for each of the 4 image topics and
 #        which em-apps are running (orbbec_camera, hal_sensor_orin).
 #
-#   ./gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal
+#   ./gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal [--deep]
 #     -> Bounce `hal_sensor_orin` (`aima em stop-app` + `start-app`) to
 #        re-arm the 3 IMX900 sensors after a boot where they came up
 #        missing (typical symptom: status shows the Orbbec topic present
@@ -34,6 +34,22 @@
 #        it briefly drops joint state / IMU / LiDAR publishers for ~3 s
 #        while the daemon restarts.
 #        ``kick`` is accepted as a deprecated alias and prints a warning.
+#
+#        With ``--deep`` it also restarts ``nvargus-daemon`` between the
+#        stop and start (requires passwordless sudo on PC2). Use this if
+#        a plain ``restart-hal`` still leaves the stereo topics at
+#        ``pubs=0`` and ``journalctl -u nvargus-daemon`` is full of
+#        ``acquireBuffer() Error Timeout`` / ``ChanselFault`` / ``FALCON_ERROR``
+#        lines. That means the libargus server itself is in a bad state
+#        (often after a previous CameraProvider was force-destroyed) and
+#        bouncing only the HAL client reconnects to the same stuck daemon.
+#        Escalation ladder when stereo cameras won't come up:
+#          1. ``restart-hal``         (cheap, fixes Argus boot race)
+#          2. ``restart-hal --deep``  (resets libargus session state)
+#          3. ``ssh run@PC2 sudo reboot`` (last resort -- needed when the
+#             kernel reports ``imx900 sensor_recovery: Not Active`` +
+#             ``ChanselFault`` after a deep bounce; the GMSL/CSI link
+#             needs the camera reset lines re-asserted at boot).
 #
 #   ./gear_sonic_deploy/scripts/x2_pc2_cameras.sh grab [OUT_DIR]
 #     -> Subscribe to each of the 4 compressed image topics on PC2 (using
@@ -89,6 +105,7 @@ SERVE_PORT="${X2_PC2_CAM_PORT:-5555}"
 SERVE_WIDTH="${X2_PC2_CAM_WIDTH:-640}"
 SERVE_HEIGHT="${X2_PC2_CAM_HEIGHT:-480}"
 SERVE_INCLUDE_REAR=false
+RESTART_HAL_DEEP=false
 
 REMOTE_BRIDGE_SCRIPT="/tmp/x2_pc2_camera_zmq_publisher.py"
 REMOTE_BRIDGE_LOG="/tmp/x2_pc2_camera_zmq_publisher.log"
@@ -113,6 +130,7 @@ while (( $# > 0 )); do
         --width)          SERVE_WIDTH="$2"; shift 2 ;;
         --height)         SERVE_HEIGHT="$2"; shift 2 ;;
         --include-rear)   SERVE_INCLUDE_REAR=true; shift ;;
+        --deep)           RESTART_HAL_DEEP=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)
             if [[ "$ACTION" == "grab" && -z "$GRAB_OUT_DIR" && "$1" != -* ]]; then
@@ -175,27 +193,73 @@ REMOTE
 }
 
 # ────────────────────────────────────────────────────────────────────────
-# restart-hal: bounce hal_sensor_orin to win the Argus boot race
+# restart-hal: bounce hal_sensor_orin (+ optionally nvargus-daemon) to
+# recover the 3 IMX900 GMSL sensors.
+#
+# Plain mode just stops/starts the HAL client (cheap, fixes the boot
+# race). ``--deep`` additionally restarts nvargus-daemon between the
+# stop and start, which is needed when libargus itself is in a bad
+# state (acquireBuffer timeouts / ChanselFault / FALCON_ERROR in
+# ``journalctl -u nvargus-daemon``).
 # ────────────────────────────────────────────────────────────────────────
 do_restart_hal() {
-    run_remote <<'REMOTE'
+    local deep="${RESTART_HAL_DEEP:-false}"
+    ssh "${SSH_OPTS[@]}" "${USER_NAME}@${HOST}" \
+        env DEEP="${deep}" bash -s <<'REMOTE'
 set -e
+deep="${DEEP:-false}"
 echo "Stopping hal_sensor_orin ..."
 aima em stop-app hal_sensor_orin 2>&1 | tail -1
 sleep 3
+if [[ "${deep}" == "true" ]]; then
+    echo "Restarting nvargus-daemon (deep mode, requires sudo) ..."
+    if sudo -n systemctl restart nvargus-daemon 2>&1; then
+        sleep 3
+        echo "  nvargus-daemon: $(systemctl is-active nvargus-daemon)"
+    else
+        echo "  ERROR: sudo systemctl restart nvargus-daemon failed."
+        echo "  Hint: ensure NOPASSWD sudo for nvargus-daemon on PC2,"
+        echo "        or run \"sudo systemctl restart nvargus-daemon\""
+        echo "        manually and re-run restart-hal."
+        exit 1
+    fi
+fi
 echo "Starting hal_sensor_orin ..."
 aima em start-app hal_sensor_orin 2>&1 | tail -1
-sleep 5
+# When we bounced nvargus too, give Argus + GMSL re-negotiation
+# longer to settle before sampling publisher counts.
+if [[ "${deep}" == "true" ]]; then sleep 12; else sleep 5; fi
 echo
 source /opt/ros/humble/setup.bash 2>/dev/null
 echo "=== post-bounce: publisher count per image topic ==="
+stereo_zero=0
 for t in /aima/hal/sensor/rgb_head_front_center/rgb_image \
          /aima/hal/sensor/stereo_head_front_left/rgb_image \
          /aima/hal/sensor/stereo_head_front_right/rgb_image \
          /aima/hal/sensor/rgb_head_rear/rgb_image; do
   cnt=$(timeout 3 ros2 topic info "$t" 2>&1 | awk -F: '/Publisher count/ {print $2}' | tr -d ' ')
   printf "  %-65s pubs=%s\n" "$t" "${cnt:-0}"
+  if [[ "$t" == *stereo_head_front* && "${cnt:-0}" -lt 1 ]]; then
+    stereo_zero=1
+  fi
 done
+if [[ "${stereo_zero}" -eq 1 ]]; then
+  echo
+  if [[ "${deep}" == "true" ]]; then
+    echo "WARNING: stereo cameras still pubs=0 after --deep bounce."
+    echo "  Likely a CSI/GMSL hardware-state issue (the IMX900 sensors"
+    echo "  register but never go Active). Recovery path:"
+    echo "    1. Check 'sudo dmesg | grep -iE imx900|max929' on PC2 for"
+    echo "       'sensor_recovery: Not Active' + 'recovery_check err'."
+    echo "    2. If those messages persist, only a PC2 reboot"
+    echo "       (re-assert camera reset lines) fixes it:"
+    echo "         ssh ${USER:-run}@<pc2> sudo reboot"
+  else
+    echo "WARNING: stereo cameras still pubs=0 after restart-hal."
+    echo "  Try the deeper recovery that also bounces libargus:"
+    echo "    $0 restart-hal --deep --host <pc2>"
+  fi
+fi
 REMOTE
 }
 

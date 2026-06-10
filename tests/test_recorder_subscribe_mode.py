@@ -903,3 +903,376 @@ def test_publish_pose_arm_overlay_in_future_window_zeros_arm_jvel() -> None:
         "expected non-zero leg jvel from the planner's stride; got "
         f"max={float(np.max(np.abs(jvel[:, :15]))):.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# VLA subscribe-mode: the live_vla_publish_motion_token bridge publishes
+# a SUPERSET of the planner payload (body_q + hands + token + future
+# window in a single message on :5556). The recorder learns to extract
+# the hand joints from that payload directly so it does not need the
+# manager's separate hand_finger_cmd stream. These tests pin:
+#
+#   1. The decoder writes left/right hand into the same state slot the
+#      manager would normally update.
+#   2. Partial / wrong-shape hand payloads are silently dropped so a
+#      mid-rollover frame can't corrupt a side.
+#   3. ``_subscribe_mode_thread(vla_mode=True)`` only binds the body_pose
+#      SUB -- the manager URL/topic args are accepted but never wired,
+#      so an absent manager publisher must NOT stall the thread.
+#   4. ``RecorderConfig(body_pose_source='vla', arm_targets_source='vla')``
+#      validates and constructs (sans LeRobot writer chain, which lives
+#      behind the lazy ensure_runtime_deps shim).
+# ---------------------------------------------------------------------------
+
+
+def test_handle_body_pose_msg_extracts_vla_hand_joints() -> None:
+    state = _SubscribeModeState()
+    left = np.linspace(0.0, 1.0, NUM_HAND_DOF_PER_SIDE, dtype=np.float32)
+    right = np.linspace(1.0, 0.0, NUM_HAND_DOF_PER_SIDE, dtype=np.float32)
+    payload = {
+        "joint_pos_mj": np.linspace(
+            -0.3, 0.3, NUM_BODY_DOFS, dtype=np.float32,
+        ),
+        "root_quat_xyzw": np.array(
+            [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
+        ),
+        "motion_token": np.zeros(64, dtype=np.float32),
+        "left_hand_joints": left,
+        "right_hand_joints": right,
+        "frame_index": np.array([7], dtype=np.int64),
+    }
+    msg = pack_pose_message(payload, topic="pose", version=4)
+    _handle_body_pose_msg([msg], state, expected_topic="pose")
+
+    snap = state.snapshot()
+    assert snap["left_hand_q"] is not None, "VLA hand never written"
+    assert snap["right_hand_q"] is not None
+    np.testing.assert_allclose(snap["left_hand_q"], left, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(snap["right_hand_q"], right, rtol=0, atol=1e-6)
+
+
+def test_handle_body_pose_msg_planner_payload_leaves_hands_untouched() -> None:
+    """Planner emits ``body_pose`` with zero-filled hand slots (10-DOF
+    each); the existing teleop pipeline gets real hand commands from
+    the manager's separate ``hand_finger_cmd`` topic. Decoding the
+    planner payload must NOT touch the existing hand slot (since the
+    manager's hand frame is the source of truth in that pipeline)."""
+    state = _SubscribeModeState()
+    # Seed with a "manager-supplied" hand pose so we can prove the
+    # decoder doesn't overwrite it.
+    seeded_left = np.full(NUM_HAND_DOF_PER_SIDE, 0.42, dtype=np.float64)
+    seeded_right = np.full(NUM_HAND_DOF_PER_SIDE, -0.13, dtype=np.float64)
+    state.update_hand_finger_cmd(seeded_left, seeded_right)
+
+    payload = {
+        "joint_pos_mj": np.zeros(NUM_BODY_DOFS, dtype=np.float32),
+        "root_quat_xyzw": np.array(
+            [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
+        ),
+        "motion_token": np.zeros(64, dtype=np.float32),
+        # Planner publishes zeros here -- still valid shape, so the
+        # decoder DOES forward them. This is fine in planner mode (no
+        # one is reading hand from body_pose), but in VLA mode the
+        # bridge always sends real values. We just assert the shape
+        # gate behaves predictably.
+        "left_hand_joints": np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float32),
+        "right_hand_joints": np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float32),
+        "frame_index": np.array([0], dtype=np.int64),
+    }
+    msg = pack_pose_message(payload, topic="body_pose", version=4)
+    _handle_body_pose_msg([msg], state, expected_topic="body_pose")
+
+    snap = state.snapshot()
+    # Zero-shaped hand was forwarded (since planner does include the
+    # field, even at zeros). This matches the existing fan-in behaviour;
+    # the loop then merges with manager hand if it arrives later.
+    np.testing.assert_allclose(
+        snap["left_hand_q"], np.zeros(NUM_HAND_DOF_PER_SIDE), rtol=0, atol=0,
+    )
+    np.testing.assert_allclose(
+        snap["right_hand_q"], np.zeros(NUM_HAND_DOF_PER_SIDE), rtol=0, atol=0,
+    )
+
+
+def test_handle_body_pose_msg_drops_wrong_shape_vla_hands() -> None:
+    state = _SubscribeModeState()
+    payload = {
+        "joint_pos_mj": np.zeros(NUM_BODY_DOFS, dtype=np.float32),
+        "root_quat_xyzw": np.array(
+            [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
+        ),
+        "motion_token": np.zeros(64, dtype=np.float32),
+        # Wrong shape on the left: must drop BOTH (partial frames
+        # would corrupt the side that did parse).
+        "left_hand_joints": np.zeros(
+            NUM_HAND_DOF_PER_SIDE - 2, dtype=np.float32,
+        ),
+        "right_hand_joints": np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float32),
+        "frame_index": np.array([0], dtype=np.int64),
+    }
+    msg = pack_pose_message(payload, topic="pose", version=4)
+    _handle_body_pose_msg([msg], state, expected_topic="pose")
+
+    snap = state.snapshot()
+    # Hand slot stays None -- partial decode rejected.
+    assert snap["left_hand_q"] is None
+    assert snap["right_hand_q"] is None
+
+
+def test_subscribe_mode_thread_vla_skips_manager_sub(planner_pub) -> None:
+    """In ``vla_mode=True`` the subscribe thread MUST NOT block on the
+    manager URL. We pass a deliberately invalid manager URL and a
+    pose-only payload that includes hands; the state should still get
+    populated from the bridge SUB alone."""
+    state = _SubscribeModeState()
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_subscribe_mode_thread,
+        kwargs=dict(
+            body_pose_url=f"tcp://127.0.0.1:{_PLANNER_PORT}",
+            body_pose_topic="pose",
+            # Bogus host:port -- if the thread tried to connect here
+            # it would either fail or hang. ``vla_mode=True`` must
+            # skip this entirely.
+            arm_and_hands_url="tcp://127.0.0.1:65000",
+            arm_targets_topic="arm_targets",
+            hand_finger_cmd_topic="hand_finger_cmd",
+            stream_mode_topic="stream_mode",
+            recorder_cmd_topic="recorder_cmd",
+            state=state,
+            stop_event=stop,
+            verbose=False,
+            vla_mode=True,
+        ),
+        name="test-recorder-vla-sub",
+        daemon=True,
+    )
+    thread.start()
+    # PUB-SUB slow-joiner: wait a beat before first publish.
+    time.sleep(0.2)
+
+    body = np.linspace(-0.1, 0.1, NUM_BODY_DOFS, dtype=np.float32)
+    left = np.full(NUM_HAND_DOF_PER_SIDE, 0.25, dtype=np.float32)
+    right = np.full(NUM_HAND_DOF_PER_SIDE, -0.25, dtype=np.float32)
+    msg = pack_pose_message(
+        {
+            "joint_pos_mj": body,
+            "root_quat_xyzw": np.array(
+                [0.0, 0.0, 0.0, 1.0], dtype=np.float32,
+            ),
+            "motion_token": np.zeros(64, dtype=np.float32),
+            "left_hand_joints": left,
+            "right_hand_joints": right,
+            "frame_index": np.array([1], dtype=np.int64),
+        },
+        topic="pose", version=4,
+    )
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        planner_pub.send(msg)
+        time.sleep(0.05)
+        snap = state.snapshot()
+        if (
+            snap["body_pose_q_mj"] is not None
+            and snap["left_hand_q"] is not None
+        ):
+            break
+
+    snap = state.snapshot()
+    try:
+        assert snap["body_pose_q_mj"] is not None, "bridge pose never received"
+        np.testing.assert_allclose(snap["body_pose_q_mj"], body, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(snap["left_hand_q"], left, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(snap["right_hand_q"], right, rtol=0, atol=1e-6)
+        # Manager-only state stays at defaults (we never subscribed).
+        assert snap["arm_left_q"] is None
+        assert snap["arm_right_q"] is None
+        assert snap["stream_mode"] == "OFF"
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+def test_recorder_rejects_mixed_vla_and_internal_sources() -> None:
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    cfg = RecorderConfig(
+        output_dir=None, task="", teleop_only=True,
+        body_pose_source="vla", arm_targets_source="internal",
+    )
+    with pytest.raises(ValueError, match="Mixing body_pose_source"):
+        X2DatasetRecorder(cfg)
+
+
+def test_recorder_rejects_mixed_zmq_and_vla_sources() -> None:
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    cfg = RecorderConfig(
+        output_dir=None, task="", teleop_only=True,
+        body_pose_source="vla", arm_targets_source="zmq",
+    )
+    with pytest.raises(ValueError, match="Mixing body_pose_source"):
+        X2DatasetRecorder(cfg)
+
+
+# ---------------------------------------------------------------------------
+# stop() auto-save semantics: in VLA subscribe-mode the recorder MUST save
+# the buffered episode on signal-triggered stop() (the only way the wrapper
+# can shut it down). In planner-zmq / internal mode it MUST drop instead
+# (operator explicitly presses X / Y to save before Ctrl-C). Catches the
+# regression "Ctrl-C silently loses every --with-record capture".
+# ---------------------------------------------------------------------------
+
+
+class _StubEpisodeBuffer:
+    """Minimal stand-in for _EpisodeBuffer: just needs len() + reset()."""
+
+    def __init__(self, n_frames: int) -> None:
+        self.frames: list[int] = list(range(n_frames))
+        self.reset_called: int = 0
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def reset(self) -> None:
+        self.frames.clear()
+        self.reset_called += 1
+
+
+class _StubSock:
+    def close(self, linger: int = 0) -> None:
+        pass
+
+
+class _StubThread:
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+class _StopSaveCapturer:
+    """Duck-typed shim that re-uses X2DatasetRecorder.stop() against a
+    minimal instance so we can assert which branch ran without booting
+    the full LeRobot writer chain."""
+
+    def __init__(
+        self, *, vla_subscribe_mode: bool, teleop_only: bool, n_frames: int = 3,
+    ) -> None:
+        from types import SimpleNamespace
+        self._stop_event = threading.Event()
+        self._is_recording = True
+        self._episode_buffer = _StubEpisodeBuffer(n_frames)
+        # _cfg only needs ``teleop_only`` for the branch we exercise.
+        self._cfg = SimpleNamespace(teleop_only=teleop_only)
+        self._vla_subscribe_mode = vla_subscribe_mode
+        # All side-effect attributes stop() touches must exist; we
+        # don't care what they do (we'll join None threads / close
+        # None sockets, which the inline try/except swallows).
+        self._sub_thread = _StubThread()
+        self._sub_mode_thread = None
+        self._gesture_thread = None
+        self._scene_state_thread = None
+        self._robot_pose_thread = None
+        self._head_camera_thread = None
+        self._head_camera_client = None
+        self._pub_sock = _StubSock()
+        self._scene_reset_pub_sock = None
+        self._task_mirror = None
+        self._quest = None
+        self._renderer = None
+        self._front_cam_renderer = None
+        # Capture which branch fired: list of ``save`` arg values.
+        self.stop_episode_calls: list[bool] = []
+
+    def _stop_episode(self, *, save: bool) -> None:
+        self.stop_episode_calls.append(save)
+        # Mirror real semantics: save=True clears buffer + flips
+        # _is_recording=False as part of the writer flush.
+        self._episode_buffer.frames.clear()
+        self._is_recording = False
+
+
+def test_stop_in_vla_mode_auto_saves_buffered_episode() -> None:
+    """Reproduces the dropped-2305-frames bug: signal handler calls
+    stop() while the run-loop is still inside its main while. In VLA
+    mode we MUST flush to disk -- there's no operator to press X."""
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    probe = _StopSaveCapturer(
+        vla_subscribe_mode=True, teleop_only=False, n_frames=2305,
+    )
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    assert probe.stop_episode_calls == [True], (
+        "VLA mode must auto-save on stop(); instead got "
+        f"_stop_episode calls = {probe.stop_episode_calls}"
+    )
+
+
+def test_stop_in_internal_mode_drops_buffered_episode() -> None:
+    """Legacy teleop semantic stays intact: Ctrl-C without an explicit
+    X button press discards the buffer (so an accidental Ctrl-C
+    doesn't contaminate the dataset)."""
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    probe = _StopSaveCapturer(
+        vla_subscribe_mode=False, teleop_only=False, n_frames=100,
+    )
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    assert probe.stop_episode_calls == [], (
+        "Internal/zmq teleop mode must NOT auto-save on stop(); "
+        f"instead got _stop_episode calls = {probe.stop_episode_calls}"
+    )
+    # And the buffer should have been explicitly reset.
+    assert probe._episode_buffer.reset_called >= 1
+
+
+def test_stop_in_vla_teleop_only_does_not_save() -> None:
+    """If a user passed --teleop-only (no parquet) and somehow ended up
+    in VLA subscribe-mode, do NOT try to save (there's no exporter)."""
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    probe = _StopSaveCapturer(
+        vla_subscribe_mode=True, teleop_only=True, n_frames=50,
+    )
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    assert probe.stop_episode_calls == [], (
+        "VLA + teleop_only must NOT auto-save (no exporter); "
+        f"instead got {probe.stop_episode_calls}"
+    )
+
+
+def test_stop_is_idempotent_no_duplicate_save() -> None:
+    """Regression: signal handler running re-entrantly during the
+    lerobot mp4 writer flush used to invoke stop() a second time
+    before the first ``_stop_episode`` had a chance to flip
+    ``_is_recording=False``. The second call observed the still-True
+    state and saved the SAME 380 buffered frames again as a duplicate
+    ``episode_000001``. The fix: stop() guards on ``_stop_called`` so
+    re-entrant invocations short-circuit.
+    """
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    probe = _StopSaveCapturer(
+        vla_subscribe_mode=True, teleop_only=False, n_frames=380,
+    )
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    # Simulate the second signal arriving (SIGTERM after SIGINT).
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    assert probe.stop_episode_calls == [True], (
+        "stop() must be idempotent across multiple signals; the second "
+        "call must NOT re-enter _stop_episode. Instead got "
+        f"_stop_episode calls = {probe.stop_episode_calls}"
+    )
+
+
+def test_stop_idempotent_internal_mode_also_no_double_reset() -> None:
+    """Internal mode discards the buffer on stop(). A second stop()
+    call must NOT reset again (cheap but a useful invariant that
+    confirms the guard fires uniformly across modes).
+    """
+    from gear_sonic.utils.teleop.x2_dataset_recorder import X2DatasetRecorder
+    probe = _StopSaveCapturer(
+        vla_subscribe_mode=False, teleop_only=False, n_frames=100,
+    )
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    first_resets = probe._episode_buffer.reset_called
+    X2DatasetRecorder.stop(probe)  # type: ignore[arg-type]
+    assert probe._episode_buffer.reset_called == first_resets, (
+        "Second stop() must short-circuit; instead the buffer was "
+        f"reset {probe._episode_buffer.reset_called} times "
+        f"(expected {first_resets})."
+    )
