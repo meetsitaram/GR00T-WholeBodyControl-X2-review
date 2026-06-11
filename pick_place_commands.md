@@ -128,6 +128,7 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
     --vla-future-lpf-hz 5.0 \
     --vla-hand-lpf-hz 10.0 \
     --vla-max-wire-step 0.07 \
+    --vla-tracking-feedback \
     --with-record \
     --output-dir data/lerobot/x2_pick_and_place_soda_can_n17_50k_v1_rollouts \
     --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
@@ -159,6 +160,32 @@ Same checkpoint, three iterations to land on the v3 LPF/step values:
 Tuning ladder if v3 misbehaves:
 - Oscillations return → tighten `--vla-max-wire-step` to 0.05 first (preserves phase response of legitimate motion); only drop LPF below 4 Hz if the step cap isn't enough.
 - Rise is still too slow → try `--vla-target-lpf-hz 7` next (back toward 10 incrementally), keep step at 0.07.
+
+#### v3 + closed-loop tracking feedback (2026-06-10 follow-up 11, Step 1)
+
+The 2026-06-10 PM run reproduced oscillations on identical v3 defaults
+that had been stable the day before — confirming static tuning can't
+cover the open-loop bridge's sensitivity to battery sag / motor
+temperature drift / SONIC PID variation. The structural fix is
+closed-loop tracking feedback (see milestone
+`2026-06-10_vla_closed_loop_wire.md` for the full design).
+
+**Step 1 rollout** (current real-robot recipe above): keeps every
+v3 default (`--vla-target-lpf-hz 5`, `--vla-future-lpf-hz 5`,
+`--vla-max-wire-step 0.07`) AND adds `--vla-tracking-feedback`. This
+is **additive** — feedback throttles per-arm-joint when the actuator
+is lagging; otherwise it's a no-op and the wire matches the v3 path.
+The point of running both in parallel is to isolate the feedback's
+contribution: if Step 1 reproduces v3's oscillations, the feedback
+law is at fault; if Step 1 is smoother, the closed loop is helping.
+
+Operator-visible telemetry: pub-tick log gains `tf_throttle=N/14`
+(N out of 14 arm joints actively protected this tick). N=0 most of
+the time = feedback is a no-op. Sustained high N = actuator is
+saturating; investigate.
+
+**Step 2** (separate commit after 2+ successful Step 1 runs): default
+flips ON, v3 statics relax (LPF 5→8, blend 40→10, step-cap 0.07→0.05).
 
 ### `run vla on x2-real RAW` — what `--vla-raw` actually disables
 

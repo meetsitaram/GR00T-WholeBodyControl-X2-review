@@ -218,6 +218,28 @@ BOLD=$'\033[1m'
 : "${VLA_HANDOFF_MAX_WIRE_STEP:=0.012}"
 : "${VLA_HANDOFF_STEP_RAMP_TICKS:=250}"
 
+# ---- Tracking feedback (2026-06-10 follow-up 11, closed-loop wire) -----
+# Closed-loop per-joint tracking feedback on the wire step cap. When
+# enabled, the bridge reads x2_debug's measured arm-joint positions
+# and velocities each tick and per-joint-throttles the per-tick step
+# so the wire never outpaces the actuator's actual response.
+# Eliminates the open-loop sensitivity to inference jitter / battery
+# sag / motor temp drift that drove the 2026-06-10 PM oscillation
+# incident.
+#
+# Step 1 rollout: default DISABLED (export VLA_TRACKING_FEEDBACK=1 or
+# pass --vla-tracking-feedback). v3 static defaults (LPF/blend/step-
+# cap) remain in place; feedback is additive belt-and-suspenders so
+# any regression on real robot can be isolated by flipping the flag.
+# Step 2 (separate commit) flips the default to ON and relaxes the
+# static defaults once feedback is validated.
+: "${VLA_TRACKING_FEEDBACK:=0}"
+: "${VLA_TRACKING_SOFT_RAD:=0.15}"
+: "${VLA_TRACKING_HARD_RAD:=0.40}"
+: "${VLA_TRACKING_VELOCITY_MARGIN:=1.5}"
+: "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK:=0.01}"
+: "${VLA_TRACKING_STALE_MS:=100}"
+
 # ---- Sim-mode pose proxy plumbing (2026-06-10 milestone, sim path) -----
 # When SIM_MODE=1 AND (VLA_CONTROL_PORT > 0 OR POSE_PROXY_OVERRIDE_PORT > 0),
 # this launcher spawns a LOCAL x2_pose_proxy on loopback between the
@@ -593,6 +615,45 @@ Flags (preferred over env vars):
                                --vla-max-wire-step (normal). Default
                                250 @ 50 Hz = 5 s. Set 0 to skip the
                                slow window entirely.
+  --vla-tracking-feedback      Enable closed-loop per-joint tracking
+                               feedback on the wire step cap (2026-06-10
+                               follow-up 11). When ON, the bridge reads
+                               x2_debug's measured arm positions +
+                               velocities and per-joint-throttles the
+                               per-tick wire step so it never outpaces
+                               the actuator's actual response. Default
+                               OFF (Step 1 belt-and-suspenders rollout:
+                               v3 LPF/blend/step-cap remain in place;
+                               feedback is additive). Opt in via this
+                               flag or VLA_TRACKING_FEEDBACK=1 env.
+  --no-vla-tracking-feedback   Force-disable tracking feedback (mid-
+                               session A/B against the scalar clamp).
+  --vla-tracking-soft-rad RAD  Position error below which the per-
+                               joint step cap stays at its base value
+                               (default 0.15 rad ~= 8.6 deg).
+  --vla-tracking-hard-rad RAD  Position error above which the per-
+                               joint step cap drops to 0 (joint frozen
+                               until actuator catches up). Default 0.40
+                               rad ~= 23 deg. Linear ramp between soft
+                               and hard.
+  --vla-tracking-velocity-margin SCALE
+                               Per-tick cap is also bounded by SCALE *
+                               |measured_dq| * dt (default 1.5 = wire
+                               can move at most 50% faster than the
+                               actuator is currently moving). Lower =
+                               more conservative.
+  --vla-tracking-velocity-floor-rad-tick RAD
+                               Minimum velocity-cap floor (default
+                               0.01 rad/tick = 0.5 rad/s @ 50 Hz). Lets
+                               the wire start from rest even when
+                               measured_dq is zero. Set 0 to require
+                               non-zero measured velocity (motion-only).
+  --vla-tracking-stale-ms MS   Tracking-feedback proprio staleness
+                               threshold. If the x2_debug snapshot is
+                               older than this, the bridge falls back
+                               to the scalar clamp for that tick.
+                               Default 100 ms = 5 publish ticks at
+                               50 Hz; covers a single packet drop.
   --pose-proxy-override-port PORT
                                Sim-only: proxy override SUB port (where
                                the teleop recorder PUBs). Default -1 =
@@ -824,6 +885,16 @@ while [[ $# -gt 0 ]]; do
         --vla-handoff-max-hold-ticks) VLA_HANDOFF_MAX_HOLD_TICKS="$2"; shift 2 ;;
         --vla-handoff-max-wire-step) VLA_HANDOFF_MAX_WIRE_STEP="$2"; shift 2 ;;
         --vla-handoff-step-ramp-ticks) VLA_HANDOFF_STEP_RAMP_TICKS="$2"; shift 2 ;;
+        # --- tracking feedback (2026-06-10 follow-up 11) ---------------
+        # Closed-loop wire step cap; default OFF for Step 1 belt-and-
+        # suspenders rollout. See the VLA_TRACKING_* env block above.
+        --vla-tracking-feedback) VLA_TRACKING_FEEDBACK=1; shift ;;
+        --no-vla-tracking-feedback) VLA_TRACKING_FEEDBACK=0; shift ;;
+        --vla-tracking-soft-rad) VLA_TRACKING_SOFT_RAD="$2"; shift 2 ;;
+        --vla-tracking-hard-rad) VLA_TRACKING_HARD_RAD="$2"; shift 2 ;;
+        --vla-tracking-velocity-margin) VLA_TRACKING_VELOCITY_MARGIN="$2"; shift 2 ;;
+        --vla-tracking-velocity-floor-rad-tick) VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK="$2"; shift 2 ;;
+        --vla-tracking-stale-ms) VLA_TRACKING_STALE_MS="$2"; shift 2 ;;
         --pose-proxy-override-port) POSE_PROXY_OVERRIDE_PORT="$2"; shift 2 ;;
         --pose-proxy-override-host) POSE_PROXY_OVERRIDE_HOST="$2"; shift 2 ;;
         --pose-proxy-override-topic) POSE_PROXY_OVERRIDE_TOPIC="$2"; shift 2 ;;
@@ -890,7 +961,17 @@ if [[ "$VLA_RAW" -eq 1 ]]; then
     VLA_MAX_WIRE_DEV_FROM_BODY=0
     VLA_MAX_WIRE_STEP=0
     VLA_CHUNK_BLEND_TICKS=0
+    # 2026-06-10 follow-up 11: tracking feedback is wire-shaping too
+    # (closed-loop variant of max_wire_step). --vla-raw means "no
+    # wire shaping" by contract, so disable it here. Operators who
+    # really want feedback active under --vla-raw must opt back in
+    # explicitly with --vla-tracking-feedback AFTER --vla-raw.
+    if [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]]; then
+        echo -e "${YELLOW}[vla-runtime] --vla-raw disables VLA_TRACKING_FEEDBACK (closed-loop wire shaping)${NC}" >&2
+    fi
+    VLA_TRACKING_FEEDBACK=0
 fi
+
 
 # Backwards-compat env: if MOTION_TOKEN_DECODER wasn't given but
 # SONIC_CHECKPOINT was, treat the latter as the decoder path and
@@ -1026,6 +1107,17 @@ log()   { echo -e "${CYAN}[vla-runtime]${NC} $*"; }
 ok()    { echo -e "${GREEN}[vla-runtime]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[vla-runtime]${NC} $*" >&2; }
 err()   { echo -e "${RED}[vla-runtime]${NC} $*" >&2; }
+
+# ----- Tracking feedback config log (2026-06-10 follow-up 11) ---------
+# Emit the operator-facing log line EARLY (right after the log()
+# helper is defined, but BEFORE preflight) so the state is visible
+# even on failed preflights. Actual BRIDGE_ARGS threading happens
+# later in the spawn block.
+if [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]]; then
+    log "tracking feedback ENABLED: soft=${VLA_TRACKING_SOFT_RAD}rad hard=${VLA_TRACKING_HARD_RAD}rad vel_margin=${VLA_TRACKING_VELOCITY_MARGIN} vel_floor=${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}rad/tick stale=${VLA_TRACKING_STALE_MS}ms (closed-loop arm-joint cap; falls back to scalar clamp when proprio stale)"
+else
+    log "tracking feedback DISABLED (set --vla-tracking-feedback or VLA_TRACKING_FEEDBACK=1 to enable closed-loop wire step cap)"
+fi
 
 # wait_for_log_marker: tails ${log_path} for ${marker} until ${pid} is
 # alive AND the marker appears, or ${timeout_s} elapses. Returns 0/1.
@@ -2001,6 +2093,7 @@ cat <<EOF
   ${BOLD}Body mode       ${NC}: ${VLA_BODY_MODE}$( [[ -n "$VLA_MODE_CONTROL_FILE" ]] && echo " (runtime switch: ${VLA_MODE_CONTROL_FILE})" )
   ${BOLD}Token decoder   ${NC}: ${MOTION_TOKEN_DECODER:-DISABLED (body will track idle_stand only)}
   ${BOLD}Wire safety     ${NC}: ramp ${VLA_RAMP_IN_TICKS}t bodyLPF ${VLA_TARGET_LPF_HZ}Hz futLPF ${VLA_FUTURE_LPF_HZ}Hz handLPF ${VLA_HAND_LPF_HZ}Hz handBlend ${VLA_HAND_CHUNK_BLEND_TICKS}t handStep≤${VLA_MAX_HAND_STEP} bodyStep≤${VLA_MAX_WIRE_STEP} body≤${VLA_MAX_WIRE_DEV_FROM_BODY} blend ${VLA_CHUNK_BLEND_TICKS}t actionIL≤${VLA_MAX_ACTION_IL}$( [[ "$VLA_RAW" -eq 1 ]] && echo "  ${RED}${BOLD}[--vla-raw: WIRE FILTERS OFF; action-IL clamp KEPT to prevent proprio runaway]${NC}" )
+  ${BOLD}Tracking feedback${NC}: $( [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]] && echo "${BOLD}ON${NC}  soft=${VLA_TRACKING_SOFT_RAD}rad hard=${VLA_TRACKING_HARD_RAD}rad vel_margin=${VLA_TRACKING_VELOCITY_MARGIN} vel_floor=${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}rad/tick stale=${VLA_TRACKING_STALE_MS}ms (closed-loop per-arm-joint wire cap; falls back to scalar clamp when proprio stale)" || echo "OFF (legacy scalar clamp; opt in via --vla-tracking-feedback)" )
   ${BOLD}Deploy clamp    ${NC}: max-target-dev ${SIM_MAX_TARGET_DEV:-off} deploy-LPF ${SIM_DEPLOY_TARGET_LPF_HZ:-off} Hz (sim)
   ${BOLD}Wrist bypass    ${NC}: ${WRIST_BYPASS:-off}$( [[ "${WRIST_BYPASS:-off}" == "ik" ]] && echo "  (deploy force-writes target_pos_mj[{20,21,27,28}] to wire IK; rate-limited via bridge max_wire_step + follow-up 6 slow-step ramp; NO global max-target-dev auto-pair after the 13:21 leg-collapse regression)" || echo "  ${RED}WARNING: wrist pitch/roll pinned at SONIC comfort -- will NOT respond to operator/VLA wrist commands. Set --wrist-bypass ik to enable.${NC}" )
   ${BOLD}Rate            ${NC}: ${RATE} Hz publisher, ${INFERENCE_MIN_PERIOD_S}s min inference period
@@ -2150,6 +2243,32 @@ if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]
     log "vla_control SUB enabled: tcp://${VLA_CONTROL_HOST_RESOLVED}:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (cold_restart_hold_ticks=${VLA_COLD_RESTART_HOLD_TICKS} handoff_max_hold_ticks=${VLA_HANDOFF_MAX_HOLD_TICKS} handoff_max_wire_step=${VLA_HANDOFF_MAX_WIRE_STEP} handoff_step_ramp_ticks=${VLA_HANDOFF_STEP_RAMP_TICKS})"
 else
     log "vla_control SUB disabled (set VLA_CONTROL_PORT > 0 to enable manual-takeover cold restarts)"
+fi
+
+# ----- Tracking feedback (2026-06-10 follow-up 11) -------------------
+# Closed-loop per-joint feedback on the wire step cap. Default OFF
+# for Step 1 belt-and-suspenders rollout; opt in via env var
+# (VLA_TRACKING_FEEDBACK=1) or --vla-tracking-feedback CLI flag.
+# When ON the bridge reads x2_debug's measured arm-joint positions
+# and velocities each tick and throttles the per-joint per-tick
+# wire step based on tracking error + measured velocity. The static
+# LPF / chunk-blend / scalar step cap stay in place (Step 1) so any
+# regression is attributable.
+#
+# Note: the log line was already emitted right after env-default
+# resolution (see the "tracking feedback ENABLED/DISABLED" line
+# above the preflight section) so the operator sees the config
+# state even if preflight fails. Here we only thread the actual
+# CLI args into BRIDGE_ARGS for the spawned bridge.
+if [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]]; then
+    BRIDGE_ARGS+=(
+        --vla-tracking-feedback
+        --vla-tracking-soft-rad "${VLA_TRACKING_SOFT_RAD}"
+        --vla-tracking-hard-rad "${VLA_TRACKING_HARD_RAD}"
+        --vla-tracking-velocity-margin "${VLA_TRACKING_VELOCITY_MARGIN}"
+        --vla-tracking-velocity-floor-rad-tick "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}"
+        --vla-tracking-stale-ms "${VLA_TRACKING_STALE_MS}"
+    )
 fi
 
 # Forward any unrecognised CLI tail as passthrough to the bridge.

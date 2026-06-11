@@ -231,6 +231,17 @@ def test_launcher_help_lists_manual_takeover_flags():
         "--pose-proxy-teleop-mode-topic",
         "--pose-proxy-teleop-mode-stale-ms",
         "--pose-proxy-downstream-port",
+        # 2026-06-10 follow-up 11: closed-loop tracking feedback flags.
+        # Same drift-prevention contract as the manual-takeover flags
+        # above -- if the operator-facing surface flips, this test
+        # fires before the next real-robot session.
+        "--vla-tracking-feedback",
+        "--no-vla-tracking-feedback",
+        "--vla-tracking-soft-rad",
+        "--vla-tracking-hard-rad",
+        "--vla-tracking-velocity-margin",
+        "--vla-tracking-velocity-floor-rad-tick",
+        "--vla-tracking-stale-ms",
     ):
         assert flag in proc.stdout, (
             f"{flag} missing from launcher --help output; "
@@ -1236,4 +1247,204 @@ def test_clamp_vector_step_f32_caps_peak_element_and_preserves_direction():
             target, None, max_step=0.1
         ),
         target,
+    )
+
+
+# ======================================================================
+# 2026-06-10 follow-up 11: closed-loop tracking feedback CLI plumbing
+# ======================================================================
+
+
+def test_launcher_accepts_tracking_feedback_cli_flags(tmp_path):
+    """``--vla-tracking-feedback`` (and the four threshold flags) must
+    be parsed by the case-statement, not fall through to the bridge
+    catch-all. Same drift-detection pattern as the manual-takeover
+    flag test above. Uses ``preflight`` + ``SKIP_PREFLIGHT=1`` so the
+    launcher exits before spawning any subprocess.
+    """
+    bash = shutil.which("bash")
+    assert bash is not None
+    run_dir = tmp_path / "tracking_preflight"
+    proc = subprocess.run(
+        [
+            bash,
+            str(LAUNCHER),
+            "preflight",
+            "--vla-tracking-feedback",
+            "--vla-tracking-soft-rad", "0.20",
+            "--vla-tracking-hard-rad", "0.50",
+            "--vla-tracking-velocity-margin", "2.0",
+            "--vla-tracking-velocity-floor-rad-tick", "0.02",
+            "--vla-tracking-stale-ms", "150",
+            "--run-dir", str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+    )
+    combined = proc.stdout + proc.stderr
+    for flag in (
+        "--vla-tracking-feedback",
+        "--vla-tracking-soft-rad",
+        "--vla-tracking-hard-rad",
+        "--vla-tracking-velocity-margin",
+        "--vla-tracking-velocity-floor-rad-tick",
+        "--vla-tracking-stale-ms",
+    ):
+        assert f"Unknown argument: {flag}" not in combined, (
+            f"launcher rejected {flag} as unknown; "
+            f"output:\n{combined!r}"
+        )
+    # preflight either succeeds or hits a domain-specific failure
+    # (e.g., model not found); the forbidden outcome is rc==2
+    # (bash usage error) which would indicate a syntax fault.
+    assert proc.returncode != 2, (
+        f"launcher returned bash usage error (rc=2); flags didn't parse. "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    # The Step 1 rollout banner must mention tracking feedback as
+    # ENABLED (since we passed --vla-tracking-feedback).
+    assert (
+        "tracking feedback ENABLED" in combined
+        or "Tracking feedback" in combined
+        and "ON" in combined
+    ), (
+        f"banner should announce tracking feedback ON when --vla-"
+        f"tracking-feedback is passed; got:\n{combined!r}"
+    )
+
+
+def test_launcher_no_tracking_feedback_default_off_in_banner(tmp_path):
+    """Default Step 1 rollout: tracking feedback is OFF unless
+    explicitly enabled. The banner must announce that state so
+    the operator knows the closed loop isn't running. Pins the
+    default-OFF contract for Step 1 (Step 2 flips this default).
+    """
+    bash = shutil.which("bash")
+    assert bash is not None
+    run_dir = tmp_path / "no_tracking_preflight"
+    proc = subprocess.run(
+        [
+            bash,
+            str(LAUNCHER),
+            "preflight",
+            "--run-dir", str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+    )
+    combined = proc.stdout + proc.stderr
+    # Either an explicit "tracking feedback DISABLED" log line
+    # (the LOG path) or the OFF-state banner line.
+    assert (
+        "tracking feedback DISABLED" in combined
+        or ("Tracking feedback" in combined and "OFF" in combined)
+    ), (
+        f"banner / log must announce tracking feedback OFF by "
+        f"default; got:\n{combined!r}"
+    )
+
+
+def test_launcher_no_vla_tracking_feedback_overrides_env(tmp_path):
+    """``--no-vla-tracking-feedback`` on the CLI must override the
+    env-var default (e.g., when an operator runs A/B against the
+    scalar clamp without unsetting their persistent VLA_TRACKING_
+    FEEDBACK=1 export). Pins the precedence: CLI wins over env.
+    """
+    bash = shutil.which("bash")
+    assert bash is not None
+    run_dir = tmp_path / "no_tf_override_preflight"
+    proc = subprocess.run(
+        [
+            bash,
+            str(LAUNCHER),
+            "preflight",
+            "--no-vla-tracking-feedback",
+            "--run-dir", str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **__import__("os").environ,
+            "SKIP_PREFLIGHT": "1",
+            "VLA_TRACKING_FEEDBACK": "1",  # env says ON
+        },
+    )
+    combined = proc.stdout + proc.stderr
+    # CLI says OFF; banner must reflect OFF.
+    assert (
+        "tracking feedback DISABLED" in combined
+        or ("Tracking feedback" in combined and "OFF" in combined)
+    ), (
+        f"--no-vla-tracking-feedback must override env VLA_TRACKING_"
+        f"FEEDBACK=1; got:\n{combined!r}"
+    )
+
+
+def test_launcher_vla_raw_disables_tracking_feedback(tmp_path):
+    """``--vla-raw`` is the documented "disable all wire shaping"
+    flag. Tracking feedback IS wire shaping (closed-loop variety),
+    so --vla-raw must also disable it for consistency with the
+    operator's mental model. Pins this for the wire-debugging
+    workflow (operator wants to see raw policy intent on the wire).
+    """
+    bash = shutil.which("bash")
+    assert bash is not None
+    run_dir = tmp_path / "vla_raw_preflight"
+    proc = subprocess.run(
+        [
+            bash,
+            str(LAUNCHER),
+            "preflight",
+            "--vla-raw",
+            "--vla-tracking-feedback",  # operator tried to opt in
+            "--run-dir", str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+    )
+    combined = proc.stdout + proc.stderr
+    # The launcher must warn about the conflict AND keep feedback OFF.
+    assert "--vla-raw disables VLA_TRACKING_FEEDBACK" in combined, (
+        f"launcher must warn that --vla-raw disables tracking feedback; "
+        f"got:\n{combined!r}"
+    )
+    assert (
+        "tracking feedback DISABLED" in combined
+        or ("Tracking feedback" in combined and "OFF" in combined)
+    ), (
+        f"banner must reflect OFF under --vla-raw; got:\n{combined!r}"
+    )
+
+
+def test_launcher_forwards_tracking_feedback_args_to_bridge():
+    """The launcher must materialise all 6 tracking-feedback flags
+    into ``BRIDGE_ARGS`` when VLA_TRACKING_FEEDBACK=1. Greps the
+    launcher source for the BRIDGE_ARGS+=(...) block instead of
+    actually spawning the bridge -- same pattern as the manual-
+    takeover forwarding test above.
+    """
+    src = LAUNCHER.read_text()
+    # The tracking-feedback BRIDGE_ARGS append block, normalised to
+    # collapse whitespace differences across indentation levels.
+    expected_fragment = (
+        '--vla-tracking-feedback '
+        '--vla-tracking-soft-rad "${VLA_TRACKING_SOFT_RAD}" '
+        '--vla-tracking-hard-rad "${VLA_TRACKING_HARD_RAD}" '
+        '--vla-tracking-velocity-margin "${VLA_TRACKING_VELOCITY_MARGIN}" '
+        '--vla-tracking-velocity-floor-rad-tick "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}" '
+        '--vla-tracking-stale-ms "${VLA_TRACKING_STALE_MS}"'
+    )
+    normalised_src = " ".join(src.split())
+    normalised_expected = " ".join(expected_fragment.split())
+    assert normalised_expected in normalised_src, (
+        f"launcher BRIDGE_ARGS+= block for tracking feedback is "
+        f"missing or has drifted. Expected fragment (whitespace-"
+        f"normalised):\n  {normalised_expected!r}"
     )

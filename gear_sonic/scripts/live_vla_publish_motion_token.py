@@ -317,6 +317,190 @@ def _clamp_vector_step(
     return (prv + delta * (max_step / peak)).astype(np.float32)
 
 
+def _clamp_vector_step_per_joint(
+    target: np.ndarray,
+    prev: np.ndarray | None,
+    max_step_per_joint: np.ndarray,
+) -> np.ndarray:
+    """Per-joint variant of :func:`_clamp_vector_step`.
+
+    Unlike the scalar variant -- which scales the ENTIRE delta vector
+    by ``max_step / peak`` (preserving direction) -- this variant
+    clamps each joint INDEPENDENTLY: joint ``i`` can move at most
+    ``max_step_per_joint[i]`` rad this tick, regardless of what the
+    other joints are doing.
+
+    Why per-joint independent: the tracking-feedback loop wants to
+    slow down ONLY the joints that are actually lagging (e.g., the
+    operator's wrist roll while the elbow tracks fine). Throttling
+    the whole vector to the slowest joint would couple unrelated
+    actuators and over-damp the wire when only one DOF is sluggish.
+    The cost is that the wire's per-tick *direction* may shift
+    slightly from the policy's intent when one joint is throttled --
+    but that shift is exactly what a per-joint actuator with PID
+    feedback would produce anyway, so it matches the physical reality
+    the policy will encounter.
+
+    Cap semantics (different from the scalar variant on purpose):
+
+      * ``cap[i] > 0``: joint ``i``'s |delta| clamped to that value.
+      * ``cap[i] == 0``: joint ``i`` is FROZEN this tick (delta = 0).
+        This is what the tracking-feedback law emits when a joint's
+        tracking error exceeds the hard threshold (actuator clearly
+        saturating; back off until it catches up).
+      * ``cap[i] < 0``: NO cap on joint ``i`` (delta passes through).
+        Used as the "joint not subject to feedback" sentinel; the
+        helper internally treats negatives as +inf.
+
+    Note: the scalar variant uses ``max_step <= 0`` to mean "step cap
+    DISABLED" (target passes through). The per-joint variant splits
+    that into two cases (freeze vs no-cap) because tracking feedback
+    needs to express both. If you want the scalar variant's
+    "disabled" semantics here, pass an all-negative cap array.
+
+    Args:
+        target: desired wire pose this tick (e.g., post-LPF).
+        prev:   previously published wire pose (anchor for the delta).
+                ``None`` means "no anchor available yet" -- pass
+                target through unchanged (same semantics as the
+                scalar variant).
+        max_step_per_joint: shape ``(N,)`` array of per-joint caps.
+                            See cap semantics above.
+    """
+    tgt = np.asarray(target, dtype=np.float32)
+    if prev is None:
+        return tgt
+    prv = np.asarray(prev, dtype=np.float32)
+    cap = np.asarray(max_step_per_joint, dtype=np.float32)
+    if cap.shape != tgt.shape:
+        raise ValueError(
+            f"max_step_per_joint shape {cap.shape} != target shape "
+            f"{tgt.shape} (per-joint clamp needs one cap per joint)"
+        )
+    delta = tgt - prv
+    # Negative cap = "no cap on this joint" (sentinel) -> +inf so
+    # np.minimum is a no-op. Zero cap = "freeze" -> np.minimum with 0
+    # forces |delta_i| = 0 (correct semantics for tracking-feedback
+    # hard-threshold freeze).
+    cap_eff = np.where(cap < 0.0, np.float32(np.inf), cap)
+    # Element-wise clamp: |delta_i| <= cap_eff[i]. Preserves sign.
+    sign = np.sign(delta).astype(np.float32)
+    clamped = sign * np.minimum(np.abs(delta), cap_eff)
+    return (prv + clamped).astype(np.float32)
+
+
+# Joint-mask constants for the tracking-feedback loop. The bridge
+# does NOT apply per-joint feedback to legs / waist / head: those
+# DOFs have their own deploy-side dynamics (SONIC balance loop,
+# waist_yaw freeze, head lock) that tracking feedback would fight
+# with. Arms + hands are the only joints the VLA bridge directly
+# authors during a chunk, so they're the only joints we gate.
+_ARM_JOINT_INDICES: tuple[int, ...] = tuple(range(15, 29))  # MJ 15..28 = L_arm(7) + R_arm(7)
+
+
+def _apply_tracking_feedback(
+    target: np.ndarray,
+    prev_wire: np.ndarray | None,
+    measured_q: np.ndarray | None,
+    measured_dq: np.ndarray | None,
+    *,
+    base_max_step: float,
+    soft_rad: float,
+    hard_rad: float,
+    vel_margin: float,
+    vel_floor_rad_tick: float,
+    dt_s: float,
+    joint_indices: tuple[int, ...] = _ARM_JOINT_INDICES,
+) -> tuple[np.ndarray, int]:
+    """Compute per-joint per-tick step caps from real proprio feedback.
+
+    Returns ``(cap_per_joint, throttle_count)`` where:
+
+      * ``cap_per_joint`` is a length-``len(target)`` array of step
+        caps (rad/tick). Joints NOT in ``joint_indices`` are filled
+        with ``base_max_step`` (i.e., no per-joint feedback applied;
+        the existing static behaviour). Joints IN ``joint_indices``
+        get the minimum of:
+
+          - Position-error backoff: ``base_max_step * f(|tgt - meas|)``
+            where ``f`` is 1.0 below ``soft_rad``, 0.0 above
+            ``hard_rad``, linear in between. Above hard the wire
+            freezes for that joint until the actuator catches up.
+          - Velocity cap: ``max(vel_floor, vel_margin * |dq| * dt)``.
+            Prevents commanding faster than the actuator is currently
+            moving (with a small overhead via ``vel_margin``) but
+            allows starts from rest via ``vel_floor``.
+
+      * ``throttle_count`` is the number of ``joint_indices`` joints
+        whose effective cap dropped below ``0.5 * base_max_step``
+        (used for telemetry; "how many joints did feedback throttle
+        this tick").
+
+    Fallbacks (all preserve byte-identical behaviour to the static
+    scalar clamp):
+
+      * ``prev_wire is None``: returns ``cap = base_max_step``
+        everywhere, ``throttle_count = 0``. Caller's scalar clamp
+        will also no-op when ``prev is None`` (per
+        ``_clamp_vector_step`` contract), so the wire is unaffected
+        anyway -- this just keeps the return value consistent.
+      * ``measured_q is None`` OR ``measured_dq is None``: same as
+        above, signals "no proprio available, fall back to scalar".
+      * ``base_max_step <= 0``: returns ``cap = 0`` everywhere
+        (matches scalar's "step cap disabled = freeze" semantics).
+    """
+    n = int(np.asarray(target).shape[0])
+    if base_max_step <= 0.0:
+        return np.zeros(n, dtype=np.float32), 0
+    base = float(base_max_step)
+    if (
+        prev_wire is None
+        or measured_q is None
+        or measured_dq is None
+    ):
+        return np.full(n, base, dtype=np.float32), 0
+
+    tgt = np.asarray(target, dtype=np.float32)
+    meas_q = np.asarray(measured_q, dtype=np.float32)
+    meas_dq = np.asarray(measured_dq, dtype=np.float32)
+    if meas_q.shape[0] != n or meas_dq.shape[0] != n:
+        # Shape mismatch -> fall back to scalar (do not silently misalign).
+        return np.full(n, base, dtype=np.float32), 0
+
+    cap = np.full(n, base, dtype=np.float32)
+    throttle_count = 0
+
+    soft = float(max(soft_rad, 0.0))
+    hard = float(max(hard_rad, soft + 1e-6))  # avoid divide-by-zero
+    vmarg = float(max(vel_margin, 0.0))
+    vfloor = float(max(vel_floor_rad_tick, 0.0))
+    dt = float(max(dt_s, 1e-6))
+
+    for j in joint_indices:
+        if j < 0 or j >= n:
+            continue
+        err = float(abs(tgt[j] - meas_q[j]))
+        # Position backoff: 1.0 at err<=soft, 0.0 at err>=hard.
+        if err <= soft:
+            pos_scale = 1.0
+        elif err >= hard:
+            pos_scale = 0.0
+        else:
+            pos_scale = (hard - err) / (hard - soft)
+        pos_cap = base * pos_scale
+        # Velocity cap: never command faster than vel_margin * |dq|
+        # per tick. Floored so the wire can start from rest.
+        vel_cap = max(vfloor, vmarg * abs(float(meas_dq[j])) * dt)
+        eff = min(pos_cap, vel_cap)
+        if eff < 0.0:
+            eff = 0.0
+        cap[j] = np.float32(eff)
+        if eff < 0.5 * base:
+            throttle_count += 1
+
+    return cap, throttle_count
+
+
 def _lpf_alpha_from_hz(cutoff_hz: float, dt_s: float) -> float:
     if cutoff_hz <= 0.0:
         return 0.0
@@ -2074,6 +2258,25 @@ def _publisher(
     handoff_max_hold_ticks: int = 200,
     handoff_max_wire_step: float = 0.012,
     handoff_step_ramp_ticks: int = 250,
+    # 2026-06-10 follow-up 11: closed-loop tracking feedback on the
+    # wire step cap. When enabled, the bridge reads x2_debug's
+    # measured arm-joint positions + velocities each tick and
+    # per-joint-throttles the wire step so it never outpaces the
+    # actuator's actual response. Eliminates the open-loop
+    # sensitivity to inference jitter / battery sag / motor temp
+    # that drove the 2026-06-10 PM oscillation incident. All gated
+    # on ``tracking_feedback_enabled`` (default False = byte-
+    # identical to legacy scalar clamp); when enabled but proprio
+    # is stale (>tracking_stale_ms since last x2_debug update) the
+    # bridge falls back to the scalar clamp automatically. See
+    # ``_apply_tracking_feedback`` docstring + the 2026-06-10
+    # closed-loop wire milestone for the full feedback law.
+    tracking_feedback_enabled: bool = False,
+    tracking_soft_rad: float = 0.15,
+    tracking_hard_rad: float = 0.40,
+    tracking_vel_margin: float = 1.5,
+    tracking_vel_floor_rad_tick: float = 0.01,
+    tracking_stale_ms: int = 100,
 ) -> int:
     """Thread C (= main thread): publish action[step] at ``rate_hz``.
 
@@ -2132,6 +2335,17 @@ def _publisher(
     chunk_step = 0
     horizon = 40
     tick = 0
+
+    # --- Tracking feedback (2026-06-10 follow-up 11) -----------------
+    # Per-tick throttle count for telemetry: how many of the 14 arm
+    # joints did the closed-loop feedback throttle below 50% of the
+    # base step cap this tick. Stays 0 when the feature is disabled
+    # OR when proprio is stale -- both cases also fall back to the
+    # scalar clamp downstream so the wire is byte-identical to the
+    # legacy path. See ``_apply_tracking_feedback`` for the law.
+    tracking_stale_s = float(max(tracking_stale_ms, 0)) / 1000.0
+    tracking_arm_count = len(_ARM_JOINT_INDICES)
+    last_tracking_throttle: int = 0
 
     # --- Bridge-side proprio assembly state ---------------------------
     # The SONIC pose decoder was trained against the IsaacLab
@@ -2282,6 +2496,21 @@ def _publisher(
                     flush=True,
                 )
         body_q_mj_now, base_quat_now, _, _, _, deploy_fresh = state.snapshot()
+        # 2026-06-10 follow-up 11: read measured velocities for the
+        # closed-loop tracking feedback. Cheap second snapshot --
+        # both reads acquire ``state.cv`` so the worst case is one
+        # tick of staleness between q and dq, well below the 50 Hz
+        # publish cadence. ``staleness_s`` is computed from the same
+        # monotonic clock the state thread uses so the feedback can
+        # decide whether to trust the snapshot or fall back to the
+        # scalar clamp.
+        body_dq_mj_now, _base_ang_vel_now = state.snapshot_velocities()
+        with state.cv:
+            tracking_staleness_s = (
+                time.monotonic() - state.last_update_monotonic
+                if state.received_any
+                else float("inf")
+            )
         token, left, right, _body_pose_chunk, chunk_id = chunk.read()
         horizon = int(token.shape[0])
         if chunk_id != last_chunk_id:
@@ -2829,9 +3058,41 @@ def _publisher(
                     handoff_step_remaining -= 1
                 else:
                     effective_max_step = float(max_wire_step)
-                cur_jpos = _clamp_vector_step(
-                    cur_jpos, prev_wire_jpos, effective_max_step
+                # 2026-06-10 follow-up 11: closed-loop tracking
+                # feedback. When enabled AND proprio is fresh, the
+                # scalar ``effective_max_step`` becomes the per-arm-
+                # joint UPPER bound; each arm joint's individual cap
+                # is then throttled by position error and velocity
+                # margin via ``_apply_tracking_feedback``. Falls back
+                # to the scalar clamp transparently when disabled or
+                # when proprio is stale (>tracking_stale_ms).
+                tracking_active = (
+                    tracking_feedback_enabled
+                    and deploy_fresh
+                    and tracking_staleness_s <= tracking_stale_s
                 )
+                if tracking_active:
+                    cap_per_joint, throttle_count = _apply_tracking_feedback(
+                        cur_jpos,
+                        prev_wire_jpos,
+                        body_q_mj_now,
+                        body_dq_mj_now,
+                        base_max_step=effective_max_step,
+                        soft_rad=tracking_soft_rad,
+                        hard_rad=tracking_hard_rad,
+                        vel_margin=tracking_vel_margin,
+                        vel_floor_rad_tick=tracking_vel_floor_rad_tick,
+                        dt_s=period,
+                    )
+                    cur_jpos = _clamp_vector_step_per_joint(
+                        cur_jpos, prev_wire_jpos, cap_per_joint
+                    )
+                    last_tracking_throttle = int(throttle_count)
+                else:
+                    cur_jpos = _clamp_vector_step(
+                        cur_jpos, prev_wire_jpos, effective_max_step
+                    )
+                    last_tracking_throttle = 0
                 cur_jpos = _clamp_vector_deviation(
                     cur_jpos,
                     np.asarray(body_q_mj_now, dtype=np.float32),
@@ -2888,9 +3149,39 @@ def _publisher(
                 handoff_step_remaining -= 1
             else:
                 effective_max_step = float(max_wire_step)
-            cur_jpos = _clamp_vector_step(
-                cur_jpos, prev_wire_jpos, effective_max_step,
+            # 2026-06-10 follow-up 11: same tracking-feedback gate as
+            # the decoder-succeeded branch above. The idle wire still
+            # benefits from per-joint feedback (especially during the
+            # post-handoff hold-at-operator-pose window where the wire
+            # is ramping back from operator pose to idle and any
+            # actuator lag could create a sustained tracking error).
+            tracking_active = (
+                tracking_feedback_enabled
+                and deploy_fresh
+                and tracking_staleness_s <= tracking_stale_s
             )
+            if tracking_active:
+                cap_per_joint, throttle_count = _apply_tracking_feedback(
+                    cur_jpos,
+                    prev_wire_jpos,
+                    body_q_mj_now,
+                    body_dq_mj_now,
+                    base_max_step=effective_max_step,
+                    soft_rad=tracking_soft_rad,
+                    hard_rad=tracking_hard_rad,
+                    vel_margin=tracking_vel_margin,
+                    vel_floor_rad_tick=tracking_vel_floor_rad_tick,
+                    dt_s=period,
+                )
+                cur_jpos = _clamp_vector_step_per_joint(
+                    cur_jpos, prev_wire_jpos, cap_per_joint
+                )
+                last_tracking_throttle = int(throttle_count)
+            else:
+                cur_jpos = _clamp_vector_step(
+                    cur_jpos, prev_wire_jpos, effective_max_step,
+                )
+                last_tracking_throttle = 0
 
         # ---- F: optional partial-body freeze (legs/waist hold idle_stand) ---
         # Freeze the selected DOFs to the ``idle_stand`` clip (with its
@@ -3230,12 +3521,26 @@ def _publisher(
                     if deploy_fresh
                     else ""
                 )
+                # 2026-06-10 follow-up 11: tracking-feedback telemetry.
+                # Only printed when the feature is enabled (avoid log
+                # spam for legacy runs). ``tf_throttle=N/14`` = how
+                # many of the 14 arm joints had their per-tick step
+                # cap dropped below 50% of base this tick by the
+                # closed-loop feedback. ``N>0`` means feedback is
+                # actively protecting the wire; sustained ``N=14``
+                # means the actuator is saturating and the operator
+                # may want to back off the task.
+                tf_tag = (
+                    f" tf_throttle={last_tracking_throttle}/{tracking_arm_count}"
+                    if tracking_feedback_enabled
+                    else ""
+                )
                 print(
                     f"[live-VLA] pub tick={tick:6d} "
                     f"chunk_id={chunk_id:4d} step={step:2d}/{horizon} "
                     f"|token|={float(np.linalg.norm(token[step])):.3f} "
                     f"|left|={float(np.linalg.norm(left[step])):.3f} "
-                    f"{decoded_tag}{hand_tag} "
+                    f"{decoded_tag}{hand_tag}{tf_tag} "
                     f"deploy_alive={alive}",
                     flush=True,
                 )
@@ -3416,6 +3721,95 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "(legacy 2026-06-10 behaviour: snap to idle on hold "
              "expiry; not recommended).",
     )
+    # ---- 2026-06-10 follow-up 11: closed-loop tracking feedback ----
+    # Per-joint proprio feedback on the wire step cap. When enabled,
+    # the bridge reads x2_debug's measured arm-joint positions and
+    # velocities each tick and throttles the per-arm-joint per-tick
+    # step so the wire never outpaces the actuator's actual response.
+    # Eliminates the open-loop sensitivity to inference jitter /
+    # battery sag / motor temperature drift that drove the
+    # 2026-06-10 PM oscillation incident.
+    #
+    # Step 1 rollout: default DISABLED (--vla-tracking-feedback to
+    # opt in). v3 static defaults (LPF/blend/step-cap) remain in
+    # place; feedback is additive belt-and-suspenders so any
+    # regression on real robot can be isolated by flipping the flag.
+    # Step 2 (separate commit) flips the default to ON and relaxes
+    # the static defaults once feedback is validated.
+    parser.add_argument(
+        "--vla-tracking-feedback",
+        dest="vla_tracking_feedback",
+        action="store_true",
+        default=False,
+        help="Enable closed-loop tracking feedback on the wire step "
+             "cap. When ON, the bridge per-arm-joint-throttles the "
+             "per-tick step based on (a) position error |target - "
+             "measured| and (b) measured joint velocity. Pairs with "
+             "--vla-tracking-{soft,hard}-rad and --vla-tracking-"
+             "{velocity-margin,velocity-floor-rad-tick}. Default OFF "
+             "(byte-identical to scalar clamp). When ON but x2_debug "
+             "proprio is stale (>--vla-tracking-stale-ms), the "
+             "bridge falls back to the scalar clamp automatically.",
+    )
+    parser.add_argument(
+        "--no-vla-tracking-feedback",
+        dest="vla_tracking_feedback",
+        action="store_false",
+        help="Force-disable tracking feedback (overrides "
+             "--vla-tracking-feedback; useful when the launcher "
+             "exports a default-on env var but the operator wants "
+             "to A/B against the scalar-clamp path mid-session).",
+    )
+    parser.add_argument(
+        "--vla-tracking-soft-rad", type=float, default=0.15,
+        help="Tracking-feedback POSITION error threshold (rad) below "
+             "which the per-joint step cap stays at its base value. "
+             "Default 0.15 rad (~8.6 deg) -- typical actuator-lag "
+             "from a v3-tuned wire is ~0.05 rad, so legitimate "
+             "motion never triggers backoff. Pair with "
+             "--vla-tracking-hard-rad.",
+    )
+    parser.add_argument(
+        "--vla-tracking-hard-rad", type=float, default=0.40,
+        help="Tracking-feedback POSITION error threshold (rad) above "
+             "which the per-joint step cap drops to 0 (joint frozen "
+             "until actuator catches up). Default 0.40 rad (~23 deg) "
+             "-- chosen so the freeze only fires when the actuator "
+             "is clearly saturating (e.g., hit a contact, hit a "
+             "joint limit, SONIC fighting the wire). Between soft "
+             "and hard the cap drops linearly.",
+    )
+    parser.add_argument(
+        "--vla-tracking-velocity-margin", type=float, default=1.5,
+        help="Tracking-feedback VELOCITY margin: per-tick cap is "
+             "capped by ``margin * |measured_dq| * dt``. Default 1.5 "
+             "lets the wire move at most 50%% faster than the "
+             "actuator is currently moving (with the floor below as "
+             "a backstop so the wire can start from rest). Lower = "
+             "more conservative.",
+    )
+    parser.add_argument(
+        "--vla-tracking-velocity-floor-rad-tick", type=float, default=0.01,
+        help="Tracking-feedback VELOCITY FLOOR (rad/tick): minimum "
+             "per-joint step the velocity cap can produce, even when "
+             "the actuator is at rest (measured_dq = 0). Default "
+             "0.01 rad/tick @ 50 Hz = 0.5 rad/s -- matches v3-tuned "
+             "max_wire_step's effective rise rate so cold starts "
+             "from idle aren't artificially frozen. Set to 0 to "
+             "REQUIRE non-zero measured velocity before allowing any "
+             "wire motion (motion-only; do NOT use for cold start).",
+    )
+    parser.add_argument(
+        "--vla-tracking-stale-ms", type=int, default=100,
+        help="Tracking-feedback STALENESS threshold (ms). If the "
+             "x2_debug snapshot is older than this, the bridge "
+             "falls back to the scalar clamp for that tick. Default "
+             "100 ms = 5 publish ticks at 50 Hz; covers a single "
+             "x2_debug packet drop without disabling feedback. Set "
+             "very high (e.g. 10000) to NEVER fall back (only use "
+             "in sim where staleness is impossible).",
+    )
+
     parser.add_argument("--rate", type=float, default=DEFAULT_PUB_RATE_HZ, help="Publish rate (Hz). 50 matches the deploy control loop.")
     parser.add_argument(
         "--duration", type=float, default=0.0,
@@ -4438,6 +4832,14 @@ def main(argv: list[str] | None = None) -> int:
             handoff_max_hold_ticks=int(args.vla_handoff_max_hold_ticks),
             handoff_max_wire_step=float(args.vla_handoff_max_wire_step),
             handoff_step_ramp_ticks=int(args.vla_handoff_step_ramp_ticks),
+            tracking_feedback_enabled=bool(args.vla_tracking_feedback),
+            tracking_soft_rad=float(args.vla_tracking_soft_rad),
+            tracking_hard_rad=float(args.vla_tracking_hard_rad),
+            tracking_vel_margin=float(args.vla_tracking_velocity_margin),
+            tracking_vel_floor_rad_tick=float(
+                args.vla_tracking_velocity_floor_rad_tick
+            ),
+            tracking_stale_ms=int(args.vla_tracking_stale_ms),
         )
 
     publisher_thread = threading.Thread(
