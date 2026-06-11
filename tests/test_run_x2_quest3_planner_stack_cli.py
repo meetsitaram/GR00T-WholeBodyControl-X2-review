@@ -596,3 +596,43 @@ def test_wrapper_forwards_preserve_arms_args_to_manager_in_both_branches() -> No
         "single-flag UX retired this opt-in. Update this pin if the "
         "env var is intentional."
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-11 regression: --no-x2-debug-bridge must survive --pc2-host
+# ---------------------------------------------------------------------------
+def test_no_x2_debug_bridge_survives_pc2_host_auto_resolution() -> None:
+    """Source-level pin for the 2026-06-11 fix to a UX bug where
+    ``--no-x2-debug-bridge`` was silently flipped back on whenever
+    ``--pc2-host`` was also passed.
+
+    The bug:
+      1. CLI parser correctly sets WITH_X2_DEBUG_BRIDGE=0 on
+         ``--no-x2-debug-bridge``.
+      2. Later, the ``--pc2-host`` fan-out block at ~line 1020
+         unconditionally re-set WITH_X2_DEBUG_BRIDGE=1 whenever
+         X2_DEBUG_BRIDGE_HOST was empty -- which it always is when
+         the operator only passed --pc2-host (no explicit bridge
+         host override).
+      3. Net effect: ``--no-x2-debug-bridge --pc2-host PC2_IP`` spawned
+         the x2_debug bridge anyway and clashed on :5570 with the
+         VLA bridge's --enable-takeover internal port (back when
+         BRIDGE_POSE_PORT_INTERNAL was 5570) -- producing
+         ``zmq.error.ZMQError: Address already in use (addr='tcp://*:5570')``
+         even though the operator had explicitly asked for the bridge
+         to be skipped.
+
+    Pin the fix: the auto-resolution must consult the explicit opt-out
+    before flipping the flag back on. We grep for the guard rather than
+    drive the wrapper to validate-only because the fan-out block runs
+    early enough that the test harness doesn't reach the bridge spawn
+    in unit-test mode anyway.
+    """
+    src = WRAPPER.read_text()
+    expect = '"${WITH_X2_DEBUG_BRIDGE}" != "0"'
+    assert expect in src, (
+        "auto-resolution of X2_DEBUG_BRIDGE_HOST under --pc2-host must "
+        "guard on WITH_X2_DEBUG_BRIDGE != 0; without that guard, "
+        "--no-x2-debug-bridge silently no-ops when --pc2-host is also "
+        "passed (2026-06-11 fix). Restore the guard."
+    )

@@ -28,16 +28,20 @@
 #             x2_mc_escalator.py         of the user's laptop layout and survives WiFi loss.
 #             export_motion_for_deploy.py
 #             x2_hand_zmq_to_aimdk_bridge.py
-#             x2_pose_proxy.py           Idle-fallback proxy: SUBs upstream pose from laptop,
-#                                        PUBs to localhost; when upstream is silent > 100 ms,
-#                                        publishes idle_stand frames from data/idle_stand.x2m2
-#                                        so the deploy never sees a silent wire.
+#             x2_pose_watchdog.py        Single-input fallback watchdog (renamed from
+#                                        x2_pose_proxy.py on 2026-06-11; manual-takeover
+#                                        arbitration moved to the laptop-side x2_pose_mux).
+#                                        SUBs upstream pose from laptop, PUBs to localhost;
+#                                        when upstream is silent > 100 ms, runs the staged
+#                                        HOLD -> BLEND -> IDLE_CLIP ladder so the deploy
+#                                        never sees a silent wire and never sees a step
+#                                        change in the commanded reference.
 #         configs/
 #             real_deploy_tuning/*.yaml  Tuning YAML files referenced via --tuning-config.
 #
 #     data/                              Pre-baked motion artifacts.
 #         idle_stand.x2m2                Looped idle_stand replay (50 Hz, ~1.5 s) used by
-#                                        x2_pose_proxy.py as the wire-silent fallback.
+#                                        x2_pose_watchdog.py as the wire-silent fallback.
 #                                        Baked from gear_sonic/data/motions/x2_planner_primitives.pkl
 #                                        via gear_sonic_deploy/scripts/bake_idle_stand_x2m2.py.
 #
@@ -479,6 +483,17 @@ else
     rsync_to_pc2 \
         "${REPO_ROOT}/gear_sonic/utils/teleop/zmq/zmq_packed_message_decoder.py" \
         "${PC2_PREFIX}/ws/src/gear_sonic/utils/teleop/zmq/zmq_packed_message_decoder.py"
+
+    # x2_pose_watchdog.py (formerly x2_pose_proxy.py; renamed on 2026-06-11
+    # when manual-takeover arbitration moved to the laptop-side x2_pose_mux)
+    # does `from gear_sonic.utils.pose_pipeline.{wire,fallback} import ...`.
+    # Stage the whole pose_pipeline/ package so the watchdog resolves its
+    # imports on PC2 without dragging in the rest of gear_sonic.
+    log "rsync gear_sonic/utils/pose_pipeline/ -> ws/src/gear_sonic/utils/pose_pipeline/"
+    rsync_to_pc2 \
+        "${REPO_ROOT}/gear_sonic/utils/pose_pipeline/" \
+        "${PC2_PREFIX}/ws/src/gear_sonic/utils/pose_pipeline/" \
+        --exclude=__pycache__/
 fi
 
 # -------------------------------------------------------------------------
@@ -584,7 +599,7 @@ else
         x2_mc_escalator.py \
         export_motion_for_deploy.py \
         x2_hand_zmq_to_aimdk_bridge.py \
-        x2_pose_proxy.py \
+        x2_pose_watchdog.py \
         x2_scan_mc_motors.py \
         ; do
         # NOTE: x2_scan_mc_motors.py isn't a runtime daemon -- it's a
@@ -613,18 +628,19 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Step 8: idle_stand X2M2 binary for the PC2 pose proxy
+# Step 8: idle_stand X2M2 binary for the PC2 pose watchdog
 # -------------------------------------------------------------------------
 #
-# x2_pose_proxy.py needs a baked idle_stand.x2m2 on PC2 to fall back to
-# whenever the upstream pose wire from the laptop goes silent. We bake
-# from the local planner primitives PKL here so the X2M2 stays in lockstep
-# with whatever idle_stand the laptop bridge would publish in --no-policy
-# mode (same source PKL, same resample-30-to-50-Hz + yaw-align-to-(0, 0)
+# x2_pose_watchdog.py (renamed from x2_pose_proxy.py on 2026-06-11) needs
+# a baked idle_stand.x2m2 on PC2 to fall back to whenever the upstream
+# pose wire from the laptop goes silent. We bake from the local planner
+# primitives PKL here so the X2M2 stays in lockstep with whatever
+# idle_stand the laptop bridge would publish in --no-policy mode (same
+# source PKL, same resample-30-to-50-Hz + yaw-align-to-(0, 0)
 # transforms). Skipped automatically if the source PKL isn't on the
 # laptop (e.g. SDK install without gear_sonic).
 
-step "8. idle_stand.x2m2 (PC2 pose proxy idle fallback)"
+step "8. idle_stand.x2m2 (PC2 pose watchdog idle fallback)"
 
 IDLE_PRIMS_PKL="${REPO_ROOT}/gear_sonic/data/motions/x2_planner_primitives.pkl"
 IDLE_X2M2_LOCAL="${REPO_ROOT}/gear_sonic_deploy/data/idle_stand.x2m2"

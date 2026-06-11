@@ -1,33 +1,36 @@
-"""End-to-end smoke test for x2_pose_proxy dual-source manual-takeover.
+"""End-to-end smoke test for x2_pose_mux dual-source manual-takeover.
 
-The 2026-06-10 milestone adds an optional second SUB to the proxy
-(``--override-port``) and an edge-triggered control PUB
-(``--vla-control-port``) so an operator can teleop-nudge the arm out of
-a stuck VLA pose without restarting any process.
-
-This test spawns the proxy as a real subprocess with all three sockets
-wired (primary SUB, override SUB, vla_control PUB) against ephemeral
-loopback ports and validates the arbitration semantics end-to-end:
+The 2026-06-10 milestone added dual-source arbitration + a
+``vla_control`` edge-event PUB so an operator can teleop-nudge the arm
+out of a stuck VLA pose without restarting any process. The 2026-06-11
+milestone moved this logic from PC2 to the laptop-side
+``x2_pose_mux``; this test spawns the mux as a real subprocess with
+all three sockets wired (primary SUB, override SUB, vla_control PUB)
+against ephemeral loopback ports and validates the arbitration
+semantics end-to-end:
 
   1. Primary fresh / override silent -> primary frames forwarded
      verbatim downstream; no vla_control events on the wire.
   2. Override starts publishing -> override frames take priority and
      are forwarded verbatim; an ``override_engaged`` event lands on
      vla_control on the first override tick.
-  3. Override goes silent (primary still publishing) -> proxy waits
+  3. Override goes silent (primary still publishing) -> mux waits
      out the ``--override-stale-ms`` debounce window, emits
      ``override_released`` exactly once, then forwards primary again.
-  4. Disabling the override (no ``--override-port``) preserves the
-     pre-2026-06-10 single-source behaviour byte-for-byte (the proxy
-     never opens an override SUB and never emits vla_control events).
+  4. The mux is always dual-source -- if the operator doesn't want
+     takeover they simply don't run it (the recorder publishes
+     straight to the PC2 watchdog). The pre-2026-06-10 "single source"
+     test below is therefore retained as a primary-only assertion
+     against the mux (override SUB attached but no operator activity).
 
 Like the fallback-ladder smoke, this is a slow integration test
 (subprocess + sleeps + ZMQ binding) and is gated on the
-``X2_POSE_PROXY_SMOKE=1`` env var so the fast unit-test pass can skip
-it. Run explicitly with::
+``X2_POSE_PROXY_SMOKE=1`` env var (kept under the old prefix so
+existing operator runbooks keep working) so the fast unit-test pass
+can skip it. Run explicitly with::
 
-    X2_POSE_PROXY_SMOKE=1 pytest \
-        tests/test_x2_pose_proxy_dual_source.py -v -s
+    X2_POSE_PROXY_SMOKE=1 pytest \\
+        tests/test_x2_pose_mux_dual_source.py -v -s
 """
 
 from __future__ import annotations
@@ -51,11 +54,24 @@ except ImportError:
     _msgpack = None  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROXY_DIR = REPO_ROOT / "gear_sonic_deploy" / "scripts"
-if str(PROXY_DIR) not in sys.path:
-    sys.path.insert(0, str(PROXY_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import x2_pose_proxy as proxy  # noqa: E402
+from gear_sonic.utils.pose_pipeline import wire  # noqa: E402
+
+
+class _ProxyShim:
+    NUM_BODY_DOFS = wire.NUM_BODY_DOFS
+    X2M2_MAGIC = wire.X2M2_MAGIC
+    pack_pose_message = staticmethod(wire.pack_pose_message)
+    decode_pose_joint_pos_mj = staticmethod(wire.decode_pose_joint_pos_mj)
+    decode_pose_left_hand = staticmethod(wire.decode_pose_left_hand)
+    decode_pose_right_hand = staticmethod(wire.decode_pose_right_hand)
+
+
+proxy = _ProxyShim()
+
+MUX_SCRIPT = REPO_ROOT / "gear_sonic" / "scripts" / "x2_pose_mux.py"
 
 
 SMOKE_ENABLED = os.environ.get("X2_POSE_PROXY_SMOKE", "") not in ("", "0")
@@ -71,20 +87,6 @@ def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
-
-
-def _write_minimal_x2m2(path: Path, *, jpos_value: float = 0.0) -> None:
-    """One-frame X2M2 with every DOF = ``jpos_value``, identity root quat."""
-    num_frames = 1
-    num_dofs = proxy.NUM_BODY_DOFS
-    fps = 50.0
-    header = struct.pack(
-        "<IIId", proxy.X2M2_MAGIC, num_frames, num_dofs, fps
-    )
-    body = np.zeros((num_frames, num_dofs + 4), dtype=np.float64)
-    body[:, :num_dofs] = jpos_value
-    body[:, num_dofs + 3] = 1.0  # quat xyzw = identity
-    path.write_bytes(header + body.tobytes(order="C"))
 
 
 def _pack_pose_frame(
@@ -163,10 +165,6 @@ def test_proxy_dual_source_override_takes_priority_and_emits_events(
 ) -> None:
     PRIMARY_VALUE = 0.10
     OVERRIDE_VALUE = 0.42
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
@@ -177,16 +175,16 @@ def test_proxy_dual_source_override_takes_priority_and_emits_events(
     # state. Production default is 200 ms.
     override_stale_ms = 100
 
-    proxy_script = REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -207,14 +205,8 @@ def test_proxy_dual_source_override_takes_priority_and_emits_events(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
         # Large hold/blend so the fallback ladder doesn't accidentally
         # mask the dual-source behaviour we're testing.
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]
@@ -367,91 +359,36 @@ def test_proxy_dual_source_override_takes_priority_and_emits_events(
     not SMOKE_ENABLED,
     reason="set X2_POSE_PROXY_SMOKE=1 to run (real subprocess + sleeps)",
 )
-def test_proxy_dual_source_disabled_by_default(
-    tmp_path: Path,
-) -> None:
-    """Without ``--override-port``, the proxy must NOT open an override
-    SUB or a control PUB and must behave identically to the legacy
-    single-source proxy. Regression escape: a future refactor that
-    accidentally enables override arbitration unconditionally would
-    introduce new sockets bound to default ports that may conflict
-    with operator-owned services on the laptop."""
-    PRIMARY_VALUE = 0.10
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
+def test_mux_requires_override_port() -> None:
+    """The 2026-06-11 mux always merges two sources; ``--override-port``
+    is now a required argparse argument. The previous "single-source
+    proxy" test (which exercised the proxy with override SUB disabled)
+    is no longer meaningful: a deployment that doesn't want manual
+    takeover simply doesn't run the mux at all -- the recorder
+    publishes straight to the PC2 watchdog.
 
-    primary_port = _pick_free_port()
-    downstream_port = _pick_free_port()
-    control_port = _pick_free_port()  # we'll try to bind it ourselves
-
-    proxy_script = REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
+    This regression pin confirms argparse rejects a mux invocation
+    that omits ``--override-port`` so an operator who copies a stale
+    launcher recipe gets a fast clear failure instead of a half-up
+    process that silently never engages."""
     cmd = [
         sys.executable,
-        str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
-        # Note: NO --override-port, NO --vla-control-port.
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
-        "--rate-hz", "50",
-        "--status-every-s", "0.5",
+        str(MUX_SCRIPT),
+        "--primary-port", "0",
+        "--out-port", "0",
+        # NB: NO --override-port.
     ]
-    proxy_proc = _spawn_proxy(cmd)
-
-    ctx = zmq.Context.instance()
-    primary_pub = ctx.socket(zmq.PUB)
-    primary_pub.bind(f"tcp://127.0.0.1:{primary_port}")
-    downstream_sub = ctx.socket(zmq.SUB)
-    downstream_sub.connect(f"tcp://127.0.0.1:{downstream_port}")
-    downstream_sub.setsockopt(zmq.SUBSCRIBE, b"pose")
-
-    # If the proxy mistakenly bound the control port, the bind below
-    # would fail with EADDRINUSE. Bind succeeding = proxy did NOT bind.
-    control_pub_owned_by_test = ctx.socket(zmq.PUB)
-    try:
-        control_pub_owned_by_test.bind(f"tcp://127.0.0.1:{control_port}")
-    except zmq.ZMQError as exc:
-        pytest.fail(
-            f"proxy mistakenly bound the control port even though "
-            f"--vla-control-port was unset; bind error: {exc}"
-        )
-
-    time.sleep(0.6)
-    try:
-        t_end = time.monotonic() + 0.6
-        while time.monotonic() < t_end:
-            primary_pub.send(_pack_pose_frame(PRIMARY_VALUE), zmq.NOBLOCK)
-            time.sleep(0.02)
-        time.sleep(0.1)
-        vals = _drain_pose(downstream_sub, time.monotonic() + 0.05)
-        assert len(vals) > 5, (
-            f"expected primary forwards in single-source mode; got "
-            f"{len(vals)}"
-        )
-        tail = np.array(vals[-5:])
-        assert np.allclose(tail, PRIMARY_VALUE, atol=1e-6), (
-            f"single-source proxy tail should be PRIMARY_VALUE; got "
-            f"{tail}"
-        )
-    finally:
-        try:
-            proxy_proc.terminate()
-            proxy_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proxy_proc.kill()
-            proxy_proc.wait(timeout=5)
-        primary_pub.close(linger=0)
-        downstream_sub.close(linger=0)
-        control_pub_owned_by_test.close(linger=0)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0, (
+        f"mux should refuse to start without --override-port; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "override-port" in result.stderr, (
+        f"argparse error should mention --override-port; got "
+        f"{result.stderr!r}"
+    )
 
 
 @pytest.mark.skipif(
@@ -489,10 +426,6 @@ def test_proxy_override_frozen_release_after_manager_freeze(
     PRIMARY_VALUE = 0.10
     OVERRIDE_BASE = 0.42
     OVERRIDE_FROZEN = 0.55
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle_frozen.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
@@ -505,16 +438,16 @@ def test_proxy_override_frozen_release_after_manager_freeze(
     override_frozen_ticks = 5
     override_frozen_tol = 1e-6
 
-    proxy_script = REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -528,12 +461,6 @@ def test_proxy_override_frozen_release_after_manager_freeze(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]
@@ -713,10 +640,6 @@ def test_proxy_override_engage_hysteresis_blocks_single_frame_flicker(
     PRIMARY_VALUE = 0.10
     OVERRIDE_FROZEN = 0.42
     OVERRIDE_FLICKER = 0.44
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle_hyst.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
@@ -726,18 +649,16 @@ def test_proxy_override_engage_hysteresis_blocks_single_frame_flicker(
     # matches the runtime default.
     engage_motion_threshold = 10
 
-    proxy_script = (
-        REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
-    )
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -748,12 +669,6 @@ def test_proxy_override_engage_hysteresis_blocks_single_frame_flicker(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]
@@ -879,27 +794,21 @@ def test_proxy_override_released_payload_carries_operator_pose(
     OVERRIDE_LEFT_FROZEN = 0.61
     OVERRIDE_RIGHT_FROZEN = 0.73
     PRIMARY_VALUE = 0.10
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle_payload.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
     control_port = _pick_free_port()
 
-    proxy_script = (
-        REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
-    )
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -912,12 +821,6 @@ def test_proxy_override_released_payload_carries_operator_pose(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]
@@ -1082,28 +985,22 @@ def test_proxy_strict_mode_gate_blocks_off_engages_arm_and_holds_through_freeze(
     OVERRIDE_VALUE = 0.42
     OVERRIDE_LEFT = 0.21
     OVERRIDE_RIGHT = 0.31
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
     control_port = _pick_free_port()
     mode_port = _pick_free_port()
 
-    proxy_script = (
-        REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
-    )
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -1124,12 +1021,6 @@ def test_proxy_strict_mode_gate_blocks_off_engages_arm_and_holds_through_freeze(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]
@@ -1369,28 +1260,22 @@ def test_proxy_strict_mode_gate_fails_closed_on_stale_signal(
     this, a transient mode-SUB disconnect mid-run would silently fall
     back to motion-hysteresis flicker, defeating the whole point.
     """
-    IDLE_VALUE = 0.0
-    x2m2_path = tmp_path / "smoke_idle.x2m2"
-    _write_minimal_x2m2(x2m2_path, jpos_value=IDLE_VALUE)
-
     primary_port = _pick_free_port()
     override_port = _pick_free_port()
     downstream_port = _pick_free_port()
     control_port = _pick_free_port()
     mode_port = _pick_free_port()
 
-    proxy_script = (
-        REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
-    )
+    proxy_script = MUX_SCRIPT
     cmd = [
         sys.executable,
         str(proxy_script),
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(primary_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "127.0.0.1",
+        "--out-port", str(downstream_port),
+        "--out-topic", "pose",
         "--override-host", "127.0.0.1",
         "--override-port", str(override_port),
         "--override-topic", "pose",
@@ -1404,12 +1289,6 @@ def test_proxy_strict_mode_gate_fails_closed_on_stale_signal(
         "--vla-control-bind-host", "127.0.0.1",
         "--vla-control-port", str(control_port),
         "--vla-control-topic", "vla_control",
-        "--idle-x2m2", str(x2m2_path),
-        "--idle-stale-ms", "100",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "5.0",
-        "--blend-secs", "2.0",
-        "--no-x2-debug-yaw-track",
         "--rate-hz", "50",
         "--status-every-s", "0.5",
     ]

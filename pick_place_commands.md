@@ -97,9 +97,13 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
 
 
 ### human-in-loop commands (sim)
+# --enable-takeover auto-promotes both loopback ports
+# (POSE_PROXY_OVERRIDE_PORT=5560, VLA_CONTROL_PORT=5559); no need to
+# re-pass them. Pass --vla-control-port 0 only if you want to
+# disable the bridge cold-restart on operator release (the wire
+# will snap to the mid-decode chunk; only useful for smoke tests).
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
-    --vla-control-port 5559 \
-    --pose-proxy-override-port 5560 \
+    --enable-takeover \
     --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
     --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
     --robocasa-env X2PickPlaceCube \
@@ -107,7 +111,7 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
 
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
     --no-deploy \
-    --pose-port 5560 \
+    --takeover \
     --no-x2-debug-bridge --preserve-arms-on-engage
 
 
@@ -120,22 +124,23 @@ PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
 
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
     --pc2-host 192.168.86.32 \
+    --enable-takeover \
     --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
     --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
     --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right" \
     --vla-max-wire-dev-from-body 1.5 \
-    --vla-target-lpf-hz 5.0 \
-    --vla-future-lpf-hz 5.0 \
+    --vla-target-lpf-hz 10.0 \
+    --vla-future-lpf-hz 10.0 \
     --vla-hand-lpf-hz 10.0 \
     --vla-max-wire-step 0.07 \
-    --vla-tracking-feedback \
     --with-record \
     --output-dir data/lerobot/x2_pick_and_place_soda_can_n17_50k_v1_rollouts \
     --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
 
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --pc2-host 192.168.86.32 \
     --no-deploy \
-    --pose-port 5560 \
+    --takeover \
     --preserve-arms-on-engage
 
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
@@ -340,53 +345,60 @@ inference modes without restarting SONIC):
 
 If VLA gets stuck (e.g. arm hovers forward-up and refuses to descend
 on the soda can), the operator can grab the wire via VR teleop,
-re-position the arm, then let go — the proxy emits an edge event
+re-position the arm, then let go — the mux emits an edge event
 that triggers a bridge cold-restart so the next decoded chunk
 ramps in from the operator's hand-off pose. No process restarts.
 
-**Wire topology** (2026-06-10 milestone). Two upstreams feed the
-PC2 pose proxy; the proxy arbitrates and emits a control event on
-the override edge:
+> **2026-06-11 update.** The single-process `x2_pose_proxy.py` was
+> split into a laptop-side `x2_pose_mux` (does the merge / engagement
+> ramp / `vla_control` edges) plus a slim PC2-side `x2_pose_watchdog`
+> (renamed from `x2_pose_proxy.py`; does only the fallback ladder).
+> See [`2026-06-11_pose_mux_split.md`](docs/source/user_guide/milestones/2026-06-11_pose_mux_split.md).
+> Operator-visible behaviour is unchanged. The big delta in the runbook:
+> the `POSE_PROXY_OVERRIDE_*` / `POSE_PROXY_TELEOP_MODE_*` /
+> `POSE_PROXY_CONTROL_*` env vars **no longer go to PC2**. Setting any
+> of them in PC2's environment now fails the daemon launch (the
+> 2026-06-11 migration error). They drive the laptop-side mux via
+> `run_x2_vla_runtime.sh --enable-takeover` instead.
+
+**Wire topology** (2026-06-11 split):
 
 ```text
-┌──────────────────────────────┐
-│ live_vla_publish_motion_token│──── tcp://laptop:5556 ─┐
-│   (autonomous bridge)        │       (primary)        │
-└──────────────────────────────┘                        ▼
-                                          ┌──────────────────┐
-                                          │  x2_pose_proxy   │── tcp://localhost:5558 ─▶ C++ deploy
-                                          │  (PC2)           │
-┌──────────────────────────────┐          │  arbitrates      │
-│ record_x2_dataset.py (teleop │── tcp://laptop:5560 ─┘ │  primary / override │
-│   --pub-port 5560)           │       (override)        └────────┬─────────┘
-└──────────────────────────────┘                                  │
-                                          tcp://0.0.0.0:5559      │
-                                          (vla_control PUB)       │
-                                              ▲                   │
-                                              │ override_engaged /
-                                              │ override_released  ▼
-                                          ┌──────────────────────────────┐
-                                          │ live_vla_publish_motion_token│
-                                          │ --vla-control-port 5559      │
-                                          │ (cold-restart on release)    │
-                                          └──────────────────────────────┘
+LAPTOP                                            PC2
+══════                                            ═══
+
+bridge :5571 (internal) ─┐
+                         ├─► mux  ═══wifi═══►  watchdog  ──► deploy
+recorder :5560 (override)─┘   *:5556          *:5558      :5558
+                              (canonical)
+                              │
+                              ▼
+                         vla_control PUB :5559
+                         (loopback; bridge SUBs)
 ```
+
+* The bridge moves from `*:5556` to `*:5571` (internal loopback) so
+  the mux can bind the canonical `*:5556` instead. PC2's watchdog
+  (and any other external SUB) continues SUBing at `LAPTOP:5556` —
+  transparent to them.
+* `:5571` (not `:5570`) was picked deliberately. `:5570` is owned by
+  the kplanner stack's `x2_debug_to_robot_pose_bridge` (publishes the
+  `robot_pose` topic); putting the VLA bridge there would zmq-bind-
+  collide whenever the operator runs both `run_x2_vla_runtime.sh
+  --enable-takeover` and `run_x2_quest3_planner_stack.sh` together
+  (the takeover flow).
+* Operator pose stays on laptop loopback. Only the merged wire
+  crosses wifi.
 
 ### One-time PC2 daemon setup
 
-Set the proxy override + control ports in the environment **before**
-`x2_pc2_daemons.sh start`. These propagate to the proxy's tmux
-session and persist across deploy restarts. The
-`POSE_PROXY_TELEOP_MODE_*` env vars enable strict mode-gated
-engagement (2026-06-10 follow-up) — point `POSE_PROXY_TELEOP_MODE_HOST`
-at the laptop that runs the Quest3 manager:
+Bring up the PC2 watchdog + deploy + hand bridge + motor monitor as
+usual. **Do not set any `POSE_PROXY_OVERRIDE_*` / `POSE_PROXY_TELEOP_*` /
+`POSE_PROXY_CONTROL_*` env vars** — those moved to the laptop on
+2026-06-11 and now hard-fail the daemon launch with a migration
+pointer:
 
 ```sh
-export POSE_PROXY_OVERRIDE_PORT=5560                 # teleop recorder wire
-export POSE_PROXY_OVERRIDE_STALE_MS=200              # debounce (default)
-export POSE_PROXY_CONTROL_PORT=5559                  # vla_control PUB
-export POSE_PROXY_TELEOP_MODE_HOST=192.168.86.22     # laptop manager
-export POSE_PROXY_TELEOP_MODE_PORT=5564              # manager --recorder-pub-port
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
     --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
     --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
@@ -394,55 +406,105 @@ export POSE_PROXY_TELEOP_MODE_PORT=5564              # manager --recorder-pub-po
     --lock-head-straight
 ```
 
-Proxy log should show on startup:
+Watchdog log should show on startup:
 
 ```text
-[pose_proxy] override SUB:   tcp://192.168.86.22:5560 topic='pose' (stale_ms=200)
-[pose_proxy] teleop_mode SUB: tcp://192.168.86.22:5564 topic='stream_mode' (stale_ms=1000) -- STRICT mode-gated engage (motion-hysteresis bypassed)
-[pose_proxy] vla_control PUB: tcp://0.0.0.0:5559 topic='vla_control'
+[pose_watchdog] upstream:   tcp://192.168.86.22:5556 topic='pose'
+[pose_watchdog] downstream: tcp://*:5558 topic='pose'
+[pose_watchdog] x2_debug:   tcp://127.0.0.1:5557 (yaw rebase)
 ```
 
-If you skip the `POSE_PROXY_TELEOP_MODE_*` exports the proxy falls back
-to motion-hysteresis and you'll see this instead:
+(No `override SUB` / `vla_control PUB` lines anymore — the watchdog
+doesn't know about either.)
 
-```text
-[pose_proxy] teleop_mode SUB: DISABLED (--teleop-mode-port not set; falling back to motion-hysteresis engage path which will flicker if operator holds controller still in ARM_MANIPULATION)
-```
+### Start the VLA bridge with manual takeover
 
-### Start the VLA bridge with cold-restart on override
+The `--enable-takeover` master switch tells the laptop launcher to
+spawn `x2_pose_mux` locally, flip the bridge's pose PUB to the
+internal `:5571`, and **auto-promote** the two laptop-loopback ports
+to their canonical defaults:
+
+* `POSE_PROXY_OVERRIDE_PORT` → `5560` (mux SUBs the recorder's
+  operator pose here)
+* `VLA_CONTROL_PORT` → `5559` (mux PUBs override-engaged / released
+  edges; bridge SUBs on loopback for cold-restart on release)
+
+Both are now purely on the laptop after the 2026-06-11 split, so the
+operator no longer has to re-pass them on every invocation. Pass
+`--vla-control-port 0` if you want to explicitly disable cold-restart
+(operator override still works, but on release the wire snaps to
+whatever VLA chunk is mid-decode — only useful for arbitration smoke
+tests, not production).
 
 ```sh
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
     --pc2-host 192.168.86.32 \
-    --vla-control-port 5559 \
+    --enable-takeover \
     --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
     --motion-token-decoder /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt \
     --prompt "pick up the mini soda can with your left hand and place it in the open black container on the right"
 ```
 
-`--vla-control-port > 0` enables the bridge's vla_control SUB. The
-host defaults to `--pc2-host`, so no extra flag is needed for the
-typical split topology. (Env-var form `VLA_CONTROL_PORT=5559 ...`
-still works as a fallback.) Bridge log should show:
+Launcher log should show:
 
 ```text
-[live-VLA] vla_control SUB connected: tcp://192.168.86.32:5559 topic='vla_control'
-[live-VLA] vla_control SUB enabled (host=192.168.86.32 port=5559 ...)
+[vla-runtime] real-robot manual-takeover plumbing ON:
+[vla-runtime]   bridge :5571 -> mux *:5556 -> PC2 watchdog 192.168.86.32:5558 -> PC2 deploy
+[vla-runtime]   override SUB: 127.0.0.1:5560 (recorder operator pose)
+[vla-runtime]   vla_control PUB: 127.0.0.1:5559 -> bridge SUB (cold-restart on release)
+[vla-runtime] spawning pose mux -> /tmp/x2_vla_runtime-…/pose_mux.log
+[vla-runtime] pose_mux.pid = 12345
 ```
+
+(If you see `WARN: vla_control DISABLED ...` instead of the
+`vla_control PUB:` line, you passed `--vla-control-port 0`. Operator
+override will still work but release-snap is back on the table.)
+
+Mux log should show:
+
+```text
+[pose_mux] primary SUB: tcp://127.0.0.1:5571 topic='pose'
+[pose_mux] override SUB: tcp://127.0.0.1:5560 topic='pose' (stale_ms=200)
+[pose_mux] out PUB:     tcp://*:5556 topic='pose'
+[pose_mux] vla_control PUB: tcp://127.0.0.1:5559 topic='vla_control'
+```
+
+Bridge log should show:
+
+```text
+[live-VLA] vla_control SUB connected: tcp://127.0.0.1:5559 topic='vla_control'
+[live-VLA] vla_control SUB enabled (host=127.0.0.1 port=5559 …)
+```
+
+(Note: the bridge's `vla_control` host defaults to `127.0.0.1` now —
+the mux is local. Pre-2026-06-11 runbooks that passed
+`--vla-control-host <PC2_IP>` still work but cross wifi for no reason.)
 
 ### Start the teleop stack alongside (publishes operator wire on :5560)
 
 The Quest3 manager + planner + recorder run as a separate process
-group. Pass `--pose-port 5560` so the recorder PUBs the operator's
-wire on the override port instead of fighting the bridge for :5556.
-Pass `--no-deploy` so we don't spawn a competing C++ deploy.
+group. Use the `--takeover` shortcut (= `--pose-port 5560`) so the
+recorder PUBs the operator's wire into the mux's override SUB
+instead of fighting the bridge for `:5556`. Pass `--no-deploy` so
+we don't spawn a competing C++ deploy.
 
 ```sh
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
     --pc2-host 192.168.86.32 \
-    --pose-port 5560 \
+    --takeover \
     --no-deploy
 ```
+
+Look for this on the stack's stderr:
+
+```text
+[quest3_stack] manual-takeover wiring ON:
+[quest3_stack]   recorder pose PUB -> tcp://*:5560 (the mux's --override-port)
+[quest3_stack]   prerequisite: run_x2_vla_runtime.sh --enable-takeover MUST be running with the same --override-port
+```
+
+If you don't see that line, the recorder is PUBing to `:5556` (the
+mux's input is starved) and engagement won't work.
 
 ### Operator workflow
 
@@ -559,28 +621,30 @@ the proxy reports `eng >= 1` in its status line.
 
 ### Disabling without uninstalling
 
-Drop `--vla-control-port` (or pass `--vla-control-port -1`) to keep
-the autonomous-only flow byte-for-byte unchanged on the bridge side;
-drop `--pose-proxy-override-port` (sim) or unset
-`POSE_PROXY_OVERRIDE_PORT` env var (real-robot, consumed by
-`x2_pc2_daemons.sh`) to do the same on the proxy. The new code paths
-are all gated on positive port numbers, so a quiet config flip back
-to single-source is one removed flag.
+Drop `--enable-takeover` from `run_x2_vla_runtime.sh` (or pass
+`--no-takeover` to explicitly negate a sticky env var). With takeover
+off, the bridge re-binds the canonical `:5556` directly, the mux is
+not spawned, and the runtime degrades to the pre-2026-06-11
+autonomous-only topology. PC2's watchdog SUBs the same
+`LAPTOP:5556` URL either way and forwards bytes verbatim — no PC2
+restart is needed when you flip takeover on or off.
 
 ### Sim-only variant (no PC2, no real robot)
 
-The 2026-06-10 sim-launcher extension spawns the same `x2_pose_proxy`
-on **loopback** when `SIM_MODE=1` AND (`VLA_CONTROL_PORT > 0` OR
-`POSE_PROXY_OVERRIDE_PORT > 0`). Wire topology mirrors the real-robot
-diagram above with `127.0.0.1` everywhere; the local sim deploy SUBs
-from the proxy's downstream port (default `:5558`) instead of the
-bridge's :5556. Legacy autonomous-only sim runs (with the new env
-vars unset) are byte-for-byte unchanged.
+In sim mode (`--pc2-host` omitted) the same `--enable-takeover`
+flag spawns BOTH the laptop-side `x2_pose_mux` AND a loopback
+`x2_pose_watchdog` so the wire topology mirrors the real-robot
+diagram with `127.0.0.1` everywhere: `bridge :5571 → mux :5556 →
+watchdog :5558 → sim deploy`. Legacy autonomous-only sim runs
+(without `--enable-takeover`) are byte-for-byte unchanged from the
+pre-takeover behaviour: the bridge binds `:5556` directly and the
+sim deploy SUBs from there.
 
-**Terminal A — VLA runtime + sim deploy + sim proxy (one command):**
+**Terminal A — VLA runtime + sim deploy + sim mux + sim watchdog (one command):**
 
 ```sh
 ./gear_sonic/scripts/run_x2_vla_runtime.sh \
+    --enable-takeover \
     --vla-control-port 5559 \
     --pose-proxy-override-port 5560 \
     --model data/checkpoints/x2_pick_and_place_soda_can_n17_50k_v1/checkpoint-50000 \
@@ -592,12 +656,13 @@ vars unset) are byte-for-byte unchanged.
 (The MuJoCo passive viewer + OmniHand compose are sim defaults. Add
 `--no-sim-viewer` for headless runs or `--no-sim-with-omnihand` to fall
 back to the bare X2 stub fingers. When `--sim-with-omnihand` is on
-AND the proxy is in the wire, the launcher also redirects the
+AND `--enable-takeover` is set, the launcher also redirects the
 OmniHand ZMQ subscriber from its default `localhost:5556` to the
-proxy's downstream port — so operator finger commands ride the
-same arbitrated wire as the body joints. Without this redirect the
-OmniHand SUB would stay pinned to the bridge's :5556 and always
-show VLA fingers regardless of override engagement.)
+sim watchdog's downstream port — so operator finger commands ride
+the same arbitrated wire as the body joints. Without this redirect
+the OmniHand SUB would stay pinned to the bridge-then-mux output at
+`:5556` and always show the merged wire fingers regardless of
+override engagement.)
 
 **Wrist bypass (OFF by default — default flipped to `ik` and reverted on 2026-06-10
 evening).** The launcher defaults `--wrist-bypass off`. This means the
@@ -719,27 +784,31 @@ the takeover loop**: we only need graspable-object chunks flowing so the
 operator can engage teleop on top. To add a new scene, see
 `gear_sonic/scripts/build_x2_robocasa_scene_xml.py`'s `_KNOWN_ENVS` registry.
 
-(Env-var form `VLA_CONTROL_PORT=5559 POSE_PROXY_OVERRIDE_PORT=5560 ./run_x2_vla_runtime.sh ...` still works as a fallback for tmux-env propagation; the CLI flags take precedence when both are set.)
+(Env-var form `ENABLE_TAKEOVER=1 VLA_CONTROL_PORT=5559 POSE_PROXY_OVERRIDE_PORT=5560 ./run_x2_vla_runtime.sh ...` still works as a fallback for tmux-env propagation; the CLI flags take precedence when both are set.)
 
-(Omit `--pc2-host` → SIM mode. The launcher spawns: bridge → proxy on
-loopback → sim deploy SUBing from the proxy. The banner shows
-`Sim pose proxy: ON (loopback) bridge :5556 -> proxy -> deploy :5558`
-when it took effect; check `${RUN_DIR}/sim_proxy.log` for the
-`override SUB` / `vla_control PUB` confirmation lines.)
+(Omit `--pc2-host` → SIM mode. With `--enable-takeover`, the launcher
+spawns `bridge :5571 → mux :5556 → loopback watchdog :5558 → sim
+deploy`. The banner shows
+`Sim pose pipeline: ON (loopback) bridge :5571 -> mux *:5556 -> watchdog *:5558 -> deploy`
+when it took effect; check `${RUN_DIR}/pose_mux.log` and
+`${RUN_DIR}/pose_watchdog.log` for the per-process confirmation
+lines.)
 
 **Terminal B — Quest 3 teleop without spawning a competing sim deploy:**
 
 ```sh
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
     --no-deploy \
-    --pose-port 5560 \
+    --takeover \
     --no-x2-debug-bridge
 ```
 
 Why each flag is required:
 - `--no-deploy` → terminal A already owns the sim deploy on `:5558` SUB; without this we'd spawn a competing one.
-- `--pose-port 5560` → recorder PUBs the operator wire to the proxy's
-  override SUB instead of fighting the bridge for `:5556`.
+- `--takeover` (= `--pose-port 5560`) → recorder PUBs the operator
+  wire to the mux's override SUB instead of fighting the merged
+  wire for `:5556`. Use `--takeover-port PORT` to override the
+  default `5560`.
 - `--no-x2-debug-bridge` → the sim deploy's `x2_mujoco_ros_bridge.py`
   already binds `:5570` for `robot_pose` natively. Spawning the
   planner stack's `x2_debug → robot_pose` bridge would clash on

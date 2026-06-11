@@ -1,17 +1,22 @@
-"""Unit tests for the x2_pose_proxy upstream-silent fallback ladder.
+"""Unit tests for the x2_pose_watchdog upstream-silent fallback ladder.
 
-The 2026-06-08 milestone replaces the proxy's binary LIVE/IDLE
+The 2026-06-08 milestone replaced the watchdog's binary LIVE/IDLE
 fallback with a staged LIVE -> HOLD -> BLEND -> IDLE_CLIP ladder so a
 WiFi blip during teleop no longer slams the arms into default-stand.
 These tests pin the ladder's decision logic plus the end-to-end byte
 behaviour (HOLD re-publishes raw bytes verbatim, BLEND lerps
 joint_pos_mj monotonically, idle-stand mode reproduces the legacy
-single-step path) so a regression in the proxy can't silently
+single-step path) so a regression in the watchdog can't silently
 re-introduce the table-slamming failure mode.
 
 The state-transition decisions are tested through the pure function
-``proxy.decide_fallback_state`` so we never have to spin up a ZMQ
+``fallback.decide_fallback_state`` so we never have to spin up a ZMQ
 context, sleep on real timers, or care about the publish thread.
+
+The 2026-06-11 milestone moved the helpers to
+``gear_sonic.utils.pose_pipeline``; the tests import from there
+rather than the watchdog script directly so the same helpers are
+exercised whether the watchdog or the laptop-side mux is the caller.
 """
 
 from __future__ import annotations
@@ -26,11 +31,38 @@ import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROXY_DIR = REPO_ROOT / "gear_sonic_deploy" / "scripts"
-if str(PROXY_DIR) not in sys.path:
-    sys.path.insert(0, str(PROXY_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import x2_pose_proxy as proxy  # noqa: E402
+# Shim: tests pre-2026-06-11 imported a single ``proxy`` module that
+# bundled wire + fallback. Build a single namespace from the shared
+# library so the test body keeps reading naturally.
+from gear_sonic.utils.pose_pipeline import fallback, wire  # noqa: E402
+
+
+class _ProxyShim:
+    """Backwards-compatible attribute proxy over wire + fallback."""
+
+    NUM_BODY_DOFS = wire.NUM_BODY_DOFS
+    HEADER_SIZE = wire.HEADER_SIZE
+    X2M2_MAGIC = wire.X2M2_MAGIC
+    pack_pose_message = staticmethod(wire.pack_pose_message)
+    decode_pose_joint_pos_mj = staticmethod(wire.decode_pose_joint_pos_mj)
+    IdleStandReplay = fallback.IdleStandReplay
+    build_idle_frame_msg = staticmethod(fallback.build_idle_frame_msg)
+    decide_fallback_state = staticmethod(fallback.decide_fallback_state)
+    STATE_LIVE = fallback.STATE_LIVE
+    STATE_COLD_IDLE = fallback.STATE_COLD_IDLE
+    STATE_HOLD = fallback.STATE_HOLD
+    STATE_BLEND = fallback.STATE_BLEND
+    STATE_IDLE_CLIP = fallback.STATE_IDLE_CLIP
+    STATE_GAP = fallback.STATE_GAP
+    IDLE_MODE_BLEND = fallback.IDLE_MODE_BLEND
+    IDLE_MODE_HOLD_LAST = fallback.IDLE_MODE_HOLD_LAST
+    IDLE_MODE_IDLE_STAND = fallback.IDLE_MODE_IDLE_STAND
+
+
+proxy = _ProxyShim()
 
 
 # ===========================================================================

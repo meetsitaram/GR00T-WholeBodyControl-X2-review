@@ -4,8 +4,11 @@
 # Spawns up to four tmux sessions on the robot's PC2 (Jetson Orin NX) and
 # gives you a single command to start / stop / inspect them:
 #
-#     x2_pose_proxy     -- the python idle-fallback pose proxy
-#                          (gear_sonic_deploy/scripts/x2_pose_proxy.py).
+#     x2_pose_watchdog  -- the python single-input fallback watchdog
+#                          (gear_sonic_deploy/scripts/x2_pose_watchdog.py;
+#                          renamed from x2_pose_proxy.py on 2026-06-11
+#                          when manual-takeover arbitration moved to the
+#                          laptop-side x2_pose_mux).
 #                          SUBs to the laptop's pose stream on
 #                          tcp://<laptop>:5556 and re-PUBs to
 #                          tcp://localhost:${PC2_POSE_PROXY_PORT}
@@ -13,7 +16,7 @@
 #                          flowing, frames are forwarded byte-for-byte.
 #                          When the laptop is silent > 300 ms (wifi
 #                          drop, laptop crash, planner stack not yet
-#                          started), the proxy runs the staged
+#                          started), the watchdog runs the staged
 #                          fallback ladder (HOLD -> BLEND -> IDLE_CLIP)
 #                          keyed by POSE_PROXY_IDLE_MODE -- by default
 #                          it re-publishes the LAST forwarded upstream
@@ -27,7 +30,10 @@
 #                          commanded reference -- the pre-2026-06-08
 #                          behaviour (immediate snap to default-stand)
 #                          slammed arms into tables on every WiFi
-#                          hiccup.
+#                          hiccup. Manual takeover (operator override
+#                          + vla_control PUB) is NOT handled here: the
+#                          laptop-side x2_pose_mux merges autonomous +
+#                          override and ships one wire upstream.
 #
 #     x2_deploy         -- the agi_x2_deploy_onnx_ref process, launched
 #                          via ``deploy_x2.sh onbot`` so the operator
@@ -40,8 +46,9 @@
 #                          (default) the deploy SUBs to
 #                          tcp://localhost:${PC2_POSE_PROXY_PORT}
 #                          instead of the laptop directly, publishes
-#                          ``x2_debug`` on tcp://0.0.0.0:5557, and
-#                          subscribes to ``pose_resume`` from the
+#                          ``x2_debug`` on tcp://0.0.0.0:5557 (which
+#                          the watchdog also SUBs to for yaw rebase),
+#                          and subscribes to ``pose_resume`` from the
 #                          laptop on tcp://<laptop>:5566 for SAFE_IDLE
 #                          recovery.
 #
@@ -244,73 +251,62 @@ POSE_PROXY_IDLE_X2M2="${POSE_PROXY_IDLE_X2M2:-${PC2_PREFIX}/data/idle_stand.x2m2
 POSE_PROXY_IDLE_MODE="${POSE_PROXY_IDLE_MODE:-blend}"
 POSE_PROXY_HOLD_LAST_SECS="${POSE_PROXY_HOLD_LAST_SECS:-10.0}"
 POSE_PROXY_BLEND_SECS="${POSE_PROXY_BLEND_SECS:-3.0}"
-# ---- Manual-takeover dual-source arbitration (2026-06-10 milestone) ----
-# When POSE_PROXY_OVERRIDE_PORT > 0, the proxy SUBs to a second pose
-# stream (typically the teleop recorder publishing the operator's wire
-# on :5560) and prefers it over the primary VLA stream whenever the
-# operator is active. POSE_PROXY_CONTROL_PORT > 0 makes the proxy
-# emit override_engaged / override_released edge events on a control
-# PUB that the VLA bridge SUBs to (vla_control), driving its cold-
-# restart on operator release. Both default disabled so existing
-# autonomous deployments are byte-for-byte unchanged.
+# Manual-takeover dual-source arbitration (the legacy 2026-06-10
+# milestone's POSE_PROXY_OVERRIDE_* / POSE_PROXY_CONTROL_* /
+# POSE_PROXY_TELEOP_MODE_* env vars) MOVED to the laptop-side
+# x2_pose_mux on the 2026-06-11 pose_mux_split. Setting any of them
+# now is a hard error -- see the migration check just below. If you
+# need manual takeover, run on the laptop:
 #
-# Conventional ports:
-#   override   = LAPTOP_HOST:5560 (teleop recorder PUB)
-#   control    = 0.0.0.0:5559 (proxy PUB; bridge SUBs from laptop)
-POSE_PROXY_OVERRIDE_HOST="${POSE_PROXY_OVERRIDE_HOST:-${LAPTOP_HOST}}"
-POSE_PROXY_OVERRIDE_PORT="${POSE_PROXY_OVERRIDE_PORT:--1}"
-POSE_PROXY_OVERRIDE_TOPIC="${POSE_PROXY_OVERRIDE_TOPIC:-pose}"
-POSE_PROXY_OVERRIDE_STALE_MS="${POSE_PROXY_OVERRIDE_STALE_MS:-200}"
-# Frozen-frame release (2026-06-10 follow-up). The Quest3 manager
-# publishes the frozen last commanded pose every tick when teleop
-# mode is OFF or LOCOMOTION, so the override SUB never goes silent
-# across an A+B+X+Y disengage gesture. Frame-equality detection in
-# the proxy catches this and fires override_released exactly once
-# after N consecutive identical frames. Default 10 ticks @ 50Hz =
-# 200ms (matches stale-ms semantics). Set to 0 to disable and
-# rely on silence-only release (legacy, only fires on full Ctrl-C
-# of the teleop stack).
-POSE_PROXY_OVERRIDE_FROZEN_TICKS="${POSE_PROXY_OVERRIDE_FROZEN_TICKS:-10}"
-# Bumped from 1e-4 on 2026-06-10 after sim repros showed repeated
-# single-frame engage/release cycles from sub-degree controller-rest
-# drift while the manager was in OFF (each cycle fires a heavy bridge
-# cold-restart). 5e-3 rad ~ 0.3 deg total joint-space motion is well
-# above resting jitter and well below intentional teleop motion. Set
-# to 1e-4 only for paranoid bytes-match detection.
-POSE_PROXY_OVERRIDE_FROZEN_L2_TOL="${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL:-5e-3}"
-# Symmetric engage-side hysteresis: require N consecutive override
-# frames with joint-space delta ABOVE --override-frozen-l2-tol before
-# firing override_engaged. Same default as frozen-ticks (10 = 200ms
-# @ 50Hz). Together with the higher tolerance above this prevents
-# brief controller jitter from spurious engage/release cycles. Set
-# to 0 for the legacy single-frame engage behaviour (only used by
-# older smoke tests, not the operator runbook).
-POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS="${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS:-10}"
-# Operator-mode SUB (2026-06-10 follow-up). When the laptop's Quest3
-# manager is on a known host:port, the proxy gates engagement on the
-# manager's stream_mode broadcast (mode != "OFF") and BYPASSES
-# motion-hysteresis. Default port matches the manager's
-# --recorder-pub-port default (5564). Set TELEOP_MODE_PORT to -1 to
-# disable -- the legacy heuristic path is the only one available in
-# that case and WILL flicker if the operator holds the controller
-# still in ARM_MANIPULATION. Real-robot operators MUST set
-# TELEOP_MODE_HOST to the laptop's address (PC2 cannot reach
-# 127.0.0.1's manager).
-POSE_PROXY_TELEOP_MODE_HOST="${POSE_PROXY_TELEOP_MODE_HOST:-127.0.0.1}"
-POSE_PROXY_TELEOP_MODE_PORT="${POSE_PROXY_TELEOP_MODE_PORT:-5564}"
-POSE_PROXY_TELEOP_MODE_TOPIC="${POSE_PROXY_TELEOP_MODE_TOPIC:-stream_mode}"
-POSE_PROXY_TELEOP_MODE_STALE_MS="${POSE_PROXY_TELEOP_MODE_STALE_MS:-1000}"
-POSE_PROXY_CONTROL_BIND="${POSE_PROXY_CONTROL_BIND:-0.0.0.0}"
-POSE_PROXY_CONTROL_PORT="${POSE_PROXY_CONTROL_PORT:--1}"
-POSE_PROXY_CONTROL_TOPIC="${POSE_PROXY_CONTROL_TOPIC:-vla_control}"
-# Auto-disable the proxy if the X2M2 file isn't staged (operators on an
-# older bringup; failure mode is just "no idle fallback, behave like before").
+#     gear_sonic/scripts/run_x2_vla_runtime.sh --enable-takeover ...
+#
+# That launcher spawns x2_pose_mux locally and merges VLA + recorder
+# into one outbound pose stream that this PC2 watchdog SUBs to.
+# Auto-disable the watchdog if the X2M2 file isn't staged (operators on
+# an older bringup; failure mode is just "no idle fallback, behave like before").
 NO_POSE_PROXY=0
+
+# ---- Legacy takeover-env migration error (2026-06-11) --------------
+# Operators with `~/.x2/env.*` files from before the pose_mux_split
+# may still export these vars. They no longer do anything on PC2 and
+# silently dropping them would mask the migration. Hard-fail with a
+# pointer at the milestone doc so the runbook gets updated.
+_LEGACY_TAKEOVER_ENVS=(
+    POSE_PROXY_OVERRIDE_HOST POSE_PROXY_OVERRIDE_PORT
+    POSE_PROXY_OVERRIDE_TOPIC POSE_PROXY_OVERRIDE_STALE_MS
+    POSE_PROXY_OVERRIDE_FROZEN_TICKS POSE_PROXY_OVERRIDE_FROZEN_L2_TOL
+    POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS
+    POSE_PROXY_TELEOP_MODE_HOST POSE_PROXY_TELEOP_MODE_PORT
+    POSE_PROXY_TELEOP_MODE_TOPIC POSE_PROXY_TELEOP_MODE_STALE_MS
+    POSE_PROXY_CONTROL_BIND POSE_PROXY_CONTROL_PORT
+    POSE_PROXY_CONTROL_TOPIC
+)
+_legacy_hits=()
+for _v in "${_LEGACY_TAKEOVER_ENVS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+        _legacy_hits+=("${_v}=${!_v}")
+    fi
+done
+if [[ ${#_legacy_hits[@]} -gt 0 ]]; then
+    printf '\e[31m[pc2 ERROR]\e[0m manual-takeover env vars moved to the laptop on 2026-06-11.\n' >&2
+    printf '\e[31m[pc2 ERROR]\e[0m The following exported vars are NOT honored by x2_pose_watchdog:\n' >&2
+    for _v in "${_legacy_hits[@]}"; do
+        printf '\e[31m[pc2 ERROR]\e[0m   %s\n' "${_v}" >&2
+    done
+    printf '\e[31m[pc2 ERROR]\e[0m Unset them, then run takeover via:\n' >&2
+    printf '\e[31m[pc2 ERROR]\e[0m   gear_sonic/scripts/run_x2_vla_runtime.sh --enable-takeover ...\n' >&2
+    printf '\e[31m[pc2 ERROR]\e[0m See docs/source/user_guide/milestones/2026-06-11_pose_mux_split.md\n' >&2
+    exit 2
+fi
 
 DEPLOY_SESSION="${DEPLOY_SESSION:-x2_deploy}"
 HAND_SESSION="${HAND_SESSION:-x2_hand_bridge}"
 MONITOR_SESSION="${MONITOR_SESSION:-x2_motor_monitor}"
-POSE_PROXY_SESSION="${POSE_PROXY_SESSION:-x2_pose_proxy}"
+# Session name kept WATCHDOG-prefixed so logs/attach/postmortem make
+# obvious which pane is the new single-input watchdog vs the old proxy
+# operators may remember by name. POSE_PROXY_SESSION env override is
+# kept for compatibility with old ~/.x2 env files that pinned the name.
+POSE_PROXY_SESSION="${POSE_PROXY_SESSION:-x2_pose_watchdog}"
 
 POSTMORTEM_OUT="${POSTMORTEM_OUT:-./postmortem_out}"
 
@@ -364,8 +360,11 @@ Per-command flags (after the subcommand):
              # short Ctrl-C-able countdown, and then requires typing
              # 'y' + Enter. Use --yes to skip the prompt in scripts.
     status   [--pc2-host H] [--pc2-user U]
-    logs     [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|proxy|all}
-    attach   [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|proxy}
+    logs     [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|watchdog|proxy|all}
+                                            # 'proxy' kept as alias for
+                                            # 'watchdog' for muscle-memory
+                                            # compatibility with old runbooks.
+    attach   [--pc2-host H] [--pc2-user U] {deploy|hand|monitor|watchdog|proxy}
     postmortem [--pc2-host H] [--pc2-user U]
                [--center-ts ISO] [--window-s SEC] [--out-dir PATH]
     print-env  [--pc2-host H] [--pc2-user U] [--laptop-host H]
@@ -464,7 +463,7 @@ while [[ $# -gt 0 ]]; do
         --center-ts) CENTER_TS="$2"; shift 2 ;;
         --window-s) WINDOW_S="$2"; shift 2 ;;
         --out-dir) POSTMORTEM_OUT="$2"; shift 2 ;;
-        deploy|hand|monitor|proxy|all) LOGS_WHICH="$1"; shift ;;
+        deploy|hand|monitor|proxy|watchdog|all) LOGS_WHICH="$1"; shift ;;
         -h|--help) usage ;;
         *) err "unknown flag: $1"; usage ;;
     esac
@@ -687,7 +686,7 @@ cmd_start() {
     if [[ "${NO_POSE_PROXY}" -eq 0 ]]; then
         if ssh_pc2 "test -f '${POSE_PROXY_IDLE_X2M2}'" >/dev/null 2>&1; then
             pose_proxy_enabled=1
-            log "  pose proxy: ENABLED"
+            log "  pose watchdog: ENABLED"
             log "    upstream    = tcp://${LAPTOP_HOST}:${LAPTOP_POSE_PORT}"
             log "    downstream  = tcp://localhost:${PC2_POSE_PROXY_PORT} (deploy SUBs here)"
             log "    idle x2m2   = ${POSE_PROXY_IDLE_X2M2}"
@@ -703,16 +702,16 @@ cmd_start() {
                     warn "    idle_mode   = idle-stand (LEGACY; arms snap to default on first stale tick)"
                     ;;
                 *)
-                    warn "    idle_mode   = ${POSE_PROXY_IDLE_MODE} (unrecognised; proxy will reject and exit)"
+                    warn "    idle_mode   = ${POSE_PROXY_IDLE_MODE} (unrecognised; watchdog will reject and exit)"
                     ;;
             esac
         else
-            warn "pose proxy idle X2M2 missing on PC2: ${POSE_PROXY_IDLE_X2M2}"
-            warn "  -> proxy DISABLED; deploy will SUB directly to laptop."
+            warn "pose watchdog idle X2M2 missing on PC2: ${POSE_PROXY_IDLE_X2M2}"
+            warn "  -> watchdog DISABLED; deploy will SUB directly to laptop."
             warn "  Run pc2_bringup.sh to stage data/idle_stand.x2m2, then retry."
         fi
     else
-        log "  pose proxy: DISABLED (--no-pose-proxy)"
+        log "  pose watchdog: DISABLED (--no-pose-proxy)"
     fi
 
     local deploy_vla_host="${LAPTOP_HOST}"
@@ -880,45 +879,21 @@ cmd_start() {
         export PYTHONPATH=${PC2_AIMDK_PREFIX}/local/lib/python3.10/dist-packages:${PC2_WS}/src:\${PYTHONPATH:-}"
     local python_bin="${PC2_VENV}/bin/python3"
 
-    # Start pose proxy BEFORE the deploy. The deploy SUBs to
+    # Start pose watchdog BEFORE the deploy. The deploy SUBs to
     # localhost:PC2_POSE_PROXY_PORT and would otherwise see "no upstream"
     # and trip its starvation watchdog (unless --disable-pose-ref-watchdog
-    # is passed, which we do). Bringing the proxy up first means by the
-    # time the operator hits "go" in the deploy tmux pane, the wire is
-    # already flowing (idle frames if the laptop publisher isn't running
-    # yet; live frames once it does).
+    # is passed, which we do). Bringing the watchdog up first means by
+    # the time the operator hits "go" in the deploy tmux pane, the wire
+    # is already flowing (idle frames if the laptop publisher isn't
+    # running yet; live frames once it does).
+    #
+    # Manual takeover (operator override + vla_control PUB) is NOT
+    # handled here -- it moved to the laptop-side x2_pose_mux on
+    # 2026-06-11. The watchdog has exactly ONE upstream SUB, one
+    # downstream PUB, and an optional x2_debug SUB for yaw rebase.
     if [[ "${pose_proxy_enabled}" -eq 1 ]]; then
-        local proxy_log="${PC2_LOG_ROOT}/pose_proxy_${now_tag}.log"
-        local proxy_script="${PC2_PREFIX}/gear_sonic_deploy/scripts/x2_pose_proxy.py"
-        # Optional manual-takeover args. Only forwarded when the
-        # operator has opted in by setting POSE_PROXY_OVERRIDE_PORT
-        # and/or POSE_PROXY_CONTROL_PORT to a positive integer in
-        # the environment / via systemd unit overrides.
-        local proxy_takeover_args=""
-        if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
-            proxy_takeover_args+=" --override-host ${POSE_PROXY_OVERRIDE_HOST}"
-            proxy_takeover_args+=" --override-port ${POSE_PROXY_OVERRIDE_PORT}"
-            proxy_takeover_args+=" --override-topic ${POSE_PROXY_OVERRIDE_TOPIC}"
-            proxy_takeover_args+=" --override-stale-ms ${POSE_PROXY_OVERRIDE_STALE_MS}"
-            proxy_takeover_args+=" --override-frozen-ticks ${POSE_PROXY_OVERRIDE_FROZEN_TICKS}"
-            proxy_takeover_args+=" --override-frozen-l2-tol ${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL}"
-            proxy_takeover_args+=" --override-engage-motion-ticks ${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS}"
-            if [[ "${POSE_PROXY_TELEOP_MODE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_TELEOP_MODE_PORT}" -gt 0 ]]; then
-                proxy_takeover_args+=" --teleop-mode-host ${POSE_PROXY_TELEOP_MODE_HOST}"
-                proxy_takeover_args+=" --teleop-mode-port ${POSE_PROXY_TELEOP_MODE_PORT}"
-                proxy_takeover_args+=" --teleop-mode-topic ${POSE_PROXY_TELEOP_MODE_TOPIC}"
-                proxy_takeover_args+=" --teleop-mode-stale-ms ${POSE_PROXY_TELEOP_MODE_STALE_MS}"
-                log "  pose proxy: override SUB enabled tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} stale_ms=${POSE_PROXY_OVERRIDE_STALE_MS} frozen_ticks=${POSE_PROXY_OVERRIDE_FROZEN_TICKS} frozen_l2_tol=${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL} engage_motion_ticks=${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS} (engage gate: STRICT stream_mode tcp://${POSE_PROXY_TELEOP_MODE_HOST}:${POSE_PROXY_TELEOP_MODE_PORT} topic=${POSE_PROXY_TELEOP_MODE_TOPIC} stale_ms=${POSE_PROXY_TELEOP_MODE_STALE_MS}; motion-hysteresis IGNORED)"
-            else
-                log "  pose proxy: override SUB enabled tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} stale_ms=${POSE_PROXY_OVERRIDE_STALE_MS} frozen_ticks=${POSE_PROXY_OVERRIDE_FROZEN_TICKS} frozen_l2_tol=${POSE_PROXY_OVERRIDE_FROZEN_L2_TOL} engage_motion_ticks=${POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS} (engage gate: LEGACY motion-hysteresis; will flicker if operator holds controller still -- set POSE_PROXY_TELEOP_MODE_PORT to enable strict mode)"
-            fi
-        fi
-        if [[ "${POSE_PROXY_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_CONTROL_PORT}" -gt 0 ]]; then
-            proxy_takeover_args+=" --vla-control-bind-host ${POSE_PROXY_CONTROL_BIND}"
-            proxy_takeover_args+=" --vla-control-port ${POSE_PROXY_CONTROL_PORT}"
-            proxy_takeover_args+=" --vla-control-topic ${POSE_PROXY_CONTROL_TOPIC}"
-            log "  pose proxy: vla_control PUB enabled tcp://${POSE_PROXY_CONTROL_BIND}:${POSE_PROXY_CONTROL_PORT} topic=${POSE_PROXY_CONTROL_TOPIC}"
-        fi
+        local proxy_log="${PC2_LOG_ROOT}/pose_watchdog_${now_tag}.log"
+        local proxy_script="${PC2_PREFIX}/gear_sonic_deploy/scripts/x2_pose_watchdog.py"
         local proxy_cmd="${python_env} && \
             ${python_bin} ${proxy_script} \
                 --upstream-host ${LAPTOP_HOST} \
@@ -930,7 +905,8 @@ cmd_start() {
                 --idle-stale-ms ${POSE_PROXY_STALE_MS} \
                 --idle-mode ${POSE_PROXY_IDLE_MODE} \
                 --hold-last-secs ${POSE_PROXY_HOLD_LAST_SECS} \
-                --blend-secs ${POSE_PROXY_BLEND_SECS}${proxy_takeover_args} \
+                --blend-secs ${POSE_PROXY_BLEND_SECS} \
+                --x2-debug-port ${PC2_DEBUG_PORT} \
                 2>&1 | tee -a ${proxy_log}"
         tmux_start_session "${POSE_PROXY_SESSION}" "${proxy_cmd}"
     fi
@@ -1090,10 +1066,10 @@ cmd_stop() {
 
     log "stopping X2 daemons on ${PC2_USER}@${PC2_HOST}"
     # Order: deploy first (its restart_mc_on_exit trap brings MC back up
-    # via the wire-still-flowing proxy), then proxy, then hand bridge +
-    # motor monitor. Killing the proxy before the deploy would yank the
-    # pose wire out from under deploy's RAMP_OUT and tip MC over a
-    # silent input source mid-handoff.
+    # via the wire-still-flowing watchdog), then watchdog, then hand
+    # bridge + motor monitor. Killing the watchdog before the deploy
+    # would yank the pose wire out from under deploy's RAMP_OUT and tip
+    # MC over a silent input source mid-handoff.
     tmux_kill_session "${DEPLOY_SESSION}"
     tmux_kill_session "${POSE_PROXY_SESSION}"
     tmux_kill_session "${HAND_SESSION}"
@@ -1140,9 +1116,10 @@ cmd_logs() {
         deploy)  tail_session_log "${DEPLOY_SESSION}"     "C++ deploy" ;;
         hand)    tail_session_log "${HAND_SESSION}"       "hand bridge" ;;
         monitor) tail_session_log "${MONITOR_SESSION}"    "motor monitor" ;;
-        proxy)   tail_session_log "${POSE_PROXY_SESSION}" "pose proxy" ;;
+        proxy|watchdog)
+                 tail_session_log "${POSE_PROXY_SESSION}" "pose watchdog" ;;
         all)
-            warn "showing the LAST 80 lines of each (use 'logs deploy|hand|monitor|proxy' to follow-tail)"
+            warn "showing the LAST 80 lines of each (use 'logs deploy|hand|monitor|watchdog' to follow-tail)"
             for s in "${POSE_PROXY_SESSION}" "${DEPLOY_SESSION}" "${HAND_SESSION}" "${MONITOR_SESSION}"; do
                 printf '\n%s== %s ==%s\n' "${C_BLUE}" "${s}" "${C_RESET}"
                 ssh_pc2 "tmux capture-pane -p -t ${s} -S -80" 2>/dev/null || warn "  ${s}: not running"
@@ -1159,7 +1136,7 @@ cmd_logs() {
 cmd_attach() {
     local target="${LOGS_WHICH}"
     if [[ "${target}" == "all" ]]; then
-        err "attach requires deploy|hand|monitor|proxy"
+        err "attach requires deploy|hand|monitor|watchdog"
         exit 1
     fi
     local s
@@ -1167,7 +1144,7 @@ cmd_attach() {
         deploy)  s="${DEPLOY_SESSION}" ;;
         hand)    s="${HAND_SESSION}" ;;
         monitor) s="${MONITOR_SESSION}" ;;
-        proxy)   s="${POSE_PROXY_SESSION}" ;;
+        proxy|watchdog) s="${POSE_PROXY_SESSION}" ;;
         *) err "unknown attach target: ${target}"; usage ;;
     esac
     info "attaching to ${s} on PC2 (Ctrl-b d to detach without killing)"

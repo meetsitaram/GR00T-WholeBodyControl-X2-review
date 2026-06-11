@@ -175,6 +175,23 @@ BOLD=$'\033[1m'
 : "${PC2_DEBUG_PORT:=5557}"
 : "${PC2_CAMERAS_PORT:=5555}"
 : "${LAPTOP_POSE_PORT:=5556}"
+# Bridge pose PUB port. Defaults to LAPTOP_POSE_PORT (the canonical
+# "where downstream consumers read pose from" port). When
+# --enable-takeover flips the laptop topology to bridge -> mux -> wire,
+# this is set to BRIDGE_POSE_PORT_INTERNAL (default 5571) so the mux
+# can bind on LAPTOP_POSE_PORT (5556) without clashing with the bridge,
+# and PC2's pose watchdog continues SUBing LAPTOP:5556 unchanged.
+# Resolved AFTER --enable-takeover is parsed.
+#
+# 2026-06-11 follow-up: moved from 5570 -> 5571 because :5570 is owned
+# by the kplanner stack's x2_debug_to_robot_pose_bridge (publishes the
+# 'robot_pose' topic for kplanner pose-feedback). Running
+# run_x2_vla_runtime.sh --enable-takeover alongside
+# run_x2_quest3_planner_stack.sh would otherwise zmq-bind-collide on
+# :5570 -- the kplanner stack's bridge would fail to start. Both ports
+# are pure laptop-loopback so there is no over-the-wire impact.
+: "${BRIDGE_POSE_PORT_INTERNAL:=5571}"
+: "${BRIDGE_POSE_PUB_PORT:=}"
 # ---- Manual-takeover (vla_control) plumbing (2026-06-10 milestone) ----
 # When VLA_CONTROL_PORT > 0, the bridge subscribes to a remote
 # vla_control PUB (the x2_pose_proxy on PC2) and cold-restarts on
@@ -238,19 +255,65 @@ BOLD=$'\033[1m'
 : "${VLA_TRACKING_HARD_RAD:=0.40}"
 : "${VLA_TRACKING_VELOCITY_MARGIN:=1.5}"
 : "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK:=0.01}"
+# 2026-06-11 follow-up: hard-cap on per-joint wire velocity (rad/s),
+# independent of the legacy ``margin * |dq|`` chasing law. Default
+# 0 = DISABLED (legacy behaviour). Set positive to actually bound
+# the wire's commanded velocity regardless of what the actuator is
+# doing. Recommended 0.8-1.5 on real X2 to suppress multi-joint
+# coordinated swing the chasing law could not constrain.
+: "${VLA_TRACKING_VELOCITY_MAX_RAD_S:=0.0}"
+# 2026-06-11 follow-up: derivative overshoot gate (rad/s). When the
+# arm is moving AWAY from the wire target faster than this, the
+# joint is near-frozen until the arm reverses or position error
+# drops below soft. Default 0 = DISABLED. Recommended 0.3-0.8 on
+# real X2.
+: "${VLA_TRACKING_OVERSHOOT_DQ_RAD_S:=0.0}"
+# 2026-06-11 follow-up: viscous damper coefficient. After all clamps,
+# subtracts ``kd * measured_dq * dt`` from the wire on tracked arm
+# joints -- actively opposes actuator motion. The cap law alone
+# can't do this; it only bounds velocity, doesn't inject opposing
+# acceleration. This is the TRUE closed-loop fix for the under-
+# damped PD oscillation mode (especially shoulders). Default 0 =
+# DISABLED. Recommended starting point 0.5-1.0 on real X2; bump
+# higher if oscillation persists. Pair with shoulder-scale below.
+: "${VLA_TRACKING_DAMPING_KD:=0.0}"
+# 2026-06-11 follow-up: per-joint scaling for the shoulder cluster
+# (MJ 15-17 left, 22-24 right). Shoulders have ~3-5x the inertia of
+# distal joints AND sit under max gravity torque -- they need more
+# damping authority than wrists. Default 1.0 = uniform damping.
+# Recommended 1.5-3.0 on real X2.
+: "${VLA_TRACKING_DAMPING_SHOULDER_SCALE:=1.0}"
 : "${VLA_TRACKING_STALE_MS:=100}"
 
-# ---- Sim-mode pose proxy plumbing (2026-06-10 milestone, sim path) -----
-# When SIM_MODE=1 AND (VLA_CONTROL_PORT > 0 OR POSE_PROXY_OVERRIDE_PORT > 0),
-# this launcher spawns a LOCAL x2_pose_proxy on loopback between the
-# bridge and the sim deploy so the manual-takeover loop works in pure
-# sim without any PC2 daemons. The bridge keeps publishing to
-# LAPTOP_POSE_PORT (5556); the proxy SUBs there, arbitrates against
-# the override SUB, and PUBs the merged wire to POSE_PROXY_DOWNSTREAM_PORT
-# (5558) where the sim deploy reads from.
+# ---- Pose-pipeline (mux + sim watchdog) plumbing (2026-06-11 split) ----
+# Replaces the legacy single-process x2_pose_proxy.py (which was
+# spawned in sim and re-implemented on PC2). The pipeline is now
+# split into two purpose-built processes:
 #
-# Defaults match x2_pc2_daemons.sh so the same operator runbook works
-# in sim and real-robot mode. Override via env vars.
+#   x2_pose_mux       -- laptop-side N-to-1 pose merger. SUBs the
+#                        bridge's pose stream (primary) + the recorder's
+#                        operator stream (override), runs the arbitration
+#                        state machine (debounce / frozen / hysteresis /
+#                        stream_mode gate / engagement ramp), and PUBs
+#                        one merged wire on LAPTOP_POSE_PORT (5556). Also
+#                        emits override_engaged / override_released
+#                        events on a vla_control PUB the bridge SUBs to.
+#                        Spawned on the laptop whenever --enable-takeover
+#                        is set (sim AND real). The PC2 watchdog (or
+#                        sim watchdog) reads exactly ONE upstream.
+#   x2_pose_watchdog  -- single-input fallback ladder. Real-robot path:
+#                        runs on PC2 via x2_pc2_daemons.sh. Sim path:
+#                        this launcher spawns one locally whenever
+#                        --enable-takeover is set so the sim deploy
+#                        sees the same HOLD -> BLEND -> IDLE_CLIP wire
+#                        the real deploy gets when upstream stalls.
+#
+# Backward compatibility: the POSE_PROXY_OVERRIDE_* / POSE_PROXY_TELEOP_*
+# env vars are STILL honored by this launcher as pass-through to the
+# mux's matching CLI args (--override-port / --teleop-mode-port / etc.)
+# so the existing operator runbook continues to work. The POSE_PROXY_
+# IDLE_* / HOLD_LAST_* / BLEND_SECS variables are honored by the sim
+# watchdog with identical semantics.
 : "${POSE_PROXY_DOWNSTREAM_HOST:=127.0.0.1}"
 : "${POSE_PROXY_DOWNSTREAM_PORT:=5558}"
 : "${POSE_PROXY_OVERRIDE_HOST:=127.0.0.1}"
@@ -317,10 +380,18 @@ BOLD=$'\033[1m'
 # gear_sonic_deploy/data/idle_stand.x2m2 (regenerate via
 # `python -m gear_sonic_deploy.scripts.bake_idle_stand_x2m2`).
 : "${POSE_PROXY_IDLE_X2M2:=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/gear_sonic_deploy/data/idle_stand.x2m2}"
-# Python interpreter for the proxy. pyzmq + numpy are the only deps;
-# the bridge venv has both. We default to the bridge's interpreter
-# so we don't introduce a second venv requirement.
+# Python interpreter for the mux + sim watchdog. pyzmq + numpy are the
+# only deps; the bridge venv has both. We default to the bridge's
+# interpreter so we don't introduce a second venv requirement.
+# POSE_PROXY_PY name kept as backward-compatible alias.
 : "${POSE_PROXY_PY:=}"
+: "${POSE_MUX_PY:=${POSE_PROXY_PY}}"
+: "${POSE_WATCHDOG_PY:=${POSE_PROXY_PY}}"
+# Master opt-in for the laptop-side mux. Default 0 (off). Flipped on
+# by --enable-takeover. When set, the laptop ALSO spawns x2_pose_mux
+# (real + sim) and x2_pose_watchdog (sim only). Required if you want
+# operator override + vla_control edge events.
+: "${ENABLE_TAKEOVER:=0}"
 : "${MODALITY_CONFIG:=gear_sonic/data/x2_modality_config_omnihand_stereo.py}"
 : "${MOTION_TOKEN_DECODER:=}"
 : "${SONIC_CHECKPOINT:=}"
@@ -564,17 +635,39 @@ Flags (preferred over env vars):
                                (default .venv/bin/python so the LeRobot deps
                                install path is hit, not env_isaaclab).
 
-  --- Manual-takeover plumbing (2026-06-10 milestone) ---
+  --- Manual-takeover plumbing (2026-06-11 mux split) ---
   Enables the operator to teleop-nudge the arm out of a stuck VLA pose
   without restarting the bridge. CLI flags override matching env vars.
-  In sim mode, setting either of the two PORTs > 0 also spawns a local
-  x2_pose_proxy on loopback so the same loop works without PC2.
+  --enable-takeover is the master switch: when set, the launcher
+  spawns x2_pose_mux locally (sim + real) and an x2_pose_watchdog
+  locally (sim only). The PC2 watchdog provides fallback in real mode.
 
+  --enable-takeover            Spawn the laptop-side x2_pose_mux and
+                               (in sim) x2_pose_watchdog. Auto-promotes
+                               --pose-proxy-override-port to 5560 and
+                               --vla-control-port to 127.0.0.1:5559
+                               (both loopback after the 2026-06-11
+                               split) so the operator doesn't need to
+                               re-pass them. Default OFF -- the bridge
+                               publishes directly to PC2 / sim deploy.
+  --no-takeover                Force takeover OFF (overrides
+                               ENABLE_TAKEOVER=1 env).
   --vla-control-port PORT      Bridge SUB port for vla_control events
-                               (proxy emits override_engaged/released
-                               edges here). Default -1 = disabled.
-  --vla-control-host HOST      Host for the vla_control SUB. Defaults to
-                               --pc2-host in real mode, 127.0.0.1 in sim.
+                               (mux emits override_engaged/released
+                               edges here). Default -1 = auto: promoted
+                               to 5559 by --enable-takeover, stays
+                               disabled otherwise. Set 0 to explicitly
+                               disable even with takeover on (operator
+                               override wins but bridge does NOT cold-
+                               restart on release, so the wire snaps
+                               back to whatever VLA chunk is mid-decode
+                               -- only useful for arbitration smoke
+                               tests, not production).
+  --vla-control-host HOST      Host for the vla_control SUB. Defaults
+                               to 127.0.0.1 when --enable-takeover is
+                               on (mux is local). Pre-2026-06-11
+                               default was --pc2-host (kept for
+                               manual VLA_CONTROL_HOST overrides).
   --vla-control-topic TOPIC    Topic prefix on the vla_control SUB
                                (default 'vla_control').
   --vla-cold-restart-hold-ticks N
@@ -874,10 +967,16 @@ while [[ $# -gt 0 ]]; do
         --encoder-config)   ENCODER_CONFIG="$2"; shift 2 ;;
         --sonic-tokenizer-device) SONIC_TOKENIZER_DEVICE="$2"; shift 2 ;;
         --recorder-py)      RECORDER_PY="$2"; shift 2 ;;
-        # --- manual-takeover plumbing (2026-06-10 milestone) -----------
+        # --- manual-takeover plumbing (2026-06-11 mux split) -----------
         # These CLI flags take precedence over the matching env vars,
         # which remain as fallbacks so the existing x2_pc2_daemons.sh
-        # tmux-env propagation path keeps working.
+        # tmux-env propagation path keeps working. --enable-takeover is
+        # the master switch: when set, the launcher spawns x2_pose_mux
+        # locally (sim + real) and an x2_pose_watchdog locally (sim
+        # only). Without it, the laptop runs bridge-only and PC2's
+        # watchdog SUBs the bridge directly (autonomous-only path).
+        --enable-takeover)  ENABLE_TAKEOVER=1; shift ;;
+        --no-takeover)      ENABLE_TAKEOVER=0; shift ;;
         --vla-control-port) VLA_CONTROL_PORT="$2"; shift 2 ;;
         --vla-control-host) VLA_CONTROL_HOST="$2"; shift 2 ;;
         --vla-control-topic) VLA_CONTROL_TOPIC="$2"; shift 2 ;;
@@ -894,6 +993,10 @@ while [[ $# -gt 0 ]]; do
         --vla-tracking-hard-rad) VLA_TRACKING_HARD_RAD="$2"; shift 2 ;;
         --vla-tracking-velocity-margin) VLA_TRACKING_VELOCITY_MARGIN="$2"; shift 2 ;;
         --vla-tracking-velocity-floor-rad-tick) VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK="$2"; shift 2 ;;
+        --vla-tracking-velocity-max-rad-s) VLA_TRACKING_VELOCITY_MAX_RAD_S="$2"; shift 2 ;;
+        --vla-tracking-overshoot-dq-rad-s) VLA_TRACKING_OVERSHOOT_DQ_RAD_S="$2"; shift 2 ;;
+        --vla-tracking-damping-kd) VLA_TRACKING_DAMPING_KD="$2"; shift 2 ;;
+        --vla-tracking-damping-shoulder-scale) VLA_TRACKING_DAMPING_SHOULDER_SCALE="$2"; shift 2 ;;
         --vla-tracking-stale-ms) VLA_TRACKING_STALE_MS="$2"; shift 2 ;;
         --pose-proxy-override-port) POSE_PROXY_OVERRIDE_PORT="$2"; shift 2 ;;
         --pose-proxy-override-host) POSE_PROXY_OVERRIDE_HOST="$2"; shift 2 ;;
@@ -1037,25 +1140,89 @@ PID_FILE_DEPLOY="${RUN_DIR}/deploy.pid"
 LOG_FILE_DEPLOY="${RUN_DIR}/deploy.log"
 PID_FILE_RECORDER="${RUN_DIR}/recorder.pid"
 LOG_FILE_RECORDER="${RUN_DIR}/recorder.log"
-PID_FILE_SIM_PROXY="${RUN_DIR}/sim_proxy.pid"
-LOG_FILE_SIM_PROXY="${RUN_DIR}/sim_proxy.log"
+PID_FILE_POSE_MUX="${RUN_DIR}/pose_mux.pid"
+LOG_FILE_POSE_MUX="${RUN_DIR}/pose_mux.log"
+PID_FILE_SIM_WATCHDOG="${RUN_DIR}/sim_watchdog.pid"
+LOG_FILE_SIM_WATCHDOG="${RUN_DIR}/sim_watchdog.log"
+# Legacy aliases for the sim_proxy pid/log paths -- some operator
+# scripts that grep ${RUN_DIR}/sim_proxy.log expect the file to
+# exist. Keep symlink-style aliases pointing at the new mux log so
+# the existing runbook still finds something useful.
+PID_FILE_SIM_PROXY="${PID_FILE_POSE_MUX}"
+LOG_FILE_SIM_PROXY="${LOG_FILE_POSE_MUX}"
 
-# Sim-mode pose proxy is in the loop iff the operator opted into
-# manual-takeover by enabling either VLA_CONTROL_PORT (edge events
-# for the bridge cold restart) or POSE_PROXY_OVERRIDE_PORT (dual-
-# source arbitration). Either alone is a valid use case, so we OR
-# them. Only takes effect when SIM_MODE=1; real-robot runs always
-# rely on the PC2-side proxy spawned by x2_pc2_daemons.sh and
-# SIM_PROXY_ENABLED stays 0 so the launcher doesn't try to bind
-# loopback sockets that conflict with the laptop's bridge PUB.
+# Manual-takeover is in the loop iff the operator opted in via
+# --enable-takeover (preferred) OR by setting POSE_PROXY_OVERRIDE_PORT /
+# VLA_CONTROL_PORT > 0 in env / CLI (the pre-2026-06-11 opt-in path,
+# kept working for runbook continuity). Unlike the legacy SIM_PROXY_
+# ENABLED flag, TAKEOVER_ENABLED is honoured in BOTH sim and real
+# modes: the laptop-side x2_pose_mux is what replaces the PC2-side
+# arbitration. The sim path additionally spawns a local x2_pose_
+# watchdog (real-robot deployments get their watchdog from
+# x2_pc2_daemons.sh).
+TAKEOVER_ENABLED="${ENABLE_TAKEOVER:-0}"
+if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+    TAKEOVER_ENABLED=1
+fi
+if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
+    TAKEOVER_ENABLED=1
+fi
+# Legacy alias name; some downstream call sites still read it.
 SIM_PROXY_ENABLED=0
-if [[ "${SIM_MODE}" -eq 1 ]]; then
-    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
-        SIM_PROXY_ENABLED=1
+if [[ "${SIM_MODE}" -eq 1 && "${TAKEOVER_ENABLED}" -eq 1 ]]; then
+    SIM_PROXY_ENABLED=1
+fi
+
+# When --enable-takeover is on, both the override SUB port (recorder
+# -> mux) and the vla_control PUB port (mux -> bridge) are purely
+# laptop-loopback after the 2026-06-11 split -- neither port crosses
+# wifi anymore. Promote them to their canonical defaults so the
+# operator doesn't have to re-pass them on every invocation. Either
+# can still be:
+#   * overridden to a non-default value via --pose-proxy-override-port
+#     / --vla-control-port / env var (e.g. to dodge a port collision);
+#   * disabled outright by passing 0 -- only useful for the rare case
+#     of "take over without bridge cold-restart" (operator override
+#     wins but on release the wire snaps to whatever VLA chunk is
+#     mid-decode).
+# The legacy 2026-06-10 default (-1) is treated as "auto" here; an
+# explicit 0 stays 0 so the disable knob remains.
+if [[ "${TAKEOVER_ENABLED}" -eq 1 ]]; then
+    if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] \
+       && [[ "${POSE_PROXY_OVERRIDE_PORT}" -lt 0 ]]; then
+        POSE_PROXY_OVERRIDE_PORT=5560
     fi
-    if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
-        SIM_PROXY_ENABLED=1
+    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] \
+       && [[ "${VLA_CONTROL_PORT}" -lt 0 ]]; then
+        VLA_CONTROL_PORT=5559
     fi
+    # vla_control is now always loopback, so the host follows. Only
+    # override if the operator didn't pin it to something explicit.
+    if [[ -z "${VLA_CONTROL_HOST}" ]]; then
+        VLA_CONTROL_HOST=127.0.0.1
+    fi
+fi
+
+# Resolve the bridge's pose PUB port now that TAKEOVER_ENABLED is
+# settled. With takeover, the bridge moves to an internal port and
+# the mux takes over LAPTOP_POSE_PORT; without takeover, the bridge
+# keeps publishing directly on LAPTOP_POSE_PORT (no behaviour change).
+if [[ -z "${BRIDGE_POSE_PUB_PORT}" ]]; then
+    if [[ "${TAKEOVER_ENABLED}" -eq 1 ]]; then
+        BRIDGE_POSE_PUB_PORT="${BRIDGE_POSE_PORT_INTERNAL}"
+    else
+        BRIDGE_POSE_PUB_PORT="${LAPTOP_POSE_PORT}"
+    fi
+fi
+# Sanity: the bridge port MUST differ from the mux's bind port when
+# takeover is on (the two would otherwise fight for LAPTOP_POSE_PORT).
+# err()/log() aren't defined this early -- raw echo to stderr instead.
+if [[ "${TAKEOVER_ENABLED}" -eq 1 \
+      && "${BRIDGE_POSE_PUB_PORT}" -eq "${LAPTOP_POSE_PORT}" ]]; then
+    echo "[vla-runtime] ERROR: BRIDGE_POSE_PUB_PORT (${BRIDGE_POSE_PUB_PORT}) collides with LAPTOP_POSE_PORT (${LAPTOP_POSE_PORT})." >&2
+    echo "[vla-runtime]   With --enable-takeover the mux binds LAPTOP_POSE_PORT, so the bridge must publish on a different port." >&2
+    echo "[vla-runtime]   Unset BRIDGE_POSE_PUB_PORT to use the default (${BRIDGE_POSE_PORT_INTERNAL}), or pick another value." >&2
+    exit 2
 fi
 # Bridge<->recorder ready-file handshake. Always defined so the bridge
 # CLI is stable, but only wired into BRIDGE_ARGS / recorder_args below
@@ -1114,7 +1281,7 @@ err()   { echo -e "${RED}[vla-runtime]${NC} $*" >&2; }
 # even on failed preflights. Actual BRIDGE_ARGS threading happens
 # later in the spawn block.
 if [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]]; then
-    log "tracking feedback ENABLED: soft=${VLA_TRACKING_SOFT_RAD}rad hard=${VLA_TRACKING_HARD_RAD}rad vel_margin=${VLA_TRACKING_VELOCITY_MARGIN} vel_floor=${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}rad/tick stale=${VLA_TRACKING_STALE_MS}ms (closed-loop arm-joint cap; falls back to scalar clamp when proprio stale)"
+    log "tracking feedback ENABLED: soft=${VLA_TRACKING_SOFT_RAD}rad hard=${VLA_TRACKING_HARD_RAD}rad vel_margin=${VLA_TRACKING_VELOCITY_MARGIN} vel_floor=${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}rad/tick vel_max=${VLA_TRACKING_VELOCITY_MAX_RAD_S}rad/s overshoot=${VLA_TRACKING_OVERSHOOT_DQ_RAD_S}rad/s damping_kd=${VLA_TRACKING_DAMPING_KD} shoulder_scale=${VLA_TRACKING_DAMPING_SHOULDER_SCALE} stale=${VLA_TRACKING_STALE_MS}ms (closed-loop arm-joint cap + viscous damper; falls back to scalar clamp when proprio stale)"
 else
     log "tracking feedback DISABLED (set --vla-tracking-feedback or VLA_TRACKING_FEEDBACK=1 to enable closed-loop wire step cap)"
 fi
@@ -1222,24 +1389,48 @@ stop_dump() {
     fi
 }
 
-stop_sim_proxy() {
-    # Tear down the sim-mode pose proxy if it was spawned. Order
-    # matters in stop_all: the sim deploy SUBs from the proxy's
-    # downstream port, so stopping deploy FIRST avoids the deploy
-    # logging "input went silent" right before we kill it anyway.
-    # The proxy holds no operator state (no parquet flush, no model
-    # weights), so a 2 s SIGTERM window is plenty.
-    if [[ -f "$PID_FILE_SIM_PROXY" ]]; then
+stop_pose_mux() {
+    # Tear down the laptop-side x2_pose_mux if it was spawned. Order
+    # matters in stop_all: the downstream watchdog (sim) / PC2
+    # watchdog (real) reads from the mux's PUB, so stopping the
+    # consumer FIRST avoids the watchdog logging "input went silent"
+    # right before we kill it anyway. The mux holds no operator
+    # state (no parquet flush, no model weights), so a 2 s SIGTERM
+    # window is plenty.
+    if [[ -f "$PID_FILE_POSE_MUX" ]]; then
         local ppid
-        ppid="$(cat "$PID_FILE_SIM_PROXY")"
+        ppid="$(cat "$PID_FILE_POSE_MUX")"
         if kill -0 "$ppid" 2>/dev/null; then
-            log "SIGTERM sim pose proxy pid=$ppid …"
+            log "SIGTERM pose mux pid=$ppid …"
             kill -TERM "$ppid" 2>/dev/null || true
             sleep 2
             kill -KILL "$ppid" 2>/dev/null || true
         fi
-        rm -f "$PID_FILE_SIM_PROXY"
+        rm -f "$PID_FILE_POSE_MUX"
     fi
+}
+
+stop_sim_watchdog() {
+    # Sim-only watchdog tear-down. Stop AFTER the deploy so the
+    # deploy's "input went silent" log doesn't fire on every shutdown.
+    if [[ -f "$PID_FILE_SIM_WATCHDOG" ]]; then
+        local wpid
+        wpid="$(cat "$PID_FILE_SIM_WATCHDOG")"
+        if kill -0 "$wpid" 2>/dev/null; then
+            log "SIGTERM sim watchdog pid=$wpid …"
+            kill -TERM "$wpid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$wpid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE_SIM_WATCHDOG"
+    fi
+}
+
+# Legacy alias preserved so callers from older runbooks / postmortem
+# scripts that grep for stop_sim_proxy keep working.
+stop_sim_proxy() {
+    stop_sim_watchdog
+    stop_pose_mux
 }
 
 stop_recorder() {
@@ -1283,15 +1474,18 @@ kill_stale_sim_processes() {
     pkill -TERM -f "live_vla_publish_motion_token" 2>/dev/null || true
     pkill -TERM -f "gear_sonic.scripts.dump_x2_debug" 2>/dev/null || true
     pkill -TERM -f "deploy_x2.sh.*sim" 2>/dev/null || true
-    # Sim-mode pose proxy spawned by spawn_sim_proxy. Match the full
-    # script path to avoid killing a PC2-side proxy that may be
-    # running under a different python in a remote session.
-    pkill -TERM -f "gear_sonic_deploy/scripts/x2_pose_proxy.py" 2>/dev/null || true
+    # Laptop-side mux + sim watchdog spawned by spawn_pose_mux /
+    # spawn_sim_watchdog. Match the full script path so we don't
+    # accidentally kill the PC2-side watchdog that may be running
+    # under a different python in a remote ssh session.
+    pkill -TERM -f "gear_sonic/scripts/x2_pose_mux.py" 2>/dev/null || true
+    pkill -TERM -f "gear_sonic_deploy/scripts/x2_pose_watchdog.py" 2>/dev/null || true
     sleep 2
     pkill -KILL -f "live_vla_publish_motion_token" 2>/dev/null || true
     pkill -KILL -f "gear_sonic.scripts.dump_x2_debug" 2>/dev/null || true
     pkill -KILL -f "deploy_x2.sh.*sim" 2>/dev/null || true
-    pkill -KILL -f "gear_sonic_deploy/scripts/x2_pose_proxy.py" 2>/dev/null || true
+    pkill -KILL -f "gear_sonic/scripts/x2_pose_mux.py" 2>/dev/null || true
+    pkill -KILL -f "gear_sonic_deploy/scripts/x2_pose_watchdog.py" 2>/dev/null || true
     # deploy_x2.sh uses gr00t-x2sim:latest (host networking). Older
     # docs referenced ancestor=x2sim; match both image + name patterns.
     local cid=""
@@ -1308,18 +1502,22 @@ kill_stale_sim_processes() {
         docker kill $cid 2>/dev/null || true
         sleep 3
     fi
-    # Build a list of ports the proxy + bridge + deploy may have left
-    # bound. Override + control entries only included when the operator
-    # opted into them (else they're -1 and would expand to nonsense).
+    # Build a list of ports the mux + bridge + watchdog + deploy may
+    # have left bound. The bridge's internal port and the mux's input/
+    # override ports are added when takeover is enabled (else they're
+    # -1 / unset and would expand to nonsense).
     local cleanup_ports=("${LAPTOP_POSE_PORT}" "${PC2_DEBUG_PORT}")
-    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
-        cleanup_ports+=("${POSE_PROXY_DOWNSTREAM_PORT}")
+    if [[ "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
+        cleanup_ports+=("${BRIDGE_POSE_PUB_PORT}")
         if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
             cleanup_ports+=("${POSE_PROXY_OVERRIDE_PORT}")
         fi
         if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
             cleanup_ports+=("${VLA_CONTROL_PORT}")
         fi
+    fi
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        cleanup_ports+=("${POSE_PROXY_DOWNSTREAM_PORT}")
     fi
     local port_re=""
     local port
@@ -1346,9 +1544,11 @@ stop_all() {
     stop_recorder
     stop_bridge
     stop_deploy
-    # Sim proxy LAST: bridge + deploy both touch its sockets, so we
-    # let them exit cleanly first. No-op when SIM_PROXY_ENABLED=0.
-    stop_sim_proxy
+    # Sim watchdog BEFORE the mux: deploy reads from watchdog, watchdog
+    # reads from mux. Reverse the dataflow when tearing down so each
+    # consumer exits before its producer disappears.
+    stop_sim_watchdog
+    stop_pose_mux
     stop_dump
     kill_stale_sim_processes
 }
@@ -1526,14 +1726,31 @@ preflight_sim_onnx() {
 }
 
 preflight_sim_ports_free() {
-    log "[preflight] sim ZMQ ports :${LAPTOP_POSE_PORT} and :${PC2_DEBUG_PORT} must be free …"
-    if ss -tln 2>/dev/null | grep -qE ":${LAPTOP_POSE_PORT}\b|:${PC2_DEBUG_PORT}\b"; then
+    # When takeover is enabled the bridge moves to
+    # BRIDGE_POSE_PUB_PORT and the mux binds LAPTOP_POSE_PORT, so we
+    # need both ports free. The sim watchdog also wants
+    # POSE_PROXY_DOWNSTREAM_PORT. Build the check list dynamically so
+    # the preflight signature reflects what's actually about to bind.
+    local ports=("${LAPTOP_POSE_PORT}" "${PC2_DEBUG_PORT}")
+    if [[ "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
+        ports+=("${BRIDGE_POSE_PUB_PORT}")
+    fi
+    if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
+        ports+=("${POSE_PROXY_DOWNSTREAM_PORT}")
+    fi
+    local port_re=""
+    local p
+    for p in "${ports[@]}"; do
+        [[ -z "${port_re}" ]] && port_re=":${p}\b" || port_re+="|:${p}\b"
+    done
+    log "[preflight] sim ZMQ ports ${ports[*]} must be free …"
+    if ss -tln 2>/dev/null | grep -qE "${port_re}"; then
         warn "  port(s) in use; stopping stale sim processes …"
         kill_stale_sim_processes
     fi
-    if ss -tln 2>/dev/null | grep -qE ":${LAPTOP_POSE_PORT}\b|:${PC2_DEBUG_PORT}\b"; then
+    if ss -tln 2>/dev/null | grep -qE "${port_re}"; then
         err "  ports still bound after cleanup. Inspect with:"
-        err "    ss -tlnp | grep -E ':${LAPTOP_POSE_PORT}|:${PC2_DEBUG_PORT}'"
+        err "    ss -tlnp | grep -E '${port_re//\\\\b/}'"
         err "  Or run: ./gear_sonic/scripts/run_x2_vla_runtime.sh stop"
         return 1
     fi
@@ -1541,14 +1758,23 @@ preflight_sim_ports_free() {
 }
 
 preflight_local_ports_free() {
-    log "[preflight] local port :${LAPTOP_POSE_PORT} must be free …"
-    if ss -tln 2>/dev/null | grep -qE ":${LAPTOP_POSE_PORT}\b"; then
-        err "  port ${LAPTOP_POSE_PORT} is already bound on this laptop."
-        err "  Check 'ss -tlnp | grep :${LAPTOP_POSE_PORT}' and stop the"
-        err "  conflicting process (likely a stale bridge from a prior run)."
+    local ports=("${LAPTOP_POSE_PORT}")
+    if [[ "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
+        ports+=("${BRIDGE_POSE_PUB_PORT}")
+    fi
+    log "[preflight] local port(s) ${ports[*]} must be free …"
+    local port_re=""
+    local p
+    for p in "${ports[@]}"; do
+        [[ -z "${port_re}" ]] && port_re=":${p}\b" || port_re+="|:${p}\b"
+    done
+    if ss -tln 2>/dev/null | grep -qE "${port_re}"; then
+        err "  port(s) ${ports[*]} already bound on this laptop."
+        err "  Check 'ss -tlnp | grep -E \"${port_re//\\\\b/}\"' and stop the"
+        err "  conflicting process (likely a stale bridge / mux from a prior run)."
         return 1
     fi
-    ok "  port :${LAPTOP_POSE_PORT} free."
+    ok "  port(s) ${ports[*]} free."
 }
 
 autostart_pc2_cameras() {
@@ -1790,20 +2016,108 @@ print_sim_artifacts() {
     log "  or: python -c \"import pandas as pd; df=pd.read_csv('${RUN_DIR}/x2_debug_trace.csv'); print(df.describe())\""
 }
 
-spawn_sim_proxy() {
-    # Spawn the pose proxy on loopback so the sim deploy gets dual-
-    # source arbitration + the same fallback ladder the PC2-side proxy
-    # provides on the real robot. The bridge keeps publishing to
-    # LAPTOP_POSE_PORT; the proxy SUBs there and republishes to
-    # POSE_PROXY_DOWNSTREAM_PORT (where the sim deploy reads from).
-    # No-op when SIM_PROXY_ENABLED=0.
-    local proxy_py="$POSE_PROXY_PY"
-    if [[ -z "$proxy_py" ]]; then
-        proxy_py="$BRIDGE_PY"
+spawn_pose_mux() {
+    # Spawn the laptop-side x2_pose_mux. SUBs the bridge's pose stream
+    # on 127.0.0.1:${BRIDGE_POSE_PUB_PORT} (primary) and the recorder's
+    # operator stream on ${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_
+    # OVERRIDE_PORT} (override), runs the arbitration state machine,
+    # and PUBs the merged pose wire on *:${LAPTOP_POSE_PORT}. Also
+    # PUBs override_engaged / override_released events on
+    # 127.0.0.1:${VLA_CONTROL_PORT} that the bridge SUBs to for cold
+    # restarts. Spawned for BOTH sim and real modes whenever
+    # TAKEOVER_ENABLED=1; the real-robot watchdog on PC2 reads the
+    # merged wire over wifi from LAPTOP:${LAPTOP_POSE_PORT}.
+    local mux_py="$POSE_MUX_PY"
+    if [[ -z "$mux_py" ]]; then
+        mux_py="$BRIDGE_PY"
     fi
-    local proxy_script="${REPO_ROOT}/gear_sonic_deploy/scripts/x2_pose_proxy.py"
-    if [[ ! -f "$proxy_script" ]]; then
-        err "sim pose proxy script missing: $proxy_script"
+    local mux_script="${REPO_ROOT}/gear_sonic/scripts/x2_pose_mux.py"
+    if [[ ! -f "$mux_script" ]]; then
+        err "x2_pose_mux script missing: $mux_script"
+        return 1
+    fi
+    # Override SUB is REQUIRED by the mux (it's the whole point). When
+    # the operator didn't set a port explicitly but ENABLE_TAKEOVER is
+    # on, fall back to the recorder's default PUB port (5560).
+    local override_port="${POSE_PROXY_OVERRIDE_PORT}"
+    if ! [[ "${override_port}" =~ ^[0-9]+$ ]] || [[ "${override_port}" -le 0 ]]; then
+        override_port=5560
+        log "  override port not set; defaulting --override-port=${override_port} (laptop recorder)"
+    fi
+    local mux_args=(
+        "$mux_script"
+        --primary-host 127.0.0.1
+        --primary-port "$BRIDGE_POSE_PUB_PORT"
+        --primary-topic pose
+        --out-host "*"
+        --out-port "$LAPTOP_POSE_PORT"
+        --out-topic pose
+        --override-host "$POSE_PROXY_OVERRIDE_HOST"
+        --override-port "$override_port"
+        --override-topic "$POSE_PROXY_OVERRIDE_TOPIC"
+        --override-stale-ms "$POSE_PROXY_OVERRIDE_STALE_MS"
+        --override-frozen-ticks "$POSE_PROXY_OVERRIDE_FROZEN_TICKS"
+        --override-frozen-l2-tol "$POSE_PROXY_OVERRIDE_FROZEN_L2_TOL"
+        --override-engage-motion-ticks "$POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS"
+        --engagement-max-wire-step "$POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP"
+        --engagement-steady-wire-step "$POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP"
+        --engagement-step-ramp-ticks "$POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS"
+        --rate-hz "$RATE"
+        --status-every-s 5.0
+    )
+    # Mode-gated engagement: hand the mux the manager's stream_mode
+    # PUB address so engagement keys on operator button presses
+    # instead of pose deltas. <= 0 falls back to the legacy motion-
+    # hysteresis path (only useful for replay smoke tests with no
+    # manager running).
+    if [[ "${POSE_PROXY_TELEOP_MODE_PORT}" =~ ^-?[0-9]+$ ]] && \
+       [[ "${POSE_PROXY_TELEOP_MODE_PORT}" -gt 0 ]]; then
+        mux_args+=(
+            --teleop-mode-host "$POSE_PROXY_TELEOP_MODE_HOST"
+            --teleop-mode-port "$POSE_PROXY_TELEOP_MODE_PORT"
+            --teleop-mode-topic "$POSE_PROXY_TELEOP_MODE_TOPIC"
+            --teleop-mode-stale-ms "$POSE_PROXY_TELEOP_MODE_STALE_MS"
+        )
+    fi
+    # vla_control PUB (bridge SUBs here). Default port = -1 means
+    # "no edge events" (e.g. dual-source arbitration only without
+    # bridge cold restarts).
+    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+        mux_args+=(
+            --vla-control-bind-host 127.0.0.1
+            --vla-control-port "$VLA_CONTROL_PORT"
+            --vla-control-topic "$VLA_CONTROL_TOPIC"
+        )
+    fi
+    log "spawning pose mux -> ${LOG_FILE_POSE_MUX}"
+    log "  CMD: ${mux_py} ${mux_args[*]}"
+    nohup "$mux_py" -u "${mux_args[@]}" \
+        > "$LOG_FILE_POSE_MUX" 2>&1 &
+    echo $! > "$PID_FILE_POSE_MUX"
+    ok "pose_mux.pid = $(cat "$PID_FILE_POSE_MUX")"
+    # Brief settle so the bind completes before downstream SUBs attach.
+    # PUB/SUB on loopback is forgiving but a SUB attaching mid-bind
+    # silently drops the first few frames.
+    sleep 0.5
+}
+
+spawn_sim_watchdog() {
+    # Sim-mode-only single-input fallback watchdog. SUBs the mux's
+    # merged wire on 127.0.0.1:${LAPTOP_POSE_PORT} and PUBs to
+    # 127.0.0.1:${POSE_PROXY_DOWNSTREAM_PORT} where the sim deploy
+    # reads from. Runs the same fallback ladder (LIVE -> HOLD -> BLEND
+    # -> IDLE_CLIP) the PC2-side watchdog provides on real-robot
+    # deployments, so a bridge crash mid-sim-run doesn't slam the sim
+    # body into safe-idle. Real-robot mode does NOT spawn this; the
+    # laptop ships the merged wire over wifi and the PC2 watchdog
+    # handles fallback.
+    local wd_py="$POSE_WATCHDOG_PY"
+    if [[ -z "$wd_py" ]]; then
+        wd_py="$BRIDGE_PY"
+    fi
+    local wd_script="${REPO_ROOT}/gear_sonic_deploy/scripts/x2_pose_watchdog.py"
+    if [[ ! -f "$wd_script" ]]; then
+        err "x2_pose_watchdog script missing: $wd_script"
         return 1
     fi
     if [[ ! -f "$POSE_PROXY_IDLE_X2M2" ]]; then
@@ -1811,8 +2125,8 @@ spawn_sim_proxy() {
         err "  Regenerate via: python -m gear_sonic_deploy.scripts.bake_idle_stand_x2m2"
         return 1
     fi
-    local proxy_args=(
-        "$proxy_script"
+    local wd_args=(
+        "$wd_script"
         --upstream-host 127.0.0.1
         --upstream-port "$LAPTOP_POSE_PORT"
         --upstream-topic pose
@@ -1826,65 +2140,24 @@ spawn_sim_proxy() {
         --blend-secs "$POSE_PROXY_BLEND_SECS"
         # Sim has no x2_debug PUB on the deploy side until the deploy
         # boots and binds :5557. Yaw rebase is a real-robot affordance
-        # (IMU pelvis quat). Disable so the proxy doesn't spam decode
-        # warnings during the deploy warmup window.
+        # (IMU pelvis quat). Disable so the watchdog doesn't spam
+        # decode warnings during the deploy warmup window.
         --no-x2-debug-yaw-track
     )
-    if [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]]; then
-        proxy_args+=(
-            --override-host "$POSE_PROXY_OVERRIDE_HOST"
-            --override-port "$POSE_PROXY_OVERRIDE_PORT"
-            --override-topic "$POSE_PROXY_OVERRIDE_TOPIC"
-            --override-stale-ms "$POSE_PROXY_OVERRIDE_STALE_MS"
-            --override-frozen-ticks "$POSE_PROXY_OVERRIDE_FROZEN_TICKS"
-            --override-frozen-l2-tol "$POSE_PROXY_OVERRIDE_FROZEN_L2_TOL"
-            --override-engage-motion-ticks "$POSE_PROXY_OVERRIDE_ENGAGE_MOTION_TICKS"
-            --engagement-max-wire-step "$POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP"
-            --engagement-steady-wire-step "$POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP"
-            --engagement-step-ramp-ticks "$POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS"
-        )
-        # Mode-gated engagement (2026-06-10). When the manager's
-        # stream_mode PUB is reachable, hand the proxy its address so
-        # engagement keys on operator button presses instead of pose
-        # deltas. Setting POSE_PROXY_TELEOP_MODE_PORT <= 0 (or
-        # --pose-proxy-teleop-mode-port -1) falls back to the legacy
-        # motion-hysteresis path -- only useful for replay smoke
-        # tests where no manager is running.
-        if [[ "${POSE_PROXY_TELEOP_MODE_PORT}" =~ ^-?[0-9]+$ ]] && \
-           [[ "${POSE_PROXY_TELEOP_MODE_PORT}" -gt 0 ]]; then
-            proxy_args+=(
-                --teleop-mode-host "$POSE_PROXY_TELEOP_MODE_HOST"
-                --teleop-mode-port "$POSE_PROXY_TELEOP_MODE_PORT"
-                --teleop-mode-topic "$POSE_PROXY_TELEOP_MODE_TOPIC"
-                --teleop-mode-stale-ms "$POSE_PROXY_TELEOP_MODE_STALE_MS"
-            )
-        fi
-    fi
-    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
-        proxy_args+=(
-            # In sim we bind on loopback only; the bridge SUBs from
-            # 127.0.0.1 via the VLA_CONTROL_HOST_RESOLVED fallback.
-            --vla-control-bind-host 127.0.0.1
-            --vla-control-port "$VLA_CONTROL_PORT"
-            --vla-control-topic "$VLA_CONTROL_TOPIC"
-        )
-    fi
-    log "spawning sim pose proxy -> ${LOG_FILE_SIM_PROXY}"
-    log "  CMD: ${proxy_py} ${proxy_args[*]}"
-    nohup "$proxy_py" -u "${proxy_args[@]}" \
-        > "$LOG_FILE_SIM_PROXY" 2>&1 &
-    echo $! > "$PID_FILE_SIM_PROXY"
-    ok "sim_proxy.pid = $(cat "$PID_FILE_SIM_PROXY")"
-    # Brief settle so the bind completes before the sim deploy SUBs.
-    # PUB/SUB on loopback is forgiving but a SUB attaching mid-bind
-    # silently drops the first few frames.
+    log "spawning sim watchdog -> ${LOG_FILE_SIM_WATCHDOG}"
+    log "  CMD: ${wd_py} ${wd_args[*]}"
+    nohup "$wd_py" -u "${wd_args[@]}" \
+        > "$LOG_FILE_SIM_WATCHDOG" 2>&1 &
+    echo $! > "$PID_FILE_SIM_WATCHDOG"
+    ok "sim_watchdog.pid = $(cat "$PID_FILE_SIM_WATCHDOG")"
     sleep 0.5
 }
 
 spawn_sim_deploy() {
-    # When the sim proxy is in the loop, point the deploy at the
-    # proxy's downstream port instead of LAPTOP_POSE_PORT. The bridge
-    # still publishes to LAPTOP_POSE_PORT; the proxy bridges the two.
+    # When the laptop mux + sim watchdog are in the loop, point the
+    # deploy at the watchdog's downstream port (the watchdog reads
+    # from the mux's merged output and provides the fallback ladder).
+    # Without takeover the deploy SUBs the bridge directly (legacy).
     local deploy_pose_host="127.0.0.1"
     local deploy_pose_port="$LAPTOP_POSE_PORT"
     if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
@@ -2074,16 +2347,28 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
 EOF
     if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
         cat <<EOF
-  ${BOLD}Sim pose proxy  ${NC}: ON (loopback) bridge :${LAPTOP_POSE_PORT} -> proxy -> deploy :${POSE_PROXY_DOWNSTREAM_PORT}
-$( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms" || echo "  ${BOLD}Override SUB    ${NC}: disabled (set POSE_PROXY_OVERRIDE_PORT > 0)" )
-$( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (bridge SUBs here)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
+  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux *:${LAPTOP_POSE_PORT} -> watchdog *:${POSE_PROXY_DOWNSTREAM_PORT} -> sim deploy
+$( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms (mux SUBs)" || echo "  ${BOLD}Override SUB    ${NC}: default tcp://127.0.0.1:5560 (set POSE_PROXY_OVERRIDE_PORT or --pose-proxy-override-port to override)" )
+$( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (mux PUBs, bridge SUBs)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
   ${BOLD}Handoff guard   ${NC}: cold_restart_hold=${VLA_COLD_RESTART_HOLD_TICKS}t max_hold=${VLA_HANDOFF_MAX_HOLD_TICKS}t slow_step=${VLA_HANDOFF_MAX_WIRE_STEP}rad/t for ${VLA_HANDOFF_STEP_RAMP_TICKS}t (wire stays at operator pose until first eligible chunk, then ramps via slow-step to normal max_wire_step)
 EOF
     fi
 else
     cat <<EOF
   ${BOLD}PC2 host        ${NC}: ${PC2_HOST}
-  ${BOLD}Pose PUB (LAN)  ${NC}: tcp://*:${LAPTOP_POSE_PORT}  (PC2 pose proxy SUBs here)
+EOF
+    if [[ "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
+        cat <<EOF
+  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux *:${LAPTOP_POSE_PORT} (PC2 watchdog SUBs LAPTOP:${LAPTOP_POSE_PORT} over wifi)
+$( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms (mux SUBs)" || echo "  ${BOLD}Override SUB    ${NC}: default tcp://127.0.0.1:5560 (set POSE_PROXY_OVERRIDE_PORT or --pose-proxy-override-port to override)" )
+$( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (mux PUBs, bridge SUBs)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
+EOF
+    else
+        cat <<EOF
+  ${BOLD}Pose PUB (LAN)  ${NC}: tcp://*:${LAPTOP_POSE_PORT}  (PC2 watchdog SUBs here directly; no laptop mux)
+EOF
+    fi
+    cat <<EOF
   ${BOLD}x2_debug SUB    ${NC}: tcp://${PC2_HOST}:${PC2_DEBUG_PORT}
   ${BOLD}Cameras SUB     ${NC}: tcp://${PC2_HOST}:${PC2_CAMERAS_PORT}
 EOF
@@ -2138,7 +2423,11 @@ BRIDGE_ARGS=(
     --modality-config "$MODALITY_CONFIG"
     --device "$VLA_DEVICE"
     --pub-host '*'
-    --pub-port "$LAPTOP_POSE_PORT"
+    # Bridge PUBs on BRIDGE_POSE_PUB_PORT (= LAPTOP_POSE_PORT when
+    # --enable-takeover is OFF; = BRIDGE_POSE_PORT_INTERNAL otherwise).
+    # With takeover the mux binds LAPTOP_POSE_PORT and reads the bridge
+    # from this internal port.
+    --pub-port "$BRIDGE_POSE_PUB_PORT"
     --pub-topic pose
     --sub-host "$DEBUG_SUB_HOST"
     --sub-port "$PC2_DEBUG_PORT"
@@ -2215,19 +2504,15 @@ if [[ "$WITH_RECORD" -eq 1 ]]; then
 fi
 # ----- Manual-takeover (vla_control) wiring ---------------------------
 # Opt-in: only forward the vla_control SUB args when an operator has
-# explicitly set VLA_CONTROL_PORT > 0 in the environment. We resolve
-# the host default LATE (after PC2_HOST has been validated) so the
-# common "proxy runs on PC2, bridge on laptop" topology Just Works
-# without an extra env var. Pass VLA_CONTROL_HOST explicitly to point
-# the bridge at a different vla_control PUB (e.g. a proxy running on
-# a third box).
+# explicitly set VLA_CONTROL_PORT > 0 (or --enable-takeover, which
+# implies it). Since the 2026-06-11 mux split, the vla_control PUB
+# always lives on the LAPTOP (next to the bridge) instead of on PC2,
+# so the default host is now 127.0.0.1 in BOTH sim and real modes.
+# Pass --vla-control-host explicitly only if the mux runs on a
+# different machine (uncommon: the launcher spawns it locally).
 if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
     if [[ -z "${VLA_CONTROL_HOST}" ]]; then
-        if [[ -n "${PC2_HOST}" ]]; then
-            VLA_CONTROL_HOST_RESOLVED="${PC2_HOST}"
-        else
-            VLA_CONTROL_HOST_RESOLVED="127.0.0.1"
-        fi
+        VLA_CONTROL_HOST_RESOLVED="127.0.0.1"
     else
         VLA_CONTROL_HOST_RESOLVED="${VLA_CONTROL_HOST}"
     fi
@@ -2267,6 +2552,10 @@ if [[ "${VLA_TRACKING_FEEDBACK}" == "1" ]]; then
         --vla-tracking-hard-rad "${VLA_TRACKING_HARD_RAD}"
         --vla-tracking-velocity-margin "${VLA_TRACKING_VELOCITY_MARGIN}"
         --vla-tracking-velocity-floor-rad-tick "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}"
+        --vla-tracking-velocity-max-rad-s "${VLA_TRACKING_VELOCITY_MAX_RAD_S}"
+        --vla-tracking-overshoot-dq-rad-s "${VLA_TRACKING_OVERSHOOT_DQ_RAD_S}"
+        --vla-tracking-damping-kd "${VLA_TRACKING_DAMPING_KD}"
+        --vla-tracking-damping-shoulder-scale "${VLA_TRACKING_DAMPING_SHOULDER_SCALE}"
         --vla-tracking-stale-ms "${VLA_TRACKING_STALE_MS}"
     )
 fi
@@ -2316,6 +2605,30 @@ if ! wait_for_log_marker "$LOG_FILE_BRIDGE" "$BRIDGE_PID" \
 fi
 ok "bridge PUB live (bootstrap idle_stand wire active)"
 
+# ----- Manual-takeover plumbing (real-robot path) ----------------------
+# Spawn the laptop-side mux as soon as the bridge's pose PUB is bound;
+# we don't need policy ready (the mux just SUBs bridge output bytes).
+# The PC2 watchdog over wifi reads the merged wire from
+# LAPTOP:${LAPTOP_POSE_PORT}, so bringing the mux up before the
+# operator triggers any teleop ensures the merged wire is live by
+# the time PC2's watchdog SUB attaches. No-op in sim mode (the sim
+# path spawns mux + sim watchdog together after policy ready, below).
+if [[ "${SIM_MODE}" -eq 0 && "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
+    log "real-robot manual-takeover plumbing ON:"
+    log "  bridge :${BRIDGE_POSE_PUB_PORT} -> mux *:${LAPTOP_POSE_PORT} -> PC2 watchdog ${PC2_HOST:-?}:5558 -> PC2 deploy"
+    log "  override SUB: ${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} (recorder operator pose)"
+    if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+        log "  vla_control PUB: 127.0.0.1:${VLA_CONTROL_PORT} -> bridge SUB (cold-restart on release)"
+    else
+        warn "  vla_control DISABLED (--vla-control-port=${VLA_CONTROL_PORT}); operator release will NOT cold-restart bridge (wire may snap to mid-decode chunk)"
+    fi
+    if ! spawn_pose_mux; then
+        err "pose mux failed to spawn — see $LOG_FILE_POSE_MUX"
+        stop_all
+        exit 1
+    fi
+fi
+
 if [[ "$SIM_MODE" -eq 1 ]]; then
     log "waiting for bridge model load (policy ready, ≤180s) …"
     if ! wait_for_log_marker "$LOG_FILE_BRIDGE" "$BRIDGE_PID" \
@@ -2331,14 +2644,27 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
         exit 1
     fi
 
-    # Manual-takeover plumbing (sim path): spawn the local pose proxy
-    # BEFORE the deploy so :5558 is already bound when the deploy SUBs.
-    # No-op when SIM_PROXY_ENABLED=0; legacy autonomous-only sim runs
-    # remain byte-for-byte unchanged (bridge ↔ deploy direct on :5556).
+    # Manual-takeover plumbing (sim path): bring up mux + watchdog
+    # BEFORE the deploy so both bind ports are live when the deploy
+    # SUBs. No-op when SIM_PROXY_ENABLED=0; legacy autonomous-only
+    # sim runs remain byte-for-byte unchanged (bridge ↔ deploy direct
+    # on :${LAPTOP_POSE_PORT}).
     if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
-        log "sim manual-takeover plumbing ON: bridge :${LAPTOP_POSE_PORT} -> proxy -> deploy :${POSE_PROXY_DOWNSTREAM_PORT}"
-        if ! spawn_sim_proxy; then
-            err "sim pose proxy failed to spawn — see $LOG_FILE_SIM_PROXY"
+        log "sim manual-takeover plumbing ON:"
+        log "  bridge :${BRIDGE_POSE_PUB_PORT} -> mux :${LAPTOP_POSE_PORT} -> watchdog :${POSE_PROXY_DOWNSTREAM_PORT} -> sim deploy"
+        log "  override SUB: ${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} (recorder operator pose)"
+        if [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]]; then
+            log "  vla_control PUB: 127.0.0.1:${VLA_CONTROL_PORT} -> bridge SUB (cold-restart on release)"
+        else
+            warn "  vla_control DISABLED (--vla-control-port=${VLA_CONTROL_PORT}); operator release will NOT cold-restart bridge"
+        fi
+        if ! spawn_pose_mux; then
+            err "pose mux failed to spawn — see $LOG_FILE_POSE_MUX"
+            stop_all
+            exit 1
+        fi
+        if ! spawn_sim_watchdog; then
+            err "sim watchdog failed to spawn — see $LOG_FILE_SIM_WATCHDOG"
             stop_all
             exit 1
         fi

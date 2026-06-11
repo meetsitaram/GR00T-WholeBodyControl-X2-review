@@ -20,9 +20,11 @@ import pytest
 
 from gear_sonic.scripts.live_vla_publish_motion_token import (
     _apply_tracking_feedback,
+    _apply_wire_damping,
     _ARM_JOINT_INDICES,
     _clamp_vector_step,
     _clamp_vector_step_per_joint,
+    _SHOULDER_JOINT_INDICES,
     NUM_BODY_DOFS,
 )
 
@@ -598,6 +600,282 @@ class TestFeedbackEndToEnd:
             f"(50 ticks * 0.02 rad/tick = 1.0 rad); "
             f"wire[15] = {wire[15]}"
         )
+
+
+class TestVelocityHardCap:
+    """2026-06-11 follow-up: add an ABSOLUTE per-joint velocity ceiling
+    (rad/s) independent of the legacy ``vmarg * |dq|`` chasing law.
+
+    The chasing law alone is permissive: as the arm accelerates, the
+    velocity cap grows with it, so the wire is never actually bounded.
+    The hard cap is the operator's safety knob -- "no joint ever moves
+    faster than X rad/s on the wire, full stop". Disabled by default
+    (``vel_max_rad_s = 0``) so existing operator runbooks are byte-
+    identical to the legacy chasing-only behaviour.
+    """
+
+    def test_disabled_by_default_matches_legacy_chasing_law(self) -> None:
+        """vel_max_rad_s=0 (default) preserves byte-identical legacy
+        cap. Operating point: small position error (well below soft
+        so pos_cap = base = 0.07), large measured velocity (5 rad/s)
+        so chasing law gives vel_cap = 1.5*5*0.02 = 0.15 rad/tick.
+        eff = min(0.07, 0.15) = 0.07. Hard-cap disabled means we
+        keep the 0.07 -- not lower."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(5.0)
+        tgt = prev.copy()
+        tgt[15] = 0.05  # err=0.05 < soft=0.15 -> pos_cap = base
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq, **_law_args(vel_max_rad_s=0.0),
+        )
+        # No hard cap: pos_cap=0.07 wins (vel chase law allows 0.15).
+        assert cap[15] == pytest.approx(0.07, abs=1e-6)
+
+    def test_hard_cap_clamps_below_chasing_law(self) -> None:
+        """vel_max_rad_s=1.0 forces vel_cap <= 1.0 * 0.02 = 0.02
+        rad/tick regardless of measured velocity. Chasing law would
+        allow 0.15 (5 rad/s actuator * 1.5 margin * 0.02 dt); hard
+        cap reins it in to 0.02. eff = min(pos_cap=0.07, vel_cap=
+        min(0.15, 0.02)) = 0.02."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(5.0)
+        tgt = prev.copy()
+        tgt[15] = 0.05  # err well below soft -> pos_cap = base
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq, **_law_args(vel_max_rad_s=1.0),
+        )
+        assert cap[15] == pytest.approx(0.02, abs=1e-6)
+
+    def test_hard_cap_does_not_override_floor(self) -> None:
+        """Even with hard cap, the velocity floor (vfloor=0.01)
+        applies so the wire can start from rest. Operating point:
+        measured velocity = 0, hard cap would allow 0.05*0.02=0.001
+        rad/tick which is below floor; cap = max(vfloor, min(chase,
+        hard)) = max(0.01, min(inf, 0.001)) = 0.01."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(0.0)
+        tgt = prev.copy()
+        tgt[15] = 0.05  # err well below soft -> pos_cap = base
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq, **_law_args(vel_max_rad_s=0.05),
+        )
+        # Floor wins.
+        assert cap[15] == pytest.approx(0.01, abs=1e-6)
+
+
+class TestOvershootGate:
+    """2026-06-11 follow-up: derivative gate that catches the case
+    where measured is moving AWAY from target (opposite sign of err).
+
+    Position-only backoff can't see this because |target - measured|
+    stays small DURING the swing-past -- the joint is moving fast
+    but in the right ballpark. The gate freezes the joint until the
+    arm reverses or the position error grows past soft.
+    """
+
+    def test_disabled_by_default(self) -> None:
+        """overshoot_dq_rad_s=0 (default) = legacy behaviour. Even
+        with target and dq having opposite signs, no near-freeze."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(0.0)
+        meas_dq[15] = -1.0  # arm moving in -x direction
+        tgt = prev.copy()
+        tgt[15] = 0.10      # target in +x direction (opposite sign!)
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq,
+            **_law_args(overshoot_dq_rad_s=0.0),
+        )
+        # No gate active -> pos_cap=0.07 (err=0.10 < soft=0.15 -> full
+        # base), vel_cap=max(0.01, 1.5*1*0.02)=0.03. min wins => 0.03.
+        assert cap[15] == pytest.approx(0.03, abs=1e-6)
+
+    def test_overshoot_fires_when_dq_and_err_opposite_sign(self) -> None:
+        """Arm moving AWAY from target faster than threshold ->
+        near-freeze (cap = vfloor * 0.1 = 0.001 rad/tick = 0.05
+        rad/s)."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(0.0)
+        meas_dq[15] = -1.0
+        tgt = prev.copy()
+        tgt[15] = 0.10
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq,
+            **_law_args(overshoot_dq_rad_s=0.5),
+        )
+        # |dq|=1.0 > thresh=0.5 AND signed_err*dq=0.10*-1=-0.10<0
+        # -> gate fires -> cap = vfloor*0.1 = 0.001.
+        assert cap[15] == pytest.approx(0.001, abs=1e-6)
+
+    def test_no_gate_when_arm_catching_up(self) -> None:
+        """Arm moving TOWARD target (same sign as err) -> no gate.
+        This is the normal tracking case; we want full throttle."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(0.0)
+        meas_dq[15] = +1.0  # arm moving toward target
+        tgt = prev.copy()
+        tgt[15] = 0.10
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq,
+            **_law_args(overshoot_dq_rad_s=0.5),
+        )
+        # signed_err*dq = 0.10*1.0 = +0.10 > 0 -> no gate, normal
+        # cap = min(pos=0.07, vel=0.03) = 0.03.
+        assert cap[15] == pytest.approx(0.03, abs=1e-6)
+
+    def test_no_gate_below_dq_threshold(self) -> None:
+        """Arm moving away but slowly (below threshold) -> no gate.
+        Threshold prevents nuisance fires on idle drift."""
+        prev = _make_pose(0.0)
+        meas_q = _make_pose(0.0)
+        meas_dq = _make_pose(0.0)
+        meas_dq[15] = -0.3  # opposite sign but below threshold
+        tgt = prev.copy()
+        tgt[15] = 0.10
+        cap, _ = _apply_tracking_feedback(
+            tgt, prev, meas_q, meas_dq,
+            **_law_args(overshoot_dq_rad_s=0.5),
+        )
+        # |dq|=0.3 < thresh=0.5 -> no gate. cap = min(0.07,
+        # max(0.01, 1.5*0.3*0.02)) = min(0.07, 0.01) = 0.01.
+        assert cap[15] == pytest.approx(0.01, abs=1e-6)
+
+
+class TestApplyWireDamping:
+    """2026-06-11 follow-up: viscous wire-level damper.
+
+    The cap law bounds wire velocity but doesn't inject opposing
+    acceleration -- it can't damp the under-damped PD oscillation
+    mode (especially shoulders) on its own. The damper subtracts
+    ``kd * measured_dq * dt`` from the wire on tracked joints,
+    actively opposing actuator motion regardless of where the
+    wire wants to go. Pure energy-bleed term.
+
+    Pinning:
+      * disabled by default (kd=0)
+      * silent passthrough when measured_dq is None
+      * subtracts the correct scalar on tracked joints
+      * leaves NON-tracked joints (legs/waist/head) untouched
+      * shoulder scale multiplies kd only on shoulder indices
+      * shape-mismatch falls back to passthrough (doesn't corrupt)
+    """
+
+    def test_disabled_by_default_when_kd_zero(self) -> None:
+        wire = _make_pose(0.5)
+        dq = _make_pose(2.0)  # arm moving at 2 rad/s
+        out = _apply_wire_damping(
+            wire, dq, kd=0.0, kd_shoulder_scale=1.0, dt_s=0.02,
+        )
+        np.testing.assert_array_equal(out, wire)
+
+    def test_passthrough_when_measured_dq_is_none(self) -> None:
+        wire = _make_pose(0.5)
+        out = _apply_wire_damping(
+            wire, None, kd=1.0, kd_shoulder_scale=2.0, dt_s=0.02,
+        )
+        np.testing.assert_array_equal(out, wire)
+
+    def test_passthrough_on_shape_mismatch(self) -> None:
+        """If proprio is the wrong shape (e.g., stale buffer with the
+        wrong NUM_DOFs), fall back to passthrough rather than
+        corrupting the wire."""
+        wire = _make_pose(0.5)
+        bad_dq = np.zeros(NUM_BODY_DOFS + 5, dtype=np.float32)
+        bad_dq[:] = 1.0
+        out = _apply_wire_damping(
+            wire, bad_dq, kd=1.0, kd_shoulder_scale=2.0, dt_s=0.02,
+        )
+        np.testing.assert_array_equal(out, wire)
+
+    def test_damper_subtracts_proportional_to_dq_on_arms(self) -> None:
+        """kd=1, dq=+2 rad/s, dt=0.02 -> per-joint correction =
+        1 * 2 * 0.02 = 0.04 rad. Wire pulled DOWN by 0.04 on the
+        arm joints (since dq is positive, we oppose by subtracting)."""
+        wire = _make_pose(0.5)
+        dq = _make_pose(2.0)
+        out = _apply_wire_damping(
+            wire, dq, kd=1.0, kd_shoulder_scale=1.0, dt_s=0.02,
+        )
+        # Arms got pulled down by 0.04.
+        for j in _ARM_JOINT_INDICES:
+            assert out[j] == pytest.approx(0.5 - 0.04, abs=1e-6), (
+                f"joint {j} damping off: got {out[j]}, expected {0.5-0.04}"
+            )
+
+    def test_damper_signs_oppose_motion(self) -> None:
+        """Arm moving in -x at 1 rad/s -> wire pulled in +x (opposing)."""
+        wire = _make_pose(0.5)
+        dq = _make_pose(-1.0)
+        out = _apply_wire_damping(
+            wire, dq, kd=0.5, kd_shoulder_scale=1.0, dt_s=0.02,
+        )
+        # Correction = -kd * dq * dt = -0.5 * -1 * 0.02 = +0.01
+        for j in _ARM_JOINT_INDICES:
+            assert out[j] == pytest.approx(0.5 + 0.01, abs=1e-6)
+
+    def test_damper_does_not_touch_non_arm_joints(self) -> None:
+        """Legs / waist / head DOFs (indices 0..14) must pass through
+        unchanged even when their measured_dq is large -- VLA doesn't
+        author them, so damping them at the wire would fight SONIC."""
+        wire = _make_pose(0.5)
+        dq = _make_pose(5.0)  # huge velocity everywhere
+        out = _apply_wire_damping(
+            wire, dq, kd=2.0, kd_shoulder_scale=1.0, dt_s=0.02,
+        )
+        for j in range(NUM_BODY_DOFS):
+            if j in _ARM_JOINT_INDICES:
+                continue
+            assert out[j] == pytest.approx(0.5, abs=1e-6), (
+                f"non-arm joint {j} got damped (out={out[j]}); damping "
+                f"must NOT touch legs/waist/head"
+            )
+
+    def test_shoulder_scale_only_amplifies_shoulder_joints(self) -> None:
+        """kd=1.0, shoulder_scale=3.0 -> shoulders see effective kd=3.0,
+        non-shoulder arm joints see kd=1.0. Verify the asymmetry."""
+        wire = _make_pose(0.5)
+        dq = _make_pose(1.0)
+        out = _apply_wire_damping(
+            wire, dq, kd=1.0, kd_shoulder_scale=3.0, dt_s=0.02,
+        )
+        shoulder_set = set(_SHOULDER_JOINT_INDICES)
+        # Shoulders: correction = -3.0 * 1.0 * 0.02 = -0.06
+        # Non-shoulder arms: correction = -1.0 * 1.0 * 0.02 = -0.02
+        for j in _ARM_JOINT_INDICES:
+            expected = 0.5 - (0.06 if j in shoulder_set else 0.02)
+            assert out[j] == pytest.approx(expected, abs=1e-6), (
+                f"joint {j} (shoulder={j in shoulder_set}) got "
+                f"{out[j]}, expected {expected}"
+            )
+
+    def test_shoulder_indices_cover_expected_joints(self) -> None:
+        """Lock down the shoulder index list so a refactor of the
+        joint layout doesn't silently break per-joint damping.
+        X2 has 7 DOF per arm; the proximal 3 (pitch+roll+yaw) per
+        side are shoulders. Left arm MJ 15-21, right arm MJ 22-28."""
+        assert _SHOULDER_JOINT_INDICES == (15, 16, 17, 22, 23, 24), (
+            "shoulder indices changed -- verify per-joint damping "
+            "still targets the high-inertia gravity-loaded joints"
+        )
+        # Every shoulder index must be in the arm tracking mask.
+        for j in _SHOULDER_JOINT_INDICES:
+            assert j in _ARM_JOINT_INDICES
+
+    def test_damper_no_correction_when_dq_zero(self) -> None:
+        """Steady-state arm (dq=0) gets ZERO damping correction, so
+        the wire converges exactly to its commanded target. Critical
+        for not introducing a steady-state error."""
+        wire = _make_pose(0.5)
+        dq = _make_pose(0.0)
+        out = _apply_wire_damping(
+            wire, dq, kd=10.0, kd_shoulder_scale=5.0, dt_s=0.02,
+        )
+        np.testing.assert_array_equal(out, wire)
 
 
 # --------------------------------------------------------------------

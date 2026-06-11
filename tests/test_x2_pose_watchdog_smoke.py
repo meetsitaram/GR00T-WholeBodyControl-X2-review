@@ -1,8 +1,8 @@
-"""End-to-end smoke test for the x2_pose_proxy upstream-silent ladder.
+"""End-to-end smoke test for the x2_pose_watchdog upstream-silent ladder.
 
-Spawns the proxy as a real subprocess against ephemeral ZMQ ports,
+Spawns the watchdog as a real subprocess against ephemeral ZMQ ports,
 publishes upstream pose frames for a few seconds, stops, and verifies
-that the proxy:
+that the watchdog:
 
   1. forwards live frames byte-for-byte during LIVE,
   2. transitions to HOLD and re-publishes the LAST upstream frame's
@@ -12,21 +12,25 @@ that the proxy:
   4. eventually arrives at IDLE_CLIP and tracks the baked clip,
   5. transitions back to LIVE the moment upstream resumes.
 
-The proxy is given a very short hold/blend window (1.0 s / 0.5 s) so
-the entire scenario completes in ~5 s. Same exact code paths as the
-production 10 s / 3 s defaults -- only the timer durations differ.
+The watchdog is given a very short hold/blend window (1.0 s / 0.5 s)
+so the entire scenario completes in ~5 s. Same exact code paths as
+the production 10 s / 3 s defaults -- only the timer durations differ.
 
 This is a slow integration test (real subprocess + sleeps + ZMQ
 binding) -- gated on the ``X2_POSE_PROXY_SMOKE=1`` env var so the
 fast unit-test suite can skip it by default. Run explicitly with::
 
-    X2_POSE_PROXY_SMOKE=1 pytest tests/test_x2_pose_proxy_smoke.py -v -s
+    X2_POSE_PROXY_SMOKE=1 pytest tests/test_x2_pose_watchdog_smoke.py -v -s
 
-The proxy is given a very short hold/blend window (1.0 s / 0.5 s) so
-the entire scenario completes in ~5 s; pass
-``X2_POSE_PROXY_SMOKE_LONG=1`` to use the production defaults (10 s
-HOLD + 3 s BLEND) for the full 14 s validation before a real-robot
-session.
+Pass ``X2_POSE_PROXY_SMOKE_LONG=1`` to use the production defaults
+(10 s HOLD + 3 s BLEND) for the full 14 s validation before a real-
+robot session.
+
+The 2026-06-11 milestone renamed ``x2_pose_proxy.py`` to
+``x2_pose_watchdog.py``; the test exercises the same PC2 single-input
++ fallback-ladder behaviour. The env var name kept its old prefix
+(``X2_POSE_PROXY_SMOKE``) so existing operator runbooks and CI
+recipes continue to work.
 """
 
 from __future__ import annotations
@@ -44,11 +48,20 @@ import pytest
 import zmq
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROXY_DIR = REPO_ROOT / "gear_sonic_deploy" / "scripts"
-if str(PROXY_DIR) not in sys.path:
-    sys.path.insert(0, str(PROXY_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import x2_pose_proxy as proxy  # noqa: E402
+from gear_sonic.utils.pose_pipeline import wire  # noqa: E402
+
+
+class _ProxyShim:
+    NUM_BODY_DOFS = wire.NUM_BODY_DOFS
+    X2M2_MAGIC = wire.X2M2_MAGIC
+    pack_pose_message = staticmethod(wire.pack_pose_message)
+    decode_pose_joint_pos_mj = staticmethod(wire.decode_pose_joint_pos_mj)
+
+
+proxy = _ProxyShim()
 
 
 SMOKE_ENABLED = os.environ.get("X2_POSE_PROXY_SMOKE", "") not in ("", "0")
@@ -136,10 +149,12 @@ def test_proxy_e2e_fallback_ladder(
     blend_secs = 3.0 if SMOKE_LONG else 0.5
     stale_ms = 100
 
-    proxy_script = REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_proxy.py"
+    watchdog_script = (
+        REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_watchdog.py"
+    )
     cmd = [
         sys.executable,
-        str(proxy_script),
+        str(watchdog_script),
         "--upstream-host", "127.0.0.1",
         "--upstream-port", str(upstream_port),
         "--upstream-topic", "pose",
@@ -302,6 +317,6 @@ def test_proxy_e2e_fallback_ladder(
         # it with -s and watching the proxy.
         if request.node.session.testsfailed:
             print(
-                "----- proxy stdout/stderr tail -----\n"
+                "----- watchdog stdout/stderr tail -----\n"
                 + (log_tail or "")[-4000:]
             )

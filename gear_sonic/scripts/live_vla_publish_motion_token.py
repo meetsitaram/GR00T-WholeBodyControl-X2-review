@@ -396,6 +396,81 @@ def _clamp_vector_step_per_joint(
 # with. Arms + hands are the only joints the VLA bridge directly
 # authors during a chunk, so they're the only joints we gate.
 _ARM_JOINT_INDICES: tuple[int, ...] = tuple(range(15, 29))  # MJ 15..28 = L_arm(7) + R_arm(7)
+# Shoulder joints get a separate (typically larger) damping
+# coefficient because they have ~3-5x the inertia of distal joints
+# AND sit under maximum gravity torque -- the two ingredients that
+# make their natural oscillation mode dominant on real X2. Within
+# each 7-DOF arm (L: MJ 15-21, R: MJ 22-28) the proximal three
+# joints are shoulder_pitch / shoulder_roll / shoulder_yaw per the
+# X2 URDF; that's MJ {15,16,17} left and MJ {22,23,24} right.
+# Distal joints (elbow + wrist 3-DOF) stay on the base kd.
+_SHOULDER_JOINT_INDICES: tuple[int, ...] = (15, 16, 17, 22, 23, 24)
+
+
+def _apply_wire_damping(
+    wire: np.ndarray,
+    measured_dq: np.ndarray | None,
+    *,
+    kd: float,
+    kd_shoulder_scale: float,
+    dt_s: float,
+    joint_indices: tuple[int, ...] = _ARM_JOINT_INDICES,
+    shoulder_indices: tuple[int, ...] = _SHOULDER_JOINT_INDICES,
+) -> np.ndarray:
+    """Subtract velocity-proportional damping from the wire on tracked joints.
+
+    True closed-loop fix for the shoulder-oscillation mode that
+    rate-capping alone cannot suppress. The cap law only bounds how
+    fast the wire can step from one tick to the next; it doesn't
+    push the wire OPPOSITE to actuator motion. Without that
+    opposing term, the wire and the PD loop on the deploy compose
+    into an under-damped second-order system: any disturbance
+    (chunk-boundary step, LPF transient, gravity sag) excites the
+    arm's natural frequency and rings out slowly.
+
+    Adding ``wire[j] -= kd * measured_dq[j] * dt`` injects viscous
+    damping at the wire level. Physical reading:
+
+      * Arm at rest (dq=0): no correction. Wire converges normally
+        to its commanded target.
+      * Arm moving in +x at 2 rad/s, kd=0.5: wire pulled in -x by
+        ``0.5 * 2 * 0.02 = 0.02 rad`` per tick = 1 rad/s of damping
+        authority. The wire actively opposes whichever direction the
+        arm is going, bleeding kinetic energy out of the loop.
+      * Arm catching up to a step target: as the arm accelerates,
+        damping ramps up proportionally, preventing overshoot. As the
+        arm reaches steady state (dq -> 0), damping fades back to
+        zero so the target is hit exactly.
+
+    The shoulder-scale multiplier exists because shoulder pitch/roll
+    have ~3-5x the inertia of distal joints (wrist roll, elbow) and
+    sit under maximum gravity torque. They need correspondingly more
+    damping authority. ``kd_shoulder_scale=2.0`` doubles kd on the
+    proximal 3 joints per arm without touching the wrist tuning.
+
+    Disabled by default (``kd=0``) -- legacy runs unaffected.
+
+    Fallbacks:
+      * ``measured_dq is None`` -- silent passthrough (matches the
+        scalar / per-joint clamps' contract when proprio is unavailable).
+      * ``kd <= 0`` -- silent passthrough.
+    """
+    if measured_dq is None or kd <= 0.0:
+        return wire
+    out = np.asarray(wire, dtype=np.float32).copy()
+    dq = np.asarray(measured_dq, dtype=np.float32)
+    if dq.shape[0] != out.shape[0]:
+        return out  # shape mismatch -> fall back to scalar (don't corrupt)
+    shoulder_set = set(shoulder_indices)
+    scale = float(max(kd_shoulder_scale, 0.0))
+    base_kd = float(kd)
+    dt = float(max(dt_s, 1e-6))
+    for j in joint_indices:
+        if not (0 <= j < dq.shape[0]):
+            continue
+        joint_kd = base_kd * scale if j in shoulder_set else base_kd
+        out[j] -= np.float32(joint_kd * float(dq[j]) * dt)
+    return out
 
 
 def _apply_tracking_feedback(
@@ -409,6 +484,8 @@ def _apply_tracking_feedback(
     hard_rad: float,
     vel_margin: float,
     vel_floor_rad_tick: float,
+    vel_max_rad_s: float = 0.0,
+    overshoot_dq_rad_s: float = 0.0,
     dt_s: float,
     joint_indices: tuple[int, ...] = _ARM_JOINT_INDICES,
 ) -> tuple[np.ndarray, int]:
@@ -474,12 +551,19 @@ def _apply_tracking_feedback(
     hard = float(max(hard_rad, soft + 1e-6))  # avoid divide-by-zero
     vmarg = float(max(vel_margin, 0.0))
     vfloor = float(max(vel_floor_rad_tick, 0.0))
+    vmax_hard_tick = (
+        float(vel_max_rad_s) * float(max(dt_s, 1e-6))
+        if vel_max_rad_s and vel_max_rad_s > 0.0
+        else float("inf")
+    )
+    overshoot_thresh = float(max(overshoot_dq_rad_s, 0.0))
     dt = float(max(dt_s, 1e-6))
 
     for j in joint_indices:
         if j < 0 or j >= n:
             continue
-        err = float(abs(tgt[j] - meas_q[j]))
+        signed_err = float(tgt[j] - meas_q[j])
+        err = abs(signed_err)
         # Position backoff: 1.0 at err<=soft, 0.0 at err>=hard.
         if err <= soft:
             pos_scale = 1.0
@@ -488,10 +572,33 @@ def _apply_tracking_feedback(
         else:
             pos_scale = (hard - err) / (hard - soft)
         pos_cap = base * pos_scale
-        # Velocity cap: never command faster than vel_margin * |dq|
-        # per tick. Floored so the wire can start from rest.
-        vel_cap = max(vfloor, vmarg * abs(float(meas_dq[j])) * dt)
+        # Velocity cap composes two terms:
+        #   * vmarg * |dq| * dt -- LEGACY chasing law (kept for backward
+        #     compat / opt-out). Lets the wire scale with actuator's
+        #     natural velocity; permissive by design.
+        #   * vmax_hard_tick    -- HARD ceiling in rad/s converted to
+        #     rad/tick. Bounds the wire's commanded velocity regardless
+        #     of what the actuator is doing. Default INF = disabled
+        #     (legacy behaviour). Set positive to actually cap.
+        # Floor lets the wire start from rest.
+        vel_cap = max(
+            vfloor,
+            min(vmarg * abs(float(meas_dq[j])) * dt, vmax_hard_tick),
+        )
         eff = min(pos_cap, vel_cap)
+        # Derivative overshoot gate: when the arm is already moving
+        # AWAY from the target (signed_err and meas_dq have opposite
+        # sign) faster than overshoot_thresh rad/s, the PD loop is
+        # going to swing past -- pushing the wire harder makes it
+        # worse. Near-freeze the joint until the arm reverses
+        # direction or the position error drops back below soft.
+        # Disabled when overshoot_thresh == 0 (legacy behaviour).
+        if (
+            overshoot_thresh > 0.0
+            and signed_err * float(meas_dq[j]) < 0.0
+            and abs(float(meas_dq[j])) > overshoot_thresh
+        ):
+            eff = min(eff, vfloor * 0.1)
         if eff < 0.0:
             eff = 0.0
         cap[j] = np.float32(eff)
@@ -2276,6 +2383,10 @@ def _publisher(
     tracking_hard_rad: float = 0.40,
     tracking_vel_margin: float = 1.5,
     tracking_vel_floor_rad_tick: float = 0.01,
+    tracking_vel_max_rad_s: float = 0.0,
+    tracking_overshoot_dq_rad_s: float = 0.0,
+    tracking_damping_kd: float = 0.0,
+    tracking_damping_shoulder_scale: float = 1.0,
     tracking_stale_ms: int = 100,
 ) -> int:
     """Thread C (= main thread): publish action[step] at ``rate_hz``.
@@ -3082,10 +3193,25 @@ def _publisher(
                         hard_rad=tracking_hard_rad,
                         vel_margin=tracking_vel_margin,
                         vel_floor_rad_tick=tracking_vel_floor_rad_tick,
+                        vel_max_rad_s=tracking_vel_max_rad_s,
+                        overshoot_dq_rad_s=tracking_overshoot_dq_rad_s,
                         dt_s=period,
                     )
                     cur_jpos = _clamp_vector_step_per_joint(
                         cur_jpos, prev_wire_jpos, cap_per_joint
+                    )
+                    # True closed-loop damping: oppose measured arm
+                    # velocity by pulling the wire backward by
+                    # ``kd * dq * dt``. Bleeds energy out of the
+                    # under-damped PD loop that the cap law alone
+                    # cannot suppress (caps bound *velocity*; this
+                    # injects an opposing *acceleration*).
+                    cur_jpos = _apply_wire_damping(
+                        cur_jpos,
+                        body_dq_mj_now,
+                        kd=tracking_damping_kd,
+                        kd_shoulder_scale=tracking_damping_shoulder_scale,
+                        dt_s=period,
                     )
                     last_tracking_throttle = int(throttle_count)
                 else:
@@ -3171,10 +3297,19 @@ def _publisher(
                     hard_rad=tracking_hard_rad,
                     vel_margin=tracking_vel_margin,
                     vel_floor_rad_tick=tracking_vel_floor_rad_tick,
+                    vel_max_rad_s=tracking_vel_max_rad_s,
+                    overshoot_dq_rad_s=tracking_overshoot_dq_rad_s,
                     dt_s=period,
                 )
                 cur_jpos = _clamp_vector_step_per_joint(
                     cur_jpos, prev_wire_jpos, cap_per_joint
+                )
+                cur_jpos = _apply_wire_damping(
+                    cur_jpos,
+                    body_dq_mj_now,
+                    kd=tracking_damping_kd,
+                    kd_shoulder_scale=tracking_damping_shoulder_scale,
+                    dt_s=period,
                 )
                 last_tracking_throttle = int(throttle_count)
             else:
@@ -3798,6 +3933,60 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "from idle aren't artificially frozen. Set to 0 to "
              "REQUIRE non-zero measured velocity before allowing any "
              "wire motion (motion-only; do NOT use for cold start).",
+    )
+    parser.add_argument(
+        "--vla-tracking-velocity-max-rad-s", type=float, default=0.0,
+        help="Tracking-feedback VELOCITY HARD CEILING (rad/s per joint). "
+             "Independent of measured velocity -- this is the absolute "
+             "max the wire is ever allowed to step in rad/s on any "
+             "tracked joint, regardless of what the legacy "
+             "``margin * |dq|`` chasing law allows. Default 0 = "
+             "DISABLED (legacy chasing-only behaviour). Set to e.g. "
+             "1.0 to hard-cap each arm joint at 1 rad/s; the wire "
+             "will literally never command faster than that no matter "
+             "how fast the actuator is going. Recommended 0.8-1.5 on "
+             "real X2 to suppress the multi-joint coordinated swing "
+             "the original chasing law could not bound.",
+    )
+    parser.add_argument(
+        "--vla-tracking-overshoot-dq-rad-s", type=float, default=0.0,
+        help="Tracking-feedback OVERSHOOT GATE (rad/s). When the arm is "
+             "already moving AWAY from the wire target (signed position "
+             "error and measured velocity have opposite sign) faster "
+             "than this threshold, the joint is near-frozen (cap "
+             "dropped to floor * 0.1) until the arm reverses or the "
+             "position error drops back below --vla-tracking-soft-rad. "
+             "Catches the open-loop PD overshoot the position-only "
+             "backoff cannot see (position error stays small DURING "
+             "the swing-past). Default 0 = DISABLED. Recommended "
+             "0.3-0.8 rad/s to bite on real oscillation without "
+             "triggering on legitimate fast moves.",
+    )
+    parser.add_argument(
+        "--vla-tracking-damping-kd", type=float, default=0.0,
+        help="Tracking-feedback VISCOUS DAMPER coefficient (kd). True "
+             "closed-loop fix for the under-damped PD-loop oscillation "
+             "mode that rate-capping alone cannot suppress. After all "
+             "clamps, subtracts ``kd * measured_dq * dt`` from the "
+             "wire on each tracked arm joint -- actively pulls the "
+             "wire backward when the arm is moving forward and vice "
+             "versa, injecting an opposing acceleration that bleeds "
+             "kinetic energy out of the loop. Default 0 = DISABLED "
+             "(legacy cap-only behaviour). Recommended starting "
+             "value 0.5-1.0 on real X2; bump higher if shoulder "
+             "oscillation persists. Composes with --vla-tracking-"
+             "damping-shoulder-scale for stiffer shoulder damping.",
+    )
+    parser.add_argument(
+        "--vla-tracking-damping-shoulder-scale", type=float, default=1.0,
+        help="Multiplier on --vla-tracking-damping-kd for shoulder "
+             "joints specifically (MJ 15-17 left arm, 22-24 right "
+             "arm). Shoulders have ~3-5x the inertia of distal joints "
+             "AND sit under maximum gravity torque, so they need "
+             "correspondingly more damping authority. Default 1.0 = "
+             "uniform damping. Recommended 1.5-3.0 on real X2 to "
+             "suppress shoulder-dominant oscillation modes without "
+             "over-damping the wrists.",
     )
     parser.add_argument(
         "--vla-tracking-stale-ms", type=int, default=100,
@@ -4838,6 +5027,16 @@ def main(argv: list[str] | None = None) -> int:
             tracking_vel_margin=float(args.vla_tracking_velocity_margin),
             tracking_vel_floor_rad_tick=float(
                 args.vla_tracking_velocity_floor_rad_tick
+            ),
+            tracking_vel_max_rad_s=float(
+                args.vla_tracking_velocity_max_rad_s
+            ),
+            tracking_overshoot_dq_rad_s=float(
+                args.vla_tracking_overshoot_dq_rad_s
+            ),
+            tracking_damping_kd=float(args.vla_tracking_damping_kd),
+            tracking_damping_shoulder_scale=float(
+                args.vla_tracking_damping_shoulder_scale
             ),
             tracking_stale_ms=int(args.vla_tracking_stale_ms),
         )

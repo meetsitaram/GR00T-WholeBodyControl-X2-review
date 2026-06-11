@@ -182,6 +182,17 @@
 #       --vla-bridge /tmp/x2_pick_place_apple_v1_run1 \
 #       --vla-prompt "pick up the apple from the table"
 #
+#   # Manual-takeover mode (2026-06-11 mux split). Operator runs the
+#   # autonomous VLA via run_x2_vla_runtime.sh --enable-takeover (which
+#   # spawns x2_pose_mux locally on :5560 override SUB), and this
+#   # quest stack with --takeover so its recorder PUBs operator pose
+#   # into the mux's override port instead of straight at the deploy:
+#   ./run_x2_vla_runtime.sh --model /path/to/hf_ckpt \
+#       --pc2-host 10.0.1.41 --enable-takeover &
+#   ./run_x2_quest3_planner_stack.sh --duration 0 \
+#       --remote-deploy 10.0.1.41 --takeover
+#   # Equivalent: --pose-port 5560 (the mux's --override-port default).
+#
 #   # Split-topology / remote-deploy mode: laptop runs only the
 #   # operator-side stack (manager + planner + recorder); the C++
 #   # deploy + hand bridge + motor monitor are already running on PC2
@@ -282,10 +293,18 @@ POSE_TOPIC="pose"
 DEBUG_PORT=5557         # deploy PUB -> recorder SUB
 DEBUG_TOPIC="x2_debug"
 # When set non-empty, override POSE_PORT after CLI parsing. Used by the
-# 2026-06-10 manual-takeover wiring: the teleop recorder publishes the
-# operator's wire on :5558 so the PC2 x2_pose_proxy can arbitrate
-# between it and the autonomous VLA bridge on :5556.
+# 2026-06-11 mux-split manual-takeover wiring: the teleop recorder
+# publishes the operator's wire on :5560 (laptop loopback) so the
+# laptop-side x2_pose_mux (spawned by run_x2_vla_runtime.sh
+# --enable-takeover) can arbitrate it against the autonomous VLA
+# bridge on the bridge's internal port. The mux then PUBs the merged
+# wire on :5556 (LAPTOP_POSE_PORT) for the PC2 watchdog or sim
+# watchdog. --takeover is a convenience flag that sets this to 5560.
 POSE_PORT_OVERRIDE=""
+# Mux override port the teleop wire targets. Defaults match the
+# x2_pose_mux's default --override-port. Settable so operator can
+# stage multiple mux+stack pairs on the same laptop without clashing.
+TAKEOVER_OVERRIDE_PORT=5560
 PLANNER_CMD_PORT=5563   # manager PUB -> planner SUB
 PLANNER_CMD_TOPIC="planner_cmd"
 ARM_HANDS_PORT=5564     # manager PUB -> recorder SUB (4 multiplexed topics)
@@ -804,12 +823,32 @@ while [[ $# -gt 0 ]]; do
         --scene-reset-port) SCENE_RESET_PORT="$2"; shift 2 ;;
         --pose-port)
             # Wire OUT port for the recorder's merged `pose` PUB. Used
-            # by the 2026-06-10 manual-takeover workflow to route the
-            # teleop wire to a separate port (e.g. :5558) so the
-            # x2_pose_proxy on PC2 can arbitrate it against the
-            # autonomous VLA bridge on :5556. Default 5556 (legacy
-            # autonomous-or-teleop-only wiring).
+            # by the 2026-06-11 mux-split workflow to route the
+            # teleop wire to the laptop-side x2_pose_mux's override
+            # SUB (default :5560) instead of straight to the deploy.
+            # Default 5556 (legacy autonomous-or-teleop-only wiring).
+            # Equivalent shortcut: --takeover (sets this to 5560).
             POSE_PORT_OVERRIDE="$2"; shift 2 ;;
+        --takeover)
+            # Convenience flag for the 2026-06-11 manual-takeover
+            # workflow. Equivalent to ``--pose-port ${TAKEOVER_OVERRIDE_PORT}``
+            # (default 5560). Operator passes this when running
+            # alongside ``run_x2_vla_runtime.sh --enable-takeover``:
+            # the VLA runtime spawns x2_pose_mux locally with
+            # ``--override-port 5560``, and this flag points the
+            # quest stack's recorder PUB at that same port so the
+            # mux sees the operator's wire.
+            POSE_PORT_OVERRIDE="${TAKEOVER_OVERRIDE_PORT}"
+            shift
+            ;;
+        --takeover-port)
+            # Override the mux override port the recorder targets.
+            # Only useful if you've changed x2_pose_mux's
+            # --override-port from the default 5560.
+            TAKEOVER_OVERRIDE_PORT="$2"
+            POSE_PORT_OVERRIDE="${TAKEOVER_OVERRIDE_PORT}"
+            shift 2
+            ;;
         --log-dir) LOG_DIR="$2"; shift 2 ;;
         --sidecar-log) SIDECAR_LOG="$2"; shift 2 ;;
         --cleanup-only) CLEANUP_ONLY=1; shift ;;
@@ -904,6 +943,20 @@ if [[ -n "${POSE_PORT_OVERRIDE}" ]]; then
         exit 1
     fi
     POSE_PORT="${POSE_PORT_OVERRIDE}"
+    if [[ "${POSE_PORT}" -eq "${TAKEOVER_OVERRIDE_PORT}" ]]; then
+        # Surface this prominently -- operator passed --takeover (or
+        # --pose-port ${TAKEOVER_OVERRIDE_PORT} verbatim). The recorder will
+        # PUB to the mux's override SUB instead of straight to the
+        # deploy, so the deploy / PC2 watchdog must be reading from
+        # the mux's output (LAPTOP_POSE_PORT, default 5556). The
+        # laptop-side mux is started by run_x2_vla_runtime.sh
+        # --enable-takeover; this stack will silently disappear into
+        # the void if the mux isn't running.
+        echo "[quest3_stack] manual-takeover wiring ON:" >&2
+        echo "[quest3_stack]   recorder pose PUB -> tcp://*:${POSE_PORT} (the mux's --override-port)" >&2
+        echo "[quest3_stack]   prerequisite: run_x2_vla_runtime.sh --enable-takeover MUST be running with the same --override-port" >&2
+        echo "[quest3_stack]   the mux re-publishes the merged wire on LAPTOP_POSE_PORT (default 5556) for PC2/sim watchdog" >&2
+    fi
 fi
 
 # Convenience boolean: set iff --vla-bridge MODEL_DIR was passed OR
@@ -964,7 +1017,15 @@ if [[ -n "${PC2_HOST}" ]]; then
         exit 1
     fi
     REMOTE_DEPLOY_HOST="${PC2_HOST}"
-    if [[ -z "${X2_DEBUG_BRIDGE_HOST}" ]]; then
+    # 2026-06-11 follow-up: previously this block force-set
+    # WITH_X2_DEBUG_BRIDGE=1 whenever --pc2-host was passed without an
+    # explicit --x2-debug-bridge-host. That silently overrode an
+    # explicit --no-x2-debug-bridge from the operator (the flag parser
+    # at the top correctly set WITH_X2_DEBUG_BRIDGE=0; this block then
+    # flipped it back to 1, making --no-x2-debug-bridge a no-op
+    # whenever --pc2-host was also passed). Now we only auto-enable
+    # the bridge when the operator did NOT explicitly opt out.
+    if [[ -z "${X2_DEBUG_BRIDGE_HOST}" && "${WITH_X2_DEBUG_BRIDGE}" != "0" ]]; then
         X2_DEBUG_BRIDGE_HOST="${PC2_HOST}"
         WITH_X2_DEBUG_BRIDGE=1
     fi

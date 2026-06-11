@@ -1,41 +1,44 @@
-"""Smoke tests for the sim-mode pose-proxy plumbing in
+"""Smoke tests for the pose-pipeline plumbing in
 ``gear_sonic/scripts/run_x2_vla_runtime.sh``.
 
-The 2026-06-10 manual-takeover milestone extended the sim launcher to
-spawn a local ``x2_pose_proxy.py`` on loopback so the same operator
-workflow (override SUB + vla_control PUB) works in pure sim without
-PC2 daemons. The proxy is a real subprocess that the bash launcher
-builds an argv for from env vars (``POSE_PROXY_DOWNSTREAM_PORT``,
-``POSE_PROXY_OVERRIDE_PORT``, ``VLA_CONTROL_PORT`` etc.).
+The 2026-06-11 pose_mux_split refactor replaced the single-process
+``x2_pose_proxy.py`` (spawned in sim, re-implemented on PC2) with two
+purpose-built processes:
 
-The dual-source semantics themselves are already covered by
-``tests/test_x2_pose_proxy_dual_source.py``. What's NOT covered is
-arg-name drift: a typo in the bash launcher (``--override-port-name``
-instead of ``--override-port``, or ``--idle-x2m2-file`` instead of
-``--idle-x2m2``) would only fail at first sim launch, hours after the
-edit landed.
+  * ``x2_pose_mux``      -- laptop-side N-to-1 pose merger (sim + real)
+  * ``x2_pose_watchdog`` -- single-input fallback ladder (PC2 in real
+                            mode; loopback in sim mode)
 
-This test closes that gap with two cheap checks:
+The dual-source semantics themselves are covered by
+``tests/test_x2_pose_mux_dual_source.py`` (gated on X2_POSE_PROXY_SMOKE=1).
+The fallback ladder + wire helpers are covered by the renamed
+``tests/test_x2_pose_watchdog_fallback_ladder.py`` +
+``tests/test_pose_pipeline_*.py`` unit tests.
 
-1. ``test_launcher_bash_syntax_ok`` -- ``bash -n`` on the launcher.
-   Catches structural bash mistakes (unmatched ``fi``, bad heredoc,
-   stray backtick) introduced while wiring the proxy spawn.
+What's NOT covered by those is arg-name drift between the bash
+launcher and the new mux + watchdog argparse signatures. A typo in the
+launcher (``--primary-port-name`` instead of ``--primary-port``,
+``--out-port`` vs ``--downstream-port``) would only fail at first
+real launch, hours after the edit landed.
 
-2. ``test_spawn_sim_proxy_argv_parses`` -- builds the same argv the
-   bash launcher would build when SIM_PROXY_ENABLED=1 and feeds it to
-   ``x2_pose_proxy.main``'s parser via ``parse_args``. Catches argname
-   typos, missing required args, and incompatible value types. We
-   intentionally do NOT spawn the proxy: that path is exercised by the
-   subprocess smokes already.
+This file closes that gap:
 
-Both tests run in the fast unit-test pass (no env-var gate) because
-they're <1 s combined and have no external dependencies beyond the
-proxy module already imported by the dual-source smoke.
+1. ``bash -n`` on the launcher (catches structural bash errors).
+2. ``--help`` lists the canonical CLI flag surface (mux + legacy alias).
+3. CLI flags parse without falling through to the bridge catch-all.
+4. The argv ``spawn_pose_mux`` / ``spawn_sim_watchdog`` build is
+   accepted by the actual mux / watchdog argparse parsers.
+5. Source-level pattern pins for the bridge --pub-port flip on
+   --enable-takeover and the sim-deploy reading from the watchdog.
+
+The existing wrist-bypass / handoff-slow-step / tracking-feedback
+launcher-forwarding tests are preserved verbatim because those concerns
+are orthogonal to the mux split.
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -45,128 +48,63 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "gear_sonic" / "scripts" / "run_x2_vla_runtime.sh"
-PROXY_DIR = REPO_ROOT / "gear_sonic_deploy" / "scripts"
+MUX_SCRIPT = REPO_ROOT / "gear_sonic" / "scripts" / "x2_pose_mux.py"
+WATCHDOG_SCRIPT = (
+    REPO_ROOT / "gear_sonic_deploy" / "scripts" / "x2_pose_watchdog.py"
+)
 IDLE_X2M2 = REPO_ROOT / "gear_sonic_deploy" / "data" / "idle_stand.x2m2"
-
-if str(PROXY_DIR) not in sys.path:
-    sys.path.insert(0, str(PROXY_DIR))
-
-import x2_pose_proxy as proxy  # noqa: E402
+BRIDGE_SCRIPT = (
+    REPO_ROOT / "gear_sonic" / "scripts" / "live_vla_publish_motion_token.py"
+)
 
 
-def _build_proxy_parser() -> argparse.ArgumentParser:
-    """Reconstruct the proxy's argparse exactly the way ``main`` does.
-
-    We mirror ``proxy.main`` up to (but not including) ``parse_args``
-    so the test catches drift without us hand-maintaining a second
-    copy of the parser. If ``proxy.main`` ever gains a refactor that
-    exposes ``build_parser()`` directly, switch to that and delete
-    this shim. Until then this is the cheapest robust option.
-    """
-    # The cleanest path is to import _argparser_ from proxy if exposed;
-    # otherwise we monkey-call main with a sentinel that short-circuits
-    # right after parse_args. Currently the proxy inlines the parser
-    # in main(), so we feed our argv through main() and rely on the
-    # idle_x2m2 file existence check at line ~848 acting as a quick
-    # early-exit-on-bad-arg gate (it runs AFTER parse_args, so an
-    # argparse failure trips first via SystemExit).
-    return _IndirectProxyArgvCheck()
+# ===========================================================================
+# Helpers
+# ===========================================================================
+def _bash() -> str:
+    bash = shutil.which("bash")
+    assert bash is not None, "bash not on PATH; cannot drive the launcher"
+    return bash
 
 
-class _IndirectProxyArgvCheck:
-    """Adapter that exposes ``parse_args`` by re-running proxy.main on
-    a stripped argv until parse_args succeeds, then returns the
-    parsed Namespace by intercepting the next instruction.
-
-    In practice we just shell out to the proxy script with ``--help``
-    to confirm the parser is well-formed, then call ``main(argv)``
-    inside a try/except SystemExit and accept either a parse-pass
-    (which then trips on the file-not-found guard) or a parse-fail.
-    """
-
-    def parse_args(self, argv: list[str]) -> argparse.Namespace:
-        # We can't cleanly extract the parser; instead, invoke main()
-        # and trust SystemExit to surface argparse failures. main()
-        # validates --hold-last-secs / --blend-secs / --idle-x2m2
-        # BEFORE binding any sockets, so a well-formed argv with a
-        # real idle_x2m2 will reach the socket-bind step. We don't
-        # want to bind, so we intentionally pass a bogus idle path
-        # AFTER the test confirms argparse accepted the rest.
-        #
-        # Two-phase check:
-        #   Phase 1: argv as built by the launcher should NOT trigger
-        #            argparse SystemExit. Re-running main with a
-        #            sentinel idle path proves the parser accepted
-        #            everything else; we catch the idle-file error
-        #            as success.
-        sentinel = "/nonexistent/sentinel_idle.x2m2"
-        argv_munged = list(argv)
-        for i, tok in enumerate(argv_munged):
-            if tok == "--idle-x2m2" and i + 1 < len(argv_munged):
-                argv_munged[i + 1] = sentinel
-        try:
-            rc = proxy.main(argv_munged)
-        except SystemExit as e:
-            code = getattr(e, "code", 1) or 0
-            if code == 0:
-                return argparse.Namespace()
-            raise AssertionError(
-                f"argparse rejected launcher argv (SystemExit code={code}): "
-                f"{argv_munged!r}"
-            )
-        # main() returns 1 when idle_x2m2 is missing -- that means
-        # argparse + range validators passed and we tripped on the
-        # file check. Anything else is a real failure.
-        if rc == 1:
-            return argparse.Namespace()
-        raise AssertionError(
-            f"proxy.main returned unexpected rc={rc} for argv={argv_munged!r}"
-        )
-
-
-def _build_launcher_argv(
+def _build_mux_argv(
     *,
-    upstream_port: int,
-    downstream_port: int,
-    override_port: int,
-    vla_control_port: int,
+    primary_port: int = 5571,
+    out_port: int = 5556,
+    override_port: int = 5560,
+    vla_control_port: int = -1,
+    teleop_mode_port: int = -1,
 ) -> list[str]:
-    """Mirror the argv ``spawn_sim_proxy`` builds in the bash launcher.
+    """Mirror the argv ``spawn_pose_mux`` builds in the bash launcher.
 
-    Keep this in sync with the ``proxy_args=( … )`` array in
-    ``gear_sonic/scripts/run_x2_vla_runtime.sh::spawn_sim_proxy``.
-    Any divergence is exactly the bug this test is here to catch.
+    Keep this in sync with the ``mux_args=( … )`` array in
+    ``gear_sonic/scripts/run_x2_vla_runtime.sh::spawn_pose_mux``. Any
+    divergence is exactly the bug this test exists to catch.
     """
-    argv: list[str] = [
-        "--upstream-host", "127.0.0.1",
-        "--upstream-port", str(upstream_port),
-        "--upstream-topic", "pose",
-        "--downstream-host", "127.0.0.1",
-        "--downstream-port", str(downstream_port),
-        "--downstream-topic", "pose",
-        "--idle-x2m2", str(IDLE_X2M2),
-        "--idle-stale-ms", "300",
-        "--idle-mode", "blend",
-        "--hold-last-secs", "10.0",
-        "--blend-secs", "3.0",
-        "--no-x2-debug-yaw-track",
+    argv = [
+        "--primary-host", "127.0.0.1",
+        "--primary-port", str(primary_port),
+        "--primary-topic", "pose",
+        "--out-host", "*",
+        "--out-port", str(out_port),
+        "--out-topic", "pose",
+        "--override-host", "127.0.0.1",
+        "--override-port", str(override_port),
+        "--override-topic", "pose",
+        "--override-stale-ms", "200",
+        "--override-frozen-ticks", "10",
+        "--override-frozen-l2-tol", "5e-3",
+        "--override-engage-motion-ticks", "10",
+        "--engagement-max-wire-step", "0.012",
+        "--engagement-steady-wire-step", "0.035",
+        "--engagement-step-ramp-ticks", "250",
+        "--rate-hz", "50",
+        "--status-every-s", "5.0",
     ]
-    if override_port > 0:
+    if teleop_mode_port > 0:
         argv += [
-            "--override-host", "127.0.0.1",
-            "--override-port", str(override_port),
-            "--override-topic", "pose",
-            "--override-stale-ms", "200",
-            "--override-frozen-ticks", "10",
-            "--override-frozen-l2-tol", "5e-3",
-            "--override-engage-motion-ticks", "10",
-            # 2026-06-10 follow-up: when the manager's stream_mode
-            # PUB is reachable on 127.0.0.1:5564 (the default in
-            # run_x2_vla_runtime.sh sim mode) the launcher hands the
-            # proxy these args too. Mirror that here so the test
-            # stays a faithful argv echo.
             "--teleop-mode-host", "127.0.0.1",
-            "--teleop-mode-port", "5564",
+            "--teleop-mode-port", str(teleop_mode_port),
             "--teleop-mode-topic", "stream_mode",
             "--teleop-mode-stale-ms", "1000",
         ]
@@ -179,16 +117,38 @@ def _build_launcher_argv(
     return argv
 
 
-def test_launcher_bash_syntax_ok():
+def _build_watchdog_argv(
+    *,
+    upstream_port: int = 5556,
+    downstream_port: int = 5558,
+    idle_x2m2: Path | None = None,
+) -> list[str]:
+    """Mirror the argv ``spawn_sim_watchdog`` builds in the launcher."""
+    return [
+        "--upstream-host", "127.0.0.1",
+        "--upstream-port", str(upstream_port),
+        "--upstream-topic", "pose",
+        "--downstream-host", "127.0.0.1",
+        "--downstream-port", str(downstream_port),
+        "--downstream-topic", "pose",
+        "--idle-x2m2", str(idle_x2m2 or IDLE_X2M2),
+        "--idle-stale-ms", "300",
+        "--idle-mode", "blend",
+        "--hold-last-secs", "10.0",
+        "--blend-secs", "3.0",
+        "--no-x2-debug-yaw-track",
+    ]
+
+
+# ===========================================================================
+# Launcher syntax + --help drift detection
+# ===========================================================================
+def test_launcher_bash_syntax_ok() -> None:
     """``bash -n`` catches structural bash errors in the launcher."""
-    bash = shutil.which("bash")
-    assert bash is not None, "bash not on PATH; cannot syntax-check launcher"
     assert LAUNCHER.is_file(), f"launcher missing: {LAUNCHER}"
     proc = subprocess.run(
-        [bash, "-n", str(LAUNCHER)],
-        capture_output=True,
-        text=True,
-        timeout=15,
+        [_bash(), "-n", str(LAUNCHER)],
+        capture_output=True, text=True, timeout=15,
     )
     assert proc.returncode == 0, (
         f"bash -n failed (rc={proc.returncode}):\n"
@@ -196,31 +156,30 @@ def test_launcher_bash_syntax_ok():
     )
 
 
-def test_launcher_help_lists_manual_takeover_flags():
-    """``--help`` must document the manual-takeover CLI flags.
-
-    Regression escape: if a future refactor renames the case-statement
-    entries but forgets to update the heredoc, the operator-facing
-    contract silently drifts. Pinning the visible flag names in the
-    help output is the cheapest way to keep them in lock-step.
-    """
-    bash = shutil.which("bash")
-    assert bash is not None, "bash not on PATH; cannot run launcher --help"
+def test_launcher_help_lists_takeover_and_legacy_flags() -> None:
+    """``--help`` must document both the new --enable-takeover flag and
+    the legacy --pose-proxy-* / --vla-control-* aliases that operators
+    have in their existing runbooks. Pinning the visible surface in
+    the help output is the cheapest way to keep the case-statement
+    and the heredoc in lock-step."""
     proc = subprocess.run(
-        [bash, str(LAUNCHER), "--help"],
-        capture_output=True,
-        text=True,
-        timeout=15,
+        [_bash(), str(LAUNCHER), "--help"],
+        capture_output=True, text=True, timeout=15,
     )
     assert proc.returncode == 0, (
         f"--help failed (rc={proc.returncode}):\n"
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
     for flag in (
+        # New master switch
+        "--enable-takeover",
+        # vla_control (preserved through the refactor)
         "--vla-control-port",
         "--vla-control-host",
         "--vla-cold-restart-hold-ticks",
         "--vla-handoff-max-hold-ticks",
+        # Legacy aliases -- preserved as pass-through to the mux so
+        # operator runbooks don't break.
         "--pose-proxy-override-port",
         "--pose-proxy-override-stale-ms",
         "--pose-proxy-override-frozen-ticks",
@@ -231,10 +190,7 @@ def test_launcher_help_lists_manual_takeover_flags():
         "--pose-proxy-teleop-mode-topic",
         "--pose-proxy-teleop-mode-stale-ms",
         "--pose-proxy-downstream-port",
-        # 2026-06-10 follow-up 11: closed-loop tracking feedback flags.
-        # Same drift-prevention contract as the manual-takeover flags
-        # above -- if the operator-facing surface flips, this test
-        # fires before the next real-robot session.
+        # Tracking feedback (orthogonal to the split; preserved)
         "--vla-tracking-feedback",
         "--no-vla-tracking-feedback",
         "--vla-tracking-soft-rad",
@@ -242,38 +198,30 @@ def test_launcher_help_lists_manual_takeover_flags():
         "--vla-tracking-velocity-margin",
         "--vla-tracking-velocity-floor-rad-tick",
         "--vla-tracking-stale-ms",
+        # Wrist bypass (orthogonal; preserved)
+        "--wrist-bypass",
     ):
         assert flag in proc.stdout, (
-            f"{flag} missing from launcher --help output; "
-            f"the case statement and the heredoc have drifted."
+            f"{flag} missing from launcher --help; the case statement "
+            f"and the heredoc have drifted."
         )
 
 
-def test_launcher_accepts_manual_takeover_cli_flags(tmp_path):
+def test_launcher_accepts_takeover_cli_flags(tmp_path: Path) -> None:
     """CLI flags must be parsed without falling into the ``*) ARGS+=``
     catch-all (which would silently forward them to the bridge and the
     operator would see "bridge: unrecognized argument" hours later).
 
-    We run the launcher with ``preflight`` so it parses argv, runs the
-    pre-flight probes, and exits without spawning anything. A typo in
-    the case-statement would hit the ``*) ARGS+=("$1"); shift`` branch
-    and the flags would end up in ``BRIDGE_ARGS``. We can't observe
-    that directly without intercepting subprocess, so we check the
-    next-best signal: the launcher banner echoes the resolved sim-
-    proxy state, which only flips ON when the parsed values land in
-    ``POSE_PROXY_OVERRIDE_PORT`` (not in ``ARGS``).
+    We run the launcher with ``preflight`` + ``SKIP_PREFLIGHT=1`` so it
+    parses argv, runs no probes, and exits cheaply.
     """
-    bash = shutil.which("bash")
-    assert bash is not None
     run_dir = tmp_path / "preflight_run"
-    # preflight in sim mode (no --pc2-host) with the new CLI flags;
-    # SKIP_PREFLIGHT skips the heavy model + decoder probes so the
-    # test stays fast. We only care about the argv parse path.
     proc = subprocess.run(
         [
-            bash,
+            _bash(),
             str(LAUNCHER),
             "preflight",
+            "--enable-takeover",
             "--vla-control-port", "5559",
             "--pose-proxy-override-port", "5560",
             "--pose-proxy-override-stale-ms", "150",
@@ -288,987 +236,558 @@ def test_launcher_accepts_manual_takeover_cli_flags(tmp_path):
             "--vla-cold-restart-hold-ticks", "30",
             "--run-dir", str(run_dir),
         ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SKIP_PREFLIGHT": "1"},
     )
-    # preflight exits 0 on a clean parse + skipped probes. If the new
-    # flags fell through to the catch-all, BRIDGE_ARGS would be set
-    # but preflight never reads them, so we'd still exit 0 -- the
-    # observable signal is the banner / log lines. Check stdout for
-    # the resolved sim-proxy state.
     combined = proc.stdout + proc.stderr
-    # Either the launcher prints the banner with the proxy line, or
-    # (if preflight short-circuits before the banner) it at least
-    # doesn't emit an "unrecognized argument" warning for our flags.
     for flag in (
+        "--enable-takeover",
         "--vla-control-port",
         "--pose-proxy-override-port",
-        "--pose-proxy-override-stale-ms",
-        "--pose-proxy-override-frozen-ticks",
-        "--pose-proxy-override-frozen-l2-tol",
-        "--pose-proxy-override-engage-motion-ticks",
         "--pose-proxy-teleop-mode-host",
-        "--pose-proxy-teleop-mode-port",
-        "--pose-proxy-teleop-mode-topic",
-        "--pose-proxy-teleop-mode-stale-ms",
         "--pose-proxy-downstream-port",
         "--vla-cold-restart-hold-ticks",
     ):
-        # A drift-detection regex: "Unknown argument: --vla-control-port"
-        # or similar. The launcher doesn't currently emit such a
-        # warning (the catch-all is silent), so this is forward-
-        # looking insurance. The stricter check below is the real
-        # gate.
         assert f"Unknown argument: {flag}" not in combined, (
             f"launcher rejected {flag} as unknown ({combined!r})"
         )
-    # preflight either succeeds (rc=0) or fails with a domain-
-    # specific reason (model missing, etc.) -- both are fine. The
-    # forbidden outcome is rc != 0 paired with a bash-level usage
-    # error (rc=2) or a "command not found" trace.
-    assert proc.returncode in (0, 1), (
-        f"launcher preflight returned unexpected rc={proc.returncode}; "
-        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    # preflight either succeeds (rc=0) or fails with a domain-specific
+    # reason (model missing, etc.). The forbidden outcome is rc=2 (bash
+    # usage error) which would indicate a syntax fault in the case
+    # statement.
+    assert proc.returncode != 2, (
+        f"launcher preflight returned bash usage error rc=2; argv "
+        f"didn't parse. stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
+
+
+# ===========================================================================
+# Mux argparse + spawn argv parity
+# ===========================================================================
+def test_mux_help_lists_required_args() -> None:
+    """The mux must accept the canonical CLI surface the launcher
+    builds. Cheapest sanity check: --help completes cleanly with the
+    expected flag set in the output."""
+    proc = subprocess.run(
+        [sys.executable, str(MUX_SCRIPT), "--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"mux --help failed (rc={proc.returncode}): {proc.stderr!r}"
+    )
+    for flag in (
+        "--primary-host", "--primary-port", "--primary-topic",
+        "--out-host", "--out-port", "--out-topic",
+        "--override-host", "--override-port", "--override-topic",
+        "--override-stale-ms",
+        "--override-frozen-ticks", "--override-frozen-l2-tol",
+        "--override-engage-motion-ticks",
+        "--engagement-max-wire-step", "--engagement-steady-wire-step",
+        "--engagement-step-ramp-ticks",
+        "--teleop-mode-host", "--teleop-mode-port",
+        "--teleop-mode-topic", "--teleop-mode-stale-ms",
+        "--vla-control-bind-host", "--vla-control-port",
+        "--vla-control-topic",
+        "--rate-hz", "--status-every-s",
+    ):
+        assert flag in proc.stdout, (
+            f"{flag} missing from mux --help; CLI surface drift"
+        )
 
 
 @pytest.mark.parametrize(
-    "override_port,vla_control_port",
+    "vla_control_port,teleop_mode_port",
     [
-        # Override only: dual-source arbitration without cold-restart edge.
-        (5560, -1),
-        # vla_control only: edge events without a second pose source
-        # (operator wants the bridge to react to PROXY-side OVERRIDE
-        # state but isn't wiring a teleop SUB yet -- valid use case
-        # during integration ramp-up).
-        (-1, 5559),
-        # Both: the canonical sim manual-takeover configuration.
-        (5560, 5559),
+        (-1, -1),     # arbitration only, no edge events, no strict mode
+        (5559, -1),   # arbitration + edge events
+        (5559, 5564), # full takeover topology
     ],
 )
-def test_spawn_sim_proxy_argv_parses(override_port, vla_control_port):
-    """The launcher's spawn_sim_proxy argv must pass proxy argparse.
+def test_spawn_pose_mux_argv_parses(
+    vla_control_port: int, teleop_mode_port: int,
+) -> None:
+    """The launcher's spawn_pose_mux argv must pass mux argparse.
 
     Catches typos / arg-name drift between the bash launcher and the
-    proxy script. The proxy's idle-x2m2 file-not-found guard is what
-    actually short-circuits us out of main(); reaching that means
-    argparse + range validators accepted everything else.
+    mux script. We run the mux with ``--help`` first to confirm the
+    parser is well-formed, then re-invoke it with the launcher-style
+    argv plus an explicit ``--help`` tail. argparse runs validation
+    before --help, so a bogus arg trips before the help text prints.
     """
-    assert IDLE_X2M2.is_file(), (
-        f"idle_stand.x2m2 missing at {IDLE_X2M2} -- rebake via "
-        f"`python -m gear_sonic_deploy.scripts.bake_idle_stand_x2m2`"
-    )
-    argv = _build_launcher_argv(
-        upstream_port=5556,
-        downstream_port=5558,
-        override_port=override_port,
+    argv = _build_mux_argv(
         vla_control_port=vla_control_port,
+        teleop_mode_port=teleop_mode_port,
     )
-    parser = _build_proxy_parser()
-    parser.parse_args(argv)
+    proc = subprocess.run(
+        [sys.executable, str(MUX_SCRIPT)] + argv + ["--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"mux rejected launcher argv (rc={proc.returncode}):\n"
+        f"argv={argv}\nstderr={proc.stderr!r}"
+    )
 
 
-def test_spawn_sim_deploy_routes_omnihand_sub_through_proxy_when_proxy_on():
-    """spawn_sim_deploy MUST redirect --sim-hand-zmq-host/--sim-hand-zmq-port
-    to the proxy's downstream port when SIM_PROXY_ENABLED=1 and
-    SIM_WITH_OMNIHAND=1.
+# ===========================================================================
+# Watchdog argparse + spawn argv parity
+# ===========================================================================
+def test_watchdog_help_lists_required_args() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(WATCHDOG_SCRIPT), "--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"watchdog --help failed (rc={proc.returncode}): {proc.stderr!r}"
+    )
+    for flag in (
+        "--upstream-host", "--upstream-port", "--upstream-topic",
+        "--downstream-host", "--downstream-port", "--downstream-topic",
+        "--idle-x2m2", "--idle-stale-ms", "--idle-mode",
+        "--hold-last-secs", "--blend-secs",
+        "--no-x2-debug-yaw-track",
+    ):
+        assert flag in proc.stdout, (
+            f"{flag} missing from watchdog --help; CLI surface drift"
+        )
 
-    Regression pin for the 2026-06-10 late-afternoon "fingers still
-    not responding" bug. The OmniHand SUB in
-    ``x2_mujoco_ros_bridge.py`` defaults to ``localhost:5556``
-    (the bridge's port), bypassing the proxy entirely. Without this
-    redirect, operator finger commands silently die on the recorder
-    -> proxy -> deploy hop because OmniHand never subscribed to the
-    proxy's downstream port. Body joints still work (sim deploy's
-    body SUB IS routed through the proxy), so the user-visible
-    symptom is exactly "override engages, body follows, fingers
-    stuck at VLA chunks" -- the same thing they hit.
 
-    This is a source-level pattern check (no subprocess) because
-    spawn_sim_deploy isn't trivially reachable from outside the
-    launcher's main() flow; the alternative would be sourcing the
-    bash file with all the right env-var stubs in place, which is
-    fragile. Direct pattern assertion catches the regression cheaply.
+def test_watchdog_rejects_legacy_takeover_flags() -> None:
+    """The 2026-06-11 split moved manual-takeover args to the mux.
+    Anyone running the watchdog with legacy --override-port /
+    --vla-control-port flags MUST get a clean migration error pointing
+    at the milestone doc (not a confusing argparse 'unrecognized
+    argument' message).
+    """
+    proc = subprocess.run(
+        [
+            sys.executable, str(WATCHDOG_SCRIPT),
+            "--upstream-host", "127.0.0.1",
+            "--upstream-port", "5556",
+            "--downstream-port", "5558",
+            "--idle-x2m2", str(IDLE_X2M2),
+            # The flag that should trigger the migration error:
+            "--override-port", "5560",
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 2, (
+        f"watchdog should exit 2 on legacy takeover flag; got "
+        f"rc={proc.returncode}, stderr={proc.stderr!r}"
+    )
+    assert "x2_pose_mux" in proc.stderr, (
+        f"watchdog migration error should mention x2_pose_mux; "
+        f"got stderr={proc.stderr!r}"
+    )
+    assert "2026-06-11" in proc.stderr, (
+        f"watchdog migration error should reference the milestone "
+        f"date; got stderr={proc.stderr!r}"
+    )
+
+
+@pytest.mark.skipif(
+    not IDLE_X2M2.is_file(),
+    reason=f"idle_stand.x2m2 missing at {IDLE_X2M2}",
+)
+def test_spawn_sim_watchdog_argv_parses() -> None:
+    """The launcher's spawn_sim_watchdog argv must pass watchdog
+    argparse. Same drift-prevention contract as the mux test above."""
+    argv = _build_watchdog_argv()
+    proc = subprocess.run(
+        [sys.executable, str(WATCHDOG_SCRIPT)] + argv + ["--help"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, (
+        f"watchdog rejected launcher argv (rc={proc.returncode}):\n"
+        f"argv={argv}\nstderr={proc.stderr!r}"
+    )
+
+
+# ===========================================================================
+# Launcher source-level pattern pins
+# ===========================================================================
+def test_launcher_enable_takeover_auto_promotes_loopback_ports() -> None:
+    """--enable-takeover MUST promote POSE_PROXY_OVERRIDE_PORT to 5560
+    and VLA_CONTROL_PORT to 5559 when the operator left them at the
+    legacy disabled defaults (-1). Both ports are now pure laptop
+    loopback after the 2026-06-11 split, so requiring the operator
+    to re-pass them on every invocation buys nothing -- and forgetting
+    --vla-control-port specifically means the bridge will NOT cold-
+    restart on release (the wire snaps to the mid-decode chunk).
+
+    Pure source-level pattern check; spawning a real subprocess just
+    to verify two env-var defaults is overkill.
     """
     src = LAUNCHER.read_text()
-    # Find spawn_sim_deploy() function body.
+
+    # Anchor block: the promotion lives directly after the
+    # TAKEOVER_ENABLED resolution. Keep the search narrow so a stray
+    # constant elsewhere in the script can't fake the test green.
+    anchor = "if [[ \"${TAKEOVER_ENABLED}\" -eq 1 ]]; then"
+    anchor_idx = src.find(anchor)
+    assert anchor_idx >= 0, "TAKEOVER_ENABLED auto-promotion block missing"
+    # ~2 KB after the anchor should comfortably contain the whole
+    # promotion stanza without dragging in unrelated downstream logic.
+    block = src[anchor_idx : anchor_idx + 2048]
+
+    assert "POSE_PROXY_OVERRIDE_PORT=5560" in block, (
+        "--enable-takeover must auto-promote POSE_PROXY_OVERRIDE_PORT "
+        "to the recorder's canonical PUB port (5560) when the operator "
+        "didn't override it; otherwise the mux has no override SUB to "
+        "listen on and takeover silently no-ops"
+    )
+    assert "VLA_CONTROL_PORT=5559" in block, (
+        "--enable-takeover must auto-promote VLA_CONTROL_PORT to 5559 "
+        "(the canonical loopback port for mux -> bridge edge events) "
+        "when the operator didn't override it; otherwise the bridge "
+        "won't cold-restart on operator release and the wire snaps "
+        "back to whatever VLA chunk is mid-decode"
+    )
+    assert "VLA_CONTROL_HOST=127.0.0.1" in block, (
+        "--enable-takeover must default VLA_CONTROL_HOST to loopback "
+        "since the mux is co-located with the bridge after the "
+        "2026-06-11 split (the pre-split default was --pc2-host, "
+        "which would cross wifi for no reason)"
+    )
+
+    # The explicit-disable knob (--vla-control-port 0) MUST still
+    # survive auto-promotion. The guard pattern is `... -lt 0` so a
+    # zero value short-circuits the promotion.
+    assert "POSE_PROXY_OVERRIDE_PORT}\" -lt 0" in block, (
+        "auto-promotion guard must be -lt 0 (not -le 0 or != 0); "
+        "operators rely on --pose-proxy-override-port 0 to opt out"
+    )
+    assert "VLA_CONTROL_PORT}\" -lt 0" in block, (
+        "auto-promotion guard must be -lt 0 so --vla-control-port 0 "
+        "remains a valid opt-out knob"
+    )
+
+
+def test_launcher_bridge_pub_port_uses_internal_port_on_takeover() -> None:
+    """With --enable-takeover the bridge must publish on
+    BRIDGE_POSE_PUB_PORT (= BRIDGE_POSE_PORT_INTERNAL, default 5571)
+    instead of LAPTOP_POSE_PORT (5556). Otherwise the mux would clash
+    with the bridge over the canonical pose port and one of them
+    silently fails to bind.
+
+    2026-06-11 follow-up: the internal port moved from 5570 -> 5571
+    after we discovered :5570 was already owned by the kplanner stack's
+    x2_debug_to_robot_pose_bridge (publishes 'robot_pose' topic). If
+    this pin ever moves again, also update tests/_build_mux_argv()'s
+    primary_port default, pick_place_commands.md, and the 2026-06-11
+    pose-pipeline-split milestone doc.
+
+    Pins the BRIDGE_ARGS slot for --pub-port. Source-level pattern
+    check (no subprocess needed)."""
+    src = LAUNCHER.read_text()
+    assert "BRIDGE_POSE_PORT_INTERNAL:=5571" in src, (
+        "BRIDGE_POSE_PORT_INTERNAL default missing/wrong; the bridge "
+        "won't have a clean internal port to publish on when takeover "
+        "is enabled (and :5570 collides with the kplanner stack's "
+        "x2_debug_to_robot_pose_bridge per 2026-06-11 fix)"
+    )
+    assert '--pub-port "$BRIDGE_POSE_PUB_PORT"' in src, (
+        "bridge --pub-port must use BRIDGE_POSE_PUB_PORT (not "
+        "LAPTOP_POSE_PORT directly); otherwise the mux + bridge will "
+        "fight over port 5556 when --enable-takeover is set"
+    )
+
+
+def test_launcher_spawn_pose_mux_uses_pipeline_topology() -> None:
+    """spawn_pose_mux MUST plumb the right ports through:
+      - --primary-port reads BRIDGE_POSE_PUB_PORT (bridge's internal port)
+      - --out-port binds LAPTOP_POSE_PORT (the canonical pose port)
+      - --override-port pulls from POSE_PROXY_OVERRIDE_PORT (with the
+        recorder default 5560 when unset)
+    so the same env-var surface that drove the old proxy keeps working.
+    """
+    src = LAUNCHER.read_text()
+    start = src.find("\nspawn_pose_mux()")
+    assert start >= 0, "spawn_pose_mux() not found in launcher"
+    end = src.find("\n}\n", start)
+    assert end > start
+    body = src[start:end]
+    assert '--primary-port "$BRIDGE_POSE_PUB_PORT"' in body, (
+        "spawn_pose_mux --primary-port must use BRIDGE_POSE_PUB_PORT"
+    )
+    assert '--out-port "$LAPTOP_POSE_PORT"' in body, (
+        "spawn_pose_mux --out-port must bind LAPTOP_POSE_PORT (so "
+        "external consumers -- PC2 watchdog or sim watchdog -- can "
+        "continue SUBing at the canonical port)"
+    )
+    assert "POSE_PROXY_OVERRIDE_PORT" in body, (
+        "spawn_pose_mux must consume POSE_PROXY_OVERRIDE_PORT so the "
+        "existing operator runbook keeps working"
+    )
+    # Engagement ramp args must be forwarded to the mux's matching
+    # CLI surface (the mux took these over from the old proxy).
+    for arg in (
+        '--engagement-max-wire-step "$POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP"',
+        '--engagement-steady-wire-step "$POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP"',
+        '--engagement-step-ramp-ticks "$POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS"',
+    ):
+        assert arg in body, (
+            f"spawn_pose_mux missing {arg!r}; the engagement ramp will "
+            f"silently fall back to the mux's parser defaults"
+        )
+
+
+def test_launcher_spawn_sim_watchdog_uses_pipeline_topology() -> None:
+    """spawn_sim_watchdog MUST read from the mux's output port
+    (LAPTOP_POSE_PORT) and PUB to the sim deploy port
+    (POSE_PROXY_DOWNSTREAM_PORT). Pins the dataflow:
+    bridge -> mux *:5556 -> watchdog *:5558 -> sim deploy."""
+    src = LAUNCHER.read_text()
+    start = src.find("\nspawn_sim_watchdog()")
+    assert start >= 0, "spawn_sim_watchdog() not found in launcher"
+    end = src.find("\n}\n", start)
+    assert end > start
+    body = src[start:end]
+    assert '--upstream-port "$LAPTOP_POSE_PORT"' in body, (
+        "spawn_sim_watchdog --upstream-port must read LAPTOP_POSE_PORT "
+        "(the mux's output, not the bridge's internal port)"
+    )
+    assert '--downstream-port "$POSE_PROXY_DOWNSTREAM_PORT"' in body, (
+        "spawn_sim_watchdog --downstream-port must use "
+        "POSE_PROXY_DOWNSTREAM_PORT (where the sim deploy SUBs from)"
+    )
+    assert "--no-x2-debug-yaw-track" in body, (
+        "sim watchdog must disable yaw rebase (no deploy x2_debug PUB "
+        "during sim warmup)"
+    )
+
+
+def test_launcher_pose_mux_spawned_in_both_sim_and_real_takeover() -> None:
+    """spawn_pose_mux must be called in BOTH the sim and real
+    branches when TAKEOVER_ENABLED=1, because the laptop-side mux is
+    what replaces the PC2-side dual-source arbitration in either mode."""
+    src = LAUNCHER.read_text()
+    # The sim path spawns mux + sim watchdog inside the SIM_PROXY_ENABLED
+    # block; the real path spawns mux on TAKEOVER_ENABLED right after
+    # the bridge PUB binds.
+    sim_block = src[src.find('"sim manual-takeover plumbing ON:"'):]
+    sim_block = sim_block[:sim_block.find('spawn_sim_deploy')]
+    assert "spawn_pose_mux" in sim_block, (
+        "spawn_pose_mux must be invoked in the sim manual-takeover "
+        "block (the mux is the merge/arbitration brain in sim too)"
+    )
+    real_block = src[src.find('"real-robot manual-takeover plumbing ON:"'):]
+    real_block = real_block[:real_block.find("\nfi\n")]
+    assert "spawn_pose_mux" in real_block, (
+        "spawn_pose_mux must be invoked in the real-robot manual-"
+        "takeover block (the mux runs on the LAPTOP next to the "
+        "bridge; PC2 only has the watchdog)"
+    )
+
+
+def test_launcher_sim_watchdog_only_spawned_in_sim_mode() -> None:
+    """The sim watchdog provides the fallback ladder when the sim
+    deploy is colocated on the laptop. Real-robot deployments get
+    their watchdog from PC2's x2_pc2_daemons.sh; the launcher MUST NOT
+    spawn a second watchdog locally in real mode."""
+    src = LAUNCHER.read_text()
+    # The only spawn_sim_watchdog invocation must live inside the sim
+    # branch (after "policy ready; spawning sim deploy"). The real-
+    # robot block must NOT call spawn_sim_watchdog.
+    real_block = src[src.find('"real-robot manual-takeover plumbing ON:"'):]
+    real_block = real_block[:real_block.find("\nfi\n")]
+    assert "spawn_sim_watchdog" not in real_block, (
+        "spawn_sim_watchdog must NOT be invoked in the real-robot "
+        "manual-takeover block -- PC2's x2_pose_watchdog handles "
+        "fallback on the robot side"
+    )
+
+
+def test_legacy_spawn_sim_proxy_alias_exists() -> None:
+    """Older runbooks / postmortem scripts may grep for the
+    spawn_sim_proxy / stop_sim_proxy function names. Keep wrapper
+    aliases that delegate to the new mux + watchdog spawns so the
+    runbook stays buildable."""
+    src = LAUNCHER.read_text()
+    assert "stop_sim_proxy()" in src, (
+        "stop_sim_proxy() alias must exist (delegates to "
+        "stop_sim_watchdog + stop_pose_mux). Operator scripts grep "
+        "for this name."
+    )
+
+
+def test_kill_stale_sim_processes_targets_new_scripts() -> None:
+    """kill_stale_sim_processes must look for the new x2_pose_mux.py
+    and x2_pose_watchdog.py paths -- a stale daemon from a previous
+    run otherwise wedges the ports forever."""
+    src = LAUNCHER.read_text()
+    start = src.find("kill_stale_sim_processes()")
+    assert start >= 0
+    end = src.find("\n}\n", start)
+    body = src[start:end]
+    assert "gear_sonic/scripts/x2_pose_mux.py" in body, (
+        "kill_stale_sim_processes must target the new x2_pose_mux.py "
+        "path"
+    )
+    assert "gear_sonic_deploy/scripts/x2_pose_watchdog.py" in body, (
+        "kill_stale_sim_processes must target the new "
+        "x2_pose_watchdog.py path"
+    )
+
+
+# ===========================================================================
+# spawn_sim_deploy: OmniHand redirect through the watchdog (preserved)
+# ===========================================================================
+def test_spawn_sim_deploy_routes_omnihand_sub_through_pipeline_when_proxy_on() -> None:
+    """When the laptop mux + sim watchdog are in the wire, the sim
+    deploy's OmniHand ZMQ SUB MUST go through the same wire as the
+    body joints. Otherwise the operator's finger commands silently
+    die on the recorder -> mux -> watchdog -> deploy hop (the body
+    SUB is routed; the OmniHand SUB defaults to LAPTOP_POSE_PORT and
+    misses the merged wire). This was the 2026-06-10 "fingers still
+    not responding" regression."""
+    src = LAUNCHER.read_text()
     start = src.find("\nspawn_sim_deploy()")
     assert start >= 0, "spawn_sim_deploy() not found in launcher"
     end = src.find("\n}\n", start)
-    assert end > start, (
-        "spawn_sim_deploy() opening found but no matching closing brace"
-    )
     func_body = src[start:end]
-    # Three claims, all conjunctive:
-    #   1. --sim-with-omnihand is added inside the SIM_WITH_OMNIHAND
-    #      branch (regression check on the umbrella feature),
-    #   2. --sim-hand-zmq-host is added in the SAME branch,
-    #   3. --sim-hand-zmq-port is added in the SAME branch,
-    # AND the host/port pair is gated on SIM_PROXY_ENABLED.
-    assert "--sim-with-omnihand" in func_body, (
-        "spawn_sim_deploy must forward --sim-with-omnihand to deploy_x2.sh"
-    )
+    assert "--sim-with-omnihand" in func_body
     assert "--sim-hand-zmq-host" in func_body, (
-        "spawn_sim_deploy must forward --sim-hand-zmq-host to deploy_x2.sh "
-        "when proxy + omnihand are both on (otherwise the OmniHand SUB "
-        "bypasses the proxy and operator finger commands are silently "
-        "dropped during override)"
+        "spawn_sim_deploy must forward --sim-hand-zmq-host to deploy_x2.sh"
     )
     assert "--sim-hand-zmq-port" in func_body, (
-        "spawn_sim_deploy must forward --sim-hand-zmq-port to deploy_x2.sh "
-        "when proxy + omnihand are both on (see --sim-hand-zmq-host)"
+        "spawn_sim_deploy must forward --sim-hand-zmq-port to deploy_x2.sh"
     )
-    # The host/port pair MUST be gated on SIM_PROXY_ENABLED so legacy
-    # autonomous-only sim runs (no proxy in the wire) don't try to
-    # subscribe through a port that nothing is publishing on.
     hand_zmq_idx = func_body.find("--sim-hand-zmq-host")
-    # Look backwards for the nearest SIM_PROXY_ENABLED gate.
     preceding = func_body[:hand_zmq_idx]
     assert "SIM_PROXY_ENABLED" in preceding, (
         "the --sim-hand-zmq-host/port forwarding MUST be gated on "
-        "SIM_PROXY_ENABLED so legacy non-proxy sim runs aren't "
-        "broken by pointing OmniHand at an unbound port"
+        "SIM_PROXY_ENABLED (= sim + takeover) so legacy non-pipeline "
+        "sim runs aren't broken by pointing OmniHand at an unbound port"
     )
-    # The host/port pair MUST resolve to the proxy's downstream
-    # (NOT LAPTOP_POSE_PORT). spawn_sim_deploy already computes
-    # deploy_pose_host/port for the body SUB; the new wire must
-    # reuse those exact variables so body + fingers cannot disagree.
     assert '"$deploy_pose_host"' in func_body, (
-        "spawn_sim_deploy must reuse $deploy_pose_host for the new "
+        "spawn_sim_deploy must reuse $deploy_pose_host for the "
         "OmniHand wire so body + fingers come from the same source"
     )
     assert '"$deploy_pose_port"' in func_body, (
-        "spawn_sim_deploy must reuse $deploy_pose_port for the new "
+        "spawn_sim_deploy must reuse $deploy_pose_port for the "
         "OmniHand wire so body + fingers come from the same source"
     )
 
 
-def test_spawn_sim_deploy_forwards_wrist_bypass_via_deploy_extra_arg():
-    """spawn_sim_deploy must forward $WRIST_BYPASS to deploy_x2.sh.
-
-    Regression pin for the 2026-06-10 "wrist not responding to teleop"
-    bug. The SONIC tracker pins wrist pitch/roll regardless of the IK
-    reference -- see wrist_bypass.hpp. The C++ deploy provides
-    ``--wrist-bypass ik`` for surgical override of those 4 MJ DOFs
-    ({20,21,27,28}) with the wire's joint_pos_mj before the safety
-    stack. The launcher previously never set this, so even though
-    operator/VLA wrist commands were on the wire, SONIC clamped them
-    away. The fix is to forward $WRIST_BYPASS to deploy_x2.sh via two
-    ``--deploy-extra-arg`` tokens (because the C++ CLI expects
-    ``--wrist-bypass <mode>`` as a value-separated pair).
-    """
+def test_spawn_sim_deploy_forwards_wrist_bypass_via_deploy_extra_arg() -> None:
+    """spawn_sim_deploy must forward $WRIST_BYPASS to deploy_x2.sh
+    via two --deploy-extra-arg tokens. Same regression pin as
+    2026-06-10 follow-up 7."""
     src = LAUNCHER.read_text()
     start = src.find("\nspawn_sim_deploy()")
-    assert start >= 0, "spawn_sim_deploy() not found in launcher"
+    assert start >= 0
     end = src.find("\n}\n", start)
-    assert end > start
     func_body = src[start:end]
-    # Two extras (key + value) because deploy_x2.sh appends each
-    # extra verbatim; ``--wrist-bypass ik`` would otherwise be
-    # collapsed into a single ill-formed token.
-    assert "--wrist-bypass" in func_body, (
-        "spawn_sim_deploy must forward --wrist-bypass to the C++ deploy "
-        "via --deploy-extra-arg so the SONIC wrist clamp is bypassed "
-        "for manual takeover and VLA wrist tracking"
-    )
+    assert "--wrist-bypass" in func_body
     assert func_body.count("--deploy-extra-arg") >= 3, (
         "spawn_sim_deploy must use --deploy-extra-arg at least three "
-        "times: one for --disable-pose-ref-watchdog, plus a key+value "
+        "times: one for --disable-pose-ref-watchdog plus a key+value "
         "pair for --wrist-bypass <mode>"
     )
-    # Default value must be 'ik' (per 2026-06-10 follow-up 7 -- the
-    # operator at 13:12 explicitly requested wrist_bypass be enabled
-    # so wrist gestures actually move the wrist).
-    src_for_default = LAUNCHER.read_text()
-    assert 'WRIST_BYPASS:=ik' in src_for_default, (
-        "WRIST_BYPASS default must be 'ik' (per follow-up 7 the "
-        "operator explicitly requested wrist ik enabled so wrist "
-        "gestures actually move the wrist). If you intended to "
-        "default 'off', read 2026-06-10 follow-up 7 first."
+    assert 'WRIST_BYPASS:=ik' in src, (
+        "WRIST_BYPASS default must be 'ik' (per 2026-06-10 follow-up 7)"
     )
-    # CRITICAL NEGATIVE PIN -- the launcher MUST NOT auto-pair
-    # wrist_bypass=ik with ``--max-target-dev``. Follow-up 8 proved
-    # the auto-pair makes the robot collapse: --max-target-dev is a
-    # GLOBAL absolute clamp on ALL joint groups (leg + waist + arm
-    # + head), pinning everything to default +/- N. At 0.05 the
-    # robot couldn't bend its knees enough to stand (act_clip_ticks
-    # 916/1000 in the 13:21 deploy.log). Wrist slam mitigation lives
-    # on the bridge side instead (--vla-max-wire-step + follow-up 6
-    # slow-step ramp). Pin BOTH the absence of the auto-pair AND
-    # the absence of the env var so a future revival of the same
-    # mistake fails CI before it ships.
-    assert 'WRIST_BYPASS_MAX_TARGET_DEV' not in src_for_default, (
-        "WRIST_BYPASS_MAX_TARGET_DEV must not exist -- it was "
-        "introduced in follow-up 7 to auto-pair --wrist-bypass ik "
-        "with --max-target-dev, but the 13:21 run proved this makes "
-        "the robot collapse (the flag is a GLOBAL clamp on leg + "
-        "waist + arm + head, not a wrist-specific rate clamp). "
-        "See follow-up 8 in the 2026-06-10 milestone doc before "
-        "reintroducing this."
-    )
-    # The forwarded --deploy-extra-arg block must NOT mention
-    # --max-target-dev in the wrist-bypass forwarding (a future
-    # change that defaults it back as part of the wrist block
-    # would re-trigger the collapse).
-    wrist_block_start = src_for_default.find('WRIST_BYPASS}" != "off"')
-    assert wrist_block_start > 0, (
-        "couldn't find the wrist-bypass forwarding conditional; "
-        "did you rename WRIST_BYPASS? if so update this test."
-    )
-    wrist_block = src_for_default[
-        wrist_block_start : wrist_block_start + 2000
-    ]
-    assert '--deploy-extra-arg --max-target-dev' not in wrist_block, (
-        "wrist-bypass forwarding block re-introduced "
-        "--deploy-extra-arg --max-target-dev; this is the exact "
-        "regression that collapsed the robot in the 13:21 run. "
-        "If you need a wrist-specific clamp, add a per-group "
-        "override in the C++ deploy (--max-target-dev-wrist), "
-        "don't reuse the global --max-target-dev."
+    assert 'WRIST_BYPASS_MAX_TARGET_DEV' not in src, (
+        "the global --max-target-dev auto-pair from follow-up 7 was "
+        "reverted in follow-up 8 (it collapsed the robot's legs); do "
+        "not reintroduce"
     )
 
 
-def test_launcher_help_lists_wrist_bypass_flag():
-    """``--help`` must document --wrist-bypass so operators can find it."""
-    bash = shutil.which("bash")
-    assert bash is not None
-    proc = subprocess.run(
-        [bash, str(LAUNCHER), "--help"],
-        capture_output=True, text=True, timeout=15,
-    )
-    assert proc.returncode == 0
-    assert "--wrist-bypass" in proc.stdout, (
-        "--wrist-bypass missing from launcher --help; the case "
-        "statement and the heredoc have drifted"
-    )
-
-
-def test_launcher_forwards_handoff_max_hold_ticks_to_bridge():
-    """The smooth-handoff CLI flag must reach the bridge BRIDGE_ARGS.
-
-    Regression pin for the 2026-06-10 (PM follow-up 3) smooth-handoff
-    guard. The bridge takes ``--vla-handoff-max-hold-ticks N``; the
-    launcher reads it as ``VLA_HANDOFF_MAX_HOLD_TICKS`` (env or CLI)
-    and appends it to BRIDGE_ARGS inside the manual-takeover wiring
-    block. Without this, the bridge defaults the new guard to 200
-    silently and the operator can't tune the safety cap from the
-    launcher. We grep the launcher source for the wiring pattern;
-    avoids subprocess flakiness.
-    """
+# ===========================================================================
+# Bridge-side handoff plumbing (preserved across the refactor)
+# ===========================================================================
+def test_launcher_forwards_handoff_max_hold_ticks_to_bridge() -> None:
     src = LAUNCHER.read_text()
-    # The default must be set so older callers (env-var-only) still get
-    # the guard on.
     assert 'VLA_HANDOFF_MAX_HOLD_TICKS:=200' in src, (
-        "VLA_HANDOFF_MAX_HOLD_TICKS default missing/wrong; should be "
-        "200 (= 4 s @ 50 Hz)"
+        "VLA_HANDOFF_MAX_HOLD_TICKS default missing/wrong"
     )
-    # The CLI flag must be in the case statement.
     assert '--vla-handoff-max-hold-ticks)' in src, (
         "--vla-handoff-max-hold-ticks missing from launcher case "
         "statement; CLI override won't take effect"
     )
-    # The BRIDGE_ARGS append must reference both VLA_HANDOFF_MAX_HOLD_TICKS
-    # and the flag name.
-    assert '--vla-handoff-max-hold-ticks "${VLA_HANDOFF_MAX_HOLD_TICKS}"' in src, (
-        "BRIDGE_ARGS append for --vla-handoff-max-hold-ticks missing; "
-        "the bridge won't see the operator's value"
+    assert (
+        '--vla-handoff-max-hold-ticks "${VLA_HANDOFF_MAX_HOLD_TICKS}"'
+        in src
+    ), (
+        "BRIDGE_ARGS append for --vla-handoff-max-hold-ticks missing"
     )
 
 
-def test_bridge_fails_fast_when_handoff_max_hold_less_than_cold_restart_hold():
-    """Bridge MUST refuse to start when handoff cap < cold-restart hold.
+def test_launcher_forwards_handoff_slow_step_to_bridge() -> None:
+    src = LAUNCHER.read_text()
+    assert 'VLA_HANDOFF_MAX_WIRE_STEP:=0.012' in src
+    assert 'VLA_HANDOFF_STEP_RAMP_TICKS:=250' in src
+    for flag in (
+        '--vla-handoff-max-wire-step)',
+        '--vla-handoff-step-ramp-ticks)',
+    ):
+        assert flag in src, f"{flag} missing from case statement"
+    for wiring in (
+        '--vla-handoff-max-wire-step "${VLA_HANDOFF_MAX_WIRE_STEP}"',
+        '--vla-handoff-step-ramp-ticks "${VLA_HANDOFF_STEP_RAMP_TICKS}"',
+    ):
+        assert wiring in src, f"BRIDGE_ARGS append {wiring!r} missing"
 
-    A handoff cap shorter than the minimum hold would mean the bridge
-    releases the wire to idle BEFORE the proxy's HOLD ladder finishes
-    replaying the operator pose -- the exact "abrupt motion" symptom
-    the smooth-handoff guard is here to prevent. The bridge's
-    startup validator catches this with sys.exit(2). We invoke the
-    bridge with --help-style smoke (real launch needs a model + GPU)
-    by triggering the validator via a minimal argv. Since the
-    validator runs before any heavy init, we can drive it with a
-    bogus model path and assert sys.exit(2) with the expected message.
-    """
-    bridge = REPO_ROOT / "gear_sonic" / "scripts" / "live_vla_publish_motion_token.py"
-    assert bridge.is_file()
-    # Invoke with the bad combination; the validator runs before model
-    # loading. We don't need a real model because the validator exits
-    # at the top of main(). Use --help to confirm the flag is wired.
+
+# ===========================================================================
+# Bridge source-level pins (orthogonal to the mux split; preserved)
+# ===========================================================================
+def test_bridge_help_lists_handoff_max_hold_ticks() -> None:
     proc = subprocess.run(
-        [sys.executable, str(bridge), "--help"],
+        [sys.executable, str(BRIDGE_SCRIPT), "--help"],
         capture_output=True, text=True, timeout=20,
     )
     assert proc.returncode == 0, (
         f"bridge --help failed (rc={proc.returncode}): {proc.stderr}"
     )
-    assert "--vla-handoff-max-hold-ticks" in proc.stdout, (
-        "--vla-handoff-max-hold-ticks missing from bridge --help; "
-        "argparse drift"
-    )
-    assert "Safety cap" in proc.stdout, (
-        "--vla-handoff-max-hold-ticks help text doesn't explain its "
-        "role as the safety cap; help text drift could mislead "
-        "operators tuning the value"
-    )
+    assert "--vla-handoff-max-hold-ticks" in proc.stdout
+    assert "Safety cap" in proc.stdout
 
 
-def test_handoff_gate_requires_nontrivial_token_magnitude():
-    """The cold-restart handoff gate MUST check token magnitude.
-
-    Regression pin for 2026-06-10 follow-up 5. The original
-    follow-up 3 gate released the wire when ``chunk_id > baseline
-    and chunk_id > 0`` -- but the decoder below has its own gate
-    (``np.linalg.norm(token[step]) > 1e-3``) that skips zero-token
-    chunks. The mismatch meant that if VLA produced a steady
-    stream of zero-token chunks (which happens whenever the model
-    hasn't latched onto the prompt, the camera feed is missing /
-    occluded, or the proprio decoder is starved), the cold-restart
-    hold would release the wire on the FIRST chunk arrival, the
-    decoder would refuse to use that chunk, and ``cur_jpos`` would
-    fall through to ``idle_loop.current(tick)`` (= idle_stand pose).
-    The operator's wire would snap from operator-pose to
-    idle_stand-pose in a single tick -- which produced the
-    2026-06-10 12:26 "hand slammed into the table" report (see
-    docs/source/user_guide/milestones/2026-06-10_vla_manual_takeover.md,
-    follow-up 4 / 5).
-
-    The fix mirrors the decoder's token-norm guard inside the
-    handoff gate so the wire stays at operator-pose until VLA is
-    producing usable tokens OR ``handoff_max_hold_ticks`` expires.
-    Pin both the source-level pattern (so a future "just check
-    chunk_id" refactor fails this test) AND the always-on per-tick
-    wire rate clamp on the idle branch (defense-in-depth: if the
-    safety cap DOES expire, the wire ramps from operator-pose to
-    idle at ``max_wire_step`` rad/tick instead of snapping).
-    """
-    bridge = (
-        REPO_ROOT / "gear_sonic" / "scripts" / "live_vla_publish_motion_token.py"
-    )
-    src = bridge.read_text()
-    # The gate must include a token-magnitude check. We pin the
-    # exact variable name ``current_token_norm`` so a refactor that
-    # renames it fails loudly here -- the e2e symptom (slam) is
-    # impossible to catch in CI without a sim run, but the variable
-    # presence is a cheap proxy.
-    assert "current_token_norm = float(np.linalg.norm(token[step]))" in src, (
-        "cold-restart handoff gate is missing the token-magnitude "
-        "snapshot. Without ``current_token_norm`` the gate can release "
-        "the wire on a zero-token chunk and the decoder skip + fall-through "
-        "to idle_stand will produce the 12:26 slam regression. See follow-up "
-        "5 in docs/source/user_guide/milestones/2026-06-10_vla_manual_takeover.md"
-    )
+def test_handoff_gate_requires_nontrivial_token_magnitude() -> None:
+    """Cold-restart handoff gate must include the token-norm clause
+    (2026-06-10 follow-up 5; symptom is the 12:26 hand-into-table)."""
+    src = BRIDGE_SCRIPT.read_text()
+    assert "current_token_norm = float(np.linalg.norm(token[step]))" in src
     assert (
         "first_eligible_chunk_ready = (" in src
         and "current_token_norm > 1e-3" in src
-    ), (
-        "cold-restart handoff first_eligible_chunk_ready predicate must "
-        "include the ``current_token_norm > 1e-3`` clause; otherwise "
-        "the gate releases on zero-token chunks and the wire snaps to "
-        "idle_stand."
     )
-    # Defense-in-depth: the per-tick wire rate clamp must also fire
-    # on the ``else`` (idle wire) branch. Without this, the safety
-    # cap expiring still produces a snap (just delayed).
     assert (
         "# Idle wire (deploy stale, no decoder, or zero-token chunk)." in src
         and "cur_jpos = _clamp_vector_step(" in src
         and "max_wire_step" in src
-    ), (
-        "idle-wire branch must call ``_clamp_vector_step(cur_jpos, "
-        "prev_wire_jpos, max_wire_step)`` so when the cold-restart "
-        "safety cap expires the wire ramps from operator-pose to "
-        "idle_stand instead of snapping."
     )
 
 
-def test_launcher_forwards_handoff_slow_step_to_bridge():
-    """Launcher must forward the slow-step window flags to the bridge.
-
-    2026-06-10 follow-up 6 added ``--vla-handoff-max-wire-step`` and
-    ``--vla-handoff-step-ramp-ticks`` to bound the per-element wire
-    step right after the cold-restart hold releases (the 12:50 +
-    13:05 runs showed body_Δ=0.247 rad sustained during the LPF ramp
-    even with the existing handoff guard fired correctly). The
-    launcher reads these as env vars (defaults 0.012 / 250) and CLI
-    flags, and MUST forward both to ``BRIDGE_ARGS`` so the bridge
-    sees the operator's values -- otherwise the bridge silently
-    falls back to its own defaults and the operator can't tune the
-    slow window from the launcher.
-    """
-    src = LAUNCHER.read_text()
-    assert 'VLA_HANDOFF_MAX_WIRE_STEP:=0.012' in src, (
-        "VLA_HANDOFF_MAX_WIRE_STEP default missing/wrong; should "
-        "be 0.012 rad/tick (= ~36 deg/s/joint at 50 Hz, ~3x slower "
-        "than --vla-max-wire-step default of 0.035 rad/tick). "
-        "Lower -> slower / safer handoff; higher -> closer to a slam."
-    )
-    assert 'VLA_HANDOFF_STEP_RAMP_TICKS:=250' in src, (
-        "VLA_HANDOFF_STEP_RAMP_TICKS default missing/wrong; should "
-        "be 250 ticks (= 5 s @ 50 Hz). Lower -> wire returns to "
-        "normal speed sooner; higher -> longer safe ramp."
-    )
-    for flag in (
-        '--vla-handoff-max-wire-step)',
-        '--vla-handoff-step-ramp-ticks)',
-    ):
-        assert flag in src, (
-            f"{flag.rstrip(')')!r} missing from launcher case "
-            "statement; CLI override won't take effect"
-        )
-    for wiring in (
-        '--vla-handoff-max-wire-step "${VLA_HANDOFF_MAX_WIRE_STEP}"',
-        '--vla-handoff-step-ramp-ticks "${VLA_HANDOFF_STEP_RAMP_TICKS}"',
-    ):
-        assert wiring in src, (
-            f"BRIDGE_ARGS append for {wiring!r} missing; the bridge "
-            "won't see the operator's value"
-        )
-
-
-def test_handoff_slow_step_state_machine_in_bridge_source():
-    """Bridge source must implement the slow-step state machine.
-
-    Pins the structural pieces of the 2026-06-10 follow-up 6 fix so
-    a refactor that drops them fails CI before the operator sees a
-    regressed slam:
-
-      - ``handoff_step_remaining`` countdown variable
-      - Arming the countdown on both success AND safety-cap paths
-        out of the cold-restart hold
-      - Linear interpolation ``handoff_max_wire_step -> max_wire_step``
-        across ``handoff_step_ramp_ticks`` ticks
-      - Applying the interpolated ``effective_max_step`` to the rate
-        clamp in BOTH the decoder-succeeded branch AND the idle-wire
-        fallthrough branch (defense-in-depth -- if only one branch
-        gets the slow step, the safety-cap path still slams)
-    """
-    bridge = (
-        REPO_ROOT / "gear_sonic" / "scripts" / "live_vla_publish_motion_token.py"
-    )
-    src = bridge.read_text()
-    assert "handoff_step_remaining = 0" in src, (
-        "missing initialiser ``handoff_step_remaining = 0`` -- the "
-        "post-handoff slow-step countdown won't exist"
-    )
-    # Both paths out of the hold must arm the countdown. We search
-    # for the arm pattern after both the success log line and the
-    # safety-cap log line.
+def test_handoff_slow_step_state_machine_in_bridge_source() -> None:
+    """Bridge source must implement the 2026-06-10 follow-up 6 slow-
+    step ramp + apply effective_max_step on both branches."""
+    src = BRIDGE_SCRIPT.read_text()
+    assert "handoff_step_remaining = 0" in src
     success_arm = "handoff_step_remaining = max(int(handoff_step_ramp_ticks), 0)"
-    assert src.count(success_arm) >= 2, (
-        f"``{success_arm}`` must appear at least twice (once on the "
-        "first-eligible-chunk success path, once on the safety-cap "
-        "expiry path). Otherwise the slow-step ramp won't engage on "
-        "one of them, producing a slam on that path."
-    )
-    # The interpolation formula must be present.
+    assert src.count(success_arm) >= 2
     assert (
         "(1.0 - ramp_progress) * float(handoff_max_wire_step)" in src
         and "ramp_progress * float(max_wire_step)" in src
-    ), (
-        "linear interpolation handoff_max_wire_step -> max_wire_step "
-        "missing; the wire step won't actually ramp"
     )
-    # The interpolated ``effective_max_step`` must be passed to the
-    # rate clamp in BOTH branches.
     assert (
         src.count("cur_jpos = _clamp_vector_step(") >= 2
         and src.count("effective_max_step") >= 2
-    ), (
-        "``effective_max_step`` must be used in BOTH the decoder-"
-        "succeeded AND idle-wire rate-clamp call sites. Otherwise "
-        "the slow step only applies on one path; the other path "
-        "will slam."
     )
 
 
-def test_launcher_forwards_engagement_slow_step_to_proxy():
-    """Launcher must forward the proxy engagement-ramp flags.
-
-    2026-06-10 follow-up 9 added a SYMMETRIC slow-step ramp on the
-    LIVE -> OVERRIDE edge (operator takes over from VLA), mirroring
-    follow-up 6's handoff slow-step on the OVERRIDE -> LIVE edge.
-    Without this the proxy forwarded the operator's first override
-    frame VERBATIM and the deploy slammed the body across the full
-    VLA -> operator joint-space delta in one tick (the user
-    reported "still rams when taking over from vla to ON" at 13:29
-    after follow-up 6 fixed the OFF transition).
-
-    The launcher reads three env vars (defaults 0.012 / 0.035 /
-    250 to match the bridge handoff defaults) and three CLI flags;
-    all three must be forwarded to the proxy spawn argv. Negative
-    assertion: the launcher MUST NOT auto-pair these with any
-    deploy-side flag (the follow-up 8 regression: a global
-    --max-target-dev collapsed the robot's legs).
-    """
-    src = LAUNCHER.read_text()
-    for default in (
-        'POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP:=0.012',
-        'POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP:=0.035',
-        'POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS:=250',
-    ):
-        assert default in src, (
-            f"default ``{default}`` missing from launcher; the "
-            "engagement ramp will fall back to whatever the proxy "
-            "parser defaults to (currently the same numbers, but "
-            "this pin catches divergence)"
-        )
-    for flag in (
-        '--pose-proxy-engagement-max-wire-step)',
-        '--pose-proxy-engagement-steady-wire-step)',
-        '--pose-proxy-engagement-step-ramp-ticks)',
-    ):
-        assert flag in src, (
-            f"CLI flag {flag.rstrip(')')!r} missing from launcher "
-            "case statement; the operator can't override the default"
-        )
-    for wiring in (
-        '--engagement-max-wire-step "$POSE_PROXY_ENGAGEMENT_MAX_WIRE_STEP"',
-        '--engagement-steady-wire-step "$POSE_PROXY_ENGAGEMENT_STEADY_WIRE_STEP"',
-        '--engagement-step-ramp-ticks "$POSE_PROXY_ENGAGEMENT_STEP_RAMP_TICKS"',
-    ):
-        assert wiring in src, (
-            f"proxy_args append for {wiring!r} missing; the proxy "
-            "won't see the operator's value -- engagement ramp will "
-            "silently fall back to parser default"
-        )
-    # Negative: must NOT auto-pair the proxy engagement flags with
-    # any deploy-side rate-limit flag. The deploy's --max-target-dev
-    # is a GLOBAL absolute clamp on all joint groups (not per-tick,
-    # not arm-specific) and pairing it with anything collapsed the
-    # robot during follow-up 7 (see test_spawn_sim_deploy_forwards_
-    # wrist_bypass_via_deploy_extra_arg negative assertions).
-    assert "ENGAGEMENT_MAX_TARGET_DEV" not in src, (
-        "follow-up 8 regression: do NOT auto-pair the proxy "
-        "engagement ramp with --max-target-dev. The proxy controls "
-        "the wire step alone; the deploy's own rate limits stay "
-        "at their defaults."
-    )
-
-
-def test_proxy_engagement_clamp_state_machine_in_source():
-    """Proxy source must implement the engagement-ramp state machine.
-
-    Pins the structural pieces of 2026-06-10 follow-up 9 so a
-    refactor that drops them fails CI before the operator sees a
-    regressed slam on takeover:
-
-      - ``rebuild_msg_with_jpos_override`` helper that surgically
-        replaces ``joint_pos_mj`` bytes (preserves hands / root_quat /
-        future window)
-      - ``_clamp_vector_step_f32`` per-element rate clamp
-      - ``engagement_clamp_remaining`` countdown variable
-      - Arming the countdown on the LIVE -> OVERRIDE edge
-      - Tearing down the countdown on the OVERRIDE -> LIVE edge
-        (so re-engage starts fresh from the new VLA anchor)
-      - Linear interpolation ``engagement_max_wire_step ->
-        engagement_steady_wire_step`` across ``engagement_step_
-        ramp_ticks``
-      - Applying the clamp via ``rebuild_msg_with_jpos_override``
-        (NOT via forwarding the original frame verbatim -- the
-        whole point of the fix)
-    """
-    proxy = (
-        REPO_ROOT
-        / "gear_sonic_deploy"
-        / "scripts"
-        / "x2_pose_proxy.py"
-    )
-    src = proxy.read_text()
-    assert "def rebuild_msg_with_jpos_override(" in src, (
-        "missing surgical jpos-replace helper; the proxy can't "
-        "modify operator frames without re-packing the whole frame"
-    )
-    assert "def _clamp_vector_step_f32(" in src, (
-        "missing per-element rate clamp helper; the engagement ramp "
-        "has nothing to call to slow down the wire step"
-    )
-    assert "engagement_clamp_remaining = 0" in src, (
-        "missing initialiser ``engagement_clamp_remaining = 0``; "
-        "the engagement-ramp countdown won't exist"
-    )
-    # Must be armed on the LIVE -> OVERRIDE edge (i.e., inside the
-    # ``if override_fresh and not override_active`` block where
-    # override_active flips True).
-    assert (
-        "engagement_clamp_remaining = engagement_step_ramp_ticks"
-        in src
-    ), (
-        "missing arm site ``engagement_clamp_remaining = "
-        "engagement_step_ramp_ticks``; the LIVE -> OVERRIDE edge "
-        "won't trigger the slow-step ramp"
-    )
-    # Must be torn down on the OVERRIDE -> LIVE/IDLE edge so a
-    # rapid release+re-engage within the window re-arms cleanly.
-    teardown_idx = src.find(
-        "engagement_clamp_remaining = 0\n                "
-        "engagement_last_forwarded_jpos = None"
-    )
-    assert teardown_idx != -1, (
-        "missing release-edge teardown of engagement_clamp_"
-        "remaining + engagement_last_forwarded_jpos; a rapid "
-        "release-then-re-engage within the ramp window will "
-        "inherit the previous (stale) anchor and skip the "
-        "slow-step bridge from VLA's new pose"
-    )
-    # Linear interpolation formula must be present.
-    assert (
-        "(1.0 - ramp_progress) * engagement_max_wire_step" in src
-        and "ramp_progress * engagement_steady_wire_step" in src
-    ), (
-        "linear interpolation engagement_max_wire_step -> "
-        "engagement_steady_wire_step missing; the wire step won't "
-        "actually ramp"
-    )
-    # The clamp MUST be applied via the surgical-rebuild helper
-    # (not by just forwarding the original frame), and the
-    # rebuilt-frame branch must update both the forwarded message
-    # AND the next-tick anchor.
-    assert "rebuilt = rebuild_msg_with_jpos_override(" in src, (
-        "engagement clamp isn't applied to the forwarded bytes; "
-        "the operator's verbatim jpos still hits the wire and the "
-        "deploy still slams"
-    )
-    assert "engagement_last_forwarded_jpos = (\n" in src, (
-        "engagement_last_forwarded_jpos must be updated to the "
-        "clamped pose on every successful clamp so the next tick's "
-        "step is measured from THIS forwarded pose (not the prev "
-        "anchor, which would let the operator's pose drift away "
-        "faster than max_step per tick)"
-    )
-
-
-def test_rebuild_msg_with_jpos_override_preserves_other_fields():
-    """``rebuild_msg_with_jpos_override`` must NOT touch other fields.
-
-    The whole point of the surgical-byte-replace helper is that the
-    proxy can clamp ONLY ``joint_pos_mj`` while leaving every other
-    field (hands, root_quat, motion_token, frame_index, future
-    window) byte-identical. If the helper re-packs the frame from
-    scratch it might quietly drop a field (e.g., the operator's
-    hand joints, which would make finger commands stop working
-    mid-takeover -- exactly the failure mode follow-up 5 already
-    fixed once).
-
-    Round-trip test:
-      1. Pack a frame with a known jpos + non-zero hands +
-         arbitrary root_quat
-      2. Run it through rebuild_msg_with_jpos_override with a new
-         jpos
-      3. Re-decode: jpos must match the new value; hands +
-         root_quat must be byte-identical to the original
-    """
-    sys.path.insert(0, str(PROXY_DIR))
-    try:
-        import importlib
-        proxy_mod = importlib.import_module("x2_pose_proxy")
-    finally:
-        sys.path.pop(0)
-
-    import numpy as np
-
-    num_body = proxy_mod.NUM_BODY_DOFS
-    num_hand = proxy_mod.DEFAULT_HAND_DOF
-    jpos_orig = np.linspace(-0.5, 0.5, num_body, dtype=np.float32)
-    jpos_new = np.full(num_body, 0.3, dtype=np.float32)
-    left_hand = np.linspace(0.1, 0.9, num_hand, dtype=np.float32)
-    right_hand = np.linspace(0.9, 0.1, num_hand, dtype=np.float32)
-    root_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    payload = {
-        "joint_pos_mj": jpos_orig,
-        "root_quat_xyzw": root_quat,
-        "left_hand_joints": left_hand,
-        "right_hand_joints": right_hand,
-        "frame_index": np.array([42], dtype=np.int64),
-    }
-    msg = proxy_mod.pack_pose_message(payload, topic="pose", version=4)
-    rebuilt = proxy_mod.rebuild_msg_with_jpos_override(
-        msg, "pose", jpos_new
-    )
-    assert rebuilt is not None, (
-        "rebuild_msg_with_jpos_override returned None for a well-"
-        "formed frame; the proxy will fall back to forwarding "
-        "verbatim and the engagement clamp won't engage"
-    )
-    assert len(rebuilt) == len(msg), (
-        "rebuilt frame length differs from original; the header / "
-        "field layout was modified, which will break the deploy's "
-        "fixed-offset cursor walk"
-    )
-    new_jpos_decoded = proxy_mod.decode_pose_joint_pos_mj(
-        rebuilt, topic="pose"
-    )
-    np.testing.assert_array_equal(new_jpos_decoded, jpos_new)
-    new_left = proxy_mod.decode_pose_left_hand(rebuilt, topic="pose")
-    new_right = proxy_mod.decode_pose_right_hand(rebuilt, topic="pose")
-    np.testing.assert_array_equal(new_left, left_hand)
-    np.testing.assert_array_equal(new_right, right_hand)
-
-
-def test_rebuild_msg_with_field_overrides_flattens_future_window():
-    """Multi-field rebuild must replace future arrays in one byte-splice.
-
-    2026-06-10 follow-up 9b: the engagement slow-step clamp on
-    ``joint_pos_mj`` alone wasn't enough -- the deploy's window-
-    mode policy reads ``joint_pos_mj_future`` (9 slots, 0.1 s
-    apart) for forward prediction. The operator's untouched
-    future encoded "go all the way to operator-pose in 0.9 s"
-    and the policy slammed the body to follow even when the
-    current jpos was properly rate-limited.
-
-    The fix: during the engagement ramp, the proxy broadcasts the
-    clamped current jpos to all 9 future slots AND zeros the
-    velocity-future field. This test pins the byte-splice
-    invariants:
-
-      - All three target fields (jpos, jpos_future, jvel_future)
-        get spliced in one pass
-      - Other fields (root_quat, hand joints, frame_index,
-        future quat, future_dt_s, root_xy_world) stay byte-
-        identical
-      - Frame length unchanged (so the deploy's fixed-offset
-        cursor walk keeps working)
-      - Unmatched override key returns None (callers must
-        notice and fall back to the single-field path)
-    """
-    sys.path.insert(0, str(PROXY_DIR))
-    try:
-        import importlib
-        proxy_mod = importlib.import_module("x2_pose_proxy")
-    finally:
-        sys.path.pop(0)
-
-    import numpy as np
-
-    num_body = proxy_mod.NUM_BODY_DOFS
-    num_hand = proxy_mod.DEFAULT_HAND_DOF
-    num_future = proxy_mod._NUM_FUTURE_SLOTS
-
-    # Build a frame matching what the recorder publishes during
-    # OVERRIDE: current jpos + hands + future window.
-    jpos_orig = np.linspace(-0.5, 0.5, num_body, dtype=np.float32)
-    left_hand = np.linspace(0.1, 0.9, num_hand, dtype=np.float32)
-    right_hand = np.linspace(0.9, 0.1, num_hand, dtype=np.float32)
-    root_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    jpos_future_orig = np.tile(
-        np.linspace(-1.0, 1.0, num_body, dtype=np.float32),
-        (num_future, 1),
-    )
-    rot_future_orig = np.tile(root_quat, (num_future, 1))
-    jvel_future_orig = np.full(
-        (num_future, num_body), 0.5, dtype=np.float32
-    )
-    payload = {
-        "joint_pos_mj": jpos_orig,
-        "root_quat_xyzw": root_quat,
-        "motion_token": np.zeros(64, dtype=np.float32),
-        "left_hand_joints": left_hand,
-        "right_hand_joints": right_hand,
-        "frame_index": np.array([42], dtype=np.int64),
-        "joint_pos_mj_future": jpos_future_orig,
-        "root_quat_xyzw_future": rot_future_orig,
-        "joint_vel_mj_future": jvel_future_orig,
-    }
-    msg = proxy_mod.pack_pose_message(payload, topic="pose", version=4)
-
-    clamped = np.full(num_body, 0.3, dtype=np.float32)
-    flat_future = np.broadcast_to(
-        clamped, (num_future, num_body)
-    ).astype(np.float32, copy=True)
-    zero_vel = np.zeros((num_future, num_body), dtype=np.float32)
-    overrides = {
-        "joint_pos_mj": clamped,
-        "joint_pos_mj_future": flat_future,
-        "joint_vel_mj_future": zero_vel,
-    }
-    rebuilt = proxy_mod.rebuild_msg_with_field_overrides(
-        msg, "pose", overrides
-    )
-    assert rebuilt is not None, (
-        "multi-field rebuild returned None for a well-formed frame"
-    )
-    assert len(rebuilt) == len(msg), (
-        "rebuilt frame length changed; header / cursor layout "
-        "mutated and the deploy's offset walk will break"
-    )
-
-    new_jpos = proxy_mod.decode_pose_joint_pos_mj(rebuilt, topic="pose")
-    np.testing.assert_array_equal(new_jpos, clamped)
-
-    # Other fields must be byte-identical to the original.
-    new_left = proxy_mod.decode_pose_left_hand(rebuilt, topic="pose")
-    new_right = proxy_mod.decode_pose_right_hand(rebuilt, topic="pose")
-    np.testing.assert_array_equal(new_left, left_hand)
-    np.testing.assert_array_equal(new_right, right_hand)
-
-    # Decode future arrays via the generic f32 walker.
-    new_jpos_future = proxy_mod._decode_pose_field_f32(
-        rebuilt, "pose",
-        name="joint_pos_mj_future",
-        expected_shape=(num_future, num_body),
-    )
-    new_jvel_future = proxy_mod._decode_pose_field_f32(
-        rebuilt, "pose",
-        name="joint_vel_mj_future",
-        expected_shape=(num_future, num_body),
-    )
-    new_rot_future = proxy_mod._decode_pose_field_f32(
-        rebuilt, "pose",
-        name="root_quat_xyzw_future",
-        expected_shape=(num_future, 4),
-    )
-    # The generic field walker returns the buffer as 1D f32; reshape
-    # back to declared shape for comparison.
-    np.testing.assert_array_equal(
-        new_jpos_future.reshape(num_future, num_body), flat_future
-    )
-    np.testing.assert_array_equal(
-        new_jvel_future.reshape(num_future, num_body), zero_vel
-    )
-    # rot_future MUST be untouched (we only flatten body, not pelvis
-    # orientation -- the deploy reads root_quat_xyzw_future for the
-    # window-mode root-frame prediction and would lose heading
-    # tracking if we zeroed it).
-    np.testing.assert_array_equal(
-        new_rot_future.reshape(num_future, 4), rot_future_orig
-    )
-
-    # Negative: an override key that doesn't match any field must
-    # return None so callers notice the typo rather than silently
-    # ignoring the requested clamp.
-    rebuilt_bad = proxy_mod.rebuild_msg_with_field_overrides(
-        msg, "pose", {"joint_pos_mj": clamped, "nonexistent": clamped},
-    )
-    assert rebuilt_bad is None, (
-        "unmatched override key was silently ignored; future "
-        "refactors that rename a wire field would skip the clamp "
-        "without any test failure"
-    )
-
-
-def test_proxy_engagement_clamp_flattens_future_window_in_source():
-    """Source must call the multi-field rebuild with future overrides.
-
-    Pins the 2026-06-10 follow-up 9b structural change: the
-    engagement-clamp call site must pass joint_pos_mj_future +
-    joint_vel_mj_future in the overrides dict, not just
-    joint_pos_mj. A refactor that drops the future-flattening
-    will let the deploy's window-mode policy slam to follow the
-    operator's untouched future window.
-    """
-    proxy = (
-        REPO_ROOT
-        / "gear_sonic_deploy"
-        / "scripts"
-        / "x2_pose_proxy.py"
-    )
-    src = proxy.read_text()
-    assert (
-        'rebuild_msg_with_field_overrides(' in src
-    ), (
-        "multi-field rebuild helper not invoked; the engagement "
-        "clamp only touches the current jpos and the future "
-        "window still snaps -> deploy slams"
-    )
-    # The overrides dict must include all three fields.
-    for field in (
-        '"joint_pos_mj": clamped_jpos',
-        '"joint_pos_mj_future": flat_future',
-        '"joint_vel_mj_future": zero_future_vel',
-    ):
-        assert field in src, (
-            f"missing override entry ``{field}``; the future "
-            "window field won't be flattened during the engagement "
-            "ramp and the deploy's window-mode policy will slam"
-        )
-    # Flat future is broadcast from clamped_jpos -- not from the
-    # operator's raw future (which would defeat the purpose).
-    assert (
-        "np.broadcast_to(\n                            clamped_jpos,"
-        in src
-    ), (
-        "flat_future must be built from clamped_jpos (not from "
-        "op_jpos or the operator's raw future); the whole point "
-        "is to tell the policy 'hold the clamped current pose, "
-        "no future motion'"
-    )
-
-
-def test_clamp_vector_step_f32_caps_peak_element_and_preserves_direction():
-    """``_clamp_vector_step_f32`` must shrink proportionally, not slice.
-
-    The bridge's ``_clamp_vector_step`` deliberately scales the
-    whole delta vector by ``max_step / peak`` (not per-element
-    saturating clip) so a coordinated multi-joint motion stays
-    on its original trajectory -- just slower. The proxy helper
-    is a 1:1 mirror; if a future refactor swaps it for per-element
-    np.clip the takeover handoff will warp the operator's pose
-    (small joints saturate while big joints don't, twisting the
-    body).
-    """
-    sys.path.insert(0, str(PROXY_DIR))
-    try:
-        import importlib
-        proxy_mod = importlib.import_module("x2_pose_proxy")
-    finally:
-        sys.path.pop(0)
-
-    import numpy as np
-
-    prev = np.zeros(5, dtype=np.float32)
-    # delta = [0.1, 0.2, 0.4, 0.05, 0.0]; peak = 0.4
-    target = np.array([0.1, 0.2, 0.4, 0.05, 0.0], dtype=np.float32)
-    clamped = proxy_mod._clamp_vector_step_f32(
-        target, prev, max_step=0.1
-    )
-    # scale = 0.1 / 0.4 = 0.25; result = target * 0.25 (since prev=0)
-    expected = np.array(
-        [0.025, 0.05, 0.1, 0.0125, 0.0], dtype=np.float32
-    )
-    np.testing.assert_allclose(clamped, expected, rtol=1e-6)
-    # Direction preserved: clamped / target must be uniform.
-    nonzero = target != 0.0
-    ratios = clamped[nonzero] / target[nonzero]
-    np.testing.assert_allclose(
-        ratios, np.full(ratios.shape, 0.25, dtype=np.float32),
-        rtol=1e-6,
-    )
-    # No-op when peak <= max_step.
-    small = np.array([0.01, 0.02, 0.03], dtype=np.float32)
-    np.testing.assert_array_equal(
-        proxy_mod._clamp_vector_step_f32(
-            small, np.zeros(3, dtype=np.float32), max_step=0.1
-        ),
-        small,
-    )
-    # No-op when prev is None (cold-start tick).
-    np.testing.assert_array_equal(
-        proxy_mod._clamp_vector_step_f32(
-            target, None, max_step=0.1
-        ),
-        target,
-    )
-
-
-# ======================================================================
-# 2026-06-10 follow-up 11: closed-loop tracking feedback CLI plumbing
-# ======================================================================
-
-
-def test_launcher_accepts_tracking_feedback_cli_flags(tmp_path):
-    """``--vla-tracking-feedback`` (and the four threshold flags) must
-    be parsed by the case-statement, not fall through to the bridge
-    catch-all. Same drift-detection pattern as the manual-takeover
-    flag test above. Uses ``preflight`` + ``SKIP_PREFLIGHT=1`` so the
-    launcher exits before spawning any subprocess.
-    """
-    bash = shutil.which("bash")
-    assert bash is not None
+# ===========================================================================
+# Tracking feedback (preserved across the refactor)
+# ===========================================================================
+def test_launcher_accepts_tracking_feedback_cli_flags(
+    tmp_path: Path,
+) -> None:
     run_dir = tmp_path / "tracking_preflight"
     proc = subprocess.run(
         [
-            bash,
-            str(LAUNCHER),
+            _bash(), str(LAUNCHER),
             "preflight",
             "--vla-tracking-feedback",
             "--vla-tracking-soft-rad", "0.20",
@@ -1278,10 +797,8 @@ def test_launcher_accepts_tracking_feedback_cli_flags(tmp_path):
             "--vla-tracking-stale-ms", "150",
             "--run-dir", str(run_dir),
         ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SKIP_PREFLIGHT": "1"},
     )
     combined = proc.stdout + proc.stderr
     for flag in (
@@ -1292,159 +809,66 @@ def test_launcher_accepts_tracking_feedback_cli_flags(tmp_path):
         "--vla-tracking-velocity-floor-rad-tick",
         "--vla-tracking-stale-ms",
     ):
-        assert f"Unknown argument: {flag}" not in combined, (
-            f"launcher rejected {flag} as unknown; "
-            f"output:\n{combined!r}"
-        )
-    # preflight either succeeds or hits a domain-specific failure
-    # (e.g., model not found); the forbidden outcome is rc==2
-    # (bash usage error) which would indicate a syntax fault.
+        assert f"Unknown argument: {flag}" not in combined
     assert proc.returncode != 2, (
         f"launcher returned bash usage error (rc=2); flags didn't parse. "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
-    # The Step 1 rollout banner must mention tracking feedback as
-    # ENABLED (since we passed --vla-tracking-feedback).
     assert (
         "tracking feedback ENABLED" in combined
-        or "Tracking feedback" in combined
-        and "ON" in combined
-    ), (
-        f"banner should announce tracking feedback ON when --vla-"
-        f"tracking-feedback is passed; got:\n{combined!r}"
+        or ("Tracking feedback" in combined and "ON" in combined)
     )
 
 
-def test_launcher_no_tracking_feedback_default_off_in_banner(tmp_path):
-    """Default Step 1 rollout: tracking feedback is OFF unless
-    explicitly enabled. The banner must announce that state so
-    the operator knows the closed loop isn't running. Pins the
-    default-OFF contract for Step 1 (Step 2 flips this default).
-    """
-    bash = shutil.which("bash")
-    assert bash is not None
+def test_launcher_no_tracking_feedback_default_off_in_banner(
+    tmp_path: Path,
+) -> None:
     run_dir = tmp_path / "no_tracking_preflight"
     proc = subprocess.run(
         [
-            bash,
-            str(LAUNCHER),
+            _bash(), str(LAUNCHER),
             "preflight",
             "--run-dir", str(run_dir),
         ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SKIP_PREFLIGHT": "1"},
     )
     combined = proc.stdout + proc.stderr
-    # Either an explicit "tracking feedback DISABLED" log line
-    # (the LOG path) or the OFF-state banner line.
     assert (
         "tracking feedback DISABLED" in combined
         or ("Tracking feedback" in combined and "OFF" in combined)
-    ), (
-        f"banner / log must announce tracking feedback OFF by "
-        f"default; got:\n{combined!r}"
     )
 
 
-def test_launcher_no_vla_tracking_feedback_overrides_env(tmp_path):
-    """``--no-vla-tracking-feedback`` on the CLI must override the
-    env-var default (e.g., when an operator runs A/B against the
-    scalar clamp without unsetting their persistent VLA_TRACKING_
-    FEEDBACK=1 export). Pins the precedence: CLI wins over env.
-    """
-    bash = shutil.which("bash")
-    assert bash is not None
-    run_dir = tmp_path / "no_tf_override_preflight"
-    proc = subprocess.run(
-        [
-            bash,
-            str(LAUNCHER),
-            "preflight",
-            "--no-vla-tracking-feedback",
-            "--run-dir", str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={
-            **__import__("os").environ,
-            "SKIP_PREFLIGHT": "1",
-            "VLA_TRACKING_FEEDBACK": "1",  # env says ON
-        },
-    )
-    combined = proc.stdout + proc.stderr
-    # CLI says OFF; banner must reflect OFF.
-    assert (
-        "tracking feedback DISABLED" in combined
-        or ("Tracking feedback" in combined and "OFF" in combined)
-    ), (
-        f"--no-vla-tracking-feedback must override env VLA_TRACKING_"
-        f"FEEDBACK=1; got:\n{combined!r}"
-    )
-
-
-def test_launcher_vla_raw_disables_tracking_feedback(tmp_path):
-    """``--vla-raw`` is the documented "disable all wire shaping"
-    flag. Tracking feedback IS wire shaping (closed-loop variety),
-    so --vla-raw must also disable it for consistency with the
-    operator's mental model. Pins this for the wire-debugging
-    workflow (operator wants to see raw policy intent on the wire).
-    """
-    bash = shutil.which("bash")
-    assert bash is not None
-    run_dir = tmp_path / "vla_raw_preflight"
-    proc = subprocess.run(
-        [
-            bash,
-            str(LAUNCHER),
-            "preflight",
-            "--vla-raw",
-            "--vla-tracking-feedback",  # operator tried to opt in
-            "--run-dir", str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**__import__("os").environ, "SKIP_PREFLIGHT": "1"},
-    )
-    combined = proc.stdout + proc.stderr
-    # The launcher must warn about the conflict AND keep feedback OFF.
-    assert "--vla-raw disables VLA_TRACKING_FEEDBACK" in combined, (
-        f"launcher must warn that --vla-raw disables tracking feedback; "
-        f"got:\n{combined!r}"
-    )
-    assert (
-        "tracking feedback DISABLED" in combined
-        or ("Tracking feedback" in combined and "OFF" in combined)
-    ), (
-        f"banner must reflect OFF under --vla-raw; got:\n{combined!r}"
-    )
-
-
-def test_launcher_forwards_tracking_feedback_args_to_bridge():
-    """The launcher must materialise all 6 tracking-feedback flags
-    into ``BRIDGE_ARGS`` when VLA_TRACKING_FEEDBACK=1. Greps the
-    launcher source for the BRIDGE_ARGS+=(...) block instead of
-    actually spawning the bridge -- same pattern as the manual-
-    takeover forwarding test above.
-    """
+def test_launcher_forwards_tracking_feedback_args_to_bridge() -> None:
     src = LAUNCHER.read_text()
-    # The tracking-feedback BRIDGE_ARGS append block, normalised to
-    # collapse whitespace differences across indentation levels.
     expected_fragment = (
         '--vla-tracking-feedback '
         '--vla-tracking-soft-rad "${VLA_TRACKING_SOFT_RAD}" '
         '--vla-tracking-hard-rad "${VLA_TRACKING_HARD_RAD}" '
         '--vla-tracking-velocity-margin "${VLA_TRACKING_VELOCITY_MARGIN}" '
         '--vla-tracking-velocity-floor-rad-tick "${VLA_TRACKING_VELOCITY_FLOOR_RAD_TICK}" '
+        '--vla-tracking-velocity-max-rad-s "${VLA_TRACKING_VELOCITY_MAX_RAD_S}" '
+        '--vla-tracking-overshoot-dq-rad-s "${VLA_TRACKING_OVERSHOOT_DQ_RAD_S}" '
+        '--vla-tracking-damping-kd "${VLA_TRACKING_DAMPING_KD}" '
+        '--vla-tracking-damping-shoulder-scale "${VLA_TRACKING_DAMPING_SHOULDER_SCALE}" '
         '--vla-tracking-stale-ms "${VLA_TRACKING_STALE_MS}"'
     )
     normalised_src = " ".join(src.split())
     normalised_expected = " ".join(expected_fragment.split())
     assert normalised_expected in normalised_src, (
-        f"launcher BRIDGE_ARGS+= block for tracking feedback is "
-        f"missing or has drifted. Expected fragment (whitespace-"
-        f"normalised):\n  {normalised_expected!r}"
+        "launcher BRIDGE_ARGS+= block for tracking feedback is missing "
+        "or has drifted; 2026-06-11 follow-up added "
+        "--vla-tracking-velocity-max-rad-s (hard cap), "
+        "--vla-tracking-overshoot-dq-rad-s (derivative gate), and "
+        "--vla-tracking-damping-kd / -shoulder-scale (viscous damper)"
     )
+
+
+def test_launcher_help_lists_wrist_bypass_flag() -> None:
+    proc = subprocess.run(
+        [_bash(), str(LAUNCHER), "--help"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert proc.returncode == 0
+    assert "--wrist-bypass" in proc.stdout

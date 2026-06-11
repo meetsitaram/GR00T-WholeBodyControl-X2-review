@@ -1,9 +1,11 @@
 """Unit tests for the live VLA bridge's manual-takeover signal.
 
 The 2026-06-10 milestone wires a vla_control SUB into the bridge so
-the proxy can drive a cold restart on operator release. The actual
-SUB worker is gated on a running ZMQ peer (covered by the dual-source
-smoke at tests/test_x2_pose_proxy_dual_source.py) but the
+the proxy can drive a cold restart on operator release. The 2026-06-11
+milestone moved the publisher from the PC2 proxy to the laptop-side
+``x2_pose_mux`` (the bridge-side consumer contract is unchanged).
+The actual SUB worker is gated on a running ZMQ peer (covered by the
+dual-source smoke at tests/test_x2_pose_mux_dual_source.py) but the
 ``_VlaControlSignal`` state machine is pure-Python and trivially
 testable here. These tests pin the engage/release/consume semantics
 so a refactor of the publisher's cold-restart consumer can't silently

@@ -1,11 +1,12 @@
-"""Unit tests for the x2_pose_proxy yaw-rebase + x2_debug decoder additions.
+"""Unit tests for pose_pipeline.wire yaw-rebase + x2_debug decoder.
 
-The proxy is shipped to PC2 by ``pc2_bringup.sh`` and runs there with a
-minimal numpy + pyzmq + stdlib budget. These tests pin the three new
-helpers (yaw_from_quat_wxyz, rebase_quats_xyzw_by_yaw,
-decode_x2_debug_base_quat) so a regression in the proxy can't silently
-re-introduce the "robot snaps back to spawn heading on planner-stack
-termination" symptom in production.
+The pose watchdog is shipped to PC2 by ``pc2_bringup.sh`` and runs
+there with a minimal numpy + pyzmq + stdlib budget. The laptop mux
+shares the same helpers. These tests pin the three yaw/quat helpers
+(yaw_from_quat_wxyz, rebase_quats_xyzw_by_yaw,
+decode_x2_debug_base_quat) so a regression can't silently re-introduce
+the "robot snaps back to spawn heading on planner-stack termination"
+symptom in production.
 
 Each helper is exercised in isolation:
 
@@ -39,11 +40,26 @@ import pytest
 from scipy.spatial.transform import Rotation as Rot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROXY_DIR = REPO_ROOT / "gear_sonic_deploy" / "scripts"
-if str(PROXY_DIR) not in sys.path:
-    sys.path.insert(0, str(PROXY_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import x2_pose_proxy as proxy  # noqa: E402
+from gear_sonic.utils.pose_pipeline import fallback, wire  # noqa: E402
+
+
+class _ProxyShim:
+    """Backwards-compatible attribute proxy over wire + fallback."""
+
+    NUM_BODY_DOFS = wire.NUM_BODY_DOFS
+    HEADER_SIZE = wire.HEADER_SIZE
+    X2_DEBUG_HEADER_SIZE = wire.X2_DEBUG_HEADER_SIZE
+    decode_x2_debug_base_quat = staticmethod(wire.decode_x2_debug_base_quat)
+    yaw_from_quat_wxyz = staticmethod(wire.yaw_from_quat_wxyz)
+    rebase_quats_xyzw_by_yaw = staticmethod(wire.rebase_quats_xyzw_by_yaw)
+    IdleStandReplay = fallback.IdleStandReplay
+    build_idle_frame_msg = staticmethod(fallback.build_idle_frame_msg)
+
+
+proxy = _ProxyShim()
 
 
 # ===========================================================================

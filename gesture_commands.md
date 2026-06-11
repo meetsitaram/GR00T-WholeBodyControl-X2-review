@@ -1,5 +1,14 @@
 # Gesture Commands
 
+> **Scope.** This page covers **pre-baked motion clips** (sit / stand /
+> gestures) played via `play_gesture` — these load a `.x2m2` pickle
+> and replay it on the C++ deploy's `--input-type=motion_file` path
+> (or its sim equivalent). For **runtime manual takeover** of a
+> running VLA wire (operator nudges + cold-restart edge events), see
+> `pick_place_commands.md` and the 2026-06-11 pose-pipeline-split
+> milestone — that's a different code path (laptop-side `x2_pose_mux`
+> + PC2-side `x2_pose_watchdog`) and does not use `play_gesture`.
+
 =============== do not auto edit this section ===============
 ### start sonic on PC2 : Robogym Wifi
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \

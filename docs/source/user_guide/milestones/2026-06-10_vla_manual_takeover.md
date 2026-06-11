@@ -1,5 +1,19 @@
 # 2026-06-10 — Manual takeover during VLA inference (no restart)
 
+> **⚠ Architecture superseded on 2026-06-11.** The PC2-side
+> `x2_pose_proxy.py` described below was retired in the
+> [2026-06-11 pose pipeline split](2026-06-11_pose_mux_split.md). The
+> arbitration / engagement-ramp / `vla_control` logic moved to a new
+> laptop-side `x2_pose_mux`; the proxy file became
+> `x2_pose_watchdog` and runs only the fallback ladder. The
+> **operator-visible behaviour is unchanged** (same engage / release
+> semantics, same `vla_control` event protocol, same defaults). The
+> `POSE_PROXY_OVERRIDE_*` env-var surface still works (it now drives
+> the mux instead of the PC2 proxy). Read this milestone for the
+> mechanism / state-machine / tuning rationale; read the 2026-06-11
+> milestone for the current process layout and `--enable-takeover`
+> launcher flag.
+
 > **Session focus.** Give the operator a way to nudge the X2's arms out
 > of a stuck VLA pose using VR teleop **without** restarting the bridge
 > or any other process, and without modifying the Quest 3 manager (the
