@@ -711,6 +711,50 @@ the legacy `action.commanded_body_q_mj` for v0 datasets.
 | `--start-frame INT` / `--end-frame INT` / `--loop` | — | Window + loop the playback. |
 | `--no-omnihand` | off | Drop the OmniHand mesh (debug only). |
 
+### SONIC-loop replay (full deploy + v5 future-window wire)
+
+Plays a recorded episode through the **live SONIC deploy** (sim or
+real robot), so the body physically tracks the recording instead of
+just viewing the parquet in a passive MuJoCo viewer. Single-shell
+launcher; spawns the deploy + the replay client and tears them down
+in reverse order on Ctrl-C. Required reading on the wire contract:
+[2026-06-22 milestone](docs/source/user_guide/milestones/2026-06-22_dataset_replay_v5_wire.md).
+
+```sh
+# Sim (default): brings up deploy_x2.sh sim --vla --sim-with-omnihand
+# --sim-viewer alongside the replay client.
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0
+
+# Sim + recorded-camera rerun viewer side-by-side.
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0 --with-rerun
+
+# Real-robot first pass: half-speed, e-stop in reach. Requires
+# x2_pc2_daemons.sh start to be running on PC2 already.
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0 \
+    --pc2-host 192.168.86.32 --rate-scale 0.5 --with-rerun
+
+# Free :5556 + kill orphan deploy/replay processes after a crashed run.
+./gear_sonic/scripts/run_x2_replay_stack.sh --cleanup-only
+```
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `--dataset NAME-OR-PATH` | — | Dataset root under `data/lerobot/` or any path. |
+| `--episode INT` | `0` | Zero-indexed episode. |
+| `--rate FLOAT` | dataset native fps | Publish rate override. Future-window stride uses native fps (independent of this knob). |
+| `--rate-scale FLOAT` | `1.0` | Multiplier on rate. `0.5` = half-speed wall-clock for cautious first passes. |
+| `--loop` | off | Loop the episode indefinitely. |
+| `--countdown S` | `3.0` | Hold-frame-0 warm-up before the trajectory starts (gives the deploy's handoff ramp time to settle). |
+| `--hold-on-exit S` | `0.5` | Hold-the-last-frame soft stop. SONIC decays PD gains in ~200 ms. |
+| `--no-deploy` / `--pc2-host HOST` | — | Skip spawning a sim deploy (external deploy / real robot, respectively). |
+| `--with-rerun` | off | Spawn `view_x2_recorded_dataset.sh` for the same episode; GUI outlives this wrapper. |
+| `--no-sim-viewer` / `--sim-profile {handoff,parity,manual}` | viewer on, `handoff` | Sim deploy knobs forwarded to `deploy_x2.sh`. |
+| `--duration S` | `0` | Wall-clock cap; `0` = run until the replay's own end-of-episode signal. |
+| `--cleanup-only` | — | Free `:5556`, sweep stale `x2sim` docker containers, exit. |
+
 ### Offline retargeting replay (re-derive parquet from the debug NPZ)
 
 Useful for tuning new retargeter / calibration / filter params against

@@ -1010,76 +1010,121 @@ Useful selectors:
 | `--scalar-decimate N` | Subsample scalars to every Nth frame; useful for > 30 K-frame sessions where chart panes get sluggish. |
 | `--max-scalar-dims K` | Per-column cap on vector expansion. Default 64 covers `body_q_mj` (30) + omnihand (10 + 10) + projected gravity (3). Set to 0 to skip scalars (same as `--skip-scalars`). |
 
-### 6.3 Re-publish the recorded motion tokens to a fresh deploy
+### 6.3 Replay a recorded episode through the live deploy
 
-This is the strongest acceptance gate: it proves the saved
-`action.motion_token` stream alone is enough to re-create the
-on-robot trajectory, end-to-end, with no operator in the loop. We do
-not yet ship a one-line script for this, but the recipe is short:
+This is the strongest acceptance gate the dataset path has: it proves
+the saved `action.body_q_mj` (plus the OmniHand finger columns) is
+enough to re-create the on-robot trajectory end-to-end, with no
+operator and no policy in the loop. The full sim or real-robot stack
+is one command:
 
-1. Launch a fresh deploy (no recorder, no VR):
-
-   ```bash
-   gear_sonic_deploy/deploy_x2.sh sim \
-       --vla \
-       --sim-profile gantry \
-       --sim-with-omnihand \
-       --sim-viewer \
-       --model /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501
-   ```
-
-2. In a second shell, stream the saved tokens at the original 50 Hz
-   over the same `pose` ZMQ topic the recorder used:
-
-   ```python
-   # gear_sonic/scripts/replay_x2_dataset.py  (sketch)
-   import time
-   import numpy as np
-   import pyarrow.parquet as pq
-   import zmq
-   from gear_sonic.scripts.live_vla_publish_motion_token import (
-       DEFAULT_STAND_POSE_MUJOCO_RAD,
-   )
-   from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
-
-   df = pq.read_table(
-       "data/lerobot/x2_quest3_v0/data/chunk-000/episode_000000.parquet"
-   ).to_pandas()
-
-   ctx = zmq.Context.instance()
-   pub = ctx.socket(zmq.PUB)
-   pub.bind("tcp://*:5556")
-   time.sleep(0.5)  # wait for the deploy SUB to wire up
-
-   body = np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32)
-   for frame_idx, row in df.iterrows():
-       msg = pack_pose_message(
-           dict(
-               joint_pos_mj=body,
-               root_quat_xyzw=np.array([0, 0, 0, 1], dtype=np.float32),
-               motion_token=row["action.motion_token"].astype(np.float32),
-               left_hand_joints=row["action.left_hand_joints"].astype(np.float32),
-               right_hand_joints=row["action.right_hand_joints"].astype(np.float32),
-               frame_index=np.array([frame_idx], dtype=np.int64),
-           ),
-           topic="pose",
-           version=4,
-       )
-       pub.send(msg)
-       time.sleep(1 / 50.0)
-   ```
-
-3. Watch the MuJoCo viewer. The robot should re-execute the demo
-   identically (within tracking-policy noise). If it doesn't, the
-   dataset isn't faithful — the recorder is doing something you
-   didn't see, or the FSQ codebook drifted between sessions.
-
-```{admonition} Roadmap
-:class: note
-A `replay_x2_sonic.py` CLI that wraps recipe 6.3 + a multi-episode
-sequencer is on the v1 backlog (it's the SONIC counterpart to the
-kinematic replay shipped in 6.4 below). Today, copy-paste the snippet.
+```bash
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0
 ```
+
+The wrapper brings up `deploy_x2.sh sim --vla --sim-with-omnihand
+--sim-viewer` on localhost, waits for it to log `Launching ...`,
+spawns the replay client against it, and tears everything down in
+reverse order on Ctrl-C (replay gets `SIGINT` first so its
+`hold_on_exit` ramp-down completes against a still-alive deploy
+before the sim container goes away). See the
+[2026-06-22 milestone](../user_guide/milestones/2026-06-22_dataset_replay_v5_wire.md)
+for the topology diagram and the v5 wire contract this depends on.
+
+```{admonition} Why the **body** moves now (and didn't before)
+:class: important
+The C++ deploy on PC2 (`agi_x2_deploy_onnx_ref`) **ignores**
+`motion_token` on the wire and re-tokenizes the trajectory each tick
+from the v5 future window (`joint_pos_mj_future`, 9 slots × 31 DOFs at
+0.1 s spacing). The pre-2026-06-22 replay tool published only the v4
+envelope; the deploy back-filled the future window with the trained
+`default_angles` stand pose and the body held `idle_stand` while only
+the OmniHand fingers tracked (different code path, no future-window
+dependency). The new replay payload includes the v5 future-window
+fields — sourced from `body_q_mj[f+5, f+10, ..., f+45]` and tail-tiled
+past episode end — and the body now tracks the recording.
+```
+
+#### Three deploy modes
+
+| Mode | Flag | What happens |
+|---|---|---|
+| **Sim (default)** | (none) | Wrapper spawns `deploy_x2.sh sim --vla --sim-profile handoff --sim-with-omnihand --sim-viewer --wrist-bypass ik`. Safe for first-pass validation. |
+| **External deploy** | `--no-deploy` | Skips the spawn; assume you brought up a deploy in another shell. Useful for inspecting the wire with a separate `pose` SUB. |
+| **Real robot** | `--pc2-host <PC2_IP>` | Skips the spawn; assume `x2_pc2_daemons.sh start` is already running on PC2. The replayer's PUB still binds locally (`*:5556`); PC2 connects out. |
+
+#### Useful flags (all forward to `replay_x2_dataset` 1-for-1)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--dataset <name-or-path>` | — | Short name under `data/lerobot/` or absolute path. **Required.** |
+| `--episode <int>` | `0` | Zero-indexed episode within the dataset. |
+| `--rate <Hz>` | dataset native fps | Override the publish rate. The v5 future-window stride is always derived from the dataset's NATIVE fps, so `--rate` only changes the publish cadence, not the per-slot lookahead. |
+| `--rate-scale <float>` | `1.0` | Multiplier on rate. `0.5` = half-speed wall-clock playback. The future window still represents 0.1 s per slot of the source's recorded dynamics (correct for the deploy's tokenizer). |
+| `--loop` | off | Loop the episode indefinitely. |
+| `--countdown <s>` | `3.0` | Seconds of "hold frame 0" warm-up before the trajectory starts. Gives the deploy's handoff ramp time to transition from default angles to the recording's starting pose. |
+| `--hold-on-exit <s>` | `0.5` | Seconds of "hold the last frame" before exit. SONIC's safety stack decays PD gains in ~200 ms; 0.5 s is the soft-stop window. |
+| `--with-rerun` | off | Also spawn the [recorded-camera viewer](#62-rerun-viewer-for-the-recorded-dataset-view_x2_recorded_datasetsh) for the same `--dataset` / `--episode`. The rerun GUI process is spawned by `rr.init(spawn=True)` and **outlives this wrapper** so you can scrub the recording after the live run ends. Requires the dedicated `.venv-viewer/`; see `install_scripts/install_viewer.sh`. |
+| `--no-sim-viewer` | off | Headless variant (no MuJoCo window). Useful for CI / capture sweeps. |
+| `--duration <s>` | `0` | Wall-clock cap; `0` = run until the replay's own end-of-episode signal. |
+| `--cleanup-only` | — | Free `:5556`, sweep stale `x2sim` docker containers from a crashed run, exit. |
+
+#### Example: sim + recorded cameras side-by-side
+
+```bash
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0 --with-rerun
+```
+
+The MuJoCo viewer shows the live deploy executing the recorded
+`body_q_mj`; the rerun GUI shows the operator's original 4 camera
+streams (`ego_view`, `head_front`, `stereo_left`, `stereo_right`)
+plus the per-joint scalar timeline and 3-D wrist-FK trace for the
+same episode. Eyeball both panes side-by-side to confirm the live
+playback matches what you expected.
+
+#### Example: real-robot first pass (half-speed, e-stop in reach)
+
+```bash
+# On PC2 (separate shell):
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start \
+    --attach --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
+    --lock-head-straight
+
+# On the laptop:
+./gear_sonic/scripts/run_x2_replay_stack.sh \
+    --dataset x2_reach_and_retract_v1 --episode 0 \
+    --pc2-host 192.168.86.32 --rate-scale 0.5 --with-rerun
+```
+
+```{admonition} Safety
+:class: warning
+* Object position on the table MUST match the recording. The replayer
+  has no perception loop; it commands the same wrist trajectory
+  regardless of where the soda can / apple actually is.
+* The first real-robot run should always use `--rate-scale 0.5` and an
+  operator hand on the e-stop. After one clean half-speed pass, drop
+  the scale.
+* The recorded `action.body_q_mj` is what the operator **commanded**,
+  not what the robot **achieved**. SONIC's tracking-policy will still
+  apply its safety filters; expect ~1–2 mm of arm tracking error per
+  joint relative to the recording.
+```
+
+#### What `motion_token` is doing (or rather, isn't)
+
+The replay still copies `action.motion_token` from the parquet into
+the wire envelope, but the C++ deploy **ignores it** — it re-tokenizes
+the trajectory each tick from `joint_pos_mj_future`. The token field
+on the wire is a debug echo only. The actual lever that drives the
+body is the v5 future-window; if the body isn't moving but the fingers
+are, you're looking at a v4-only envelope (likely because the wrapper
+spawned an outdated replay client that hasn't been rebuilt — see
+`tests/test_replay_x2_dataset_future_window.py::test_payload_packs_and_unpacks_byte_for_byte`,
+the byte-roundtrip pin that gates this contract).
 
 ### 6.4 Kinematic MuJoCo replay (`replay_x2_kinematic.py`)
 
@@ -1146,7 +1191,7 @@ current state of the matrix:
 |---|---|---|
 | **teleop** (no recording) | [`teleop_x2_kinematic.py`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | [`record_x2_dataset.py --teleop-only`](../../../gear_sonic/scripts/record_x2_dataset.py) |
 | **record** (with dataset writes) | [`teleop_x2_kinematic.py --output-dir <path>`](../../../gear_sonic/scripts/teleop_x2_kinematic.py) | [`record_x2_dataset.py`](../../../gear_sonic/scripts/record_x2_dataset.py) |
-| **replay** (no operator) | [`replay_x2_kinematic.py`](../../../gear_sonic/scripts/replay_x2_kinematic.py) (this section) | recipe 6.3 sketch only — `replay_x2_sonic.py` planned |
+| **replay** (no operator) | [`replay_x2_kinematic.py`](../../../gear_sonic/scripts/replay_x2_kinematic.py) (this section) | [`run_x2_replay_stack.sh`](../../../gear_sonic/scripts/run_x2_replay_stack.sh) → [`replay_x2_dataset.py`](../../../gear_sonic/scripts/replay_x2_dataset.py) ([§6.3](#63-replay-a-recorded-episode-through-the-live-deploy)) |
 
 Two scripts double-duty as both `teleop` and `record` today via a
 mode flag (`--output-dir` for the kinematic side, `--teleop-only` for
@@ -1206,6 +1251,7 @@ Run these before merging any change to the recorder:
 .venv/bin/python -m pytest tests/test_embodiment_registry.py -x
 .venv/bin/python -m pytest tests/test_x2_kinematic_view.py -x
 .venv/bin/python -m pytest tests/test_replay_x2_kinematic.py -x
+.venv/bin/python -m pytest tests/test_replay_x2_dataset_future_window.py -x
 ```
 
 * [`tests/test_x2_arm_ik_smoke.py`](../../../tests/test_x2_arm_ik_smoke.py)
@@ -1237,6 +1283,15 @@ Run these before merging any change to the recorder:
   pins the kinematic-replay CLI's pure helpers (arg parsing, dataset
   resolution, chunk-path math, parquet schema validation) without
   launching the MuJoCo viewer.
+* [`tests/test_replay_x2_dataset_future_window.py`](../../../tests/test_replay_x2_dataset_future_window.py)
+  pins the SONIC-loop replay's v5 future-window helper + payload
+  schema (see [§6.3](#63-replay-a-recorded-episode-through-the-live-deploy)
+  and the [2026-06-22 milestone](../user_guide/milestones/2026-06-22_dataset_replay_v5_wire.md)).
+  The critical test (`test_payload_packs_and_unpacks_byte_for_byte`)
+  asserts that `pack_pose_message(..., version=4)` →
+  `unpack_message()` roundtrips every byte of every v5 field, so the
+  C++ deploy on PC2 is guaranteed to promote the replay's frames to
+  v5 mode (= the body actually moves, not just the fingers).
 
 ---
 

@@ -9,6 +9,15 @@
 # anything that walks here but fails under Quest 3 teleop points at the
 # input chain (intent decoder / debounce / hysteresis), not the model.
 #
+# Launcher family (single-shell deploy + foreground client + trap-cleaned
+# reverse-order shutdown):
+#
+#     teleop          run_x2_quest3_planner_stack.sh
+#     recording       run_x2_quest3_planner_stack.sh --with-record --head-cameras
+#     autonomous VLA  run_x2_vla_runtime.sh
+#     dataset replay  run_x2_replay_stack.sh
+#     pkl-driven      run_x2_pkl_planner_stack.sh        (this file)
+#
 # Lightweight topology (no recorder, no manager):
 #
 #                       ┌────────────────────────┐

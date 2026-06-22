@@ -12,6 +12,8 @@
 #     teleop          run_x2_quest3_planner_stack.sh
 #     recording       run_x2_quest3_planner_stack.sh --with-record --head-cameras
 #     autonomous VLA  run_x2_vla_runtime.sh        (this file)
+#     dataset replay  run_x2_replay_stack.sh
+#     pkl-driven      run_x2_pkl_planner_stack.sh
 #
 # The SONIC tracker (the C++ deploy on PC2 with the fused
 # encoder+FSQ+decoder ONNX) stays alive across mode switches via
