@@ -374,9 +374,13 @@ def _pelvis_rot_from_torso_imu(
     # product below corresponds to R_pelvis_torso = R_z(qy) R_y(qp) R_x(qr)
     # which is the pelvis-frame expression of a vector originally in the
     # torso frame.
-    Ry = transform.Rotation.from_euler("z", waist_yaw)
-    Rp = transform.Rotation.from_euler("y", waist_pitch)
-    Rr = transform.Rotation.from_euler("x", waist_roll)
+    # scipy >= 1.13 requires the angles array's last dim to match the
+    # seq-axis count: with a single-axis seq like "z", the input must be
+    # shape (T, 1), not (T,). [:, None] satisfies both old and new scipy
+    # without changing the resulting rotations.
+    Ry = transform.Rotation.from_euler("z", waist_yaw[:, None])
+    Rp = transform.Rotation.from_euler("y", waist_pitch[:, None])
+    Rr = transform.Rotation.from_euler("x", waist_roll[:, None])
     R_waist = Ry * Rp * Rr  # R_pelvis_torso(t)
 
     R_imu_0_inv = R_imu[0].inv()
@@ -385,6 +389,99 @@ def _pelvis_rot_from_torso_imu(
     delta_waist = R_waist * R_waist_0_inv
     R_pelvis = delta_imu * delta_waist.inv()
     return R_pelvis.as_quat().astype(np.float64)  # xyzw
+
+
+def _pelvis_rot_from_foot_flat(
+    dof: np.ndarray,
+    floor_anchor: str,
+) -> np.ndarray:
+    """Reconstruct ``R_world_pelvis(t)`` from leg kinematics under the
+    constraint that the anchor foot stays at its frame-0 world
+    orientation (i.e. flat on the ground, as it was at idle).
+
+    Why not just use the torso IMU? For in-place gestures (hug, bow,
+    reach) MC commands a balance-preserving posture: arms forward, hips
+    push back, torso also tilts back so the COM stays over the feet.
+    The torso IMU reads a slightly forward-tilted torso (because the
+    waist chain doesn't compensate fully), and the IMU-derived pelvis
+    pitch comes out forward too -- which makes the MuJoCo replay
+    moonwalk the feet under a forward-leaning robot that would
+    physically tip over.
+
+    Foot-flat IK instead asks: *given the recorded leg joints, what
+    pelvis rotation keeps the anchor foot at its initial orientation?*
+    That's a closed-form FK problem:
+
+        Define R_chain(t) := orientation of the anchor foot body in the
+                              PELVIS frame, computed by running FK with
+                              pelvis at world identity and DOFs at t.
+        Foot world orientation = R_pelvis(t) · R_chain(t).
+        Want foot world orientation == R_chain(0) (the "flat" reference).
+        =>  R_pelvis(t) = R_chain(0) · R_chain(t)^{-1}
+
+    Properties:
+      * Frame 0 ⇒ R_pelvis(0) = I (matches the IMU-derived convention).
+      * Both legs idle ⇒ pelvis stays at identity (no rotation).
+      * Hip flexes 5° (knee forward) ⇒ pelvis rolls back 5° to keep the
+        foot flat. Matches the operator's "body tilts back to balance
+        arms-forward weight shift" expectation.
+
+    Trade-off: this discards the IMU reading entirely. Drift, sensor
+    bias, and any genuine pelvis motion that ISN'T captured by leg
+    joints (e.g. the operator physically lifting the robot) is lost.
+    For in-place MC gestures that's a feature, not a bug.
+
+    Anchor side: with ``floor_anchor in {left-foot, right-foot}`` the
+    side is fixed for the whole take. With ``lower-foot`` (default) we
+    pick the side that's lowest at frame 0 and stick with it -- mid-
+    take anchor swap would cause a pelvis rotation discontinuity.
+    """
+    ctx = _get_floor_anchor_ctx()
+    mj_model = ctx.mj_model
+    mj_data = ctx.mj_data
+    n = int(dof.shape[0])
+
+    def _set_provisional(f: int) -> None:
+        mj_data.qpos[0] = 0.0
+        mj_data.qpos[1] = 0.0
+        mj_data.qpos[2] = ctx.default_pelvis_z  # any Z is fine, we
+                                                # only read orientations
+        mj_data.qpos[3] = 1.0  # wxyz identity
+        mj_data.qpos[4] = 0.0
+        mj_data.qpos[5] = 0.0
+        mj_data.qpos[6] = 0.0
+        mj_data.qpos[7:7 + X2_NUM_DOF] = dof[f]
+        mj_data.qvel[:] = 0.0
+        mujoco.mj_forward(mj_model, mj_data)
+
+    def _foot_world_rot(body_id: int) -> transform.Rotation:
+        # MjData.xmat is (nbody, 9) row-major rotation; ndarray view is
+        # fine. We copy to be safe against the in-place qpos updates.
+        return transform.Rotation.from_matrix(
+            mj_data.xmat[body_id].reshape(3, 3).copy()
+        )
+
+    # Pick anchor side at frame 0 and hold it.
+    _set_provisional(0)
+    if floor_anchor == "left-foot":
+        anchor_body = ctx.left_ankle_body_id
+    elif floor_anchor == "right-foot":
+        anchor_body = ctx.right_ankle_body_id
+    else:  # lower-foot or unknown -> default to lower foot at frame 0
+        left_min = float(mj_data.geom_xpos[ctx.left_foot_geom_ids, 2].min())
+        right_min = float(mj_data.geom_xpos[ctx.right_foot_geom_ids, 2].min())
+        anchor_body = (ctx.left_ankle_body_id if left_min <= right_min
+                       else ctx.right_ankle_body_id)
+
+    R_ref = _foot_world_rot(anchor_body)  # R_chain(0)
+
+    out_xyzw = np.zeros((n, 4), dtype=np.float64)
+    for f in range(n):
+        _set_provisional(f)
+        R_chf = _foot_world_rot(anchor_body)
+        R_pelvis = R_ref * R_chf.inv()
+        out_xyzw[f] = R_pelvis.as_quat()  # xyzw
+    return out_xyzw
 
 
 class _FloorAnchorContext:
@@ -448,11 +545,17 @@ def _floor_anchored_root_trans(
     dof: np.ndarray,
     root_xyzw: np.ndarray,
     mode: str,
+    anchor_xy: bool = False,
 ) -> np.ndarray:
     """Per-frame foot-FK pass returning (T, 3) world XYZ so the chosen
-    anchor foot's lowest contact sphere sits at z=0. XY is pinned to
-    (0, 0) -- recovering true world XY requires the LiDAR SLAM odometry
-    path (see ``_slam_root_trans``), not joints+IMU alone.
+    anchor foot's lowest contact sphere sits at z=0. When ``anchor_xy``
+    is False (legacy), pelvis XY stays pinned at (0, 0) -- adequate when
+    the take really is in place and a downstream SLAM substitute is
+    available for world XY. When ``anchor_xy`` is True, the anchor
+    foot's ankle world XY is also held constant across the take (i.e.
+    pelvis XY shifts so the planted foot stays put). Required for any
+    motion that involves hip/knee weight shifts -- without it, joint
+    motion makes the feet appear to slide under a locked pelvis.
 
     ``mode``:
         ``lower-foot``  pick MIN(left_min, right_min) Z per frame. The
@@ -466,17 +569,32 @@ def _floor_anchored_root_trans(
                         joint noise briefly puts the right lower than
                         the left).
         ``right-foot``  symmetric.
+
+    With ``anchor_xy=True`` + ``lower-foot`` mode, the XY lock follows
+    the current anchor side: when the anchor swaps (foot transfer in
+    walking), the new anchor's current world XY becomes the lock target,
+    so the pelvis doesn't jump. For in-place gestures the anchor side
+    typically doesn't switch, so the lock target is the frame-0 anchor
+    XY (which is (0, 0) by construction).
     """
     ctx = _get_floor_anchor_ctx()
     mj_model = ctx.mj_model
     mj_data = ctx.mj_data
     left_ids = ctx.left_foot_geom_ids
     right_ids = ctx.right_foot_geom_ids
+    left_ankle_id = ctx.left_ankle_body_id
+    right_ankle_id = ctx.right_ankle_body_id
     z0 = ctx.default_pelvis_z
 
     n = int(dof.shape[0])
     out = np.zeros((n, 3), dtype=np.float32)
+    locked_xy: np.ndarray | None = None
+    last_anchor: str | None = None
     for f in range(n):
+        # Run FK with pelvis at origin XY. Since the pelvis is the free
+        # root, any later XY shift translates the whole tree rigidly --
+        # we read the anchor ankle's "at-origin" XY and add the
+        # correction at the end, no second FK pass needed.
         mj_data.qpos[0] = 0.0
         mj_data.qpos[1] = 0.0
         mj_data.qpos[2] = z0  # provisional; corrected below
@@ -492,15 +610,35 @@ def _floor_anchored_root_trans(
         left_min = float(mj_data.geom_xpos[left_ids, 2].min())
         right_min = float(mj_data.geom_xpos[right_ids, 2].min())
         if mode == "lower-foot":
-            anchor_z = min(left_min, right_min)
+            anchor_side = "left" if left_min <= right_min else "right"
         elif mode == "left-foot":
-            anchor_z = left_min
+            anchor_side = "left"
         elif mode == "right-foot":
-            anchor_z = right_min
+            anchor_side = "right"
         else:
             raise ValueError(f"unknown floor_anchor mode: {mode}")
 
+        anchor_z = left_min if anchor_side == "left" else right_min
         out[f, 2] = z0 - anchor_z
+
+        if anchor_xy:
+            anchor_body = (left_ankle_id if anchor_side == "left"
+                           else right_ankle_id)
+            # MjData.xpos is (nbody, 3) world body-frame origins after
+            # mj_forward; the attribute is `xpos`, NOT `body_xpos`
+            # (which exists on MjModel for *default* poses, not on
+            # MjData).
+            ankle_xy_at_origin = mj_data.xpos[anchor_body, :2].copy()
+            if locked_xy is None or anchor_side != last_anchor:
+                # First frame OR foot transfer: re-anchor at the new
+                # anchor's current world XY (with pelvis XY = 0 the
+                # ankle world XY equals ankle_xy_at_origin, so the
+                # initial lock is just where the anchor naturally is).
+                locked_xy = ankle_xy_at_origin
+            out[f, 0] = float(locked_xy[0] - ankle_xy_at_origin[0])
+            out[f, 1] = float(locked_xy[1] - ankle_xy_at_origin[1])
+            last_anchor = anchor_side
+
     return out
 
 
@@ -549,7 +687,8 @@ def _slam_root_trans_rot(
 def convert_one(npz_path: Path, *, fps: int, source: str,
                 root_rot_mode: str, anchor_z: float,
                 trim_start: float, trim_end: float,
-                floor_anchor: str, use_slam: str) -> dict:
+                floor_anchor: str, use_slam: str,
+                anchor_xy: bool = False) -> dict:
     with np.load(npz_path, allow_pickle=True) as npz:
         # Joint-name sanity check before anything else.
         for g, _, names in X2_GROUP_ORDER:
@@ -658,6 +797,11 @@ def convert_one(npz_path: Path, *, fps: int, source: str,
                         waist_pitch=dof[:, 13].astype(np.float64),
                         waist_roll=dof[:, 14].astype(np.float64),
                     )
+        elif root_rot_mode == "foot-flat":
+            # No IMU input; pelvis rotation derived purely from leg-chain
+            # FK + foot-flat constraint. See _pelvis_rot_from_foot_flat
+            # docstring for derivation.
+            root_xyzw = _pelvis_rot_from_foot_flat(dof, floor_anchor)
         else:
             raise ValueError(f"unknown --root-rot mode: {root_rot_mode}")
 
@@ -683,7 +827,7 @@ def convert_one(npz_path: Path, *, fps: int, source: str,
             slam_used = False
         else:
             root_trans = _floor_anchored_root_trans(
-                dof, root_xyzw, floor_anchor,
+                dof, root_xyzw, floor_anchor, anchor_xy=anchor_xy,
             )
             slam_used = False
 
@@ -719,8 +863,12 @@ def convert_one(npz_path: Path, *, fps: int, source: str,
             "x2_record_dof_source": source,
             "x2_record_root_rot_mode": root_rot_mode,
             "x2_record_floor_anchor": floor_anchor,
-            "x2_record_root_pose_source": ("slam" if slam_used
-                                            else f"foot-fk:{floor_anchor}"),
+            "x2_record_anchor_xy": bool(anchor_xy),
+            "x2_record_root_pose_source": (
+                "slam" if slam_used
+                else (f"foot-fk:{floor_anchor}+xy" if anchor_xy
+                      else f"foot-fk:{floor_anchor}")
+            ),
             "x2_record_window_s": (float(t0), float(t1)),
         }
 
@@ -743,18 +891,26 @@ def main() -> int:
                         "'cmd' = MC's commanded positions (what MC wanted "
                         "to happen). Default: state.")
     p.add_argument("--root-rot",
-                   choices=("identity", "torso-imu", "torso-imu-raw"),
+                   choices=("identity", "torso-imu", "torso-imu-raw",
+                            "foot-flat"),
                    default="torso-imu",
                    help="Pelvis world rotation source. 'torso-imu' "
                         "(default) reconstructs the pelvis rotation by "
                         "inverting the waist chain through the recorded "
-                        "waist joint angles -- the right thing when the "
-                        "operator squats / shifts weight without tilting "
-                        "the torso. 'identity' keeps the pelvis dead "
-                        "upright (joint-only animation). 'torso-imu-raw' "
-                        "pastes the torso IMU quat straight into the "
-                        "pelvis slot (legacy / debug, double-counts the "
-                        "waist).")
+                        "waist joint angles -- right when the operator "
+                        "squats / shifts weight without tilting the "
+                        "torso. 'foot-flat' (recommended for in-place "
+                        "MC gestures: hug, bow, reach) derives the "
+                        "pelvis rotation entirely from leg kinematics "
+                        "so the anchor foot stays at its frame-0 "
+                        "(idle, flat) world orientation; this produces "
+                        "physically-correct counter-balance pitch (e.g. "
+                        "pelvis tilts back when arms reach forward), "
+                        "vs the IMU which can read a tip-over forward "
+                        "lean. 'identity' keeps the pelvis dead upright "
+                        "(joint-only animation). 'torso-imu-raw' pastes "
+                        "the torso IMU quat straight into the pelvis "
+                        "slot (legacy / debug, double-counts the waist).")
     p.add_argument("--anchor-z", type=float, default=1.0,
                    help="Pelvis world Z (height) when --floor-anchor=none. "
                         "Ignored otherwise (foot FK computes it per frame). "
@@ -762,20 +918,32 @@ def main() -> int:
     p.add_argument("--floor-anchor",
                    choices=("lower-foot", "left-foot", "right-foot", "none"),
                    default="lower-foot",
-                   help="How to ground the pelvis (both Z and XY) in world "
-                        "frame. 'lower-foot' (default) runs per-frame "
-                        "forward kinematics on the X2 MJCF and (1) pins "
-                        "the lowest contact sphere across both feet to "
-                        "z=0, (2) shifts pelvis XY so the anchor foot's "
-                        "ankle body stays at its lock-in world XY. The "
-                        "anchor side can switch (foot transfer for "
-                        "walking), with --anchor-xy-hyst worth of "
-                        "stickiness so stand recordings don't flap the "
-                        "anchor on sub-mm noise. 'left-foot' / "
-                        "'right-foot' hard-lock one side as the anchor "
-                        "for the whole take (single-leg balance demos). "
-                        "'none' falls back to the locked-in-place (0, 0, "
-                        "--anchor-z) behaviour with no FK.")
+                   help="How to ground the pelvis Z in world frame. "
+                        "'lower-foot' (default) runs per-frame forward "
+                        "kinematics on the X2 MJCF and pins the lowest "
+                        "contact sphere across both feet to z=0. "
+                        "'left-foot' / 'right-foot' hard-lock one side "
+                        "as the Z anchor for the whole take (single-leg "
+                        "balance demos so the lifted leg stays visibly "
+                        "off the ground even with joint noise). 'none' "
+                        "falls back to the locked-in-place (0, 0, "
+                        "--anchor-z) behaviour with no FK. Use "
+                        "--anchor-xy to additionally pin the anchor "
+                        "foot's world XY (recommended for any take "
+                        "with hip/knee weight shifts, including "
+                        "in-place gestures that sit back, lean, or "
+                        "squat -- otherwise the pelvis stays at (0, 0) "
+                        "and joint motion looks like sliding feet).")
+    p.add_argument("--anchor-xy", action="store_true", default=False,
+                   help="When --floor-anchor uses foot-FK (lower/left/"
+                        "right-foot), also shift pelvis XY so the "
+                        "anchor foot's ankle body stays at its lock-in "
+                        "world XY. The anchor side can swap (foot "
+                        "transfer during walking); the lock target "
+                        "re-bases to the new anchor's current world XY "
+                        "to avoid a pelvis jump. Default off for "
+                        "backward compatibility with older PKLs; "
+                        "MC-gesture captures should always enable it.")
     p.add_argument("--root-pose-source",
                    choices=("auto", "require", "off"), default="auto",
                    help="How to derive the pelvis world pose. 'auto' "
@@ -819,7 +987,9 @@ def main() -> int:
         print(f"Converting {npz_path.name} -> '{key}'  "
               f"(source={args.source}, root_rot={args.root_rot}, "
               f"root_pose_source={args.root_pose_source}, "
-              f"floor_anchor={args.floor_anchor}, fps={args.fps})",
+              f"floor_anchor={args.floor_anchor}"
+              f"{'+xy' if args.anchor_xy else ''}, "
+              f"fps={args.fps})",
               flush=True)
         try:
             entry = convert_one(
@@ -833,6 +1003,7 @@ def main() -> int:
                 floor_anchor=args.floor_anchor,
                 use_slam=("off" if args.root_pose_source == "off"
                           else args.root_pose_source),
+                anchor_xy=args.anchor_xy,
             )
         except (ValueError, KeyError) as e:
             print(f"  ERROR: {e}", file=sys.stderr)
