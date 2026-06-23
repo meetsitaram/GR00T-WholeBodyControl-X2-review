@@ -1,5 +1,12 @@
 # 2026-06-23 — VLA bridge holds last-good live `root_quat` across `x2_debug` stalls
 
+> **Status: ✅ Real-robot validated 2026-06-23.** Operator launched
+> `run_x2_vla_runtime.sh --pc2-host …` from progressively non-zero
+> physical headings, manually nudged the robot to new orientations
+> mid-session, and confirmed the body holds heading instead of
+> snapping back to the SONIC-boot frame. No more "robot resets to
+> spawn heading on every wifi blip" symptom under autonomous VLA.
+
 > **Session focus.** A regression of the heading-stability symptom
 > first triaged on [2026-06-07](2026-06-07_vla_bridge_heading_stability_and_head_lock.md):
 > the robot still snaps back to spawn heading on every nudge during a
