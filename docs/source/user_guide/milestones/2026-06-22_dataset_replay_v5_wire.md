@@ -130,11 +130,15 @@ replay_x2_dataset.py ─── pose :5556 ═wifi═══►│  x2_pc2_daemons
                                               real motors @ 50 Hz
 ```
 
-The replay's PUB binds locally on `*:5556`; PC2's pose proxy
-connects out from the daemon side (assumed already running via
-`./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start`). The replay
-banner echoes the `--pc2-host` value for operator-visible routing
-confirmation but doesn't change the bind topology.
+The replay's PUB binds locally on `${PUB_BIND_HOST}:5556` — the
+host is gated on `--pc2-host` (see the
+[2026-06-23 LAN-isolation follow-up](2026-06-23_pose_pub_lan_isolation.md)).
+Without `--pc2-host`, the bind is `127.0.0.1` so PC2's always-on
+pose proxy can't reach the wire over wifi even if its daemons are
+still up from a previous real-robot session. With `--pc2-host`, the
+bind is `*` so PC2 can SUB. PC2's pose proxy connects out from the
+daemon side (assumed already running via
+`./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start`).
 
 ---
 

@@ -1113,6 +1113,39 @@ else
     DEBUG_SUB_HOST="localhost"
 fi
 
+# ---------------------------------------------------------------------------
+# LAN isolation for the laptop pose PUB.
+#
+# PC2's x2_pose_proxy is a long-lived daemon started once via
+# ``x2_pc2_daemons.sh start --laptop-host <LAPTOP_IP> ...`` and stays up
+# across laptop sessions by design (operator never SSHes in to bounce it).
+# It SUBs ``<LAPTOP_IP>:LAPTOP_POSE_PORT`` over wifi -- ZMQ SUBs connect
+# out, our PUB just binds and accepts whatever attaches.
+#
+# That means a sim run on the laptop that binds the pose PUB on ``*``
+# (all interfaces) silently delivers the wire to PC2 too, and the real
+# robot starts tracking the sim wire even though the operator never
+# passed ``--pc2-host``. We saw this in 2026-06-23: the wrapper banner
+# said "sim run artifacts" + ``docker stop`` of the sim container, but
+# the physical robot moved.
+#
+# Fix: gate the laptop-side pose PUB bind on SIM_MODE. In sim mode bind
+# loopback so the wire is physically unreachable from PC2; in real mode
+# bind '*' so PC2 (and any debug SUB) can attach. Applies to the bridge
+# PUB, the mux out-host (when --enable-takeover is set), and the
+# recorder PUB. The recorder skips binding in VLA subscribe-mode anyway
+# (it just ingests off the bridge), so the gating there is defensive
+# for the standalone-record-without-bridge case.
+#
+# Escape hatch: explicit ``PUB_BIND_HOST=*`` env wins, for the rare
+# cross-host sim-mode debug case (a colleague SUBing the laptop wire
+# from another machine on the LAN).
+if [[ "$SIM_MODE" -eq 1 ]]; then
+    : "${PUB_BIND_HOST:=127.0.0.1}"
+else
+    : "${PUB_BIND_HOST:=*}"
+fi
+
 # --robocasa-env validation (sim-only). Resolve the short name to an absolute
 # MJCF path under gear_sonic/data/assets/robocasa_scenes/<NAME>.xml and fail
 # loud if the scene isn't pre-built. On real-robot runs the flag makes no
@@ -1922,7 +1955,7 @@ spawn_recorder() {
         --sub-host "$DEBUG_SUB_HOST"
         --sub-port "$PC2_DEBUG_PORT"
         --sub-topic x2_debug
-        --pub-host '*'
+        --pub-host "$PUB_BIND_HOST"
         --pub-port "$LAPTOP_POSE_PORT"
         --pub-topic pose
         --rate "$RATE"
@@ -2051,7 +2084,7 @@ spawn_pose_mux() {
         --primary-host 127.0.0.1
         --primary-port "$BRIDGE_POSE_PUB_PORT"
         --primary-topic pose
-        --out-host "*"
+        --out-host "$PUB_BIND_HOST"
         --out-port "$LAPTOP_POSE_PORT"
         --out-topic pose
         --override-host "$POSE_PROXY_OVERRIDE_HOST"
@@ -2345,11 +2378,12 @@ if [[ "$SIM_MODE" -eq 1 ]]; then
   ${BOLD}Sim profile     ${NC}: ${SIM_PROFILE} (viewer=$([[ "$SIM_VIEWER" -eq 1 ]] && echo on || echo off))
   ${BOLD}Sim scene       ${NC}: $([[ -n "$ROBOCASA_SCENE_XML" ]] && echo "robocasa: ${ROBOCASA_ENV} (${ROBOCASA_SCENE_XML})" || echo "default x2_ultra.xml (empty world)")
   ${BOLD}x2_debug SUB    ${NC}: tcp://localhost:${PC2_DEBUG_PORT}
+  ${BOLD}Pose PUB bind   ${NC}: ${PUB_BIND_HOST}:${LAPTOP_POSE_PORT}$( [[ "$PUB_BIND_HOST" == "127.0.0.1" ]] && echo "  (LAN-isolated: PC2 cannot SUB even if x2_pose_proxy is running)" || echo "  ${RED}WARNING: '*' bind in sim mode -- PC2 pose proxy can SUB the wire over wifi${NC}" )
   ${BOLD}Cameras         ${NC}: ghost MuJoCo renderer (modality-driven stereo keys)
 EOF
     if [[ "${SIM_PROXY_ENABLED:-0}" -eq 1 ]]; then
         cat <<EOF
-  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux *:${LAPTOP_POSE_PORT} -> watchdog *:${POSE_PROXY_DOWNSTREAM_PORT} -> sim deploy
+  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux ${PUB_BIND_HOST}:${LAPTOP_POSE_PORT} -> watchdog *:${POSE_PROXY_DOWNSTREAM_PORT} -> sim deploy
 $( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms (mux SUBs)" || echo "  ${BOLD}Override SUB    ${NC}: default tcp://127.0.0.1:5560 (set POSE_PROXY_OVERRIDE_PORT or --pose-proxy-override-port to override)" )
 $( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (mux PUBs, bridge SUBs)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
   ${BOLD}Handoff guard   ${NC}: cold_restart_hold=${VLA_COLD_RESTART_HOLD_TICKS}t max_hold=${VLA_HANDOFF_MAX_HOLD_TICKS}t slow_step=${VLA_HANDOFF_MAX_WIRE_STEP}rad/t for ${VLA_HANDOFF_STEP_RAMP_TICKS}t (wire stays at operator pose until first eligible chunk, then ramps via slow-step to normal max_wire_step)
@@ -2358,16 +2392,17 @@ EOF
 else
     cat <<EOF
   ${BOLD}PC2 host        ${NC}: ${PC2_HOST}
+  ${BOLD}Pose PUB bind   ${NC}: ${PUB_BIND_HOST}:${LAPTOP_POSE_PORT}$( [[ "$PUB_BIND_HOST" == "127.0.0.1" ]] && echo "  ${RED}WARNING: loopback bind in real mode -- PC2 cannot receive the wire${NC}" || echo "  (LAN-visible: PC2 pose proxy SUBs this stream over wifi)" )
 EOF
     if [[ "${TAKEOVER_ENABLED:-0}" -eq 1 ]]; then
         cat <<EOF
-  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux *:${LAPTOP_POSE_PORT} (PC2 watchdog SUBs LAPTOP:${LAPTOP_POSE_PORT} over wifi)
+  ${BOLD}Pose pipeline   ${NC}: ON  bridge :${BRIDGE_POSE_PUB_PORT} -> mux ${PUB_BIND_HOST}:${LAPTOP_POSE_PORT} (PC2 watchdog SUBs LAPTOP:${LAPTOP_POSE_PORT} over wifi)
 $( [[ "${POSE_PROXY_OVERRIDE_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${POSE_PROXY_OVERRIDE_PORT}" -gt 0 ]] && echo "  ${BOLD}Override SUB    ${NC}: tcp://${POSE_PROXY_OVERRIDE_HOST}:${POSE_PROXY_OVERRIDE_PORT} topic=${POSE_PROXY_OVERRIDE_TOPIC} stale=${POSE_PROXY_OVERRIDE_STALE_MS}ms (mux SUBs)" || echo "  ${BOLD}Override SUB    ${NC}: default tcp://127.0.0.1:5560 (set POSE_PROXY_OVERRIDE_PORT or --pose-proxy-override-port to override)" )
 $( [[ "${VLA_CONTROL_PORT}" =~ ^-?[0-9]+$ ]] && [[ "${VLA_CONTROL_PORT}" -gt 0 ]] && echo "  ${BOLD}vla_control PUB ${NC}: tcp://127.0.0.1:${VLA_CONTROL_PORT} topic=${VLA_CONTROL_TOPIC} (mux PUBs, bridge SUBs)" || echo "  ${BOLD}vla_control PUB ${NC}: disabled (set VLA_CONTROL_PORT > 0)" )
 EOF
     else
         cat <<EOF
-  ${BOLD}Pose PUB (LAN)  ${NC}: tcp://*:${LAPTOP_POSE_PORT}  (PC2 watchdog SUBs here directly; no laptop mux)
+  ${BOLD}Pose pipeline   ${NC}: bridge tcp://${PUB_BIND_HOST}:${LAPTOP_POSE_PORT}  (PC2 watchdog SUBs here directly; no laptop mux)
 EOF
     fi
     cat <<EOF
@@ -2424,7 +2459,7 @@ BRIDGE_ARGS=(
     --embodiment-tag "$EMBODIMENT_TAG"
     --modality-config "$MODALITY_CONFIG"
     --device "$VLA_DEVICE"
-    --pub-host '*'
+    --pub-host "$PUB_BIND_HOST"
     # Bridge PUBs on BRIDGE_POSE_PUB_PORT (= LAPTOP_POSE_PORT when
     # --enable-takeover is OFF; = BRIDGE_POSE_PORT_INTERNAL otherwise).
     # With takeover the mux binds LAPTOP_POSE_PORT and reads the bridge

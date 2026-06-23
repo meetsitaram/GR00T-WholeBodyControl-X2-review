@@ -206,6 +206,32 @@ if [[ -z "${LOG_DIR}" ]]; then
 fi
 mkdir -p "${LOG_DIR}"
 
+# ---------------------------------------------------------------------------
+# LAN isolation for the replay pose PUB.
+#
+# PC2's x2_pose_proxy is a long-lived daemon started once via
+# ``x2_pc2_daemons.sh start --laptop-host <LAPTOP_IP> ...``. It SUBs
+# ``<LAPTOP_IP>:${POSE_PORT}`` over wifi and stays connected across
+# laptop sessions. ZMQ SUBs connect out, our PUB just binds and
+# accepts whatever attaches.
+#
+# That means a sim replay that binds the pose PUB on ``*`` (all
+# interfaces) silently delivers the wire to PC2 too. The real robot
+# starts tracking the sim replay even though the operator never
+# passed ``--pc2-host``. Mirrors the 2026-06-23 fix in
+# ``run_x2_vla_runtime.sh`` (same root cause, same gating shape).
+#
+# Fix: gate the replay's pose PUB bind on PC2_HOST. Without
+# ``--pc2-host``: bind loopback so the wire is unreachable from PC2.
+# With ``--pc2-host``: bind '*' so the always-on PC2 pose proxy can
+# attach. Override-able via ``PUB_BIND_HOST=*`` env for the rare
+# cross-host sim-mode debug case.
+if [[ -n "${PC2_HOST}" ]]; then
+    : "${PUB_BIND_HOST:=*}"
+else
+    : "${PUB_BIND_HOST:=127.0.0.1}"
+fi
+
 # --------------------------------------------------------------------------
 # Logging helpers
 # --------------------------------------------------------------------------
@@ -496,6 +522,7 @@ ${C_GREEN}+---------------------------------------------------------------------
   deploy           : ${DEPLOY_DESC}
   rerun viewer     : $([[ "${WITH_RERUN}" -eq 1 ]] && echo "ON  (recorded cameras + scalars; GUI outlives this wrapper)" || echo "OFF (pass --with-rerun to spawn alongside the live stack)")
   ports            : pose=${POSE_PORT}  x2_debug=${DEBUG_PORT}
+  pose PUB bind    : ${PUB_BIND_HOST}:${POSE_PORT}$( [[ "${PUB_BIND_HOST}" == "127.0.0.1" ]] && echo "  (LAN-isolated: PC2 cannot SUB even if x2_pose_proxy is up)" || echo "  (LAN-visible: PC2 pose proxy SUBs this stream over wifi)" )
 EOF
 echo
 
@@ -597,7 +624,7 @@ REPLAY_ARGS=(
     -m gear_sonic.scripts.replay_x2_dataset
     --dataset "${DATASET}"
     --episode "${EPISODE}"
-    --pub-host "*"
+    --pub-host "${PUB_BIND_HOST}"
     --pub-port "${POSE_PORT}"
     --pub-topic "${POSE_TOPIC}"
 )
