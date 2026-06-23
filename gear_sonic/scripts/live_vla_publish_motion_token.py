@@ -230,6 +230,169 @@ def _tile_root_quat_future(quat_xyzw: np.ndarray) -> np.ndarray:
     return np.broadcast_to(q, (_NUM_FUTURE_SLOTS, 4)).copy()
 
 
+# ---------------------------------------------------------------------------
+# Hold-last-good live root_quat across x2_debug stalls
+# ---------------------------------------------------------------------------
+#
+# Background. The deploy_fresh gate (state.is_alive, 1 s freshness) used
+# to control BOTH the existence of a tick-recent x2_debug sample AND the
+# wire root_quat / waist_yaw_pin rebase. That conflation is the
+# "robot snaps back to spawn heading on every wifi blip" bug -- a >1 s
+# stall flipped deploy_fresh False, the rebase was skipped, the wire
+# shipped the baked-identity quat from the idle clip, and the C++
+# deploy commanded the body back to world +X.
+#
+# Fix. Hold the last-known live ``base_quat`` (and ``body_q_mj`` for the
+# waist_yaw pin) across stalls of arbitrary length: a cached measured
+# yaw is strictly better than identity because identity is a known-
+# wrong orientation that fights the IMU on every tick. This mirrors
+# the kplanner's robot_pose hold-last-good pattern at
+# ``gear_sonic/scripts/x2_kplanner.py:2816-2821`` (line range as of the
+# fix) which is what protects Quest3 / VR teleop sessions from this
+# exact failure mode. See
+# ``docs/source/user_guide/milestones/2026-06-23_vla_bridge_yaw_hold_last_good.md``.
+
+
+@dataclass(frozen=True)
+class _WireRebaseSource:
+    """Resolved source for the wire root_quat rebase + waist_yaw pin.
+
+    Returned by :func:`_resolve_wire_rebase_source` once per tick. The
+    publisher uses :attr:`base_quat_wxyz` for the wire's
+    ``root_quat_xyzw`` (yaw-only re-projection) and
+    :attr:`body_q_mj` for the live ``waist_yaw`` slot when the legs/
+    waist freeze is engaged.
+
+    Attributes
+    ----------
+    base_quat_wxyz
+        The (wxyz) pelvis quat to rebase the wire root_quat from. ``None``
+        means no x2_debug has ever arrived (bootstrap; the publish gate
+        will withhold sends and the C++ deploy's own measured-quat
+        bootstrap override carries the orientation reference).
+    body_q_mj
+        The 31-D MuJoCo-order body pose used to pin the live waist_yaw
+        joint (slot 12) during legs/waist freeze. ``None`` iff
+        :attr:`base_quat_wxyz` is ``None`` (the two go together).
+    source
+        ``"live"`` -- fresh x2_debug arrived this tick.
+        ``"cached"`` -- using the last-known sample (x2_debug stalled).
+        ``"none"`` -- never received any x2_debug yet.
+    cache_age_s
+        ``0.0`` for ``"live"``, the actual cache age (seconds) for
+        ``"cached"``, and ``+inf`` for ``"none"``. Used for the
+        STALE→CACHED transition log so the operator can correlate the
+        rebase source against wifi telemetry.
+    """
+
+    base_quat_wxyz: Optional[np.ndarray]
+    body_q_mj: Optional[np.ndarray]
+    source: str
+    cache_age_s: float
+
+
+def _resolve_wire_rebase_source(
+    *,
+    deploy_fresh: bool,
+    base_quat_now: np.ndarray,
+    body_q_mj_now: np.ndarray,
+    last_known_base_quat_wxyz: Optional[np.ndarray],
+    last_known_body_q_mj: Optional[np.ndarray],
+    last_known_x2_debug_monotonic: float,
+    now_monotonic: float,
+) -> _WireRebaseSource:
+    """Pick (base_quat, body_q) used for this tick's rebase + waist pin.
+
+    Hold-last-good semantics: once we've ever seen an x2_debug frame,
+    we keep using the cached value across arbitrarily long stalls
+    rather than reverting to identity. The cache is one-way sticky;
+    the only transitions are ``none -> live`` (first frame),
+    ``live -> cached`` (stall), and ``cached -> live`` (recovery).
+
+    Pure function; tested directly by
+    ``tests/test_live_vla_bridge_yaw_hold_last_good.py``.
+    """
+    if deploy_fresh:
+        return _WireRebaseSource(
+            base_quat_wxyz=np.asarray(base_quat_now, dtype=np.float64).copy(),
+            body_q_mj=np.asarray(body_q_mj_now, dtype=np.float64).copy(),
+            source="live",
+            cache_age_s=0.0,
+        )
+    if (
+        last_known_base_quat_wxyz is not None
+        and last_known_body_q_mj is not None
+    ):
+        age = max(0.0, now_monotonic - last_known_x2_debug_monotonic)
+        return _WireRebaseSource(
+            base_quat_wxyz=last_known_base_quat_wxyz,
+            body_q_mj=last_known_body_q_mj,
+            source="cached",
+            cache_age_s=age,
+        )
+    return _WireRebaseSource(
+        base_quat_wxyz=None,
+        body_q_mj=None,
+        source="none",
+        cache_age_s=float("inf"),
+    )
+
+
+def _log_rebase_source_transition(
+    *,
+    new_source: str,
+    prev_source: str,
+    base_quat_wxyz: Optional[np.ndarray],
+    cache_age_s: float,
+) -> None:
+    """Emit at most one log line per rebase-source transition.
+
+    Operator-visible lines:
+
+    * ``none -> live``: initial activation, prints the live yaw.
+    * ``live -> cached``: x2_debug stalled past the freshness window;
+      cache age at the transition is included.
+    * ``cached -> live``: x2_debug recovered.
+
+    The cache is one-way sticky so other transitions
+    (``cached -> none``, ``live -> none``) are impossible by
+    construction. No-op when ``new_source == prev_source``.
+    """
+    if new_source == prev_source:
+        return
+    if new_source == "live" and prev_source == "none":
+        if base_quat_wxyz is None:
+            return
+        from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw
+
+        wxyz = np.asarray(base_quat_wxyz, dtype=np.float64).reshape(-1)
+        q = np.array(
+            [wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64
+        )
+        yaw_deg = math.degrees(float(yaw_of_quat_xyzw(q)))
+        print(
+            f"[live-VLA] root_quat yaw-rebase ACTIVE: wire "
+            f"root_quat_xyzw now tracks live x2_debug heading "
+            f"(yaw={yaw_deg:+.1f}deg)",
+            flush=True,
+        )
+    elif new_source == "cached" and prev_source == "live":
+        print(
+            f"[live-VLA] root_quat yaw-rebase STALE: x2_debug silent "
+            f">{DEPLOY_ALIVE_STALE_THRESHOLD_S:.1f}s; holding cached "
+            f"base_quat (cache age={cache_age_s * 1000:.0f}ms). Wire "
+            f"will NOT revert to identity (no snap-back to spawn "
+            f"heading).",
+            flush=True,
+        )
+    elif new_source == "live" and prev_source == "cached":
+        print(
+            "[live-VLA] root_quat yaw-rebase RECOVERED: x2_debug back "
+            "online; resuming live yaw tracking.",
+            flush=True,
+        )
+
+
 def _default_stand_body_pose_f32() -> np.ndarray:
     return np.asarray(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float32)
 
@@ -2511,7 +2674,16 @@ def _publisher(
     last_wire_chunk_id = -1
     chunk_blend_from: Optional[np.ndarray] = None
     chunk_blend_remaining = 0
-    yaw_rebase_logged = False
+    # ---- Hold-last-good live root_quat + body_q across x2_debug stalls ----
+    # See _resolve_wire_rebase_source / _log_rebase_source_transition. The
+    # cache is one-way sticky: once x2_debug has ever arrived, we hold the
+    # last value across arbitrary stalls instead of reverting to the
+    # baked-identity quat that would drag the robot back to spawn
+    # heading on every >1 s wifi blip.
+    last_known_base_quat_wxyz: Optional[np.ndarray] = None
+    last_known_body_q_mj: Optional[np.ndarray] = None
+    last_known_x2_debug_monotonic: float = -1.0
+    prev_rebase_source: str = "none"
     bootstrap_publish_logged = False
     bootstrap_first_publish_logged = False
     # Manual-takeover (vla_control) cold-restart bookkeeping. When the
@@ -2607,6 +2779,36 @@ def _publisher(
                     flush=True,
                 )
         body_q_mj_now, base_quat_now, _, _, _, deploy_fresh = state.snapshot()
+        # ---- Cache last-known x2_debug for the hold-last-good rebase ----
+        # Updated only when deploy_fresh, so the cache always holds a
+        # value that was tick-recent at the moment we captured it. Used
+        # below by _resolve_wire_rebase_source for the wire root_quat
+        # rebase + waist_yaw pin so a stale x2_debug never drags the
+        # wire back to identity.
+        if deploy_fresh:
+            last_known_base_quat_wxyz = np.asarray(
+                base_quat_now, dtype=np.float64
+            ).copy()
+            last_known_body_q_mj = np.asarray(
+                body_q_mj_now, dtype=np.float64
+            ).copy()
+            last_known_x2_debug_monotonic = time.monotonic()
+        rebase_source = _resolve_wire_rebase_source(
+            deploy_fresh=deploy_fresh,
+            base_quat_now=base_quat_now,
+            body_q_mj_now=body_q_mj_now,
+            last_known_base_quat_wxyz=last_known_base_quat_wxyz,
+            last_known_body_q_mj=last_known_body_q_mj,
+            last_known_x2_debug_monotonic=last_known_x2_debug_monotonic,
+            now_monotonic=time.monotonic(),
+        )
+        _log_rebase_source_transition(
+            new_source=rebase_source.source,
+            prev_source=prev_rebase_source,
+            base_quat_wxyz=rebase_source.base_quat_wxyz,
+            cache_age_s=rebase_source.cache_age_s,
+        )
+        prev_rebase_source = rebase_source.source
         # 2026-06-10 follow-up 11: read measured velocities for the
         # closed-loop tracking feedback. Cheap second snapshot --
         # both reads acquire ``state.cv`` so the worst case is one
@@ -3342,8 +3544,20 @@ def _publisher(
                 idle_jpos=idle_baseline,
                 freeze_indices=_freeze_idx,
             )
-            if deploy_fresh and bool(np.isin(WAIST_YAW_IDX, _freeze_idx)):
-                measured_waist_yaw = float(body_q_mj_now[WAIST_YAW_IDX])
+            # Hold-last-good: pin the live waist_yaw value from the
+            # cached body_q (rebase_source.body_q_mj) whether the
+            # snapshot was live this tick or merely cached during a
+            # stall. The old gate on deploy_fresh reverted to
+            # idle_stand's waist_yaw on every >1 s stall (~33 deg off
+            # default), which produced the steady-state heading drift
+            # we explicitly engineered the surgical pin to avoid.
+            if (
+                rebase_source.body_q_mj is not None
+                and bool(np.isin(WAIST_YAW_IDX, _freeze_idx))
+            ):
+                measured_waist_yaw = float(
+                    rebase_source.body_q_mj[WAIST_YAW_IDX]
+                )
                 cur_jpos = np.asarray(cur_jpos, dtype=np.float32).copy()
                 cur_jpos[WAIST_YAW_IDX] = measured_waist_yaw
                 if "joint_pos_mj_future" in future_fields:
@@ -3447,8 +3661,20 @@ def _publisher(
         # while the robot is physically facing another heading, SONIC's
         # tokenizer obs sees a large orientation error and keeps twisting
         # waist_yaw (even with legs/waist joint targets frozen).
-        if deploy_fresh:
-            live_root_quat = _root_quat_xyzw_from_base_quat_wxyz(base_quat_now)
+        #
+        # Hold-last-good: the rebase fires whenever we have ANY known
+        # base_quat (rebase_source.base_quat_wxyz is not None), not just
+        # when this tick had a fresh x2_debug. A stale cached quat is
+        # strictly better than baked identity because identity is a
+        # known-wrong orientation (= world +X = spawn heading) that
+        # fights the IMU on every tick. State-transition logging is
+        # handled above by _log_rebase_source_transition so the operator
+        # gets one line per ACTIVE / STALE / RECOVERED edge instead of
+        # 50 Hz spam.
+        if rebase_source.base_quat_wxyz is not None:
+            live_root_quat = _root_quat_xyzw_from_base_quat_wxyz(
+                rebase_source.base_quat_wxyz
+            )
             cur_quat = live_root_quat
             if "root_quat_xyzw_future" in future_fields:
                 future_fields = {
@@ -3457,21 +3683,6 @@ def _publisher(
                         live_root_quat
                     ),
                 }
-            if not yaw_rebase_logged:
-                from gear_sonic.utils.planner.blending import yaw_of_quat_xyzw
-
-                wxyz = np.asarray(base_quat_now, dtype=np.float64).reshape(-1)
-                q = np.array(
-                    [wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64
-                )
-                yaw_deg = math.degrees(float(yaw_of_quat_xyzw(q)))
-                print(
-                    f"[live-VLA] root_quat yaw-rebase ACTIVE: wire "
-                    f"root_quat_xyzw now tracks live x2_debug heading "
-                    f"(yaw={yaw_deg:+.1f}deg)",
-                    flush=True,
-                )
-                yaw_rebase_logged = True
 
         if not deploy_fresh:
             payload = {
