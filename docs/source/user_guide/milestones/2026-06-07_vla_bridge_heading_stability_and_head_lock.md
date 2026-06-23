@@ -5,6 +5,15 @@
 > on first start, head drifts off-center under SONIC" into "starts
 > heading-agnostic, head stays straight ahead." All fixes are on the
 > bridge / launcher side; the C++ deploy is untouched.
+>
+> **Subsystem reference.** This is one of several heading-stability
+> milestones on the VLA / kplanner / recorder / watchdog surface. For
+> the cross-publisher architectural view and the historical timeline of
+> every snap-back bug + fix shipped on this surface, see
+> [`x2_heading_stability_and_yaw_rebase`](../../references/x2_heading_stability_and_yaw_rebase.md).
+> The 2026-06-23 follow-up that complements the bootstrap-safe gate
+> with mid-session hold-last-good is documented at
+> [`2026-06-23_vla_bridge_yaw_hold_last_good`](2026-06-23_vla_bridge_yaw_hold_last_good.md).
 
 ---
 

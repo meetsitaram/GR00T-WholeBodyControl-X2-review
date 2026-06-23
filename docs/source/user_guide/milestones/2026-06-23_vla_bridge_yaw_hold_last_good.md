@@ -8,6 +8,15 @@
 > more than 1 second. Fix lifts the kplanner's "hold last good
 > measured value" pattern into the bridge so a stale `x2_debug` stream
 > never drags the robot back to world +X.
+>
+> **Subsystem reference.** This milestone is one entry in a longer
+> story about how the X2 stack keeps the wire's `root_quat_xyzw`
+> honest across the four laptop / PC2 wire publishers. For the
+> full architectural picture (all four publishers, the two patterns
+> they use, the deploy-side bootstrap escape hatch, the diagnostic
+> tooling, the historical timeline, and the dormant recorder bug),
+> see
+> [`x2_heading_stability_and_yaw_rebase`](../../references/x2_heading_stability_and_yaw_rebase.md).
 
 ---
 
