@@ -20,7 +20,7 @@ the pick and place action sequence is raise left hand sideways to shoulder heigh
     --with-record \
     --head-cameras \
     --output-dir data/lerobot/x2_pick_and_place_soda_can \
-    --task "pick up the mini soda can with your left hand and place it in the open black container on the right"
+    --task "task description"
 
 ### camera access on PC2
 gear_sonic_deploy/scripts/x2_pc2_cameras.sh status --host 192.168.86.32
@@ -75,6 +75,7 @@ gear_sonic_deploy/scripts/x2_pc2_cameras.sh restart-hal --host 192.168.86.32
 .venv/bin/python -m gear_sonic.scripts.vr_operator_calibrate --operator-id default
 
 ### groot training
+- make sure to use the yaml config
 conda activate env_isaaclab
 PYTHONPATH=external_dependencies/Isaac-GR00T:. python \
     external_dependencies/Isaac-GR00T/gr00t/experiment/launch_finetune.py \
