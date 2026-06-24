@@ -5,12 +5,47 @@ Capture mobile-app-triggered MC gestures (wave, handshake, ...) from the
 real X2 robot into SOMA-byte-compatible motion-lib PKLs, ready to drop
 into sonic training alongside the bones-seed corpus.
 
+### See also
+- [pkl_direct_commands.md](pkl_direct_commands.md) -- play any
+  captured PKL straight into SONIC (sim or real) without spinning up
+  the Quest3 / kplanner stack. Uses `play_gesture` for in-place clips
+  and `play_locomotion` for walks / turns over the shared
+  `motion_clip_cmd` wire.
+
 =============== do not auto edit this section ===============
 
-### replay gestures in sim
+### capture gesture
+./gear_sonic_deploy/scripts/record_x2_mc_gesture.sh     \
+    --pc2-host 192.168.86.32 --view left_bump 001 
+
+### view gesture
+.venv/bin/python gear_sonic/scripts/play_x2_motion_mujoco.py     --motion gear_sonic/data/motions/x2_recorded/mc_gestures/hug_001.pkl    --motion-key hug_001
+
+### play gesture onto the sonic stack in sim
 gear_sonic/scripts/run_x2_quest3_planner_stack.sh
 
 python -m gear_sonic.scripts.play_gesture     --pkl gear_sonic/data/motions/x2_recorded/mc_gestures/left_kiss_001.pkl
+
+
+### play gesture onto the sonic stack on real robot
+
+##### start sonic on PC2 : Robogym Wifi
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery.yaml \
+    --lock-head-straight
+
+##### stop sonic
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
+
+##### run teleop stack with recording enabled
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --pc2-host 192.168.86.32 \
+    --head-cameras 
+
+python -m gear_sonic.scripts.play_gesture \
+    --pkl gear_sonic/data/motions/x2_recorded/mc_gestures/left_kiss_001.pkl
 
 =============== end of pure manual notes section ===============
 

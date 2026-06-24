@@ -1,14 +1,21 @@
-"""Unit tests for :mod:`gear_sonic.utils.teleop.gesture_session`.
+"""Unit tests for :mod:`gear_sonic.utils.teleop.motion_clip_session`.
 
 Covers:
 
 * Catalog YAML parsing (default catalog + malformed inputs).
 * PKL load + resample math (length, dtype, shape).
-* Yaw-only root rebase: first emitted root_quat matches the operator-
-  supplied robot yaw; roll/pitch pass through unchanged.
+* Yaw-only root rebase for ``kind="gesture"``: first emitted root_quat
+  matches the operator-supplied robot yaw; roll/pitch pass through
+  unchanged.
+* Locomotion branch (``kind="locomotion"``) applies the SAME rigid
+  yaw rebase as gesture (frame 0 yaw aligned with robot yaw) but
+  preserves the authored relative yaw evolution across frames --
+  so the takeover from idle-stand is C0-continuous in yaw while a
+  walk-and-turn clip still turns by the authored amount.
 * Future window padding past clip end.
 * Session lifecycle (next_frame / is_done / StopIteration).
-* JSON command parsing (play with name, play with pkl, stop, errors).
+* JSON command parsing (play with name, play with pkl, stop, errors,
+  kind discriminator).
 
 The tests use the shipped sit_stand_sit catalog as the realistic PKL
 fixture; if it ever moves, update :data:`_CATALOG_PATH`.
@@ -22,16 +29,16 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as Rot
 
-from gear_sonic.utils.teleop.gesture_session import (
+from gear_sonic.utils.teleop.motion_clip_session import (
     GESTURE_DEFAULT_CATALOG_PATH,
-    GestureCatalogEntry,
-    GesturePlayRequest,
-    GestureSession,
-    GestureStopRequest,
+    MotionClipEntry,
+    MotionClipPlayRequest,
+    MotionClipSession,
+    MotionClipStopRequest,
     X2_NUM_BODY_DOFS,
     estimate_duration_s,
     load_catalog,
-    parse_gesture_command,
+    parse_motion_clip_command,
 )
 
 
@@ -39,7 +46,7 @@ _CATALOG_PATH = GESTURE_DEFAULT_CATALOG_PATH
 _TARGET_RATE = 50.0
 
 
-def _first_entry() -> GestureCatalogEntry:
+def _first_entry() -> MotionClipEntry:
     cat = load_catalog(_CATALOG_PATH)
     return next(iter(cat.values()))
 
@@ -55,6 +62,8 @@ def test_load_default_catalog_has_at_least_one_resolvable_entry() -> None:
     for entry in cat.values():
         src = entry.resolved_source()
         assert src.is_file(), f"catalog entry {entry.name!r} points at missing PKL: {src}"
+        # Catalog rows always load as gestures (locomotion uses --pkl).
+        assert entry.kind == "gesture"
 
 
 def test_load_catalog_rejects_missing_file(tmp_path: Path) -> None:
@@ -130,7 +139,7 @@ def test_shipped_catalog_marks_sit_down_A540_hold_after() -> None:
 
 def test_session_loads_first_catalog_entry_and_resamples_to_target_rate() -> None:
     entry = _first_entry()
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -143,12 +152,14 @@ def test_session_loads_first_catalog_entry_and_resamples_to_target_rate() -> Non
     assert sess.duration_s == pytest.approx(sess.n_frames / _TARGET_RATE)
     # Catalog default key is the first one in the PKL (per spec).
     assert sess.motion_key_resolved
+    # Catalog entries ship as gestures.
+    assert sess.kind == "gesture"
 
 
 def test_estimate_duration_matches_session_duration() -> None:
     entry = _first_entry()
     est = estimate_duration_s(entry, _TARGET_RATE)
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -157,10 +168,10 @@ def test_estimate_duration_matches_session_duration() -> None:
     assert est == pytest.approx(sess.duration_s, abs=1.0 / _TARGET_RATE)
 
 
-def test_root_rebase_aligns_first_frame_yaw_with_robot_yaw() -> None:
+def test_gesture_root_rebase_aligns_first_frame_yaw_with_robot_yaw() -> None:
     entry = _first_entry()
     target_yaw = 0.7  # rad, not aligned with PKL
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=target_yaw,
@@ -172,7 +183,7 @@ def test_root_rebase_aligns_first_frame_yaw_with_robot_yaw() -> None:
     assert yaw0 == pytest.approx(target_yaw, abs=1e-4)
 
 
-def test_root_rebase_delta_is_pure_world_z_rotation() -> None:
+def test_gesture_root_rebase_delta_is_pure_world_z_rotation() -> None:
     """Yaw-only rebase rotates every frame's quat by the same Rz(dyaw).
 
     We can't just compare ZYX Euler pitches because changing yaw on
@@ -182,12 +193,12 @@ def test_root_rebase_delta_is_pure_world_z_rotation() -> None:
     rotation between the two sessions is a pure z-axis rotation.
     """
     entry = _first_entry()
-    sess_a = GestureSession(
+    sess_a = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
     )
-    sess_b = GestureSession(
+    sess_b = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=1.2345,
@@ -203,6 +214,76 @@ def test_root_rebase_delta_is_pure_world_z_rotation() -> None:
     np.testing.assert_allclose(q_delta[:, 2], q_delta[0, 2], atol=1e-4)
 
 
+def test_locomotion_kind_rebases_frame0_yaw_to_robot_yaw() -> None:
+    """``kind="locomotion"`` applies the same single rigid Rz(dyaw)
+    as gesture: frame 0's published yaw must equal the operator-
+    supplied robot yaw, so the takeover from idle-stand doesn't
+    teleport-rotate the body.
+    """
+    base_entry = _first_entry()
+    loco_entry = MotionClipEntry(
+        name=base_entry.name,
+        source=base_entry.source,
+        motion_key=base_entry.motion_key,
+        start_frame=base_entry.start_frame,
+        n_frames=base_entry.n_frames,
+        hold_after=base_entry.hold_after,
+        kind="locomotion",
+    )
+    target_yaw = 0.7
+    sess = MotionClipSession(
+        entry=loco_entry,
+        target_rate_hz=_TARGET_RATE,
+        robot_root_yaw_rad=target_yaw,
+    )
+    assert sess.kind == "locomotion"
+    yaw0 = Rot.from_quat(sess.root_quat_xyzw[0].astype(np.float64)).as_euler("zyx")[0]
+    # Same tolerance as the gesture variant: stacked f32 quat-multiply noise.
+    assert yaw0 == pytest.approx(target_yaw, abs=1e-4)
+
+
+def test_locomotion_kind_preserves_authored_relative_yaw_evolution() -> None:
+    """The rebase is a single Rz(dyaw) shared across frames, so
+    per-frame yaw DELTAS must be preserved bit-for-bit between two
+    locomotion sessions with different robot_root_yaw seeds. (A
+    walk-and-turn clip turning by 90deg authored must still turn
+    by 90deg published, regardless of which heading the robot
+    started from.)
+    """
+    base_entry = _first_entry()
+    loco_entry = MotionClipEntry(
+        name=base_entry.name,
+        source=base_entry.source,
+        motion_key=base_entry.motion_key,
+        start_frame=base_entry.start_frame,
+        n_frames=base_entry.n_frames,
+        hold_after=base_entry.hold_after,
+        kind="locomotion",
+    )
+    sess_a = MotionClipSession(
+        entry=loco_entry,
+        target_rate_hz=_TARGET_RATE,
+        robot_root_yaw_rad=0.0,
+    )
+    sess_b = MotionClipSession(
+        entry=loco_entry,
+        target_rate_hz=_TARGET_RATE,
+        robot_root_yaw_rad=1.7,
+    )
+    qa = Rot.from_quat(sess_a.root_quat_xyzw.astype(np.float64))
+    qb = Rot.from_quat(sess_b.root_quat_xyzw.astype(np.float64))
+    # qb = q_delta * qa  ->  q_delta = qb * qa.inv(), a pure world-Z
+    # rotation by the robot-yaw difference, identical on every frame
+    # (which means the per-frame deltas yaw_k - yaw_0 are the same
+    # in both sessions, i.e. authored evolution preserved).
+    q_delta = (qb * qa.inv()).as_rotvec()
+    np.testing.assert_allclose(q_delta[:, 0], 0.0, atol=1e-4)
+    np.testing.assert_allclose(q_delta[:, 1], 0.0, atol=1e-4)
+    np.testing.assert_allclose(q_delta[:, 2], q_delta[0, 2], atol=1e-4)
+    # Joint angles untouched by the rebase in either branch.
+    np.testing.assert_array_equal(sess_a.body_q_mj, sess_b.body_q_mj)
+
+
 # ---------------------------------------------------------------------------
 # Session: next_frame + future window
 # ---------------------------------------------------------------------------
@@ -210,7 +291,7 @@ def test_root_rebase_delta_is_pure_world_z_rotation() -> None:
 
 def test_next_frame_advances_index_and_flips_is_done_after_exhaustion() -> None:
     entry = _first_entry()
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -229,7 +310,7 @@ def test_next_frame_advances_index_and_flips_is_done_after_exhaustion() -> None:
 
 def test_future_window_step_and_padding_at_end_of_clip() -> None:
     entry = _first_entry()
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -250,7 +331,7 @@ def test_future_window_step_and_padding_at_end_of_clip() -> None:
 
 def test_future_window_step_matches_dt_and_rate() -> None:
     entry = _first_entry()
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -269,7 +350,7 @@ def test_future_window_step_matches_dt_and_rate() -> None:
 
 def test_future_window_zero_returns_empty() -> None:
     entry = _first_entry()
-    sess = GestureSession(
+    sess = MotionClipSession(
         entry=entry,
         target_rate_hz=_TARGET_RATE,
         robot_root_yaw_rad=0.0,
@@ -291,9 +372,9 @@ def test_session_rejects_too_short_clip(tmp_path: Path) -> None:
     }
     p = tmp_path / "tiny.pkl"
     joblib.dump({"only": one_frame}, p)
-    entry = GestureCatalogEntry(name="tiny", source=p, motion_key=None)
+    entry = MotionClipEntry(name="tiny", source=p, motion_key=None)
     with pytest.raises(ValueError, match=r"sliced length must be >= 2"):
-        GestureSession(
+        MotionClipSession(
             entry=entry,
             target_rate_hz=_TARGET_RATE,
             robot_root_yaw_rad=0.0,
@@ -306,28 +387,46 @@ def test_session_rejects_too_short_clip(tmp_path: Path) -> None:
 
 
 def test_parse_play_with_name() -> None:
-    req = parse_gesture_command({"action": "play", "name": "foo"})
-    assert isinstance(req, GesturePlayRequest)
+    req = parse_motion_clip_command({"action": "play", "name": "foo"})
+    assert isinstance(req, MotionClipPlayRequest)
     assert req.name == "foo"
     assert req.pkl_path is None
+    # Default kind is gesture when the wire omits it.
+    assert req.kind == "gesture"
 
 
 def test_parse_play_with_pkl() -> None:
-    req = parse_gesture_command({"action": "play", "pkl": "/tmp/a.pkl"})
-    assert isinstance(req, GesturePlayRequest)
+    req = parse_motion_clip_command({"action": "play", "pkl": "/tmp/a.pkl"})
+    assert isinstance(req, MotionClipPlayRequest)
     assert req.name is None
     assert req.pkl_path == Path("/tmp/a.pkl")
+    assert req.kind == "gesture"
+
+
+def test_parse_play_kind_locomotion() -> None:
+    req = parse_motion_clip_command(
+        {"action": "play", "pkl": "/tmp/walk.pkl", "kind": "locomotion"}
+    )
+    assert isinstance(req, MotionClipPlayRequest)
+    assert req.kind == "locomotion"
+
+
+def test_parse_play_rejects_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="'kind' must be one of"):
+        parse_motion_clip_command(
+            {"action": "play", "name": "foo", "kind": "dance"}
+        )
 
 
 def test_parse_play_carries_overrides() -> None:
-    req = parse_gesture_command({
+    req = parse_motion_clip_command({
         "action": "play",
         "name": "foo",
         "motion_key": "bar",
         "start_frame": 30,
         "n_frames": 100,
     })
-    assert isinstance(req, GesturePlayRequest)
+    assert isinstance(req, MotionClipPlayRequest)
     assert req.motion_key == "bar"
     assert req.start_frame == 30
     assert req.n_frames == 100
@@ -336,45 +435,45 @@ def test_parse_play_carries_overrides() -> None:
 
 
 def test_parse_play_carries_hold_after_true_and_false() -> None:
-    req_true = parse_gesture_command(
+    req_true = parse_motion_clip_command(
         {"action": "play", "name": "foo", "hold_after": True}
     )
-    req_false = parse_gesture_command(
+    req_false = parse_motion_clip_command(
         {"action": "play", "name": "foo", "hold_after": False}
     )
-    assert isinstance(req_true, GesturePlayRequest)
-    assert isinstance(req_false, GesturePlayRequest)
+    assert isinstance(req_true, MotionClipPlayRequest)
+    assert isinstance(req_false, MotionClipPlayRequest)
     assert req_true.hold_after is True
     assert req_false.hold_after is False
 
 
 def test_parse_play_rejects_non_bool_hold_after() -> None:
     with pytest.raises(ValueError, match="hold_after"):
-        parse_gesture_command(
+        parse_motion_clip_command(
             {"action": "play", "name": "foo", "hold_after": "yes"}
         )
 
 
 def test_parse_stop() -> None:
-    req = parse_gesture_command({"action": "stop"})
-    assert isinstance(req, GestureStopRequest)
+    req = parse_motion_clip_command({"action": "stop"})
+    assert isinstance(req, MotionClipStopRequest)
 
 
 def test_parse_rejects_unknown_action() -> None:
     with pytest.raises(ValueError, match="unknown action"):
-        parse_gesture_command({"action": "wiggle"})
+        parse_motion_clip_command({"action": "wiggle"})
 
 
 def test_parse_rejects_play_without_target() -> None:
     with pytest.raises(ValueError, match="exactly one of"):
-        parse_gesture_command({"action": "play"})
+        parse_motion_clip_command({"action": "play"})
 
 
 def test_parse_rejects_play_with_both_name_and_pkl() -> None:
     with pytest.raises(ValueError, match="exactly one of"):
-        parse_gesture_command({"action": "play", "name": "a", "pkl": "b.pkl"})
+        parse_motion_clip_command({"action": "play", "name": "a", "pkl": "b.pkl"})
 
 
 def test_parse_rejects_non_dict_payload() -> None:
     with pytest.raises(ValueError, match="must be a JSON object"):
-        parse_gesture_command(["not", "a", "dict"])  # type: ignore[arg-type]
+        parse_motion_clip_command(["not", "a", "dict"])  # type: ignore[arg-type]

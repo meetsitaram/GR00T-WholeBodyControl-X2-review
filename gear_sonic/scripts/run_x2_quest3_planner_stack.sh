@@ -315,11 +315,11 @@ BODY_POSE_TOPIC="body_pose"
 SCENE_STATE_PORT=5559   # deploy bridge PUB -> recorder SUB (per-tick obj qpos)
 SCENE_RESET_PORT=5560   # recorder PUB -> deploy bridge SUB (re-randomise objs)
 # Gesture playback (live PKL takeover): recorder SUB.binds, transient
-# play_gesture script PUB.connects. See
-# gear_sonic/utils/teleop/gesture_session.py and the
+# play_gesture / play_locomotion script PUB.connects. See
+# gear_sonic/utils/teleop/motion_clip_session.py and the
 # "Play a gesture mid-VR-session" section in clip_motion_commands.md.
-GESTURE_CMD_PORT=5568   # play_gesture PUB -> recorder SUB
-GESTURE_CMD_TOPIC="gesture_cmd"
+MOTION_CLIP_CMD_PORT=5568   # play_gesture/play_locomotion PUB -> recorder SUB
+MOTION_CLIP_CMD_TOPIC="motion_clip_cmd"
 GESTURE_CATALOG="${REPO_ROOT}/gear_sonic/data/motions/gestures/gestures_v1.yaml"
 
 # --------------------------------------------------------------------------
@@ -2811,9 +2811,9 @@ RECORDER_ARGS=(
     --sub-host "${RECORDER_DEBUG_SUB_HOST}"
     --sub-port "${DEBUG_PORT}"
     --sub-topic "${DEBUG_TOPIC}"
-    --gesture-cmd-host '*'
-    --gesture-cmd-port "${GESTURE_CMD_PORT}"
-    --gesture-cmd-topic "${GESTURE_CMD_TOPIC}"
+    --motion-clip-cmd-host '*'
+    --motion-clip-cmd-port "${MOTION_CLIP_CMD_PORT}"
+    --motion-clip-cmd-topic "${MOTION_CLIP_CMD_TOPIC}"
     --gesture-catalog "${GESTURE_CATALOG}"
     --rate "${RATE}"
 )
@@ -3127,9 +3127,9 @@ if [[ "${VLA_MODE}" -eq 1 ]]; then
         --sub-host localhost
         --sub-port "${DEBUG_PORT}"
         --sub-topic "${DEBUG_TOPIC}"
-        --gesture-cmd-host '*'
-        --gesture-cmd-port "${GESTURE_CMD_PORT}"
-        --gesture-cmd-topic "${GESTURE_CMD_TOPIC}"
+        --motion-clip-cmd-host '*'
+        --motion-clip-cmd-port "${MOTION_CLIP_CMD_PORT}"
+        --motion-clip-cmd-topic "${MOTION_CLIP_CMD_TOPIC}"
         --gesture-catalog "${GESTURE_CATALOG}"
         --rate "${RATE}"
         --teleop-only

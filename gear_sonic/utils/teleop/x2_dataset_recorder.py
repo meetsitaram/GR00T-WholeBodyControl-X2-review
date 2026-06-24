@@ -140,15 +140,15 @@ from gear_sonic.utils.teleop.finger_signal_filter import (
     FingerFilterParams,
     FingerSignalFilter,
 )
-from gear_sonic.utils.teleop.gesture_session import (
-    GESTURE_CMD_DEFAULT_PORT,
-    GESTURE_CMD_DEFAULT_TOPIC,
-    GestureCatalogEntry,
-    GesturePlayRequest,
-    GestureSession,
-    GestureStopRequest,
+from gear_sonic.utils.teleop.motion_clip_session import (
+    MOTION_CLIP_CMD_DEFAULT_PORT,
+    MOTION_CLIP_CMD_DEFAULT_TOPIC,
+    MotionClipEntry,
+    MotionClipPlayRequest,
+    MotionClipSession,
+    MotionClipStopRequest,
     load_catalog as load_gesture_catalog,
-    parse_gesture_command,
+    parse_motion_clip_command,
 )
 from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader
@@ -387,39 +387,47 @@ class RecorderConfig:
     stream_mode_topic: str = "stream_mode"
     recorder_cmd_topic: str = "recorder_cmd"
 
-    # ── Live gesture playback (PKL takeover during subscribe mode) ─────
+    # ── Live motion-clip playback (PKL takeover during subscribe mode) ──
     # When ``gesture_catalog_path`` is set (or even when it isn't --
     # ad-hoc ``--pkl`` payloads still work), the recorder opens a SUB
-    # on ``gesture_cmd_*`` for play / stop commands. While a gesture
-    # is active inside :meth:`_run_subscribe_mode` the kplanner
-    # body_pose + manager arm/hand merge are bypassed and the PKL
-    # frames are emitted on the ``pose`` topic verbatim. On natural
-    # completion or an explicit ``stop`` the recorder snaps back to
-    # forwarding kplanner frames (no blend; see ``GestureSession``
-    # docstring for the design rationale).
+    # on ``motion_clip_cmd_*`` for play / stop commands. The wire
+    # carries both gestures (in-place, yaw-rebased to robot heading)
+    # and locomotion (authored yaw preserved); the ``kind`` field on
+    # each play payload picks the branch inside
+    # :class:`MotionClipSession`. While a clip is active inside
+    # :meth:`_run_subscribe_mode` the kplanner body_pose + manager
+    # arm/hand merge are bypassed and the PKL frames are emitted on
+    # the ``pose`` topic verbatim. On natural completion or an
+    # explicit ``stop`` the recorder snaps back to forwarding kplanner
+    # frames (no blend; see ``MotionClipSession`` docstring).
     #
     # Wire-level details + JSON payload shapes live in
-    # :mod:`gear_sonic.utils.teleop.gesture_session`. Setting
-    # ``gesture_catalog_path = None`` disables gesture support entirely
-    # (no SUB bound). Only meaningful in ``body_pose_source=='zmq'``;
-    # ignored in legacy internal-Quest mode.
-    gesture_cmd_host: str = "*"
-    """Interface for the gesture_cmd SUB ``bind``. Defaults to ``*``
+    # :mod:`gear_sonic.utils.teleop.motion_clip_session`. Setting
+    # ``gesture_catalog_path = None`` only suppresses catalog loading;
+    # the SUB still binds so ad-hoc ``--pkl`` plays (both gesture and
+    # locomotion) keep working. Only meaningful in
+    # ``body_pose_source=='zmq'``; ignored in legacy internal-Quest mode.
+    motion_clip_cmd_host: str = "*"
+    """Interface for the motion_clip_cmd SUB ``bind``. Defaults to ``*``
     (all interfaces) because trigger scripts are transient: the
-    recorder is the stable side, so it binds and ``play_gesture``
-    connects. Mirrors the asymmetry already used for ``scene_reset``
-    (recorder PUB ``bind`` vs bridge SUB ``connect``)."""
-    gesture_cmd_port: int = GESTURE_CMD_DEFAULT_PORT
-    gesture_cmd_topic: str = GESTURE_CMD_DEFAULT_TOPIC
+    recorder is the stable side, so it binds and ``play_gesture`` /
+    ``play_locomotion`` connect. Mirrors the asymmetry already used
+    for ``scene_reset`` (recorder PUB ``bind`` vs bridge SUB
+    ``connect``)."""
+    motion_clip_cmd_port: int = MOTION_CLIP_CMD_DEFAULT_PORT
+    motion_clip_cmd_topic: str = MOTION_CLIP_CMD_DEFAULT_TOPIC
     gesture_catalog_path: Optional[Path] = None
-    gesture_future_dt_s: float = 0.1
-    """Spacing of the strictly-future window the gesture player passes
-    to the C++ deploy tokenizer. Matches the kplanner default (see
-    :func:`gear_sonic.utils.planner.state_machine.build_pose_payload`)."""
-    gesture_future_window_frames: int = 9
+    """Path to the gesture catalog YAML. Locomotion clips do not have
+    a catalog (operators pass ``--pkl`` directly), so this stays
+    gesture-only."""
+    clip_future_dt_s: float = 0.1
+    """Spacing of the strictly-future window the motion-clip player
+    passes to the C++ deploy tokenizer. Matches the kplanner default
+    (see :func:`gear_sonic.utils.planner.state_machine.build_pose_payload`)."""
+    clip_future_window_frames: int = 9
     """Number of strictly-future frames packed into the deploy wire's
     ``joint_pos_mj_future`` / ``root_quat_xyzw_future`` arrays during
-    gesture playback. Matches the kplanner's
+    motion-clip playback. Matches the kplanner's
     ``NUM_FUTURE_FRAMES - 1 == 9`` convention."""
 
     # ── Phase-1 robocasa scene plumbing (G1 architecture) ──────────────
@@ -1156,7 +1164,7 @@ def _handle_arm_and_hands_msg(
             return
 
 
-def _subscribe_gesture_cmd_thread(
+def _subscribe_motion_clip_cmd_thread(
     *,
     url: str,
     topic: str,
@@ -1164,13 +1172,14 @@ def _subscribe_gesture_cmd_thread(
     stop_event: threading.Event,
     verbose: bool = False,
 ) -> None:
-    """Dedicated SUB on the ``gesture_cmd`` topic.
+    """Dedicated SUB on the ``motion_clip_cmd`` topic.
 
     Decodes each JSON play / stop payload into a
-    :class:`GesturePlayRequest` or :class:`GestureStopRequest` and
-    pushes it onto ``request_queue`` for the recorder publish loop to
-    drain on its next tick. Malformed payloads are logged + dropped
-    so an external trigger script can never tear down the recorder.
+    :class:`MotionClipPlayRequest` or :class:`MotionClipStopRequest`
+    and pushes it onto ``request_queue`` for the recorder publish
+    loop to drain on its next tick. Malformed payloads are logged +
+    dropped so an external trigger script can never tear down the
+    recorder.
 
     Wire shape is multipart ``[topic_bytes, json_payload_bytes]`` to
     match the manager's existing ``recorder_cmd`` convention.
@@ -1181,11 +1190,11 @@ def _subscribe_gesture_cmd_thread(
     sub.setsockopt(zmq.RCVTIMEO, 100)
     sub.setsockopt_string(zmq.SUBSCRIBE, topic)
     # SUB binds (not connects) because the trigger script is the
-    # transient side. See ``RecorderConfig.gesture_cmd_host`` doc.
+    # transient side. See ``RecorderConfig.motion_clip_cmd_host`` doc.
     sub.bind(url)
     if verbose:
         print(
-            f"[recorder] gesture_cmd SUB bind: {url} topic={topic!r}",
+            f"[recorder] motion_clip_cmd SUB bind: {url} topic={topic!r}",
             flush=True,
         )
 
@@ -1198,21 +1207,21 @@ def _subscribe_gesture_cmd_thread(
             if len(parts) < 2:
                 if verbose:
                     print(
-                        f"[recorder] gesture_cmd: dropping single-part "
+                        f"[recorder] motion_clip_cmd: dropping single-part "
                         f"message (expected [topic, json])",
                         flush=True,
                     )
                 continue
             try:
                 payload = json.loads(parts[1].decode("utf-8"))
-                req = parse_gesture_command(payload)
+                req = parse_motion_clip_command(payload)
             except (
                 json.JSONDecodeError,
                 UnicodeDecodeError,
                 ValueError,
             ) as exc:
                 print(
-                    f"[recorder] gesture_cmd: ignoring malformed "
+                    f"[recorder] motion_clip_cmd: ignoring malformed "
                     f"payload: {exc}",
                     flush=True,
                 )
@@ -1616,26 +1625,27 @@ class X2DatasetRecorder:
                     flush=True,
                 )
 
-        # ── Gesture playback wiring ────────────────────────────────────
+        # ── Motion-clip playback wiring ────────────────────────────────
         # Catalog is best-effort: if the file is missing / malformed we
         # log a warning and proceed with an empty catalog so the SUB
-        # is still bound (ad-hoc ``--pkl`` payloads continue to work).
-        # Setting ``cfg.gesture_catalog_path is None`` disables gesture
-        # support entirely (no SUB, no queue). Only meaningful in
+        # is still bound (ad-hoc ``--pkl`` payloads continue to work,
+        # for both gestures and locomotion). Only meaningful in
         # subscribe mode; legacy internal-Quest path ignores all of
         # this regardless.
-        self._gesture_catalog: dict[str, GestureCatalogEntry] = {}
-        self._gesture_request_queue: Optional["queue.Queue[Any]"] = None
-        self._gesture_thread: Optional[threading.Thread] = None
-        self._active_gesture: Optional[GestureSession] = None
-        # When the active gesture finishes with ``hold_after=True`` we
+        self._gesture_catalog: dict[str, MotionClipEntry] = {}
+        self._motion_clip_request_queue: Optional["queue.Queue[Any]"] = None
+        self._motion_clip_thread: Optional[threading.Thread] = None
+        self._active_clip: Optional[MotionClipSession] = None
+        # When the active clip finishes with ``hold_after=True`` we
         # latch its final body_q + root_quat here so the publish loop
         # can republish them tick-after-tick until an explicit stop or
         # a new play arrives. ``None`` means "not holding". See
         # :meth:`_run_subscribe_mode` for the publish gate and the
-        # GestureCatalogEntry.hold_after docstring for the wire semantics.
-        self._active_gesture_hold_after: bool = False
-        self._gesture_held_frame: Optional[dict[str, np.ndarray]] = None
+        # MotionClipEntry.hold_after docstring for the wire semantics.
+        # Only meaningful for ``kind="gesture"`` plays; locomotion
+        # clips always end at idle stand via the recorder fallback.
+        self._active_clip_hold_after: bool = False
+        self._clip_held_frame: Optional[dict[str, np.ndarray]] = None
 
         # Idle-yaw rebase logging gates. We re-derive the idle frame's
         # ``root_quat_xyzw`` from the live ``x2_debug`` ``base_quat``
@@ -1662,28 +1672,28 @@ class X2DatasetRecorder:
                     f"(ad-hoc --pkl play still works)",
                     flush=True,
                 )
-            self._gesture_request_queue = queue.Queue()
-            self._gesture_thread = threading.Thread(
-                target=_subscribe_gesture_cmd_thread,
+            self._motion_clip_request_queue = queue.Queue()
+            self._motion_clip_thread = threading.Thread(
+                target=_subscribe_motion_clip_cmd_thread,
                 kwargs=dict(
                     url=(
-                        f"tcp://{cfg.gesture_cmd_host}:"
-                        f"{cfg.gesture_cmd_port}"
+                        f"tcp://{cfg.motion_clip_cmd_host}:"
+                        f"{cfg.motion_clip_cmd_port}"
                     ),
-                    topic=cfg.gesture_cmd_topic,
-                    request_queue=self._gesture_request_queue,
+                    topic=cfg.motion_clip_cmd_topic,
+                    request_queue=self._motion_clip_request_queue,
                     stop_event=self._stop_event,
                     verbose=cfg.verbose,
                 ),
-                name="recorder-gesture-cmd-sub",
+                name="recorder-motion-clip-cmd-sub",
                 daemon=True,
             )
             if cfg.verbose:
                 print(
-                    f"[recorder] gesture_cmd wired: "
-                    f"SUB tcp://{cfg.gesture_cmd_host}:"
-                    f"{cfg.gesture_cmd_port} "
-                    f"topic={cfg.gesture_cmd_topic!r}",
+                    f"[recorder] motion_clip_cmd wired: "
+                    f"SUB tcp://{cfg.motion_clip_cmd_host}:"
+                    f"{cfg.motion_clip_cmd_port} "
+                    f"topic={cfg.motion_clip_cmd_topic!r}",
                     flush=True,
                 )
 
@@ -1935,8 +1945,8 @@ class X2DatasetRecorder:
         self._sub_thread.start()
         if self._sub_mode_thread is not None:
             self._sub_mode_thread.start()
-        if self._gesture_thread is not None:
-            self._gesture_thread.start()
+        if self._motion_clip_thread is not None:
+            self._motion_clip_thread.start()
         # Robocasa scene_state subscriber (no-op when not in scene mode).
         if self._scene_state_thread is not None:
             self._scene_state_thread.start()
@@ -2134,9 +2144,9 @@ class X2DatasetRecorder:
                 self._sub_mode_thread.join(timeout=1.0)
             except Exception:
                 pass
-        if self._gesture_thread is not None:
+        if self._motion_clip_thread is not None:
             try:
-                self._gesture_thread.join(timeout=1.0)
+                self._motion_clip_thread.join(timeout=1.0)
             except Exception:
                 pass
         if self._scene_state_thread is not None:
@@ -2525,38 +2535,39 @@ class X2DatasetRecorder:
                                 flush=True,
                             )
 
-                # Gesture override path. Drained AFTER recorder_cmd so
-                # the manager can still start/stop dataset episodes
-                # mid-gesture; runs BEFORE the body_pose-None check so
-                # an operator can fire a gesture even before kplanner
+                # Motion-clip override path. Drained AFTER recorder_cmd
+                # so the manager can still start/stop dataset episodes
+                # mid-clip; runs BEFORE the body_pose-None check so an
+                # operator can fire a clip even before kplanner
                 # publishes (e.g. on a cold-started stack). Skipped in
                 # VLA mode: the bridge owns the wire and there is no
-                # external gesture trigger surface.
+                # external clip trigger surface.
                 if not self._vla_subscribe_mode:
-                    self._drain_gesture_commands(snap)
+                    self._drain_clip_commands(snap)
                 if (
                     not self._vla_subscribe_mode
-                    and self._active_gesture is not None
-                    and not self._active_gesture.is_done()
+                    and self._active_clip is not None
+                    and not self._active_clip.is_done()
                 ):
-                    self._publish_gesture_frame(tick=tick)
-                    if self._active_gesture.is_done():
+                    self._publish_clip_frame(tick=tick)
+                    if self._active_clip.is_done():
                         # Clip just finished on this tick: either snap
                         # back to kplanner (hold_after=False) or latch
                         # the last frame for indefinite republish
                         # (hold_after=True).
-                        if self._active_gesture_hold_after:
-                            self._gesture_held_frame = {
-                                "body_q_mj": self._active_gesture.body_q_mj[-1].astype(
+                        if self._active_clip_hold_after:
+                            self._clip_held_frame = {
+                                "body_q_mj": self._active_clip.body_q_mj[-1].astype(
                                     np.float64, copy=True
                                 ),
-                                "root_quat_xyzw": self._active_gesture.root_quat_xyzw[-1].astype(
+                                "root_quat_xyzw": self._active_clip.root_quat_xyzw[-1].astype(
                                     np.float32, copy=True
                                 ),
                             }
                             print(
-                                f"[recorder] gesture "
-                                f"{self._active_gesture.entry.name!r} "
+                                f"[recorder] motion-clip "
+                                f"(kind={self._active_clip.kind}) "
+                                f"{self._active_clip.entry.name!r} "
                                 f"completed; HOLDING last frame "
                                 f"(send 'stop' or another 'play' to release)",
                                 flush=True,
@@ -2564,25 +2575,27 @@ class X2DatasetRecorder:
                         else:
                             if self._cfg.verbose:
                                 print(
-                                    f"[recorder] gesture "
-                                    f"{self._active_gesture.entry.name!r} "
+                                    f"[recorder] motion-clip "
+                                    f"(kind={self._active_clip.kind}) "
+                                    f"{self._active_clip.entry.name!r} "
                                     f"completed; resuming kplanner forwarding",
                                     flush=True,
                                 )
-                        self._active_gesture = None
-                        self._active_gesture_hold_after = False
+                        self._active_clip = None
+                        self._active_clip_hold_after = False
                     tick += 1
                     next_tick += period
                     self._sleep_until(next_tick)
                     continue
                 if (
                     not self._vla_subscribe_mode
-                    and self._gesture_held_frame is not None
+                    and self._clip_held_frame is not None
                 ):
-                    # Hold mode: keep the robot parked at the last gesture
-                    # frame. We bypass the body_pose-None check on purpose
-                    # -- the operator chose to leave the robot here.
-                    self._publish_held_gesture_frame(tick=tick)
+                    # Hold mode: keep the robot parked at the last clip
+                    # frame. We bypass the body_pose-None check on
+                    # purpose -- the operator chose to leave the robot
+                    # here.
+                    self._publish_held_clip_frame(tick=tick)
                     tick += 1
                     next_tick += period
                     self._sleep_until(next_tick)
@@ -3437,15 +3450,21 @@ class X2DatasetRecorder:
 
         return quat_xyzw
 
-    # -- gesture playback (subscribe-mode override path) ---------------------
+    # -- motion-clip playback (subscribe-mode override path) ----------------
 
     def _snapshot_robot_yaw(self, snap: dict) -> float:
         """Best-effort estimate of the robot's current world-frame yaw.
 
-        Used as the rebase target for the PKL's frame-0 yaw so the
-        gesture starts at the operator's current heading. Falls back
-        to 0 rad when the body_pose snapshot has no root quat yet
-        (e.g. gesture triggered before kplanner publishes anything).
+        Used as the rebase target for the PKL's frame-0 yaw so a
+        gesture clip starts at the operator's current heading. Falls
+        back to 0 rad when the body_pose snapshot has no root quat
+        yet (e.g. clip triggered before kplanner publishes anything).
+
+        Scope note: only consulted by the gesture branch of
+        :meth:`_drain_clip_commands`. The locomotion branch reads
+        :meth:`_snapshot_live_deploy_yaw` first so it works in stacks
+        that have no kplanner publishing body_pose (see the direct-
+        PKL launcher).
         """
         rq = snap.get("root_quat_xyzw")
         if rq is None:
@@ -3455,48 +3474,104 @@ class X2DatasetRecorder:
         except (ValueError, TypeError):
             return 0.0
 
-    def _resolve_gesture_entry(
-        self, req: GesturePlayRequest
-    ) -> Optional[GestureCatalogEntry]:
+    def _snapshot_live_deploy_yaw(self) -> Optional[float]:
+        """Live world-frame yaw of the robot from the deploy's x2_debug.
+
+        Returns the yaw extracted from ``base_quat`` if the
+        ``x2_debug`` SUB thread is alive, else ``None`` so the caller
+        can fall back to the kplanner body_pose snap. Mirrors the
+        liveness gating used by :meth:`_compute_idle_root_quat_xyzw`
+        so the locomotion rebase target and the idle-stand pose are
+        derived from the same source -- which means the transition
+        from idle to clip is C0-continuous in yaw on tick zero.
+
+        Scoped to the locomotion clip branch on purpose: gestures
+        keep using :meth:`_snapshot_robot_yaw` to preserve their
+        legacy shipping behaviour per operator request.
+        """
+        try:
+            (
+                _body_q,
+                base_quat_wxyz,
+                _lh,
+                _rh,
+                _rev,
+                alive,
+            ) = self._latest_state.snapshot()
+        except Exception:  # noqa: BLE001 - defensive at the wire
+            return None
+        if not alive:
+            return None
+        try:
+            return float(
+                yaw_of_quat_xyzw(
+                    np.array(
+                        [
+                            base_quat_wxyz[1],
+                            base_quat_wxyz[2],
+                            base_quat_wxyz[3],
+                            base_quat_wxyz[0],
+                        ],
+                        dtype=np.float64,
+                    )
+                )
+            )
+        except (ValueError, TypeError):
+            return None
+
+    def _resolve_clip_entry(
+        self, req: MotionClipPlayRequest
+    ) -> Optional[MotionClipEntry]:
         """Resolve a play request to a catalog entry (or ad-hoc one).
 
         Returns ``None`` on unknown name with an operator log. Per-
         request ``motion_key`` / ``start_frame`` / ``n_frames`` fields
-        override the catalog entry's defaults when provided.
+        override the catalog entry's defaults when provided. The
+        request's ``kind`` is forwarded onto ad-hoc entries (catalog
+        rows always load with ``kind="gesture"`` because the catalog
+        is gesture-only).
         """
         if req.pkl_path is not None:
-            return GestureCatalogEntry(
+            return MotionClipEntry(
                 name=f"adhoc:{req.pkl_path.name}",
                 source=req.pkl_path,
                 motion_key=req.motion_key,
                 start_frame=req.start_frame,
                 n_frames=req.n_frames,
+                kind=req.kind,
             )
         name = req.name
         if not self._gesture_catalog:
             print(
-                f"[recorder] gesture PLAY: catalog empty / unavailable; "
-                f"cannot resolve name {name!r} (use --pkl for ad-hoc)",
+                f"[recorder] motion-clip PLAY: catalog empty / "
+                f"unavailable; cannot resolve name {name!r} "
+                f"(use --pkl for ad-hoc)",
                 flush=True,
             )
             return None
         if name not in self._gesture_catalog:
             avail = ", ".join(list(self._gesture_catalog.keys())[:5])
             print(
-                f"[recorder] gesture PLAY: unknown name {name!r}; "
-                f"have {len(self._gesture_catalog)} entries (first few: {avail})",
+                f"[recorder] motion-clip PLAY: unknown name {name!r}; "
+                f"have {len(self._gesture_catalog)} entries "
+                f"(first few: {avail})",
                 flush=True,
             )
             return None
         base = self._gesture_catalog[name]
+        # Catalog rows ship as kind="gesture"; the request can still
+        # override (we honor whatever play_gesture / play_locomotion
+        # stamped on the wire even for catalog-name lookups).
+        kind = req.kind
         if (
             req.motion_key is None
             and req.start_frame == 0
             and req.n_frames is None
+            and kind == base.kind
         ):
             return base
         # Per-request overrides win over catalog defaults.
-        return GestureCatalogEntry(
+        return MotionClipEntry(
             name=base.name,
             source=base.source,
             motion_key=(
@@ -3508,10 +3583,12 @@ class X2DatasetRecorder:
             n_frames=(
                 base.n_frames if req.n_frames is None else req.n_frames
             ),
+            hold_after=base.hold_after,
+            kind=kind,
         )
 
-    def _drain_gesture_commands(self, snap: dict) -> None:
-        """Apply queued gesture_cmd requests at the top of a publish tick.
+    def _drain_clip_commands(self, snap: dict) -> None:
+        """Apply queued motion_clip_cmd requests at the top of a publish tick.
 
         Multiple commands in one tick are applied in order; a `play`
         after another `play` supersedes the in-flight session at
@@ -3521,120 +3598,162 @@ class X2DatasetRecorder:
         operator intuition: 'stop, then play X' acts like 'play X').
 
         ``stop`` also releases a held-final-frame state
-        (:attr:`_gesture_held_frame`), so the same wire command covers
+        (:attr:`_clip_held_frame`), so the same wire command covers
         both "abort mid-clip" and "release from indefinite hold". When
-        a new ``play`` arrives during a held state, the new session's
-        yaw rebase seeds off the held root_quat (instead of the
-        kplanner body_pose snap) so the takeover between two halves
-        of the same source PKL stays continuous.
+        a new ``play`` arrives during a held state, the new gesture
+        session's yaw rebase seeds off the held root_quat (instead of
+        the kplanner body_pose snap) so the takeover between two
+        halves of the same source PKL stays continuous. (Locomotion
+        sessions ignore the yaw seed entirely.)
         """
-        if self._gesture_request_queue is None:
+        if self._motion_clip_request_queue is None:
             return
         while True:
             try:
-                req = self._gesture_request_queue.get_nowait()
+                req = self._motion_clip_request_queue.get_nowait()
             except queue.Empty:
                 return
-            if isinstance(req, GestureStopRequest):
-                if self._active_gesture is not None:
+            if isinstance(req, MotionClipStopRequest):
+                if self._active_clip is not None:
                     print(
-                        f"[recorder] gesture STOP (was playing "
-                        f"{self._active_gesture.entry.name!r} at frame "
-                        f"{self._active_gesture.current_index}/"
-                        f"{self._active_gesture.n_frames})",
+                        f"[recorder] motion-clip STOP (was playing "
+                        f"kind={self._active_clip.kind} "
+                        f"{self._active_clip.entry.name!r} at frame "
+                        f"{self._active_clip.current_index}/"
+                        f"{self._active_clip.n_frames})",
                         flush=True,
                     )
-                elif self._gesture_held_frame is not None:
+                elif self._clip_held_frame is not None:
                     print(
-                        "[recorder] gesture STOP (releasing held pose; "
-                        "resuming kplanner forwarding)",
+                        "[recorder] motion-clip STOP (releasing held "
+                        "pose; resuming kplanner forwarding)",
                         flush=True,
                     )
-                self._active_gesture = None
-                self._active_gesture_hold_after = False
-                self._gesture_held_frame = None
+                self._active_clip = None
+                self._active_clip_hold_after = False
+                self._clip_held_frame = None
                 continue
-            entry = self._resolve_gesture_entry(req)
+            entry = self._resolve_clip_entry(req)
             if entry is None:
                 continue
-            # Yaw seed: when superseding a held pose, take the held
-            # root_quat's yaw rather than the kplanner body_pose snap
-            # (kplanner has no idea we're holding; using its idle-stand
-            # snap would re-rotate the world at takeover and create a
-            # visible body twist between two halves of the same source
-            # PKL).
-            if self._gesture_held_frame is not None:
+            # Yaw seed selection.
+            #
+            #   1. Held-pose chain: when superseding a held PKL frame
+            #      we take the held root_quat's yaw so two halves of
+            #      the same source PKL stitch together cleanly (the
+            #      kplanner has no idea we're holding; using its
+            #      idle-stand snap would re-rotate the world at
+            #      takeover).
+            #   2. Locomotion (no held frame): use the live x2_debug
+            #      base_quat yaw -- the recorder's own subscriber to
+            #      the deploy. This is the ground truth for the
+            #      robot's current world-frame heading, and it works
+            #      whether or not a kplanner is running upstream. In
+            #      the kplanner stack it converges to the same value
+            #      as snap['root_quat_xyzw'] (the kplanner subscribes
+            #      to x2_debug too); in the direct-PKL stack there is
+            #      no kplanner publishing body_pose, so the snap dict
+            #      stays empty and the legacy code path silently fell
+            #      back to yaw=0 -- which is exactly the teleport-to-
+            #      authored-heading failure mode the operator was
+            #      seeing. Falls back to the snap-based yaw if
+            #      x2_debug has gone stale.
+            #   3. Gesture (no held frame): unchanged from the legacy
+            #      shipping behaviour -- read from the kplanner snap.
+            #      Scoped narrowly per operator request; the legacy
+            #      path is what gestures have been tested against.
+            if self._clip_held_frame is not None:
                 yaw = float(
                     yaw_of_quat_xyzw(
                         np.asarray(
-                            self._gesture_held_frame["root_quat_xyzw"],
+                            self._clip_held_frame["root_quat_xyzw"],
                             dtype=np.float64,
                         )
                     )
                 )
                 yaw_source = "held-frame"
+            elif entry.kind == "locomotion":
+                live_yaw = self._snapshot_live_deploy_yaw()
+                if live_yaw is not None:
+                    yaw = live_yaw
+                    yaw_source = "x2_debug-base_quat"
+                else:
+                    yaw = self._snapshot_robot_yaw(snap)
+                    yaw_source = "kplanner-snap-fallback"
             else:
                 yaw = self._snapshot_robot_yaw(snap)
                 yaw_source = "kplanner-snap"
             try:
-                self._active_gesture = GestureSession(
+                self._active_clip = MotionClipSession(
                     entry=entry,
                     target_rate_hz=float(self._cfg.publish_rate_hz),
                     robot_root_yaw_rad=yaw,
-                    future_dt_s=float(self._cfg.gesture_future_dt_s),
+                    future_dt_s=float(self._cfg.clip_future_dt_s),
                 )
             except (FileNotFoundError, ValueError, KeyError, RuntimeError) as exc:
                 print(
-                    f"[recorder] gesture PLAY failed for {entry.name!r}: "
-                    f"{exc}",
+                    f"[recorder] motion-clip PLAY failed for "
+                    f"{entry.name!r} (kind={entry.kind}): {exc}",
                     flush=True,
                 )
-                self._active_gesture = None
-                self._active_gesture_hold_after = False
-                self._gesture_held_frame = None
+                self._active_clip = None
+                self._active_clip_hold_after = False
+                self._clip_held_frame = None
                 continue
             # Resolve the effective hold_after: per-request wire
             # override wins, else the catalog default. Ad-hoc --pkl
             # entries default to False because they're constructed
-            # without a catalog row.
+            # without a catalog row. Locomotion sessions ignore
+            # hold_after in practice (the publish loop never reaches
+            # the held branch for a finished walk -- they fall back
+            # to idle stand instead) but we still honor an explicit
+            # operator override.
             if req.hold_after is not None:
                 effective_hold_after = bool(req.hold_after)
             else:
                 effective_hold_after = bool(entry.hold_after)
-            self._active_gesture_hold_after = effective_hold_after
+            self._active_clip_hold_after = effective_hold_after
             # Starting a new play always clears the previous held
             # frame: the new session owns the publish path.
-            self._gesture_held_frame = None
+            self._clip_held_frame = None
             hold_tag = " (will HOLD on completion)" if effective_hold_after else ""
+            # Both kinds now rebase frame-0 yaw to the operator-
+            # supplied seed; the source tag tells the operator which
+            # branch fed the seed so a missing kplanner / stale
+            # x2_debug is visible in the log.
+            yaw_tag = (
+                f" rebased_yaw={np.degrees(yaw):.1f}deg [{yaw_source}]"
+            )
             print(
-                f"[recorder] gesture PLAY {entry.name!r}: "
-                f"{self._active_gesture.n_frames} frames @ "
+                f"[recorder] motion-clip PLAY (kind={entry.kind}) "
+                f"{entry.name!r}: {self._active_clip.n_frames} frames @ "
                 f"{self._cfg.publish_rate_hz} Hz "
-                f"(~{self._active_gesture.duration_s:.1f}s) "
-                f"rebased_yaw={np.degrees(yaw):.1f}deg [{yaw_source}]"
-                f"{hold_tag}",
+                f"(~{self._active_clip.duration_s:.1f}s)"
+                f"{yaw_tag}{hold_tag}",
                 flush=True,
             )
 
-    def _publish_gesture_frame(self, *, tick: int) -> None:
-        """Emit one gesture frame on the deploy ``pose`` topic.
+    def _publish_clip_frame(self, *, tick: int) -> None:
+        """Emit one motion-clip frame on the deploy ``pose`` topic.
 
         Bypasses the kplanner body_pose + manager arm/hand merge path:
         the PKL frames carry the full 31-DOF body, hands go to zero,
         motion_token to zero. v5 future window is synthesized from
         the session's resampled buffer with the operator-configured
-        spacing.
+        spacing. Same publish shape for gesture and locomotion -- the
+        gesture vs locomotion split happens at session construction
+        time (yaw rebase gating), not here.
         """
-        assert self._active_gesture is not None  # noqa: S101 -- gated by caller
-        body, root_quat = self._active_gesture.next_frame()
+        assert self._active_clip is not None  # noqa: S101 -- gated by caller
+        body, root_quat = self._active_clip.next_frame()
         zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
-        n_future = int(self._cfg.gesture_future_window_frames)
-        jpos_future, rot_future = self._active_gesture.future_window(n_future)
+        n_future = int(self._cfg.clip_future_window_frames)
+        jpos_future, rot_future = self._active_clip.future_window(n_future)
         if n_future > 0:
             step_ticks = max(
                 1,
                 int(round(
-                    self._cfg.gesture_future_dt_s
+                    self._cfg.clip_future_dt_s
                     * self._cfg.publish_rate_hz
                 )),
             )
@@ -3654,14 +3773,14 @@ class X2DatasetRecorder:
             joint_pos_mj_future=jpos_future if n_future > 0 else None,
             root_quat_xyzw_future=rot_future if n_future > 0 else None,
             frame_index_future=frame_idx_future,
-            future_dt_s=float(self._cfg.gesture_future_dt_s),
+            future_dt_s=float(self._cfg.clip_future_dt_s),
         )
 
-    def _publish_held_gesture_frame(self, *, tick: int) -> None:
-        """Re-emit the latched final gesture frame for one publish tick.
+    def _publish_held_clip_frame(self, *, tick: int) -> None:
+        """Re-emit the latched final clip frame for one publish tick.
 
-        Engaged after a ``hold_after=True`` gesture finishes its clip;
-        the recorder parks the robot at the gesture's last body_q +
+        Engaged after a ``hold_after=True`` clip finishes; the
+        recorder parks the robot at the clip's last body_q +
         root_quat (zero hands, zero motion_token) every tick at the
         configured publish rate until either an explicit ``stop``
         clears the latch or a new ``play`` takes over the publish path.
@@ -3672,11 +3791,11 @@ class X2DatasetRecorder:
         repeating the held pose is the natural "no future motion"
         signal.
         """
-        assert self._gesture_held_frame is not None  # noqa: S101 -- gated by caller
-        body = self._gesture_held_frame["body_q_mj"]
-        root_quat = self._gesture_held_frame["root_quat_xyzw"]
+        assert self._clip_held_frame is not None  # noqa: S101 -- gated by caller
+        body = self._clip_held_frame["body_q_mj"]
+        root_quat = self._clip_held_frame["root_quat_xyzw"]
         zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
-        n_future = int(self._cfg.gesture_future_window_frames)
+        n_future = int(self._cfg.clip_future_window_frames)
         if n_future > 0:
             jpos_future = np.broadcast_to(
                 body.astype(np.float32, copy=False),
@@ -3688,7 +3807,7 @@ class X2DatasetRecorder:
             step_ticks = max(
                 1,
                 int(round(
-                    self._cfg.gesture_future_dt_s
+                    self._cfg.clip_future_dt_s
                     * self._cfg.publish_rate_hz
                 )),
             )
@@ -3710,7 +3829,7 @@ class X2DatasetRecorder:
             joint_pos_mj_future=jpos_future,
             root_quat_xyzw_future=rot_future,
             frame_index_future=frame_idx_future,
-            future_dt_s=float(self._cfg.gesture_future_dt_s),
+            future_dt_s=float(self._cfg.clip_future_dt_s),
         )
 
     def _record_frame(

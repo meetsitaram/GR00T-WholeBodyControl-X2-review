@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Trigger a gesture mid-VR-session on the running Quest3 planner stack.
+"""Trigger an in-place gesture mid-session on a running X2 stack.
 
-The recorder process owns the ``gesture_cmd`` SUB (bind on
-:data:`gear_sonic.utils.teleop.gesture_session.GESTURE_CMD_DEFAULT_PORT`).
-This script PUB-connects, sends a JSON ``play`` payload, and BLOCKS
-for the estimated clip duration so the operator gets a single
-foreground command they can ``Ctrl-C`` out of:
+The recorder process owns the ``motion_clip_cmd`` SUB (bind on
+:data:`gear_sonic.utils.teleop.motion_clip_session.MOTION_CLIP_CMD_DEFAULT_PORT`).
+This script PUB-connects, sends a JSON ``play`` payload tagged with
+``kind="gesture"``, and BLOCKS for the estimated clip duration so
+the operator gets a single foreground command they can ``Ctrl-C``
+out of:
 
     play_gesture sit_stand_sit_A538       # block ~24 s, exit
     play_gesture --pkl /path/to/clip.pkl  # ad-hoc; bypass catalog
     play_gesture --list                   # print catalog, no traffic
     play_gesture --release                # send stop, return immediately
 
+The gesture branch of :class:`MotionClipSession` yaw-rebases the
+PKL's frame-0 yaw onto the robot's current heading so an arm-wave or
+sit-down starts from wherever the robot is facing. For walks /
+turns / sidesteps where the authored heading evolution matters, use
+:file:`gear_sonic/scripts/play_locomotion.py` instead.
+
 On natural completion the recorder ends the gesture on its own (its
-:class:`GestureSession.is_done` flips after the last frame), so the
-script just exits 0. On SIGINT during the block, the script publishes
-``{"action": "stop"}`` before exiting with code 130 (Ctrl-C
-convention) so the recorder snaps back to kplanner forwarding
-immediately.
+:class:`MotionClipSession.is_done` flips after the last frame), so
+the script just exits 0. On SIGINT during the block, the script
+publishes ``{"action": "stop"}`` before exiting with code 130
+(Ctrl-C convention) so the recorder snaps back to kplanner
+forwarding immediately.
 
 Hold-after semantics
 --------------------
@@ -51,11 +58,11 @@ if str(REPO_ROOT) not in sys.path:
 
 import zmq  # noqa: E402
 
-from gear_sonic.utils.teleop.gesture_session import (  # noqa: E402
-    GESTURE_CMD_DEFAULT_PORT,
-    GESTURE_CMD_DEFAULT_TOPIC,
+from gear_sonic.utils.teleop.motion_clip_session import (  # noqa: E402
     GESTURE_DEFAULT_CATALOG_PATH,
-    GestureCatalogEntry,
+    MOTION_CLIP_CMD_DEFAULT_PORT,
+    MOTION_CLIP_CMD_DEFAULT_TOPIC,
+    MotionClipEntry,
     estimate_duration_s,
     load_catalog,
 )
@@ -88,8 +95,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--pkl", type=Path, default=None,
         help="Ad-hoc PKL path. Bypasses the catalog lookup; the "
-             "recorder builds a one-off GestureCatalogEntry from this "
-             "path (motion-key defaults to first key in the PKL).",
+             "recorder builds a one-off gesture MotionClipEntry from "
+             "this path (motion-key defaults to first key in the PKL).",
     )
     hold_group = parser.add_mutually_exclusive_group()
     hold_group.add_argument(
@@ -130,14 +137,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
              "and trigger script are on the same machine.",
     )
     parser.add_argument(
-        "--port", type=int, default=GESTURE_CMD_DEFAULT_PORT,
-        help="gesture_cmd port. Must match the recorder's "
-             "--gesture-cmd-port.",
+        "--port", type=int, default=MOTION_CLIP_CMD_DEFAULT_PORT,
+        help="motion_clip_cmd port. Must match the recorder's "
+             "--motion-clip-cmd-port.",
     )
     parser.add_argument(
-        "--topic", default=GESTURE_CMD_DEFAULT_TOPIC,
-        help="gesture_cmd topic. Must match the recorder's "
-             "--gesture-cmd-topic.",
+        "--topic", default=MOTION_CLIP_CMD_DEFAULT_TOPIC,
+        help="motion_clip_cmd topic. Must match the recorder's "
+             "--motion-clip-cmd-topic.",
     )
     parser.add_argument(
         "--linger-ms", type=int, default=200,
@@ -211,7 +218,7 @@ def _countdown(delay_s: float, *, quiet: bool) -> None:
         time.sleep(leftover)
 
 
-def _print_catalog(catalog: dict[str, GestureCatalogEntry]) -> None:
+def _print_catalog(catalog: dict[str, MotionClipEntry]) -> None:
     if not catalog:
         print("(catalog is empty)")
         return
@@ -225,14 +232,17 @@ def _print_catalog(catalog: dict[str, GestureCatalogEntry]) -> None:
         print(f"{entry.name.ljust(name_w)}{hold_tag:<6}{src}{marker}")
 
 
-def _resolve_entry(args: argparse.Namespace) -> tuple[GestureCatalogEntry, dict[str, Any]]:
+def _resolve_entry(args: argparse.Namespace) -> tuple[MotionClipEntry, dict[str, Any]]:
     """Resolve CLI args to (catalog_entry, wire_payload) for play.
 
     Returns the wire payload separately because the recorder side
     only sees ``{name, ...}`` or ``{pkl, ...}`` and resolves locally.
     The local ``entry`` retains the effective ``hold_after`` so the
     operator log can describe what will happen even though the
-    recorder is the source of truth on the wire.
+    recorder is the source of truth on the wire. Every payload is
+    stamped with ``kind="gesture"`` -- locomotion clips go through
+    :file:`gear_sonic/scripts/play_locomotion.py` which stamps
+    ``kind="locomotion"`` instead.
     """
     motion_key = args.motion_key
     start_frame = int(args.start_frame)
@@ -242,17 +252,19 @@ def _resolve_entry(args: argparse.Namespace) -> tuple[GestureCatalogEntry, dict[
         # Ad-hoc PKL has no catalog row; default hold_after to False
         # unless the operator passed --hold explicitly.
         effective_hold = bool(hold_override) if hold_override is not None else False
-        entry = GestureCatalogEntry(
+        entry = MotionClipEntry(
             name=f"adhoc:{args.pkl.name}",
             source=args.pkl,
             motion_key=motion_key,
             start_frame=start_frame,
             n_frames=n_frames,
             hold_after=effective_hold,
+            kind="gesture",
         )
         payload: dict[str, Any] = {
             "action": "play",
             "pkl": str(args.pkl),
+            "kind": "gesture",
         }
     else:
         catalog = load_catalog(args.catalog)
@@ -267,15 +279,16 @@ def _resolve_entry(args: argparse.Namespace) -> tuple[GestureCatalogEntry, dict[
         effective_hold = (
             bool(hold_override) if hold_override is not None else bool(base.hold_after)
         )
-        entry = GestureCatalogEntry(
+        entry = MotionClipEntry(
             name=base.name,
             source=base.source,
             motion_key=motion_key if motion_key is not None else base.motion_key,
             start_frame=start_frame or base.start_frame,
             n_frames=n_frames if n_frames is not None else base.n_frames,
             hold_after=effective_hold,
+            kind="gesture",
         )
-        payload = {"action": "play", "name": args.name}
+        payload = {"action": "play", "name": args.name, "kind": "gesture"}
     if motion_key is not None:
         payload["motion_key"] = motion_key
     if start_frame:
