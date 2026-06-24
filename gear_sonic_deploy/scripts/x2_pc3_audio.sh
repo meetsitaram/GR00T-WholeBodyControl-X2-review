@@ -24,6 +24,13 @@
 #                      X2_PC3_PASSWORD or "1" (the X2 SDK convention,
 #                      same as gear_sonic_deploy/scripts/x2_mc_input_source_probe.sh).
 #                      Pass --password "" to force key-only auth.
+#   --pc2-host HOST    If set, tunnel through PC2 at HOST (e.g. a WiFi IP
+#                      like 192.168.86.32) instead of going direct to PC3.
+#                      Needed when the wired SDK link to PC3 is down but
+#                      PC2 is reachable on another network and PC2 in
+#                      turn can reach PC3 over the robot's internal net.
+#                      The PC2 leg reuses --user and --password.
+#                      Default: env X2_PC2_HOST or empty (= direct).
 #   --card N           ALSA card index for the ES8388 codec. Default: 1.
 #   --no-persist       Skip `alsactl store` (mute/volume becomes in-memory
 #                      only and is lost on reboot).
@@ -40,6 +47,11 @@
 #
 #   # Just check what state PC3 is in:
 #   ./gear_sonic_deploy/scripts/x2_pc3_audio.sh status
+#
+#   # When the wired SDK cable is unplugged and PC3 is only reachable
+#   # via PC2 over WiFi:
+#   ./gear_sonic_deploy/scripts/x2_pc3_audio.sh volume 70 \
+#       --pc2-host 192.168.86.32
 #
 # Exit status: 0 on success, non-zero on SSH/ALSA failure.
 
@@ -58,6 +70,7 @@ BOLD='\033[1m'
 HOST="${X2_PC3_HOST:-10.0.1.42}"
 USER_NAME="${X2_PC3_USER:-agi}"
 PASSWORD="${X2_PC3_PASSWORD-1}"   # `-1` so explicit empty means "no password"
+PC2_HOST="${X2_PC2_HOST:-}"       # if set, route PC3 ssh through PC2 (bastion)
 CARD="${X2_PC3_CARD:-1}"
 NO_PERSIST=0
 ACTION=""
@@ -82,6 +95,7 @@ while (( $# > 0 )); do
         --host)        HOST="$2"; shift 2 ;;
         --user)        USER_NAME="$2"; shift 2 ;;
         --password)    PASSWORD="$2"; shift 2 ;;
+        --pc2-host)    PC2_HOST="$2"; shift 2 ;;
         --card)        CARD="$2"; shift 2 ;;
         --no-persist)  NO_PERSIST=1; shift ;;
         -h|--help)     print_help; exit 0 ;;
@@ -123,11 +137,27 @@ if [[ -n "$PASSWORD" ]]; then
 fi
 
 run_remote() {
-    # Run the script-on-stdin on PC3. Caller passes the bash snippet on stdin.
+    # Run the bash snippet (stdin from caller) on PC3, passing "$@" as
+    # positional args. When --pc2-host is set we tunnel via PC2 by
+    # nesting a second sshpass+ssh inside the outer hop's command --
+    # OpenSSH's ProxyJump is cleaner but only one leg can be password-
+    # authed via sshpass, so we hand-roll the two-hop here.
     if (( USE_SSHPASS )); then
-        sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${HOST}" "bash -s" "$@"
+        if [[ -n "$PC2_HOST" ]]; then
+            local inner_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+            local hop_cmd="sshpass -p '${PASSWORD//\'/\'\\\'\'}' ssh ${inner_opts} ${USER_NAME}@${HOST} bash -s"
+            local arg
+            for arg in "$@"; do
+                hop_cmd+=" $(printf '%q' "$arg")"
+            done
+            sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${PC2_HOST}" "$hop_cmd"
+        else
+            sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${HOST}" "bash -s" "$@"
+        fi
     else
-        ssh "${SSH_OPTS[@]}" "${USER_NAME}@${HOST}" "bash -s" "$@"
+        local jump_opt=()
+        [[ -n "$PC2_HOST" ]] && jump_opt+=( -o "ProxyJump=${USER_NAME}@${PC2_HOST}" )
+        ssh "${SSH_OPTS[@]}" "${jump_opt[@]}" "${USER_NAME}@${HOST}" "bash -s" "$@"
     fi
 }
 
@@ -208,7 +238,11 @@ REMOTE
 # ────────────────────────────────────────────────────────────────────────
 # Dispatch
 # ────────────────────────────────────────────────────────────────────────
-echo -e "${BLUE}[x2_pc3_audio]${NC} ${BOLD}${ACTION}${NC} on ${USER_NAME}@${HOST} (card ${CARD})"
+if [[ -n "$PC2_HOST" ]]; then
+    echo -e "${BLUE}[x2_pc3_audio]${NC} ${BOLD}${ACTION}${NC} on ${USER_NAME}@${HOST} via ${USER_NAME}@${PC2_HOST} (card ${CARD})"
+else
+    echo -e "${BLUE}[x2_pc3_audio]${NC} ${BOLD}${ACTION}${NC} on ${USER_NAME}@${HOST} (card ${CARD})"
+fi
 
 case "$ACTION" in
     status)
