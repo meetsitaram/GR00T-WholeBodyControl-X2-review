@@ -317,3 +317,13 @@ mc_motor_scan_*.jsonl
 # match it.
 build_offline/
 agibot_x2_embodiment.md
+
+# Cursor IDE per-session scratch (plan files, chat scratchpads, etc.) lands
+# under .cursor/ and is operator-local noise. Shared workspace config that
+# we *do* want tracked lives under .cursor/rules/ (rule .mdc files); the
+# carve-out below keeps that subtree visible so rules can be committed.
+# Use `.cursor/*` (NOT `.cursor/`) so git still recurses into .cursor/ and
+# the `!.cursor/rules/` re-include can take effect -- a `.cursor/` rule
+# would exclude the whole tree and negations couldn't bring anything back.
+.cursor/*
+!.cursor/rules/

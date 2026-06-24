@@ -18,3 +18,6 @@ gear_sonic_deploy/deploy_x2.sh sim \
 gear_sonic/scripts/run_x2_pkl_direct_stack.sh
 
 python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_walk_demo_v6.pkl
+
+### lower robot volume
+./gear_sonic_deploy/scripts/x2_pc3_audio.sh volume 70 --pc2-host 192.168.86.32
