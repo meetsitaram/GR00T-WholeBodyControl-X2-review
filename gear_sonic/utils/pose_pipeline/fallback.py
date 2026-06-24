@@ -131,6 +131,10 @@ def build_idle_frame_msg(
     *,
     yaw_rebase_rad: float | None = None,
     joint_pos_mj_override: np.ndarray | None = None,
+    joint_pos_mj_future_override: np.ndarray | None = None,
+    root_quat_xyzw_future_override: np.ndarray | None = None,
+    joint_vel_mj_future_override: np.ndarray | None = None,
+    motion_token_override: np.ndarray | None = None,
 ) -> bytes:
     """Pack one idle-fallback frame, optionally yaw-rebased.
 
@@ -147,12 +151,29 @@ def build_idle_frame_msg(
     ``joint_pos_mj_override`` (optional, shape (NUM_BODY_DOFS,) f32)
     lets the BLEND state machine substitute a lerp between cached-
     upstream and the baked idle clip for the CURRENT frame's joint
-    targets while reusing the rest of the frame (root_quat with yaw
-    rebase, motion token zeros, hand zeros, future window). The
-    future-window slots are intentionally left on the idle clip -- they
-    are an advisory horizon for the policy, not the immediate command,
-    and treating them as "blend toward idle in the future" matches what
-    the lerped current frame is doing in the present.
+    targets while reusing the rest of the frame.
+
+    The four ``*_future_override`` / ``motion_token_override`` kwargs
+    (added 2026-06-23 in the BLEND future-window continuity fix) let
+    the watchdog substitute lerps for the ENTIRE upstream-derived wire
+    frame, not just the current ``joint_pos_mj``. This eliminates the
+    one-tick discontinuity at the HOLD -> BLEND boundary that caused
+    the policy's planning horizon (and intent token) to flip from the
+    last VLA frame's values to the idle clip's values, producing the
+    shoulder/elbow snap operators observed at ~T+stale+hold seconds
+    after upstream went silent.
+
+    Yaw-rebase frame convention for ``root_quat_xyzw_future_override``:
+    the watchdog passes pre-rebased futures (the cached upstream futures
+    are already in the live-heading frame thanks to the 2026-06-23 VLA
+    bridge yaw-hold-last-good fix, and the idle-clip side is rebased
+    by the watchdog BEFORE lerping so both lerp endpoints share a
+    frame). When the override is set we therefore SKIP the second
+    rebase that would otherwise apply via ``yaw_rebase_rad``. The
+    same convention applies to ``root_quat_xyzw`` indirectly: the
+    BLEND path passes ``yaw_rebase_rad`` for the current quat (the
+    idle clip's current frame is still rebased), but the future
+    override is treated as already-frame-correct.
     """
     cur_jpos, cur_quat = replay.current(tick)
     if joint_pos_mj_override is not None:
@@ -169,6 +190,34 @@ def build_idle_frame_msg(
             cur_quat.reshape(1, 4), yaw_rebase_rad
         ).reshape(4)
         quat_future = rebase_quats_xyzw_by_yaw(quat_future, yaw_rebase_rad)
+    if joint_pos_mj_future_override is not None:
+        jpos_future = _validated_future_override(
+            joint_pos_mj_future_override,
+            name="joint_pos_mj_future_override",
+            shape=(NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+        )
+    if root_quat_xyzw_future_override is not None:
+        # The override is assumed already in the live-heading frame
+        # (the BLEND lerp endpoints are both pre-rebased), so DO NOT
+        # apply yaw_rebase_rad a second time here.
+        quat_future = _validated_future_override(
+            root_quat_xyzw_future_override,
+            name="root_quat_xyzw_future_override",
+            shape=(NUM_FUTURE_SLOTS, 4),
+        )
+    if joint_vel_mj_future_override is not None:
+        jvel_future = _validated_future_override(
+            joint_vel_mj_future_override,
+            name="joint_vel_mj_future_override",
+            shape=(NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+        )
+    motion_token_value = ZERO_MOTION_TOKEN
+    if motion_token_override is not None:
+        motion_token_value = _validated_future_override(
+            motion_token_override,
+            name="motion_token_override",
+            shape=ZERO_MOTION_TOKEN.shape,
+        )
     fidx_future = np.array(
         [tick + (k + 1) for k in range(NUM_FUTURE_SLOTS)],
         dtype=np.int64,
@@ -179,7 +228,7 @@ def build_idle_frame_msg(
     payload = {
         "joint_pos_mj": cur_jpos,
         "root_quat_xyzw": cur_quat,
-        "motion_token": ZERO_MOTION_TOKEN,
+        "motion_token": motion_token_value,
         "left_hand_joints": ZERO_HAND,
         "right_hand_joints": ZERO_HAND,
         "frame_index": np.array([tick], dtype=np.int64),
@@ -190,6 +239,24 @@ def build_idle_frame_msg(
         "future_dt_s": FUTURE_DT_FIELD,
     }
     return pack_pose_message(payload, topic=topic, version=4)
+
+
+def _validated_future_override(
+    arr: np.ndarray, *, name: str, shape: tuple[int, ...]
+) -> np.ndarray:
+    """Cast + shape-check a BLEND override array. Raises on mismatch.
+
+    Centralised so every override kwarg in ``build_idle_frame_msg``
+    has identical validation semantics and identical error messages
+    (instead of growing four near-duplicate copies of the same
+    five-line block).
+    """
+    out = np.asarray(arr, dtype=np.float32)
+    if out.shape != shape:
+        raise ValueError(
+            f"{name} must have shape {shape}; got {out.shape}"
+        )
+    return out
 
 
 def decide_fallback_state(
@@ -213,8 +280,8 @@ def decide_fallback_state(
     ``stale_s + hold_last_secs`` to ``stale_s + hold_last_secs +
     blend_secs``, and ``IDLE_CLIP`` afterwards. This way the on-the-
     wire behaviour matches what an operator would naively expect from
-    the CLI knobs (e.g. ``--hold-last-secs=10`` means 10 s of HOLD,
-    not "10 s minus stale threshold of HOLD").
+    the CLI knobs (e.g. ``--hold-last-secs=5`` means 5 s of HOLD,
+    not "5 s minus stale threshold of HOLD").
     """
     if not have_upstream:
         return STATE_COLD_IDLE, 0.0

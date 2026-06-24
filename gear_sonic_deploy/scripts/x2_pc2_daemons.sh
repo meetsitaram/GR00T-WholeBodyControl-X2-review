@@ -237,19 +237,23 @@ POSE_PROXY_IDLE_X2M2="${POSE_PROXY_IDLE_X2M2:-${PC2_PREFIX}/data/idle_stand.x2m2
 # Upstream-silent fallback ladder (see x2_pose_proxy.py --idle-mode).
 #
 # The 2026-06-08 default is 'blend': HOLD the last forwarded upstream
-# frame for POSE_PROXY_HOLD_LAST_SECS (default 10s), then lerp into the
-# baked idle clip over POSE_PROXY_BLEND_SECS (default 3s). This soaks
-# up WiFi blips / laptop GC stalls without changing the commanded
-# reference at all, and only glides toward default-stand if the wire
-# stays silent for genuinely long periods (laptop crash, operator
-# walked away). The pre-2026-06-08 behaviour (immediate snap to
-# default-stand on the first stale tick -- which slammed arms into
-# tables during WiFi hiccups) is still available via
-# POSE_PROXY_IDLE_MODE=idle-stand for diagnostics / regression
-# baselines. POSE_PROXY_IDLE_MODE=hold-last is the operator-
+# frame for POSE_PROXY_HOLD_LAST_SECS (default 5s as of 2026-06-23;
+# was 10s pre-2026-06-23 and reduced alongside the BLEND future-window
+# continuity fix so intentional operator shutdowns reach the smooth
+# BLEND ramp sooner), then lerp into the baked idle clip over
+# POSE_PROXY_BLEND_SECS (default 3s). This soaks up WiFi blips / laptop
+# GC stalls without changing the commanded reference at all, and only
+# glides toward default-stand if the wire stays silent for genuinely
+# long periods (laptop crash, operator walked away). Operators wanting
+# the longer 10s HOLD window back (e.g. expecting frequent multi-second
+# GC pauses) can set POSE_PROXY_HOLD_LAST_SECS=10.0. The pre-2026-06-08
+# behaviour (immediate snap to default-stand on the first stale tick
+# -- which slammed arms into tables during WiFi hiccups) is still
+# available via POSE_PROXY_IDLE_MODE=idle-stand for diagnostics /
+# regression baselines. POSE_PROXY_IDLE_MODE=hold-last is the operator-
 # responsibility mode (HOLD forever; cut power to recover).
 POSE_PROXY_IDLE_MODE="${POSE_PROXY_IDLE_MODE:-blend}"
-POSE_PROXY_HOLD_LAST_SECS="${POSE_PROXY_HOLD_LAST_SECS:-10.0}"
+POSE_PROXY_HOLD_LAST_SECS="${POSE_PROXY_HOLD_LAST_SECS:-5.0}"
 POSE_PROXY_BLEND_SECS="${POSE_PROXY_BLEND_SECS:-3.0}"
 # Manual-takeover dual-source arbitration (the legacy 2026-06-10
 # milestone's POSE_PROXY_OVERRIDE_* / POSE_PROXY_CONTROL_* /

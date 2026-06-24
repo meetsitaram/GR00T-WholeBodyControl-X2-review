@@ -376,7 +376,12 @@ BOLD=$'\033[1m'
 : "${POSE_PROXY_TELEOP_MODE_STALE_MS:=1000}"
 : "${POSE_PROXY_IDLE_STALE_MS:=300}"
 : "${POSE_PROXY_IDLE_MODE:=blend}"
-: "${POSE_PROXY_HOLD_LAST_SECS:=10.0}"
+# Default reduced from 10.0 -> 5.0 on 2026-06-23 alongside the BLEND
+# future-window continuity fix so intentional Ctrl+C reaches the
+# smooth BLEND ramp sooner (cuts the operator-visible frozen-VLA wait
+# roughly in half). Operators wanting the old 10s window back can
+# export POSE_PROXY_HOLD_LAST_SECS=10.0 before launching.
+: "${POSE_PROXY_HOLD_LAST_SECS:=5.0}"
 : "${POSE_PROXY_BLEND_SECS:=3.0}"
 # Baked idle clip the proxy falls back to. Repo ships
 # gear_sonic_deploy/data/idle_stand.x2m2 (regenerate via

@@ -137,8 +137,14 @@ from gear_sonic.utils.pose_pipeline.fallback import (  # noqa: E402
 from gear_sonic.utils.pose_pipeline.wire import (  # noqa: E402
     DEFAULT_PUB_RATE_HZ,
     decode_pose_joint_pos_mj,
+    decode_pose_joint_pos_mj_future,
+    decode_pose_joint_vel_mj_future,
+    decode_pose_motion_token,
+    decode_pose_root_quat_xyzw_future,
     decode_x2_debug_base_quat,
     load_x2m2,
+    nlerp_quat_arrays_xyzw,
+    rebase_quats_xyzw_by_yaw,
     yaw_from_quat_wxyz,
 )
 
@@ -269,10 +275,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--hold-last-secs",
         type=float,
-        default=10.0,
+        default=5.0,
         help="How long (s) to hold the last forwarded upstream frame "
-             "before transitioning toward idle (default 10.0). Only "
-             "applies when --idle-mode=blend.",
+             "before transitioning toward idle (default 5.0; reduced "
+             "from 10.0 on 2026-06-23 alongside the BLEND future-"
+             "window continuity fix so intentional operator shutdowns "
+             "reach the smooth BLEND ramp sooner). Only applies when "
+             "--idle-mode=blend.",
     )
     p.add_argument(
         "--blend-secs",
@@ -465,6 +474,19 @@ def main(argv: list[str] | None = None) -> int:
     yaw_decode_failures = 0
     last_upstream_msg: bytes | None = None
     last_upstream_jpos: np.ndarray | None = None
+    # Cached future-window + motion_token from the most recent fresh
+    # upstream frame. Used by the BLEND branch (2026-06-23 future-window
+    # continuity fix) to lerp the full upstream-derived wire frame
+    # toward the idle clip instead of letting the policy planning
+    # horizon and intent token snap in one tick at the HOLD -> BLEND
+    # boundary. Each cache stays None when the upstream is a legacy v4
+    # producer (heuristic planner, mock VLA) that never set the
+    # corresponding field -- the BLEND branch then falls back to
+    # today's snap on that field only.
+    last_upstream_jpos_future: np.ndarray | None = None
+    last_upstream_quat_future: np.ndarray | None = None
+    last_upstream_jvel_future: np.ndarray | None = None
+    last_upstream_motion_token: np.ndarray | None = None
     cur_state = STATE_COLD_IDLE
     prev_state = STATE_COLD_IDLE
     tick = 0
@@ -534,6 +556,53 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if jpos is not None:
                     last_upstream_jpos = jpos
+                # Snapshot the future window + motion token so BLEND can
+                # lerp against them instead of snapping to idle-clip
+                # values on the first BLEND tick. We try both topic
+                # candidates (upstream / downstream) the same way as
+                # the joint_pos_mj decode above. Each decoder returns
+                # None for absent fields (e.g. v4 heuristic planner
+                # frames that never set the future window); we keep
+                # whatever the previous fresh frame had cached in that
+                # case rather than clearing -- a slightly stale future
+                # cache is strictly better than no cache for the
+                # BLEND continuity invariant.
+                jpos_future = decode_pose_joint_pos_mj_future(
+                    latest, args.upstream_topic
+                )
+                if jpos_future is None:
+                    jpos_future = decode_pose_joint_pos_mj_future(
+                        latest, args.downstream_topic
+                    )
+                if jpos_future is not None:
+                    last_upstream_jpos_future = jpos_future
+                quat_future = decode_pose_root_quat_xyzw_future(
+                    latest, args.upstream_topic
+                )
+                if quat_future is None:
+                    quat_future = decode_pose_root_quat_xyzw_future(
+                        latest, args.downstream_topic
+                    )
+                if quat_future is not None:
+                    last_upstream_quat_future = quat_future
+                jvel_future = decode_pose_joint_vel_mj_future(
+                    latest, args.upstream_topic
+                )
+                if jvel_future is None:
+                    jvel_future = decode_pose_joint_vel_mj_future(
+                        latest, args.downstream_topic
+                    )
+                if jvel_future is not None:
+                    last_upstream_jvel_future = jvel_future
+                motion_token = decode_pose_motion_token(
+                    latest, args.upstream_topic
+                )
+                if motion_token is None:
+                    motion_token = decode_pose_motion_token(
+                        latest, args.downstream_topic
+                    )
+                if motion_token is not None:
+                    last_upstream_motion_token = motion_token
                 last_upstream_s = now
 
             if latest is not None:
@@ -587,17 +656,67 @@ def main(argv: list[str] | None = None) -> int:
                             yaw_rebase_rad=yaw_rebase,
                         )
                     else:
+                        # Full-frame BLEND lerp (2026-06-23 future-window
+                        # continuity fix). Pre-rebase the idle-clip
+                        # quats and lerp ALL upstream-derived fields
+                        # toward the idle clip with the same alpha as
+                        # the current jpos -- otherwise the policy's
+                        # planning horizon flips in one tick at the
+                        # HOLD -> BLEND boundary even though current
+                        # jpos is continuous, which is what produced
+                        # the shoulder/elbow snap operators reported.
+                        # Each *_future_override is only passed when
+                        # the corresponding upstream cache is non-None
+                        # (legacy v4 producers don't set futures; we
+                        # gracefully revert to today's snap on those
+                        # fields rather than fabricate values).
                         idle_jpos, _ = replay.current(idle_tick)
+                        idle_jpos_future, idle_quat_future_raw, idle_jvel_future = (
+                            replay.future_window(idle_tick)
+                        )
+                        if yaw_rebase is not None:
+                            idle_quat_future = rebase_quats_xyzw_by_yaw(
+                                idle_quat_future_raw, yaw_rebase
+                            )
+                        else:
+                            idle_quat_future = idle_quat_future_raw
                         lerp = (
                             (1.0 - blend_alpha) * last_upstream_jpos
                             + blend_alpha * idle_jpos
                         ).astype(np.float32)
+                        overrides: dict[str, np.ndarray] = {}
+                        if last_upstream_jpos_future is not None:
+                            overrides["joint_pos_mj_future_override"] = (
+                                (1.0 - blend_alpha)
+                                * last_upstream_jpos_future
+                                + blend_alpha * idle_jpos_future
+                            ).astype(np.float32)
+                        if last_upstream_quat_future is not None:
+                            overrides["root_quat_xyzw_future_override"] = (
+                                nlerp_quat_arrays_xyzw(
+                                    last_upstream_quat_future,
+                                    idle_quat_future,
+                                    blend_alpha,
+                                ).astype(np.float32)
+                            )
+                        if last_upstream_jvel_future is not None:
+                            overrides["joint_vel_mj_future_override"] = (
+                                (1.0 - blend_alpha)
+                                * last_upstream_jvel_future
+                                + blend_alpha * idle_jvel_future
+                            ).astype(np.float32)
+                        if last_upstream_motion_token is not None:
+                            overrides["motion_token_override"] = (
+                                (1.0 - blend_alpha)
+                                * last_upstream_motion_token
+                            ).astype(np.float32)
                         msg = build_idle_frame_msg(
                             replay,
                             idle_tick,
                             args.downstream_topic,
                             yaw_rebase_rad=yaw_rebase,
                             joint_pos_mj_override=lerp,
+                            **overrides,
                         )
                     try:
                         pub.send(msg, zmq.NOBLOCK)

@@ -134,7 +134,12 @@ def _build_watchdog_argv(
         "--idle-x2m2", str(idle_x2m2 or IDLE_X2M2),
         "--idle-stale-ms", "300",
         "--idle-mode", "blend",
-        "--hold-last-secs", "10.0",
+        # Default reduced 10.0 -> 5.0 on 2026-06-23 alongside the BLEND
+        # future-window continuity fix (see milestone
+        # 2026-06-23_blend_future_window_continuity.md). Operators can
+        # still override via POSE_PROXY_HOLD_LAST_SECS=10.0 if they
+        # need the old window back.
+        "--hold-last-secs", "5.0",
         "--blend-secs", "3.0",
         "--no-x2-debug-yaw-track",
     ]

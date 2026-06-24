@@ -177,3 +177,36 @@ Pass any of these as env vars to `x2_pc2_daemons.sh start` (no flag changes need
 
 - **Tune `hold_last_secs` from telemetry**. 10 s is the conservative default; on a stable WiFi link the proxy will almost never need >2 s of HOLD. Worth instrumenting "HOLD entry / exit" pairs in `x2_freeze_postmortem.py` so we can compute the actual hold-time distribution and tighten the default to the 99th percentile observed in production.
 - **Slerp the root_quat during BLEND**. Currently BLEND lerps `joint_pos_mj` but lets `build_idle_frame_msg` rebuild `root_quat` from the idle clip's R_z(0) + measured yaw. Over 3 s with a static measured yaw this is harmless, but if the robot is leaning during the blend the small pitch/roll mismatch could induce a one-time tracking jolt at BLEND -> IDLE_CLIP boundary. Slerping the cached quat -> idle quat would smooth that out; cost is a small scipy or hand-written slerp helper. Defer until we actually see the symptom.
+
+---
+
+## 2026-06-23 follow-ups
+
+This milestone shipped the HOLD → BLEND → IDLE_CLIP **state machine**
+plus a `joint_pos_mj`-only BLEND lerp. Two follow-ups landed in
+2026-06-23 that extended the same surface:
+
+- [2026-06-23 — BLEND future-window continuity + faster HOLD timeout](2026-06-23_blend_future_window_continuity.md).
+  Operator on real X2 noticed an "initial sudden snap" at the HOLD →
+  BLEND boundary followed by a smooth tail. Root cause: the original
+  BLEND lerp only covered `joint_pos_mj`; the future window,
+  `motion_token`, and hand fields all flipped in one tick from the
+  cached VLA values to the idle clip's values. The C++ deploy
+  integrates the full future window + motion_token, so the policy's
+  planning horizon reshaped instantly → shoulder/elbow step. The
+  follow-up extends `build_idle_frame_msg` with four optional
+  override kwargs (`joint_pos_mj_future`, `root_quat_xyzw_future`,
+  `joint_vel_mj_future`, `motion_token`) and rewrites the watchdog's
+  BLEND branch to lerp all of them with the same `alpha`. The same
+  follow-up reduces the `POSE_PROXY_HOLD_LAST_SECS` default from
+  10.0 s to 5.0 s, addressing the first "what to revisit next" bullet
+  above. The "slerp the root_quat during BLEND" bullet is also
+  partially addressed: the new
+  [`nlerp_quat_arrays_xyzw`](../../../../gear_sonic/utils/pose_pipeline/wire.py)
+  helper is now used for the future-window quat lerp; the current
+  frame's `root_quat_xyzw` still rebuilds from idle clip + measured
+  yaw per this milestone's original design.
+- [`x2_blend_future_window_continuity`](../../references/x2_blend_future_window_continuity.md)
+  is the dedicated long-form reference covering the wire-fields-the-
+  policy-integrates contract, the cache+lerp pattern, graceful v4
+  fallback, and the historical timeline this milestone is part of.

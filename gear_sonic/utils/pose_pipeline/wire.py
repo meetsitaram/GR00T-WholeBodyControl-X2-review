@@ -309,6 +309,78 @@ def decode_pose_right_hand(
     )
 
 
+def decode_pose_joint_pos_mj_future(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``joint_pos_mj_future`` (f32, (NUM_FUTURE_SLOTS, NUM_BODY_DOFS)).
+
+    Returns ``None`` if the field is absent (legacy v4 upstream like
+    ``x2_heuristic_planner.py`` that never set the future window) or any
+    decode failure. The watchdog uses this to snapshot the upstream
+    policy's body-trajectory horizon at every fresh tick so the BLEND
+    state can lerp the cached upstream future toward the idle clip
+    future, eliminating the one-tick "policy planning horizon flips"
+    snap that the original 2026-06-08 BLEND lerp left in place (it only
+    interpolated the current ``joint_pos_mj``).
+    """
+    return _decode_pose_field_f32(
+        msg, topic, name="joint_pos_mj_future",
+        expected_shape=(NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+    )
+
+
+def decode_pose_root_quat_xyzw_future(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``root_quat_xyzw_future`` (f32, (NUM_FUTURE_SLOTS, 4)).
+
+    See ``decode_pose_joint_pos_mj_future`` -- same purpose, same v4
+    fallback semantics. The cached upstream future quats are assumed
+    to already be in the live-heading frame (the VLA bridge applies
+    yaw rebase pre-publish as of 2026-06-23), so the watchdog must
+    NOT yaw-rebase them a second time before lerping.
+    """
+    return _decode_pose_field_f32(
+        msg, topic, name="root_quat_xyzw_future",
+        expected_shape=(NUM_FUTURE_SLOTS, 4),
+    )
+
+
+def decode_pose_joint_vel_mj_future(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``joint_vel_mj_future`` (f32, (NUM_FUTURE_SLOTS, NUM_BODY_DOFS)).
+
+    Optional v5 field -- the C++ deploy backward-finite-diffs the
+    future jpos array if this field is absent. Watchdog snapshots it
+    so the BLEND lerp can decay velocities smoothly toward the idle
+    clip's (mostly-zero) future jvel rather than letting them snap.
+    """
+    return _decode_pose_field_f32(
+        msg, topic, name="joint_vel_mj_future",
+        expected_shape=(NUM_FUTURE_SLOTS, NUM_BODY_DOFS),
+    )
+
+
+def decode_pose_motion_token(
+    msg: bytes, topic: str = "pose"
+) -> np.ndarray | None:
+    """Extract ``motion_token`` (f32, shape (SONIC_MOTION_TOKEN_DIM,)).
+
+    Latched into the deploy's tokenizer obs at line 309 of
+    ``zmq_pose_input_source.cpp``. When the bridge stops publishing,
+    the original BLEND path forced this to ``ZERO_MOTION_TOKEN`` on
+    the first BLEND tick -- a one-tick discontinuity in the policy's
+    intent signal that contributed to the shoulder/elbow snap. The
+    watchdog snapshots the latest upstream token so BLEND can decay
+    it toward zero over the blend window instead of slamming it.
+    """
+    return _decode_pose_field_f32(
+        msg, topic, name="motion_token",
+        expected_shape=(SONIC_MOTION_TOKEN_DIM,),
+    )
+
+
 def _decode_pose_field_f32(
     msg: bytes,
     topic: str,
@@ -359,9 +431,12 @@ def _decode_pose_field_f32(
         if fname == name:
             if dtype != "f32" or shape != expected_shape:
                 return None
-            return np.frombuffer(
+            flat = np.frombuffer(
                 payload[cursor:cursor + nbytes], dtype="<f4"
             ).copy()
+            if expected_shape != (nelem,):
+                flat = flat.reshape(expected_shape)
+            return flat
         cursor += nbytes
     return None  # named field absent (e.g. token-only side-channel frame)
 
@@ -392,6 +467,56 @@ def yaw_from_quat_wxyz(quat_wxyz: np.ndarray) -> float:
         2.0 * (qw * qz - qx * qy),
         1.0 - 2.0 * (qy * qy + qz * qz),
     ))
+
+
+def nlerp_quat_arrays_xyzw(
+    q_from: np.ndarray, q_to: np.ndarray, alpha: float
+) -> np.ndarray:
+    """Normalized lerp between two batches of xyzw quats.
+
+    Per-row normalized linear interpolation with dot-sign correction
+    (flip ``q_to`` to ``-q_to`` when ``dot(q_from, q_to) < 0`` so the
+    interpolation takes the short great-circle path; q and -q
+    represent the same orientation so the sign flip is identity in
+    rotation space but flips the lerp direction). Returns a new
+    array of the same dtype + shape as ``q_from``.
+
+    Why nlerp instead of full slerp: the watchdog's PC2 venv is
+    scipy-free (numpy + pyzmq + stdlib budget) and slerp would
+    require ``scipy.spatial.transform.Rotation`` or a hand-rolled
+    sin/atan2 path. For the per-tick alpha increments we use
+    (1 / (blend_secs * rate_hz) ~= 0.007 per tick at 50 Hz / 3 s)
+    and the typical quat deltas across the BLEND window (~10-30 deg
+    yaw, idle clip ~ identity), nlerp matches slerp to better than
+    0.5 deg per tick -- well below the deploy's target_lpf_hz=8 Hz
+    output bandwidth.
+
+    Degenerate inputs (`q_from + q_to_aligned` near zero, i.e.
+    truly antipodal even after sign correction) are extremely
+    unlikely in practice but fall back to ``q_from`` rather than
+    producing NaN. Either endpoint is a valid orientation; the
+    cached upstream side is the safer choice if we're already
+    seeing pathological data.
+    """
+    qf = np.asarray(q_from, dtype=np.float64)
+    qt = np.asarray(q_to, dtype=np.float64)
+    if qf.shape != qt.shape:
+        raise ValueError(
+            f"nlerp_quat_arrays_xyzw: shape mismatch q_from={qf.shape} "
+            f"q_to={qt.shape}"
+        )
+    if qf.ndim != 2 or qf.shape[1] != 4:
+        raise ValueError(
+            f"nlerp_quat_arrays_xyzw: expected (N, 4); got {qf.shape}"
+        )
+    a = float(alpha)
+    dot = np.sum(qf * qt, axis=1, keepdims=True)
+    qt_aligned = np.where(dot < 0.0, -qt, qt)
+    lerp = (1.0 - a) * qf + a * qt_aligned
+    norm = np.linalg.norm(lerp, axis=1, keepdims=True)
+    safe = norm > 1e-9
+    out = np.where(safe, lerp / np.where(safe, norm, 1.0), qf)
+    return out.astype(np.asarray(q_from).dtype, copy=False)
 
 
 def rebase_quats_xyzw_by_yaw(
