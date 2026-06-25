@@ -1,0 +1,57 @@
+# @package _global_
+# SONIC X2 Ultra — demo-v1 fine-tune corpus (~4k iter local fine-tune).
+#
+# Inherits sphere-feet bones-seed (which itself inherits bones-seed -> smoke),
+# then redirects ``motion_file`` at the merged demo-v1 PKL produced by
+# ``gear_sonic/data_process/build_x2_demo_motion_lib.py`` (101 entries:
+# 1 body_check + 3 combat + 34 dances + 51 mc_gestures + 6 retargeted walks
+# + 6 sitstand variants, ~17.7 min of motion content).
+#
+# Designed for a local single-GPU RTX 5090 (32 GB) fine-tune from the H200
+# 25k sphere-feet checkpoint. Cloud overhead (~15 min bootstrap + scp +
+# commit/push + babysit + rsync-back) eats most of the 8x throughput win
+# for a 4k-iter run on a 100-entry corpus, so we keep it local.
+#
+# Recommended launch:
+#
+#   tmux new -d -s sonic_demo \
+#     "MOTION_FILE=gear_sonic/data/motions/x2_ultra_demo_v1.pkl \
+#      EXP_NAME=sonic_x2_ultra_demo_v1 \
+#      NUM_PROCESSES=1 NUM_ENVS=3072 NUM_ITERS=4000 \
+#      USE_WANDB=True \
+#      EXTRA_FLAGS='+checkpoint=$HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt' \
+#      LOG_FILE=$HOME/sonic_demo.log \
+#      bash gear_sonic/scripts/cloud/run_smoke_8gpu.sh"
+#
+# (Yes — same launcher script, NUM_PROCESSES=1 makes it single-GPU. The
+# script name is historical; it just wraps accelerate launch + Hydra.)
+#
+# Bundle additions (over and above the bones-seed-sphere-feet bundle):
+#   - this file (sonic_x2_ultra_demo_v1.yaml)
+#   - gear_sonic/data/motions/x2_ultra_demo_v1.pkl
+#   - gear_sonic/data/motions/x2_ultra_sitstand_chain_matched.pkl
+#   - gear_sonic/data/motions/x2_ultra_dances.pkl
+#   - gear_sonic/data/motions/x2_ultra_body_check.pkl
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet
+  - _self_
+
+exp_var: demo_v1
+project_name: TRL_X2Ultra_DemoV1
+
+# Local-fine-tune sizing: 32 GB VRAM on RTX 5090. CLI override still wins.
+num_envs: 3072
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_ultra_demo_v1.pkl
+
+algo:
+  config:
+    # Fine-tune budget — bones-seed-sphere-feet pre-train is at 25k iters.
+    # 4k more on the demo corpus is enough to bias the policy toward the
+    # demo motions without nuking the broader skillset.
+    num_learning_iterations: 4000

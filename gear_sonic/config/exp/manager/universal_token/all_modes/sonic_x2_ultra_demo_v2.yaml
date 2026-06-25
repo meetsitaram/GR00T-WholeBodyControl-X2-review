@@ -1,0 +1,55 @@
+# @package _global_
+# SONIC X2 Ultra — demo-v2 fine-tune corpus (~4k iter local continuation).
+#
+# Iterates on demo_v1 with three targeted changes for real-robot deploy:
+#
+#   1. CORPUS: drops the 6 sit-on-chair variants (the IsaacLab training env
+#      has no chair geometry, so those motions trained against gravity-only
+#      support and the adaptive sampler over-concentrated on them — at end
+#      of v1 training the hardest motion was being sampled 40× more than
+#      uniform across 18 concentrated bins). Keeps the remaining 95 entries
+#      (1 body_check + 3 combat + 34 dances + 51 mc_gestures + 6 walks,
+#      ~16.8 min of motion content).
+#
+#   2. OBS NOISE: 2× wider than the warm-start ranges (gravity_dir ±0.10,
+#      base_ang_vel ±0.4 rad/s, joint_pos ±0.02 rad, joint_vel ±1.0 rad/s)
+#      — see local_dir_hist_v2.yaml.
+#
+#   3. PD GAINS: per-episode actuator KP/KD scaled to 0.85–1.15× via the
+#      new randomize_actuator_gains event term wired into the level0_4_pd
+#      preset.
+#
+# Continues from the demo_v1 final checkpoint (model_step_004000.pt), so we
+# build on top of the 4k iters that have already learned the demo corpus.
+#
+# Recommended launch:
+#
+#   bash gear_sonic/scripts/run_local_finetune_demo_v2.sh
+#
+# (or call the same env-var pattern as demo_v1 — see the launcher script
+# for the canonical invocation.)
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet
+  - override /manager_env/events: tracking/level0_4_pd
+  - override /manager_env/observations/policy: local_dir_hist_v2
+  - _self_
+
+exp_var: demo_v2
+project_name: TRL_X2Ultra_DemoV2
+
+# Local single-GPU sizing: 32 GB VRAM on RTX 5090. CLI override still wins.
+num_envs: 3072
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_ultra_demo_v2.pkl
+
+algo:
+  config:
+    # Continuation budget — start from demo_v1 final (4k iters of demo-corpus
+    # training on top of the 25k sphere-feet bones-seed pre-train) and add
+    # another 4k iters with the wider DR envelope.
+    num_learning_iterations: 4000
