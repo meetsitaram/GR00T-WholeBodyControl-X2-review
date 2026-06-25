@@ -133,6 +133,22 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MASTER_ADDR=${MASTER_ADDR:-localhost}
 export MASTER_PORT=${MASTER_PORT:-29500}
 
+# Thread caps to prevent torch-default-thread-pool oversubscription on
+# high-core-count cloud nodes. Without these, each DataLoader worker /
+# feature-cache builder worker / ProcessPool worker spawns ~nproc threads,
+# and N_workers * nproc threads fight for nproc cores → catastrophic kernel
+# scheduler thrash (140K cs/sec, ~150× slower per clip). The skeleton-assets
+# step is single-process so it doesn't hit this, but multi-process pools do.
+#
+# Cap at 6 by default: 21 workers × 6 = 126 ≈ 128 cores on the standard
+# 8× H100 / 128-vCPU Nebius node. Override OMP_NUM_THREADS if your node has
+# a very different core count.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-6}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-$OMP_NUM_THREADS}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}
+echo "  thread caps    : OMP=$OMP_NUM_THREADS MKL=$MKL_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS NUMEXPR=$NUMEXPR_NUM_THREADS"
+
 WANDB_FLAGS=()
 if [[ "$USE_WANDB" == "1" ]]; then
   WANDB_FLAGS+=(--use-wandb --wandb-project "$WANDB_PROJECT")

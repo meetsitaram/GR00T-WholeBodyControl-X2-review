@@ -184,13 +184,41 @@ under `motionbricks/out/motionbricks_{vqvae,pose,root}_x2/version_1/`:
 ```bash
 conda activate motionbricks
 cd ~/GR00T-WholeBodyControl
-python motionbricks/scripts/build_x2_skeleton_assets.py
-# ~30 s; reads ~50 clips from the BONES-SEED PKL to estimate
-# per-feature mean/std, writes to motionbricks/out/.../version_1/{skeleton,stats,hparams.yaml}
+python motionbricks/scripts/build_x2_skeleton_assets.py \
+  --pkl gear_sonic/data/motions/x2_ultra_bones_seed_chain_matched.pkl \
+  --max-clips-stats 0
+# Wall-clock cost:
+#   * ~30 s on a small subset (--max-clips-stats 200)        -- smoke / dev
+#   * ~30 s on a single ~18k locowalk PKL                    -- round-1 path
+#   * **~60-90 min on the full 38k chain_matched corpus**    -- round-2 path
+# It writes:
+#   motionbricks/out/motionbricks_vqvae_x2/version_1/skeleton/{joints,parents}.p
+#   motionbricks/out/motionbricks_vqvae_x2/version_1/stats/motion/{mean,std}.npy
+#   motionbricks/out/motionbricks_{vqvae,pose,root}_x2/version_1/hparams.yaml
 ```
 
-If you ever change the X2 skeleton class or the motion-feature pipeline,
-re-run this. Otherwise it's strictly one-time per node.
+### When to re-run the skeleton-assets step
+
+The artifacts depend on three inputs: (PKL corpus, retargeting method, MJCF).
+The skeleton (joints/parents) depends only on the MJCF. The stats (mean/std)
+depend on all three.
+
+| Future run                                              | Reuse existing stats?  |
+|---------------------------------------------------------|------------------------|
+| Resume / fine-tune current round on same corpus         | ✅ Yes                 |
+| Add a few hundred clips of the same retargeting/kind    | ✅ Yes (stats stable)  |
+| Train on halfspeed-merged v2 PKL                        | ✅ Yes (same poses)    |
+| Train on a subset (e.g. locowalk-only of same PKL)      | ✅ Yes                 |
+| Switch retargeting (e.g. legacy ↔ chain_matched)        | ❌ Rebuild             |
+| Add new motion types (dance, combat) to the corpus      | ⚠️ Rebuild recommended |
+| Change MJCF / kinematic tree                            | ❌ Rebuild             |
+| Different robot (G1, H1)                                | ❌ Rebuild             |
+
+The total artifact size is **~10 KB** — small enough to keep both on the
+cloud node and copied back to local under
+`motionbricks/out/motionbricks_*_x2/version_1/`. The
+[`gear_sonic/scripts/cloud/pull_motionbricks_assets.sh`](../../../gear_sonic/scripts/cloud/pull_motionbricks_assets.sh)
+helper rsyncs them back when a cloud-side build finishes.
 
 ### 5a. Pre-compute the FK feature cache (run **locally**, not on the H200)
 
@@ -216,6 +244,53 @@ ships it; on the cloud node, training will see `manifest.json` in
 > outside DDP. The training launcher (`run_planner_train.sh`)
 > auto-runs it if missing, so you can skip step 5 manually if you want;
 > step 5a should still be run locally to save cloud GPU time.
+
+> **⚠ CRITICAL — Thread oversubscription on high-core-count cloud nodes.**
+> If you re-run the feature cache on the cloud node (e.g. because the
+> bundle is stale, or you're building a different PKL like the
+> halfspeed-merged `_v2` for round-2 training), you **must** set OMP /
+> MKL thread caps before launching, otherwise the workers will thrash and
+> make ~zero progress.
+>
+> Symptom:
+>
+> - 21 workers at 500-700 % CPU each, all "active" via `py-spy` but no
+>   `.pt` files appear and no `[N / total]` progress lines fire even after
+>   10+ minutes.
+> - `cat /proc/<worker_pid>/status | grep Threads` shows **~64 threads
+>   per worker** (torch default = `nproc / 2`).
+> - `vmstat 1` shows `cs/sec` of 100K+ (catastrophic kernel scheduling
+>   thrash).
+> - Load avg climbs above the core count.
+>
+> Why: each worker process inherits torch's default thread pool of
+> `nproc` cores. On a 128-core box, 21 workers × 64 threads = 1,344
+> threads fighting for 128 cores. The kernel scheduler spends 99 % of
+> cycles on context switches.
+>
+> Fix — export these **before** running `build_feature_cache_x2.py` or
+> any `train_*_x2.py` launcher on a high-core-count node:
+>
+> ```bash
+> # Pick the smallest of (cores_per_worker, 6). For 21 workers on 128
+> # cores, 6 gives 21*6=126 ≈ 128 cores with a clean 1:1 thread-to-core
+> # mapping. For 32 workers on a 32-core local box, set to 1.
+> export OMP_NUM_THREADS=6
+> export MKL_NUM_THREADS=6
+> export OPENBLAS_NUM_THREADS=6
+> export NUMEXPR_NUM_THREADS=6
+> ```
+>
+> In round 2 on an 8× H100 / 128-vCPU Nebius node this fix cut feature
+> cache wall-clock from "stuck forever" to **2 min for 31K clips** —
+> ~150× per-clip throughput.
+>
+> The skeleton-assets step (single Python process) is **not** affected
+> because there's no inter-process scheduler contention. The training
+> stages (`train_{vqvae,pose,root}_x2.py`) also use multi-process
+> DataLoaders and can hit the same trap if you launch many workers on a
+> high-core-count node — `run_planner_train.sh` already exports these
+> caps on your behalf.
 
 ## 6. Configure W&B (optional)
 

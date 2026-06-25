@@ -27,6 +27,21 @@ Symlink the populated cache into pose+root version_1/ to avoid 3x disk bloat
 
 from __future__ import annotations
 
+import os
+
+# CRITICAL: cap per-worker BLAS/OMP threads BEFORE importing torch/numpy.
+# Each ProcessPool worker otherwise inherits torch's default thread pool sized
+# to nproc. On a 128-vcpu cloud node with 21 workers, that's 21 * 64 = 1,344
+# threads competing for 128 cores → kernel scheduler thrash, ~150x slowdown,
+# zero progress for >10 min. Defaults below give 21 workers * 4 threads ≈ 84
+# threads on 128 cores (clean) and 32 workers * 1 thread = 32 threads on a
+# 32-core local box. Override OMP_NUM_THREADS if your node has very different
+# topology. See docs/source/user_guide/train-planner-on-cloud.md §5a callout.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+os.environ.setdefault("OPENBLAS_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+os.environ.setdefault("NUMEXPR_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+
 import argparse
 import json
 import sys
@@ -37,6 +52,11 @@ from typing import List, Optional, Tuple
 import joblib
 import torch
 from omegaconf import OmegaConf, open_dict
+
+# Belt-and-suspenders: also cap torch's intra-op pool explicitly. The env vars
+# above govern OpenMP/MKL/OpenBLAS; this line caps torch.set_num_threads which
+# some torch builds use independently.
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
 MB_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MB_ROOT))
