@@ -3367,12 +3367,44 @@ class X2DatasetRecorder:
     def _compute_idle_root_quat_xyzw(self) -> Optional[np.ndarray]:
         """Build the yaw-rebased idle root_quat (or None for identity).
 
-        Returns a length-4 xyzw quat representing ``R_z(measured_yaw)``
-        when ``x2_debug`` is alive, else ``None`` so :meth:`_publish_pose`
-        falls back to identity (the pre-2026-06-01 wire behaviour).
+        Hold-last-good semantics (2026-06-24): once we have ever
+        received an ``x2_debug`` frame, we keep deriving the wire
+        ``root_quat`` from the cached ``base_quat_wxyz`` across stalls
+        of arbitrary length rather than reverting to identity. A stale
+        cached yaw is strictly better than identity = ``R_z(0)`` = world
+        +X, because identity is a *known-wrong* orientation the C++
+        deploy will try to twist the body toward via ``waist_yaw_joint``
+        on every tick. Only the bootstrap case (no packet ever) still
+        returns ``None`` so :meth:`_publish_pose` falls back to identity
+        -- there's no measured value to hold yet, and the deploy's own
+        bootstrap-safe quat override carries the orientation reference
+        until the SUB warms up.
+
+        This mirrors the VLA bridge's :func:`_resolve_wire_rebase_source`
+        pattern (live -> cached -> none) that fixed the
+        equivalent regression in
+        :file:`gear_sonic/scripts/live_vla_publish_motion_token.py`
+        on 2026-06-23 (commit ``8eb3279``), and the kplanner's
+        robot_pose hold-last-good at
+        :file:`gear_sonic/scripts/x2_kplanner.py:2816-2821` that
+        protects Quest3 / VR teleop sessions from this same failure
+        mode.
+
+        The bug it fixes: in the direct-PKL stack with
+        ``--pc2-host``, the recorder SUBs ``x2_debug`` from PC2 over
+        wifi. Sub-second wifi jitter is enough to flip
+        :meth:`_LatestState.is_alive` False (default
+        ``DEPLOY_ALIVE_STALE_THRESHOLD_S`` = 1.0 s); each such flip
+        used to make this helper publish identity, and the SONIC
+        policy commanded the body back to world +X (= "robot locks
+        orientation and won't let it drift").
+
         Logging is one-way-gated by ``_idle_yaw_rebase_logged_active``
         / ``_idle_yaw_rebase_logged_fallback`` so a 50 Hz idle publish
-        loop emits at most two lines, not 100/s.
+        loop emits at most two lines, not 100/s. The "fallback" line
+        now describes the live->cached transition (the wire keeps
+        publishing the last measured yaw) rather than the pre-fix
+        live->identity flip.
         """
         try:
             (
@@ -3392,26 +3424,40 @@ class X2DatasetRecorder:
                 )
             return None
 
-        if not alive:
-            # x2_debug has never arrived or has gone stale (deploy not
-            # up yet on first boot, or deploy quit). Identity is the
-            # safest fallback -- matches the pre-2026-06-01 behaviour.
-            if (
-                self._idle_yaw_rebase_logged_active
-                and not self._idle_yaw_rebase_logged_fallback
-            ):
-                print(
-                    "[recorder] idle yaw-rebase: x2_debug went stale; "
-                    "falling back to identity root_quat (waist-yaw click "
-                    "may resume until deploy comes back)",
-                    flush=True,
-                )
-                self._idle_yaw_rebase_logged_fallback = True
-                # Drop the active sticky so the next live tick re-logs
-                # an ACTIVE line -- gives the operator a visible
-                # recovery marker without spamming the boot gap.
-                self._idle_yaw_rebase_logged_active = False
+        # Read ``received_any`` directly so we can distinguish "boot
+        # gap, no packet ever" (must fall back to identity -- we have
+        # no measured value to hold yet) from "stalled but had at
+        # least one packet" (use the cached base_quat_wxyz the
+        # snapshot returns regardless of liveness). The lock is held
+        # for the duration of one field read; no contention with the
+        # SUB thread's ``update`` call.
+        with self._latest_state.cv:
+            received_any = self._latest_state.received_any
+
+        if not received_any:
+            # Bootstrap: x2_debug has never arrived. Returning None
+            # preserves the pre-fix behaviour exactly for this case
+            # (deploy hasn't booted yet / SUB still warming up).
             return None
+
+        source = "live" if alive else "cached"
+        if not alive and (
+            self._idle_yaw_rebase_logged_active
+            and not self._idle_yaw_rebase_logged_fallback
+        ):
+            print(
+                "[recorder] idle yaw-rebase: live -> CACHED "
+                "(x2_debug stalled; holding last measured yaw -- "
+                "no identity-quat fallback, so the robot's heading "
+                "won't twist back to world +X while the deploy is "
+                "silent)",
+                flush=True,
+            )
+            self._idle_yaw_rebase_logged_fallback = True
+            # Drop the active sticky so the next live tick re-logs
+            # the cached->LIVE transition. Gives the operator a
+            # visible recovery marker without spamming the gap.
+            self._idle_yaw_rebase_logged_active = False
 
         try:
             yaw = float(yaw_of_quat_xyzw(np.array(
@@ -3434,18 +3480,18 @@ class X2DatasetRecorder:
             dtype=np.float32,
         )
 
-        if not self._idle_yaw_rebase_logged_active:
+        if alive and not self._idle_yaw_rebase_logged_active:
             print(
                 f"[recorder] idle yaw-rebase: ACTIVE -- root_quat_xyzw "
                 f"now derived from live x2_debug base_quat "
-                f"(yaw={math.degrees(yaw):+.2f}deg); waist-yaw click "
-                f"protection on",
+                f"(yaw={math.degrees(yaw):+.2f}deg, source={source}); "
+                f"waist-yaw click protection on",
                 flush=True,
             )
             self._idle_yaw_rebase_logged_active = True
-            # If we previously logged a fallback, allow the next stale
-            # transition to log again so the operator can correlate
-            # recoveries.
+            # If we previously logged a fallback (live->cached), allow
+            # the next live->cached transition to log again so the
+            # operator can correlate recoveries.
             self._idle_yaw_rebase_logged_fallback = False
 
         return quat_xyzw

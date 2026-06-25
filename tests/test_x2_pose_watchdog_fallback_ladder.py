@@ -44,13 +44,18 @@ class _ProxyShim:
     """Backwards-compatible attribute proxy over wire + fallback."""
 
     NUM_BODY_DOFS = wire.NUM_BODY_DOFS
+    NUM_FUTURE_SLOTS = wire.NUM_FUTURE_SLOTS
     HEADER_SIZE = wire.HEADER_SIZE
     X2M2_MAGIC = wire.X2M2_MAGIC
     pack_pose_message = staticmethod(wire.pack_pose_message)
     decode_pose_joint_pos_mj = staticmethod(wire.decode_pose_joint_pos_mj)
+    decode_pose_root_quat_xyzw_future = staticmethod(
+        wire.decode_pose_root_quat_xyzw_future
+    )
     IdleStandReplay = fallback.IdleStandReplay
     build_idle_frame_msg = staticmethod(fallback.build_idle_frame_msg)
     decide_fallback_state = staticmethod(fallback.decide_fallback_state)
+    rebase_hold_msg = staticmethod(fallback.rebase_hold_msg)
     STATE_LIVE = fallback.STATE_LIVE
     STATE_COLD_IDLE = fallback.STATE_COLD_IDLE
     STATE_HOLD = fallback.STATE_HOLD
@@ -388,20 +393,198 @@ def test_build_idle_frame_msg_blend_lerp_monotonic_between_endpoints() -> None:
 
 
 # ===========================================================================
-# HOLD: re-publishing cached upstream bytes is byte-identical to the
-# original. Regression test in case anyone refactors HOLD to round-trip
-# the cached frame through decode/re-pack -- that would silently change
-# frame_index and the v5 future-window bytes, and we want HOLD to be
-# literally a no-op on the bytes.
+# HOLD: when the watchdog falls back to verbatim re-publish (yaw-track
+# disabled, x2_debug stale, or splice fails), the cached bytes go out
+# unchanged. Regression test for that fallback path -- we want HOLD to
+# be literally a no-op on the bytes when yaw-rebase isn't engaged so a
+# WiFi blip mid-clip never silently rewrites frame_index or the v5
+# future-window bytes.
 # ===========================================================================
-def test_hold_path_is_byte_identical_republish() -> None:
+def test_hold_path_verbatim_fallback_is_byte_identical() -> None:
     jpos = np.arange(proxy.NUM_BODY_DOFS, dtype=np.float32) * 0.1
     original_msg = _pack_pose_with_jpos(jpos)
-    # Simulate the proxy's HOLD path: cache the bytes, then publish
-    # them again later. There is no per-tick transformation.
+    # Simulate the proxy's HOLD path FALLBACK branch: cache the bytes,
+    # then publish them again later. There is no per-tick transformation
+    # when yaw-track is disabled (the active HOLD-rebase path is
+    # exercised by the dedicated tests below).
     cached = original_msg
     republish = cached
     assert republish is original_msg or republish == original_msg
-    # And the decoded jpos must round-trip exactly.
     got = proxy.decode_pose_joint_pos_mj(republish, topic="pose")
     np.testing.assert_allclose(got, jpos, atol=0.0)
+
+
+# ===========================================================================
+# rebase_hold_msg -- HOLD-state yaw rebase (2026-06-24)
+#
+# The watchdog's HOLD branch was a verbatim re-publish pre-2026-06-24,
+# which pinned the policy's heading reference to whatever yaw upstream
+# last sent. If the operator killed the laptop stack and then tried
+# to rotate the body by hand, SONIC fought back for the full
+# --hold-last-secs window before BLEND/IDLE_CLIP re-engaged the
+# idle-clip yaw rebase. ``rebase_hold_msg`` is the surgical fix: it
+# splices R_z(measured_yaw) into the cached message's root_quat
+# fields while leaving joint_pos_mj (and its future window) untouched,
+# so the body pose still freezes exactly where upstream left it.
+# ===========================================================================
+def _pack_pose_with_future_window(
+    jpos: np.ndarray,
+    current_quat_xyzw: np.ndarray,
+    future_quats_xyzw: np.ndarray,
+    topic: str = "pose",
+) -> bytes:
+    """Build a v5-style packed pose frame with a future window.
+
+    Mirrors the fields emitted by the recorder's _publish_pose when
+    both joint_pos_mj_future and root_quat_xyzw_future are supplied
+    (i.e. the locomotion / VLA path). The HOLD-rebase test cases need
+    a future window present so we can verify all 9 slots get rewritten
+    to R_z(measured_yaw).
+    """
+    if jpos.shape != (proxy.NUM_BODY_DOFS,):
+        raise ValueError("jpos must be NUM_BODY_DOFS")
+    if current_quat_xyzw.shape != (4,):
+        raise ValueError("current_quat_xyzw must be (4,)")
+    if future_quats_xyzw.shape != (proxy.NUM_FUTURE_SLOTS, 4):
+        raise ValueError(
+            f"future_quats_xyzw must be ({proxy.NUM_FUTURE_SLOTS}, 4)"
+        )
+    jpos_future = np.tile(jpos, (proxy.NUM_FUTURE_SLOTS, 1)).astype(np.float32)
+    jvel_future = np.zeros(
+        (proxy.NUM_FUTURE_SLOTS, proxy.NUM_BODY_DOFS), dtype=np.float32
+    )
+    payload = {
+        "joint_pos_mj": jpos.astype(np.float32),
+        "root_quat_xyzw": current_quat_xyzw.astype(np.float32),
+        "motion_token": np.zeros(64, dtype=np.float32),
+        "left_hand_joints": np.zeros(10, dtype=np.float32),
+        "right_hand_joints": np.zeros(10, dtype=np.float32),
+        "frame_index": np.array([42], dtype=np.int64),
+        "joint_pos_mj_future": jpos_future,
+        "root_quat_xyzw_future": future_quats_xyzw.astype(np.float32),
+        "joint_vel_mj_future": jvel_future,
+        "frame_index_future": np.arange(
+            43, 43 + proxy.NUM_FUTURE_SLOTS, dtype=np.int64
+        ),
+        "future_dt_s": np.array([0.1], dtype=np.float32),
+    }
+    return proxy.pack_pose_message(payload, topic=topic, version=4)
+
+
+def _r_z_xyzw(yaw_rad: float) -> np.ndarray:
+    """Build R_z(yaw) as an xyzw quat -- mirrors fallback._yaw_to_quat_xyzw."""
+    half = 0.5 * yaw_rad
+    return np.array(
+        [0.0, 0.0, math.sin(half), math.cos(half)], dtype=np.float32
+    )
+
+
+def test_rebase_hold_msg_v4_message_rebases_current_quat() -> None:
+    """v4 frames (recorder _publish_idle path) have no future window;
+    rebase_hold_msg must still splice the current-frame quat so the
+    deploy's single-frame fallback path gets R_z(measured_yaw)."""
+    jpos = np.arange(proxy.NUM_BODY_DOFS, dtype=np.float32) * 0.05
+    msg = _pack_pose_with_jpos(jpos)
+    target_yaw = math.radians(45.0)
+    out = proxy.rebase_hold_msg(msg, "pose", target_yaw)
+    assert out is not None
+    # joint_pos_mj must be byte-for-byte preserved (HOLD freezes pose).
+    got_jpos = proxy.decode_pose_joint_pos_mj(out, topic="pose")
+    np.testing.assert_allclose(got_jpos, jpos, atol=0.0)
+    # The output bytes should differ from the input -- the current quat
+    # field was rewritten.
+    assert out != msg
+
+
+def test_rebase_hold_msg_v5_message_rebases_current_and_future() -> None:
+    """v5 frames (laptop bridge, locomotion clip mid-play) carry a
+    9-slot root_quat_xyzw_future. rebase_hold_msg must overwrite ALL
+    of them with the same R_z(measured_yaw) so the policy's planning
+    horizon doesn't predict an anticipatory yaw change toward the
+    cached clip's authored trajectory after upstream goes silent."""
+    jpos = np.full(proxy.NUM_BODY_DOFS, 0.123, dtype=np.float32)
+    cached_current_quat = _r_z_xyzw(math.radians(-30.0))
+    # Cached future window encodes an anticipatory +60 deg turn over
+    # the 9 slots -- HOLD should NOT honour those deltas; flatten to
+    # the measured yaw across the whole window.
+    cached_future_quats = np.stack(
+        [
+            _r_z_xyzw(math.radians(-30.0 + (k + 1) * 60.0 / proxy.NUM_FUTURE_SLOTS))
+            for k in range(proxy.NUM_FUTURE_SLOTS)
+        ],
+        axis=0,
+    )
+    msg = _pack_pose_with_future_window(
+        jpos, cached_current_quat, cached_future_quats
+    )
+    target_yaw = math.radians(75.0)
+    out = proxy.rebase_hold_msg(msg, "pose", target_yaw)
+    assert out is not None
+    # joint_pos_mj must be byte-identical (HOLD freezes the body pose).
+    got_jpos = proxy.decode_pose_joint_pos_mj(out, topic="pose")
+    np.testing.assert_allclose(got_jpos, jpos, atol=0.0)
+    # All 9 future slots must equal R_z(target_yaw) bit-for-bit
+    # (same value the helper produces for the current frame).
+    expected_slot = _r_z_xyzw(target_yaw)
+    got_future = proxy.decode_pose_root_quat_xyzw_future(out, topic="pose")
+    assert got_future is not None
+    np.testing.assert_allclose(
+        got_future, np.tile(expected_slot, (proxy.NUM_FUTURE_SLOTS, 1)), atol=0.0
+    )
+
+
+def test_rebase_hold_msg_wrong_topic_returns_none() -> None:
+    """Topic mismatch must fail safely (returns None so the watchdog
+    can fall back to verbatim re-publish instead of silently sending
+    a malformed frame)."""
+    jpos = np.zeros(proxy.NUM_BODY_DOFS, dtype=np.float32)
+    msg = _pack_pose_with_jpos(jpos, topic="pose")
+    out = proxy.rebase_hold_msg(msg, "different_topic", 0.0)
+    assert out is None
+
+
+def test_rebase_hold_msg_zero_yaw_produces_identity_quat() -> None:
+    """yaw=0 must produce the identity quat xyzw=[0,0,0,1] (matches
+    the deploy's default heading reference). Guards against an off-
+    by-one in the half-angle conversion in _yaw_to_quat_xyzw."""
+    jpos = np.zeros(proxy.NUM_BODY_DOFS, dtype=np.float32)
+    cached_current_quat = _r_z_xyzw(math.radians(123.0))
+    cached_future_quats = np.tile(
+        cached_current_quat, (proxy.NUM_FUTURE_SLOTS, 1)
+    )
+    msg = _pack_pose_with_future_window(
+        jpos, cached_current_quat, cached_future_quats
+    )
+    out = proxy.rebase_hold_msg(msg, "pose", 0.0)
+    assert out is not None
+    got_future = proxy.decode_pose_root_quat_xyzw_future(out, topic="pose")
+    assert got_future is not None
+    identity = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    np.testing.assert_allclose(
+        got_future, np.tile(identity, (proxy.NUM_FUTURE_SLOTS, 1)), atol=1e-7
+    )
+
+
+def test_rebase_hold_msg_preserves_motion_token_and_hand_joints() -> None:
+    """Only the root_quat fields should change; everything else
+    (motion_token, hand joints, frame_index, future jpos) must be
+    bit-identical because HOLD's contract is 'freeze body pose, only
+    track yaw'. Without this guarantee the policy would see snap
+    changes in fields it expects to be continuous."""
+    jpos = np.arange(proxy.NUM_BODY_DOFS, dtype=np.float32) * 0.1
+    cached_current_quat = _r_z_xyzw(math.radians(10.0))
+    cached_future_quats = np.tile(
+        cached_current_quat, (proxy.NUM_FUTURE_SLOTS, 1)
+    )
+    msg = _pack_pose_with_future_window(
+        jpos, cached_current_quat, cached_future_quats
+    )
+    out = proxy.rebase_hold_msg(msg, "pose", math.radians(20.0))
+    assert out is not None
+    # joint_pos_mj must be untouched.
+    np.testing.assert_allclose(
+        proxy.decode_pose_joint_pos_mj(out, topic="pose"), jpos, atol=0.0
+    )
+    # Output length must equal input length (in-place byte splice,
+    # no field added or removed).
+    assert len(out) == len(msg)

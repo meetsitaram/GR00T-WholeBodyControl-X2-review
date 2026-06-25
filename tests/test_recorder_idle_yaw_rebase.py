@@ -20,18 +20,27 @@ Invariants pinned:
 
 1. **Fresh x2_debug + non-trivial yaw -> R_z(yaw) on the wire.** The
    xy components of the quat stay 0 (pitch/roll dropped on purpose).
-2. **Stale / never-received x2_debug -> identity.** Reverts to the
-   pre-fix behaviour so the fix never regresses the wire shape.
-3. **One-shot log gating.** The "ACTIVE" line fires once on the first
-   successful rebase, the "stale" line fires once on the next stale
-   tick, and 50 Hz of repeated activity does NOT spam logs.
-4. **Round-trip recovery logs.** If x2_debug goes stale and comes
+2. **Never-received x2_debug -> identity (bootstrap).** The deploy
+   hasn't booted yet / the SUB is still warming up; we have no
+   measured value to hold, so the wire falls back to identity.
+3. **Stale x2_debug AFTER receiving at least one packet -> cached
+   R_z(yaw) on the wire (hold-last-good).** Mirrors the VLA bridge
+   fix from 2026-06-23 (commit ``8eb3279``): a stale cached yaw is
+   strictly better than identity, because identity = world +X = a
+   known-wrong orientation the policy would actively twist toward.
+   Fixes the direct-PKL-stack regression where wifi jitter to PC2
+   flipped the wire to identity every >1 s gap.
+4. **One-shot log gating.** The "ACTIVE" line fires once on the
+   first successful rebase, the "live -> CACHED" line fires once on
+   the next stale tick, and 50 Hz of repeated activity does NOT
+   spam logs.
+5. **Round-trip recovery logs.** If x2_debug goes stale and comes
    back, the next ACTIVE line fires again (so the operator sees the
    recovery).
-5. **`_publish_idle` glue.** When the helper returns a non-None quat,
+6. **`_publish_idle` glue.** When the helper returns a non-None quat,
    `_publish_pose` is called with that exact ``root_quat_xyzw=`` kwarg;
-   when None, the kwarg is None and `_publish_pose` falls back to
-   identity internally (its existing default).
+   when None (bootstrap only), the kwarg is None and `_publish_pose`
+   falls back to identity internally.
 """
 
 from __future__ import annotations
@@ -181,25 +190,73 @@ def test_fresh_xdebug_pitch_and_roll_are_dropped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. stale / never-received x2_debug -> None (identity fallback)
+# 2. bootstrap vs stale: hold-last-good split
 # ---------------------------------------------------------------------------
 
 
 def test_never_received_xdebug_returns_none() -> None:
-    """Fresh _LatestState defaults (received_any=False) -> alive=False
-    -> helper returns None so _publish_pose falls back to identity."""
+    """Bootstrap: fresh _LatestState (received_any=False) -> helper
+    returns None so _publish_pose falls back to identity. There's no
+    measured value to hold yet, and the deploy's own bootstrap-safe
+    quat override carries the orientation reference until the SUB
+    warms up."""
     h = _IdleHarness(latest_state=_LatestState())
     quat = h._compute_idle_root_quat_xyzw()
     assert quat is None
 
 
-def test_stale_xdebug_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Once last_update_monotonic ages past DEPLOY_ALIVE_STALE_THRESHOLD_S,
-    is_alive flips to False and the helper returns None (matches the
-    pre-fix wire behaviour exactly)."""
-    state = _state_with_yaw(math.radians(45.0))
-    # Force the stored last_update_monotonic into the deep past.
+def test_stale_xdebug_holds_last_good_yaw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hold-last-good (2026-06-24): once x2_debug has produced at
+    least one frame, the helper keeps deriving root_quat from the
+    cached base_quat across stalls of arbitrary length rather than
+    reverting to identity. Mirrors the VLA bridge's
+    ``_resolve_wire_rebase_source`` cached branch (commit ``8eb3279``).
+
+    This is the fix that unblocks the direct-PKL stack against PC2
+    over wifi: sub-second wifi jitter routinely flips is_alive False
+    and the pre-fix helper used to publish identity = world +X every
+    such gap, which the SONIC policy then tried to twist the body
+    toward.
+    """
+    yaw_rad = math.radians(45.0)
+    state = _state_with_yaw(yaw_rad)
+    # Force the stored last_update_monotonic into the deep past so
+    # is_alive flips False. received_any stays True (we DID receive
+    # one packet) so the hold-last-good path kicks in.
     state.last_update_monotonic = time.monotonic() - 1e6
+    assert state.received_any, "preconditions: we must have received once"
+
+    h = _IdleHarness(latest_state=state)
+    quat = h._compute_idle_root_quat_xyzw()
+
+    assert quat is not None, (
+        "stale but received-once must hold-last-good, not fall back "
+        "to identity (= world +X = known-wrong orientation that the "
+        "policy will actively twist the body toward)"
+    )
+    qx, qy, qz, qw = quat.tolist()
+    half = 0.5 * yaw_rad
+    assert qx == pytest.approx(0.0, abs=1e-6)
+    assert qy == pytest.approx(0.0, abs=1e-6)
+    assert qz == pytest.approx(math.sin(half), abs=1e-5), (
+        "cached yaw must equal the last-received yaw bit-for-bit"
+    )
+    assert qw == pytest.approx(math.cos(half), abs=1e-5)
+
+
+def test_stale_after_never_received_still_returns_none() -> None:
+    """Combined gate: a default _LatestState (never received) plus a
+    deep-past last_update_monotonic is still bootstrap, NOT
+    hold-last-good. The cached base_quat_wxyz on a never-updated
+    state is the identity default; we must NOT publish that as if
+    it were a real measured yaw."""
+    state = _LatestState()
+    state.last_update_monotonic = time.monotonic() - 1e6
+    assert not state.received_any, (
+        "preconditions: never received, so hold-last-good must be off"
+    )
 
     h = _IdleHarness(latest_state=state)
     quat = h._compute_idle_root_quat_xyzw()
@@ -259,36 +316,62 @@ def test_log_gates_fallback_message_fires_only_after_active(
     )
 
 
-def test_log_round_trip_active_then_stale_then_active(
+def test_log_round_trip_active_then_cached_then_active(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A realistic operator-visible sequence: rebase comes up,
-    deploy quits, deploy comes back. We want exactly:
+    wifi stalls (deploy still alive, x2_debug just hasn't reached us
+    in >1 s), x2_debug comes back. We want exactly:
       * 1 ACTIVE line on first success
-      * 1 stale-fallback line on the next stale tick
+      * 1 "live -> CACHED" line on the next stale tick (the wire
+        keeps publishing the last measured yaw, not identity)
       * 1 ACTIVE line again on recovery
     """
-    state = _state_with_yaw(math.radians(20.0))
+    yaw_rad = math.radians(20.0)
+    state = _state_with_yaw(yaw_rad)
     h = _IdleHarness(latest_state=state)
 
     # Phase 1: first ACTIVE.
-    assert h._compute_idle_root_quat_xyzw() is not None
+    quat_active = h._compute_idle_root_quat_xyzw()
+    assert quat_active is not None
 
-    # Phase 2: force stale -> fallback line fires.
+    # Phase 2: force stale -> live->CACHED line fires; the helper
+    # MUST keep publishing the last measured yaw (not None / not
+    # identity), so the cached quat byte-equals the previous tick.
     state.last_update_monotonic = time.monotonic() - 1e6
-    assert h._compute_idle_root_quat_xyzw() is None
-    # Subsequent stale ticks must NOT re-log.
+    quat_cached = h._compute_idle_root_quat_xyzw()
+    assert quat_cached is not None, (
+        "stale-after-received must hold-last-good, not return None"
+    )
+    np.testing.assert_array_equal(
+        quat_cached, quat_active,
+        err_msg="cached tick must publish exactly the last live yaw",
+    )
+    # Subsequent stale ticks must NOT re-log (and must still hold).
     for _ in range(10):
-        h._compute_idle_root_quat_xyzw()
+        q = h._compute_idle_root_quat_xyzw()
+        assert q is not None
+        np.testing.assert_array_equal(q, quat_active)
 
-    # Phase 3: recovery -- bump update + re-mark alive.
+    # Phase 3: recovery -- bump update + re-mark alive (new yaw
+    # value so we can prove the live branch took over).
+    new_yaw_rad = math.radians(-30.0)
+    half = 0.5 * new_yaw_rad
     state.update(
         body_q_mj=np.zeros(31, dtype=np.float64),
-        base_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        base_quat_wxyz=np.array(
+            [math.cos(half), 0.0, 0.0, math.sin(half)],
+            dtype=np.float64,
+        ),
         left_hand_q=np.zeros(7, dtype=np.float64),
         right_hand_q=np.zeros(7, dtype=np.float64),
     )
-    assert h._compute_idle_root_quat_xyzw() is not None
+    quat_recovery = h._compute_idle_root_quat_xyzw()
+    assert quat_recovery is not None
+    # Recovery yaw should follow the new live measurement, not the
+    # stale cache (sanity that the live branch is actually firing).
+    assert quat_recovery[2] == pytest.approx(math.sin(half), abs=1e-5)
+    assert quat_recovery[3] == pytest.approx(math.cos(half), abs=1e-5)
     # And one more idle tick after recovery must NOT re-log.
     h._compute_idle_root_quat_xyzw()
 
@@ -297,17 +380,17 @@ def test_log_round_trip_active_then_stale_then_active(
         l for l in captured.out.splitlines()
         if "idle yaw-rebase: ACTIVE" in l
     ]
-    fallback_lines = [
+    cached_lines = [
         l for l in captured.out.splitlines()
-        if "idle yaw-rebase: x2_debug went stale" in l
+        if "idle yaw-rebase: live -> CACHED" in l
     ]
     assert len(active_lines) == 2, (
         f"expected 2 ACTIVE lines (initial + recovery); got "
         f"{len(active_lines)}: {active_lines}"
     )
-    assert len(fallback_lines) == 1, (
-        f"expected 1 stale-fallback line on the active->stale "
-        f"transition; got {len(fallback_lines)}: {fallback_lines}"
+    assert len(cached_lines) == 1, (
+        f"expected 1 live->CACHED line on the active->stale "
+        f"transition; got {len(cached_lines)}: {cached_lines}"
     )
 
 
@@ -338,10 +421,12 @@ def test_publish_idle_forwards_yaw_rebased_quat() -> None:
     assert qw == pytest.approx(math.cos(half), abs=1e-5)
 
 
-def test_publish_idle_falls_back_to_none_when_xdebug_silent() -> None:
-    """When x2_debug never arrived, _publish_idle calls _publish_pose
-    with ``root_quat_xyzw=None`` -- the deploy receives the recorder's
-    pre-fix identity-quat wire shape verbatim (zero regression)."""
+def test_publish_idle_falls_back_to_none_when_xdebug_never_received() -> None:
+    """Bootstrap case (received_any=False): _publish_idle calls
+    _publish_pose with ``root_quat_xyzw=None`` -- the deploy receives
+    identity, matching the pre-fix wire shape verbatim. The hold-
+    last-good branch only activates after the SUB has produced at
+    least one packet."""
     h = _IdleHarness(latest_state=_LatestState())
 
     h._publish_idle()
@@ -350,3 +435,34 @@ def test_publish_idle_falls_back_to_none_when_xdebug_silent() -> None:
     kwargs = h.publish_calls[0]
     assert kwargs["tick"] == -1
     assert kwargs["root_quat_xyzw"] is None
+
+
+def test_publish_idle_forwards_cached_quat_when_xdebug_stalls() -> None:
+    """Hold-last-good through ``_publish_idle``: after one live tick
+    the source can stall arbitrarily long and ``_publish_idle`` keeps
+    forwarding the cached R_z(yaw) quat. This is the wire shape the
+    direct-PKL stack relies on so PC2 wifi jitter doesn't twist the
+    body back to world +X every >1 s gap."""
+    yaw_rad = math.radians(75.0)
+    state = _state_with_yaw(yaw_rad)
+    h = _IdleHarness(latest_state=state)
+
+    # Tick 1: live -> caches the ACTIVE log + drives publish.
+    h._publish_idle()
+
+    # Force stale and emit another idle frame.
+    state.last_update_monotonic = time.monotonic() - 1e6
+    h._publish_idle()
+
+    assert len(h.publish_calls) == 2
+    stale_kwargs = h.publish_calls[1]
+    assert stale_kwargs["tick"] == -1
+    assert stale_kwargs["root_quat_xyzw"] is not None, (
+        "stale-after-received must publish a real quat, not None"
+    )
+    qx, qy, qz, qw = stale_kwargs["root_quat_xyzw"].tolist()
+    half = 0.5 * yaw_rad
+    assert qx == pytest.approx(0.0, abs=1e-6)
+    assert qy == pytest.approx(0.0, abs=1e-6)
+    assert qz == pytest.approx(math.sin(half), abs=1e-5)
+    assert qw == pytest.approx(math.cos(half), abs=1e-5)

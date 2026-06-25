@@ -52,6 +52,7 @@ from .wire import (
     ZERO_QVEL_FUTURE,
     pack_pose_message,
     rebase_quats_xyzw_by_yaw,
+    rebuild_msg_with_field_overrides,
 )
 
 
@@ -239,6 +240,103 @@ def build_idle_frame_msg(
         "future_dt_s": FUTURE_DT_FIELD,
     }
     return pack_pose_message(payload, topic=topic, version=4)
+
+
+def _yaw_to_quat_xyzw(yaw_rad: float) -> np.ndarray:
+    """Build ``R_z(yaw)`` as a length-4 xyzw quaternion (f32).
+
+    Matches the convention used by ``rebase_quats_xyzw_by_yaw``: a
+    pure-yaw quaternion with zero pitch/roll. Centralised so the
+    HOLD-rebase path and any future call sites agree on the exact
+    half-angle / dtype semantics (no per-call-site drift in float
+    precision or array layout).
+    """
+    import math as _math
+    half = 0.5 * float(yaw_rad)
+    return np.array(
+        [0.0, 0.0, _math.sin(half), _math.cos(half)],
+        dtype=np.float32,
+    )
+
+
+def rebase_hold_msg(
+    last_upstream_msg: bytes,
+    topic: str,
+    yaw_rad: float,
+) -> bytes | None:
+    """Yaw-rebase a cached upstream HOLD frame to ``R_z(yaw_rad)``.
+
+    The watchdog's HOLD state (originally introduced 2026-06-08 in the
+    staged fallback ladder) re-publishes the LAST forwarded upstream
+    bytes verbatim so the deploy keeps tracking the operator's final
+    pose with zero joint velocity during a brief upstream silence.
+    That verbatim re-publish has a known foot-gun: if the cached
+    message's ``root_quat_xyzw`` (and future window) describe a
+    yaw that no longer matches the robot's actual heading -- because
+    the operator manually rotated the robot during HOLD, or the
+    laptop stack was killed mid-clip -- then the SONIC policy fights
+    the body back to the cached yaw with a noticeable restoring
+    torque. Operators perceive this as "the robot snaps back to a
+    previous orientation when I kill the stack".
+
+    This helper produces a HOLD-friendly variant of the cached frame:
+    every ``root_quat_xyzw`` field (the current frame's quat plus, if
+    present, the 9 future-window slots) is REPLACED with a pure-yaw
+    ``R_z(yaw_rad)`` quaternion derived from the latest measured
+    ``x2_debug`` ``base_quat``. ``joint_pos_mj`` and the future joint
+    windows are LEFT UNTOUCHED so the body pose still freezes exactly
+    where upstream left it -- only the heading reference tracks the
+    robot's actual yaw, freeing the operator to rotate the body by
+    hand without the policy springing back.
+
+    Returns the rebased bytes on success, or ``None`` if the splice
+    failed (legacy v4 message missing a future window, corrupt
+    header, etc.). Callers should fall back to publishing
+    ``last_upstream_msg`` verbatim on ``None`` -- the worst case is
+    today's pre-fix behaviour, which is strictly safer than dropping
+    the frame.
+
+    Splice strategy: we try BOTH overrides
+    (``root_quat_xyzw`` + ``root_quat_xyzw_future``) first because
+    the future window is the dominant policy input for the planning
+    horizon. If that fails (header reports no future field, as in
+    pre-v5 producer frames), we retry with just ``root_quat_xyzw``
+    so the current-frame quat is still rebased. Only if BOTH
+    attempts fail do we return ``None``.
+
+    The future override sets all 9 slots to the SAME ``R_z(yaw_rad)``
+    quat -- i.e. "no anticipated yaw motion" -- which is the correct
+    HOLD semantic. The cached future window may have encoded
+    anticipatory yaw deltas from a locomotion clip's last frame, but
+    once upstream is silent we can't honour those deltas anyway, and
+    flattening them avoids a yaw-cylinder seam at the HOLD entry.
+    Joint-pos future slots are not touched; they keep the clip's
+    last-frame anticipatory leg/arm motion intact (the body holds
+    the final pose, not snaps to "all frames identical").
+    """
+    cur_quat = _yaw_to_quat_xyzw(yaw_rad)
+    fut_quat = np.tile(cur_quat, (NUM_FUTURE_SLOTS, 1))
+    # First try: rebase current + future. v5 producers (laptop bridge,
+    # mock VLA in v5 mode, the recorder when a clip is active) include
+    # the future window.
+    out = rebuild_msg_with_field_overrides(
+        last_upstream_msg,
+        topic,
+        {
+            "root_quat_xyzw": cur_quat,
+            "root_quat_xyzw_future": fut_quat,
+        },
+    )
+    if out is not None:
+        return out
+    # Fallback: legacy v4 producer (recorder's _publish_idle path,
+    # heuristic planner) that omits the future window. Still rebase
+    # the current quat so the policy gets at least a fresh heading.
+    return rebuild_msg_with_field_overrides(
+        last_upstream_msg,
+        topic,
+        {"root_quat_xyzw": cur_quat},
+    )
 
 
 def _validated_future_override(

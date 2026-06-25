@@ -16,12 +16,21 @@ When upstream is silent for > --idle-stale-ms (default 100):
     Run the staged fallback ladder (LIVE -> HOLD -> BLEND -> IDLE_CLIP)
     keyed by ``--idle-mode``. The default is ``blend``:
 
-      * HOLD (default 10 s): re-publish the LAST forwarded upstream
-        frame BYTE-FOR-BYTE. The deploy sees zero kinematic surprise
-        (identical bytes -> identical joint_pos -> jvel = 0) and keeps
-        commanding the operator's last pose. Soaks up WiFi blips /
-        laptop GC pauses / Cursor reloads of up to ``--hold-last-secs``
-        with no observable effect on the robot.
+      * HOLD (default 5 s): re-publish the LAST forwarded upstream
+        frame, with one targeted edit when ``x2_debug`` is alive --
+        ``root_quat_xyzw`` (and the 9 future-window slots if present)
+        is rewritten to ``R_z(measured_yaw)`` so the heading reference
+        tracks the robot's actual yaw instead of pinning to whatever
+        upstream last sent. Joint targets are still re-published
+        byte-for-byte (identical joint_pos -> jvel = 0), so the body
+        pose freezes exactly where upstream left it while the operator
+        is free to rotate the body by hand without the SONIC policy
+        springing back. Soaks up WiFi blips / laptop GC pauses /
+        Cursor reloads of up to ``--hold-last-secs`` with no
+        observable effect on the robot. Pre-2026-06-24 this was a
+        pure byte-for-byte re-publish, which pinned heading to the
+        cached yaw and caused the "robot snaps back to its previous
+        orientation when I kill the stack" symptom.
       * BLEND (default 3 s): lerp joint_pos_mj from the cached upstream
         frame toward the baked idle clip. Smooth glide rather than a
         step, so the arms drift to default over seconds rather than
@@ -52,6 +61,17 @@ When upstream is silent for > --idle-stale-ms (default 100):
     the live ``base_quat`` (IMU pelvis quat) on every tick, and
     pre-multiplies the baked clip's root quats by ``R_z(measured_yaw)``
     before publishing.
+
+    The same yaw-rebase logic now applies to the HOLD state as well
+    (2026-06-24): when a cached upstream frame is re-published during
+    HOLD, the ``root_quat_xyzw`` field (and the future window if
+    present) is spliced with ``R_z(measured_yaw)`` via
+    ``rebase_hold_msg`` so the deploy never sees a stale absolute-yaw
+    reference, regardless of which ladder state the watchdog is in.
+    Before this fix the laptop-side Ctrl-C of ``run_x2_pkl_direct_stack``
+    triggered up to ``--hold-last-secs`` seconds of "operator pushes
+    robot, robot fights back" before BLEND/IDLE_CLIP took over and
+    re-engaged yaw-rebase on the baked idle clip.
 
 What this watchdog DOES NOT DO:
     No dual-source arbitration. No engagement ramp. No teleop-mode
@@ -133,6 +153,7 @@ from gear_sonic.utils.pose_pipeline.fallback import (  # noqa: E402
     STATE_LIVE,
     build_idle_frame_msg,
     decide_fallback_state,
+    rebase_hold_msg,
 )
 from gear_sonic.utils.pose_pipeline.wire import (  # noqa: E402
     DEFAULT_PUB_RATE_HZ,
@@ -460,6 +481,28 @@ def main(argv: list[str] | None = None) -> int:
             "tables during WiFi hiccups)",
             flush=True,
         )
+    # HOLD yaw-rebase (2026-06-24): when x2_debug is alive, the HOLD
+    # state splices R_z(measured_yaw) into the cached re-publish so
+    # the body is free-yaw during HOLD (operator can rotate the
+    # robot by hand without policy spring-back). Pre-fix HOLD was
+    # verbatim re-publish, which pinned yaw to whatever upstream
+    # last sent.
+    if yaw_track_enabled:
+        print(
+            "[pose_watchdog] HOLD yaw-rebase:  ENABLED (cached "
+            "root_quat_xyzw replaced with R_z(measured_yaw) at every "
+            "HOLD tick; falls back to verbatim if x2_debug stale "
+            "or splice fails)",
+            flush=True,
+        )
+    else:
+        print(
+            "[pose_watchdog] HOLD yaw-rebase:  DISABLED (yaw-track "
+            "off -> HOLD re-publishes cached frame verbatim; "
+            "expect spring-back to last-published yaw on upstream "
+            "stall)",
+            flush=True,
+        )
 
     period = 1.0 / max(args.rate_hz, 1e-6)
     stale_s = args.idle_stale_ms / 1000.0
@@ -495,9 +538,19 @@ def main(argv: list[str] | None = None) -> int:
     idle_frames = 0
     idle_frames_with_rebase = 0
     hold_frames = 0
+    hold_frames_with_rebase = 0
     blend_frames = 0
     gap_skips = 0
     last_status_s = time.monotonic()
+    # One-shot log gates for the HOLD yaw-rebase path so a 50 Hz HOLD
+    # loop never floods the journal. Mirrors the recorder's idle
+    # rebase log gates (x2_dataset_recorder._idle_yaw_rebase_logged_*).
+    # We log once when HOLD-with-rebase first engages, once if x2_debug
+    # goes stale during HOLD, and once if rebuild_msg_with_field_overrides
+    # rejects a cached frame (legacy v4 without future, corrupt header).
+    hold_yaw_rebase_logged_active: bool = False
+    hold_yaw_rebase_logged_fallback: bool = False
+    hold_yaw_rebase_logged_splice_fail: bool = False
 
     print(
         "[pose_watchdog] starting (initial state: COLD_IDLE; will "
@@ -635,9 +688,89 @@ def main(argv: list[str] | None = None) -> int:
                     if last_upstream_msg is None:
                         cur_state = STATE_COLD_IDLE
                     else:
+                        # HOLD with optional yaw-rebase (2026-06-24).
+                        # When x2_debug yaw is fresh, splice
+                        # R_z(measured_yaw) into the cached message's
+                        # root_quat fields before re-publishing so the
+                        # SONIC policy tracks the robot's CURRENT
+                        # heading instead of fighting back to the cached
+                        # yaw. This makes Ctrl-C of the laptop stack
+                        # leave the body free-yaw (joint pose still
+                        # frozen on the cached jpos) instead of
+                        # snapping back to whatever yaw upstream last
+                        # published. Falls back to verbatim republish
+                        # when (a) yaw-track is off, (b) x2_debug is
+                        # stale, or (c) the splice fails (legacy
+                        # message header without root_quat fields).
+                        msg_to_send = last_upstream_msg
+                        rebased = False
+                        if (
+                            yaw_track_enabled
+                            and last_measured_yaw_s >= 0
+                            and (now - last_measured_yaw_s) <= yaw_max_age_s
+                        ):
+                            spliced = rebase_hold_msg(
+                                last_upstream_msg,
+                                args.upstream_topic,
+                                last_measured_yaw_rad,
+                            )
+                            if spliced is None:
+                                # Try downstream topic as a fallback --
+                                # mirrors the dual-topic decode pattern
+                                # used elsewhere in the watchdog (the
+                                # upstream may have already retopicked).
+                                spliced = rebase_hold_msg(
+                                    last_upstream_msg,
+                                    args.downstream_topic,
+                                    last_measured_yaw_rad,
+                                )
+                            if spliced is not None:
+                                msg_to_send = spliced
+                                rebased = True
+                                if not hold_yaw_rebase_logged_active:
+                                    print(
+                                        f"[pose_watchdog] HOLD yaw-rebase: "
+                                        f"ACTIVE -- cached frame's "
+                                        f"root_quat_xyzw replaced with "
+                                        f"R_z(measured_yaw="
+                                        f"{math.degrees(last_measured_yaw_rad):+.2f}deg); "
+                                        f"operator can freely rotate the "
+                                        f"body during HOLD without policy "
+                                        f"spring-back",
+                                        flush=True,
+                                    )
+                                    hold_yaw_rebase_logged_active = True
+                                    hold_yaw_rebase_logged_fallback = False
+                            elif not hold_yaw_rebase_logged_splice_fail:
+                                print(
+                                    "[pose_watchdog] HOLD yaw-rebase: "
+                                    "splice FAILED (cached message header "
+                                    "missing root_quat_xyzw, or corrupt); "
+                                    "falling back to verbatim re-publish "
+                                    "for this HOLD cycle (pre-2026-06-24 "
+                                    "behaviour)",
+                                    flush=True,
+                                )
+                                hold_yaw_rebase_logged_splice_fail = True
+                        elif (
+                            hold_yaw_rebase_logged_active
+                            and not hold_yaw_rebase_logged_fallback
+                        ):
+                            print(
+                                "[pose_watchdog] HOLD yaw-rebase: "
+                                "x2_debug went stale; falling back to "
+                                "verbatim cached-frame re-publish "
+                                "(operator may feel spring-back if the "
+                                "body rotates during this HOLD cycle)",
+                                flush=True,
+                            )
+                            hold_yaw_rebase_logged_fallback = True
+                            hold_yaw_rebase_logged_active = False
                         try:
-                            pub.send(last_upstream_msg, zmq.NOBLOCK)
+                            pub.send(msg_to_send, zmq.NOBLOCK)
                             hold_frames += 1
+                            if rebased:
+                                hold_frames_with_rebase += 1
                         except zmq.Again:
                             pass
                 elif target_state == STATE_BLEND:
@@ -844,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"[pose_watchdog] tick={tick} state={state_str} "
                     f"mode={idle_mode} upstream_age={age_str} "
                     f"fwd={fwd_frames} hold={hold_frames} "
+                    f"hold_rebased={hold_frames_with_rebase} "
                     f"blend={blend_frames} idle={idle_frames} "
                     f"idle_rebased={idle_frames_with_rebase} "
                     f"gap_skip={gap_skips} "
@@ -873,7 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[pose_watchdog] done. total_ticks={tick} fwd={fwd_frames} "
-        f"hold={hold_frames} blend={blend_frames} idle={idle_frames} "
+        f"hold={hold_frames} hold_rebased={hold_frames_with_rebase} "
+        f"blend={blend_frames} idle={idle_frames} "
+        f"idle_rebased={idle_frames_with_rebase} "
         f"gap_skip={gap_skips}",
         flush=True,
     )
