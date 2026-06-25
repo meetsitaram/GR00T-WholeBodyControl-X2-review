@@ -1,0 +1,116 @@
+name: x2_ultra_walk_loop_v1_uniform_h14
+output_key: walk__v1__home_loop
+fps: 30
+
+# Closed-loop "regular" walk choreography (2026-06-24). Same shape as
+# walk_demo_v6 and relaxed_walk_loop_v1 (anchor / pivot / walk / 2x pivot /
+# walk / pivot / anchor), but the walk primitive is the canonical
+# walk_forward_loop_* family rather than the swaggering Relaxed_walk_*
+# family. uniform_h14 retarget track (whole-body SOMA scaler @ h=1.4).
+#
+# Building blocks (all from x2_ultra_retarget_uniform_h14.pkl):
+#
+#   * idle_anchor:  neutral_idle_loop_002__A074__speed_1.0   (1.00 s)
+#   * pivot_left:   idle_turn_270_003__A149_M__speed_1.0     (4.90 s, +90)
+#   * pivot_right:  step_rotate_idle_090_002__A026_M__speed_1.0 (5.17 s, -90)
+#   * walk:         walk_forward_loop_001__A021__speed_1.0[0..N_FRAMES_WALK)
+#                   The trim is picked via the FK inter-step sweep below
+#                   so both walks end in a double-support gait phase
+#                   (minimises post-walk rest-seam foot drag) and the
+#                   per-walk yaw drift is small enough that the closed
+#                   loop reassembles within a few degrees of origin.
+#
+# Choreography:
+#
+#   1. Pivot LEFT 90 deg.       heading 0 -> +90
+#   2. Walk forward.            ~M.MM m, double-support end frame
+#   3. Stop.
+#   4. Pivot RIGHT 90 deg.      heading +90 -> 0
+#   5. Pivot RIGHT 90 deg.      heading 0 -> -90  (cancels walk 1)
+#   6. Walk forward.            ~M.MM m, back over the home tile
+#   7. Stop.
+#   8. Pivot LEFT 90 deg.       heading -90 -> 0
+#
+# Total reel: ~1.0 + 4.90 + (walk) + 5.17 + 5.17 + (walk) + 4.90 + 1.0
+#             + 7 * 2.5 (rest seams) = base 39.64 s + 2*(walk dur).
+#
+# To swap to a different walk_forward_loop_* variant after FK sweep:
+# edit the two `walk_*` segments' motion_key + n_frames in tandem.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Rest pose retargeted with the SAME uniform_h14 config as the segments
+  # below -- previously this pointed at x2_ultra_stitched_idle_relaxed_arms.pkl
+  # whose lower-body came from idle_hands_on_back_loop_001 retargeted with an
+  # older config (different knee bend, wrists rotated ~80 deg). Using the
+  # matched rest pose shrinks segment_start <-> rest L2 pose distance from
+  # ~1.7-2.0 rad down to ~0.5-0.7 rad, eliminating the visible "snap to
+  # default pose and back" between motion clips.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: walk_out
+    # walk_forward_loop_001__A021 at 1.0x, frames [0..158).
+    # FK foot-gap profile shows this clip uses a "continuous-stagger" gait
+    # (L foot held ~0.14 m ahead of R the entire walk -- the swing/stance
+    # alternation is minimal and feet never come together along the walk
+    # axis). f157 is a local minimum of |gap_walk| AND of |gap_lat|, so
+    # it's the best double-support-adjacent stance in the 2-5 m range
+    # (gap_walk=+0.14 m, gap_lat=-0.11 m, yaw drift=-1.91 deg).
+    # Cumulative pelvis travel f0->f158 = ~3.32 m at uniform_h14.
+    # Alternative trims (see FK sweep in commit notes):
+    #   f110  ->  1.94 m walked, yaw -0.71 deg, gap_lat=-0.18  (shorter, off-axis)
+    #   f176  ->  3.86 m walked, yaw -0.42 deg, gap_lat=-0.03  (longer, straightest)
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: walk_forward_loop_001__A021__speed_1.0
+    start_frame: 0
+    n_frames: 158                # 5.27 s, ~3.32 m forward
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: walk_back
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: walk_forward_loop_001__A021__speed_1.0
+    start_frame: 0
+    n_frames: 158                # 5.27 s, ~3.32 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

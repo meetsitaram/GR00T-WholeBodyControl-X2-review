@@ -1,0 +1,112 @@
+name: x2_ultra_relaxed_walk_loop_v1_halfspeed_walks
+output_key: relaxed_walk__v1_halfspeed_walks__home_loop
+fps: 30
+
+# Variant of relaxed_walk_loop_v1.yaml with the two relaxed-walk
+# segments slowed down to 0.5x (turns and idles kept at 1.0x). The
+# 0.5x variant is a frame-subsample from the 120 Hz BVH source -- it
+# samples the same gait twice as densely, so the actor walks at half
+# the speed but with the same stride length and the same stance at
+# any given gait phase. Per-frame pelvis velocity halves (~0.35 m/s
+# instead of ~0.70 m/s) which gives the policy more frames to track
+# each step.
+#
+# Frame-count derivation (1.0x -> 0.5x via the build pipeline):
+#   1.0x = stride 4 over the 120 Hz source -> T_out = T_src / 4
+#   0.5x = stride 2 over the 120 Hz source -> T_out = T_src / 2
+# i.e. the same source frame f_src maps to 1.0x output frame f_src/4
+# and to 0.5x output frame f_src/2 -- so 0.5x output frame index is
+# exactly 2x the equivalent 1.0x output frame index.
+#
+# Trim picked to match the v1 sweet spot (inter-step double-support
+# end stance):
+#   1.0x trim [0..188) ends at f187 -- gait phase f_src = 748
+#   0.5x trim [0..376) ends at f375 -- gait phase f_src = 750
+# Stance at f375 (0.5x) is gait-equivalent to f187 (1.0x); FK-measured
+# slide forecast L=0.087 / R=0.037 m vs L=0.090 / R=0.021 m at 1.0x.
+#
+# Foot-slide note: at the rest seam the leg-pose SLERP from seg_end
+# (stride) to held idle is delivered over the same 30-frame blend
+# window regardless of the underlying motion's speed (the warehouse
+# stitcher's rest layer is a fixed wall-clock duration). So foot
+# slide magnitude is *not* reduced by going slow -- the only benefit
+# of 0.5x walks is the slower per-frame pelvis velocity for tracking.
+#
+# Choreography (same shape as v1, slower walk legs):
+#
+#   1. Pivot LEFT 90 deg.        4.90 s
+#   2. Relaxed-walk forward.     12.54 s, ~3.50 m, ends inter-step
+#   3. Stop.                     2.50 s (rest seam)
+#   4. Pivot RIGHT 90 deg.       5.17 s
+#   5. Pivot RIGHT 90 deg.       5.17 s
+#   6. Relaxed-walk forward.     12.54 s, ~3.50 m, back over home
+#   7. Stop.                     2.50 s (rest seam)
+#   8. Pivot LEFT 90 deg.        4.90 s
+#
+# Total reel: ~1.0 + 4.90 + 12.54 + 5.17 + 5.17 + 12.54 + 4.90 + 1.0
+#            + 7 * 2.5 (rest seams) = ~64.72 s.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose so segment_start <-> rest pose distance is small.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (1.0x turn)
+
+  - name: relaxed_walk_out
+    # 0.5x of _001 frames [0..376). Equivalent to 1.0x [0..188) trim
+    # (gait phase identical; only wall-clock doubles). ~3.50 m forward
+    # in 12.54 s, ~0.28 m/s average pelvis speed. Ends at f375 inter-step
+    # double-support frame (gap_Y=-0.012 m, both feet planted).
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_0.5
+    start_frame: 0
+    n_frames: 376                # 12.54 s, ~3.50 m forward
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (1.0x turn)
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: relaxed_walk_back
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_0.5
+    start_frame: 0
+    n_frames: 376                # 12.54 s, ~3.50 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

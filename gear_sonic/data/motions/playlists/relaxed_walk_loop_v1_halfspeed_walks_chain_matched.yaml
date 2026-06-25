@@ -1,0 +1,80 @@
+name: x2_ultra_relaxed_walk_loop_v1_halfspeed_walks_chain_matched
+output_key: relaxed_walk__v1_halfspeed_walks_chain_matched__home_loop
+fps: 30
+
+# Chain-matched retarget + half-speed (0.5x) walk segments.
+# Combines two orthogonal axes:
+#   * source retarget: committed chain_matched config (per-chain SOMA
+#     scaler with per-segment leg ratios + chain-matched IK weights
+#     / wrist smoothing) instead of uniform_h14 (whole-body @ h=1.4)
+#   * walk speed: 0.5x for the two relaxed-walk segments; turns +
+#     idle anchors stay at 1.0x
+#
+# Same shape and same trim windows as the uniform_h14 half-speed build
+# (relaxed_walk_loop_v1_halfspeed_walks.yaml); only the source PKL
+# filenames change. See that file for the 0.5x frame-count derivation
+# (n_frames=376 = 2x the 1.0x trim of 188).
+#
+# Trade-offs vs uniform_h14 -- see FK report at the bottom of
+# play_pkl_motions_commands.md for the post-rebuild numbers.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose so segment_start <-> rest pose distance is small.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (1.0x turn)
+
+  - name: relaxed_walk_out
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_0.5
+    start_frame: 0
+    n_frames: 376                # 12.54 s, ~2.89 m forward (0.5x walk)
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: relaxed_walk_back
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_0.5
+    start_frame: 0
+    n_frames: 376                # 12.54 s, ~2.89 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

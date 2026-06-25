@@ -1,0 +1,139 @@
+name: x2_ultra_relaxed_walk_loop_v1
+output_key: relaxed_walk__v1__home_loop
+fps: 30
+
+# Closed-loop relaxed-walk choreography (2026-06-24). Same v6-style
+# rectangle-with-two-walks shape, but with the v6 short march replaced
+# by a re-retargeted relaxed-walk slice that starts from rest:
+#
+#   1. Pivot LEFT 90 deg.        heading 0 -> +90
+#   2. Relaxed-walk forward.     ~3.50 m, starts from rest, ends in
+#                                 an inter-step double-support frame.
+#   3. Stop.
+#   4. Pivot RIGHT 90 deg.       heading +90 -> 0
+#   5. Pivot RIGHT 90 deg.       heading 0 -> -90  (faces the way that
+#                                 cancels walk 1)
+#   6. Relaxed-walk forward.     ~3.50 m, back over the home tile.
+#   7. Stop.
+#   8. Pivot LEFT 90 deg.        heading -90 -> 0
+#
+# Two stops total (one after each relaxed-walk). All pivots are clean
+# in-place rotations (same primitives as v6, but re-retargeted via
+# the soma uniform-h14 track from agibot-x2-references/bones-seed/
+# retargeted/x2_retarget_compare/uniform_h14/). All walks start at
+# frame 0 (natural rest -> walk ramp).
+#
+# Trim window picked via FK foot-slide profile (2026-06-24): swept
+# variants _001..._004 at 1.5..6.5 m walked distance, computed
+# per-foot horizontal slide that the rest-layer SLERP would have to
+# absorb (pelvis is pinned at handover for the full 2.5 s rest seam,
+# so any leg-stance mismatch between seg_end and the held idle pose
+# shows up as foot drag). Combined slide + yaw-drift sweep:
+#
+#   variant   trim    dist    slide(L/R)         own_yaw_drift   loop_close
+#   _001 f95  current 1.51 m  0.315 / 0.121 m    +0.9 deg        +0.5 deg  (slidey but tight)
+#   _004 f107 -       2.50 m  0.042 / 0.069 m    +5.5 deg        +9.3 deg  (clean but off-axis)
+#   _001 f187 PICKED  3.50 m  0.090 / 0.021 m    +0.9 deg        ~ +1 deg  (both metrics good)
+#
+# _004 has the lowest slide but turns ~5 deg during the 2.5 m walk, so
+# two walks compound to ~10 deg of yaw closure error -- above the v6-class
+# 5 deg threshold. _001 walks straight (yaw drift < 1 deg/walk) AND has
+# an inter-step double-support frame at f187 (gap_Y=-0.04 m), so it wins
+# on both metrics; the only cost is a 3.5 m per-walk distance (~8 m loop
+# XY path) vs the original 1.5 m.
+#
+# Lower-speed (0.5x/0.25x) variants are intentionally NOT used here:
+# they are frame-subsamples of the same gait, so the stance at any
+# given gait phase is identical, but each rest-seam slide is delivered
+# over the same 30-frame blend window in wall-clock time -- so foot
+# slide magnitude is independent of motion speed. Re-test if a
+# different relaxed-walk source clip with substantively different
+# stride length lands in the library.
+#
+# Building blocks (all from the same re-retarget bundle):
+#
+#   * idle_anchor:   neutral_idle_loop_002__A074__speed_1.0  (1.00 s)
+#   * pivot_left:    idle_turn_270_003__A149_M__speed_1.0    (4.90 s, +90)
+#   * pivot_right:   step_rotate_idle_090_002__A026_M__speed_1.0  (5.17 s, -90)
+#   * relaxed_walk:  Relaxed_walk_forward_001__A057__speed_1.0[0..188)
+#                    6.27 s, ~3.50 m forward, inter-step end stance
+#                    (gap_Y=-0.043 m, both feet planted side-by-side).
+#
+# Total reel: ~1.0 + 4.90 + 6.27 + 5.17 + 5.17 + 6.27 + 4.90 + 1.0
+#            + 7 * 2.5 (rest seams) = ~52.08 s.
+#
+# WINNER (re-retarget track / variant / speed): uniform_h14 /
+# Relaxed_walk_forward_001__A057 / 1.0x. To re-pick after operator
+# review (e.g. preferred _004 walk style visually, accepting yaw drift):
+# edit the relaxed_walk_* motion_keys and n_frames per the slide table
+# above. Heel-strikes around f187 are at +/- a few frames; if 188
+# doesn't land cleanly, try 183 or 191.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose so segment_start <-> rest pose distance is small.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: relaxed_walk_out
+    # WINNER slice: Relaxed_walk_forward_001__A057 at 1.0x, frames
+    # [0..188). f187 lands in an inter-step "double-support" frame
+    # (gap_Y=-0.043 m, both feet planted side-by-side) instead of the
+    # mid-stride heel-strike at f95, dropping the foot-slide during the
+    # post-walk rest seam from 0.315 m (worst foot) to 0.090 m
+    # (~70% reduction). _001 also walks straight (yaw drift <1 deg
+    # over the full 188-frame slice) so the closed loop yaw closes
+    # within ~1 deg. Cumulative pelvis travel f0->f188 = ~3.50 m.
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_1.0
+    start_frame: 0
+    n_frames: 188                # 6.27 s, ~3.50 m forward, inter-step end
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: relaxed_walk_back
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_1.0
+    start_frame: 0
+    n_frames: 188                # 6.27 s, ~3.50 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

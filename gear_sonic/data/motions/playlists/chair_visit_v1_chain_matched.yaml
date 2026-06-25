@@ -1,0 +1,70 @@
+name: x2_ultra_chair_visit_v1_chain_matched
+output_key: chair_visit__v1__chain_matched__sit_down_then_stand_up
+fps: 30
+
+# Three-segment chair sit/stand sequence on the chain_matched track
+# (2026-06-24). Starts standing, sits DOWN onto the chair, holds the
+# seated pose, stands UP, and ends standing again.
+#
+# Choreography:
+#
+#   1. sit_DOWN   sit_on_chair_start_R_001__A244 [0..142)  4.73 s,
+#                                                pelvis 0.68 -> 0.39 m
+#   2. sit_STILL  sit_on_chair_loop_R_002__A244  [0..274)  9.13 s,
+#                                                pelvis held at 0.39 m
+#   3. stand_UP   sit_on_chair_stop_R_002__A244  [0..80)   2.67 s,
+#                                                pelvis 0.39 -> 0.68 m
+#
+# Total reel: 4.73 + 9.13 + 2.67 = 16.53 s.
+#
+# rest_frames: 0 is deliberate. The standard rest pose
+# (x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl, pelvis_z ~ 0.68 m)
+# is the STANDING idle, which is the OPPOSITE of the seated stance the
+# robot holds across the sit_DOWN -> sit_STILL -> stand_UP boundaries. A
+# rest layer would interpolate the robot back up to standing (+ ~29 cm in
+# pelvis z + matching leg straightening) at every seam and back down,
+# producing a "stand up and sit back down" artifact between every two
+# adjacent sitting clips.
+#
+# With rest_frames: 0 the stitcher does yaw-cylinder alignment + a hard
+# cut at each seam. The largest joint discontinuity at a seam is ~0.21 rad
+# (~12 deg, at the sit_STILL -> stand_UP boundary). Visually that's a
+# one-frame blip; functionally it's fine for SONIC tracking because the
+# stand_UP clip immediately starts driving the legs back to standing.
+# Measured boundaries (from x2_ultra_sitstand_chain_matched.pkl):
+#   sit_DOWN end     -> sit_STILL start: L2=0.24 rad, max joint d=0.11 rad
+#   sit_STILL end    -> stand_UP start : L2=0.41 rad, max joint d=0.21 rad
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Required by the schema even when rest_frames=0; pointing at the
+  # chain_matched track-matched rest PKL keeps the load path consistent
+  # with the other chain_matched playlists. With rest_frames=0 the actual
+  # rest pose is never used -- the stitcher emits a 0-frame rest layer.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 0
+  blend_in_frames: 0
+  blend_out_frames: 0
+
+segments:
+  - name: sit_down
+    source: gear_sonic/data/motions/x2_ultra_sitstand_chain_matched.pkl
+    motion_key: sit_on_chair_start_R_001__A244__speed_1.0
+    start_frame: 0
+    n_frames: 142                # 4.73 s, pelvis 0.68 -> 0.39 m
+
+  - name: sit_still
+    source: gear_sonic/data/motions/x2_ultra_sitstand_chain_matched.pkl
+    motion_key: sit_on_chair_loop_R_002__A244__speed_1.0
+    start_frame: 0
+    n_frames: 274                # 9.13 s, pelvis held at 0.39 m
+
+  - name: stand_up
+    source: gear_sonic/data/motions/x2_ultra_sitstand_chain_matched.pkl
+    motion_key: sit_on_chair_stop_R_002__A244__speed_1.0
+    start_frame: 0
+    n_frames: 80                 # 2.67 s, pelvis 0.39 -> 0.68 m

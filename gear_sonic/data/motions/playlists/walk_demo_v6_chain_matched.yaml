@@ -1,0 +1,101 @@
+name: x2_ultra_walk_demo_v6_chain_matched
+output_key: walk_demo__v6_chain_matched__home_loop
+fps: 30
+
+# Re-retargeted counterpart of gear_sonic/data/motions/playlists/walk_demo_v6.yaml
+# (2026-06-24). Same choreography, same segment names, same n_frames -- the only
+# delta is the source PKL: each segment now points at the new chain_matched retarget
+# bundle (x2_ultra_retarget_chain_matched.pkl,
+# soma_to_x2_ultra_chain_matched_retargeter_config.json -- per-chain SOMA scaler
+# with per-segment leg ratios + chain-matched IK weights / wrist smoothing) instead
+# of the older x2_ultra_bones_seed.pkl. Motion keys also drop the `loco__` subset
+# prefix and gain a `__speed_1.0` suffix to match the new bundle's naming scheme.
+#
+# Choreography (unchanged from v6):
+#
+#   1. Pivot LEFT 90 deg.
+#   2. Walk 3 steps forward.
+#   3. Stop.
+#   4. Pivot RIGHT 90 deg.
+#   5. Pivot RIGHT 90 deg.  (cumulative -180 from prev -- faces the way that
+#                            cancels walk 1)
+#   6. Walk 3 steps forward.  (returns to home XY tile)
+#   7. Stop.
+#   8. Pivot LEFT 90 deg.  (back to original heading)
+#
+# Building blocks (all from x2_ultra_retarget_chain_matched.pkl):
+#   * idle_anchor: neutral_idle_loop_002__A074__speed_1.0       (1.00 s)
+#   * pivot_left : idle_turn_270_003__A149_M__speed_1.0         (4.90 s, +90)
+#   * pivot_right: step_rotate_idle_090_002__A026_M__speed_1.0  (5.17 s, -90)
+#   * walk_3_steps: neutral_walk_180_R_002__A105__speed_1.0[0..68)
+#                   2.27 s, ~1.05 m forward, ends in a gait-neutral
+#                   heel-strike (knees flat at +5/+7 deg).
+#
+# Total reel: ~1.0 + 4.90 + 2.27 + 5.17 + 5.17 + 2.27 + 4.90 + 1.0
+#             + 7 * 2.5 (rest seams) = ~44.2 s.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose so segment_start <-> rest pose distance is small
+  # (~0.5-1.1 rad L2 vs ~1.6-2.2 with the legacy hands-on-back rest).
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_left_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: walk_3_steps_a
+    # Frames [0..68) of neutral_walk_180_R_002__A105. Heel-strikes at
+    # f24 (L), f44 (R), f68 (R again -- the strike that completes the
+    # visual landing). Both knees return to +5 / +7 deg at f68 so the
+    # swing foot has fully planted (gait-neutral end).
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_walk_180_R_002__A105__speed_1.0
+    start_frame: 0
+    n_frames: 68                 # 2.27 s, ~1.05 m forward
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: walk_3_steps_b
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_walk_180_R_002__A105__speed_1.0
+    start_frame: 0
+    n_frames: 68                 # 2.27 s, ~1.05 m forward (returns toward home)
+
+  - name: pivot_left_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg (back to original heading)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

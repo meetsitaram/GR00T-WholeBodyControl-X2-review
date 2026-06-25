@@ -1,0 +1,77 @@
+name: x2_ultra_in_place_turns_v1_chain_matched
+output_key: in_place_turns__v1__chain_matched__RLLR
+fps: 30
+
+# In-place turn-only sequence on the chain_matched track (2026-06-24).
+# Just the two pivot primitives from walk_demo_v6 (idle_turn_270 = +90 deg
+# left, step_rotate_idle_090 = -90 deg right), arranged so cumulative yaw
+# closes back to start heading:
+#
+#   1. pivot_right_1   step_rotate_idle_090 (-90 deg)
+#   2. pivot_left_1    idle_turn_270        (+90 deg)
+#   3. pivot_left_2    idle_turn_270        (+90 deg)
+#   4. pivot_right_2   step_rotate_idle_090 (-90 deg)
+#
+# Cumulative yaw on paper: -90 + 90 + 90 - 90 = 0 deg.
+#
+# These are the same primitives used in
+# gear_sonic/data/motions/playlists/walk_demo_v6_chain_matched.yaml, so
+# the chain_matched track-matched rest pose is appropriate at every seam
+# (segment_start <-> rest L2 ~ 0.5-0.7 rad, kills the legacy "snap to
+# default pose" between motion clips).
+#
+# Total reel: 1.0 + 5.17 + 4.90 + 4.90 + 5.17 + 1.0
+#             + 5 * 2.5 (rest seams) = ~34.6 s.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose so segment_start <-> rest pose distance is small.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_right_1
+    # First turn: -90 deg right.
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_left_1
+    # Cancels pivot_right_1: +90 deg back to start heading.
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: pivot_left_2
+    # Second left turn: +90 deg (now facing +90 from start).
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: idle_turn_270_003__A149_M__speed_1.0
+    start_frame: 0
+    n_frames: 147                # 4.90 s, +90 deg
+
+  - name: pivot_right_2
+    # Cancels pivot_left_2: -90 deg back to start heading.
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_chain_matched.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
