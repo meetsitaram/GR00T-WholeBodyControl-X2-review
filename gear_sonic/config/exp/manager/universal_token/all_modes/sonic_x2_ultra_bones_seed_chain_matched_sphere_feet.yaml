@@ -1,0 +1,78 @@
+# @package _global_
+# SONIC X2 Ultra — chain-matched BONES-SEED corpus, sphere feet, wider DR.
+#
+# Cloud-scale continuation of the H200 25k sphere-feet checkpoint
+# (~/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt)
+# trained on the new chain_matched retargeter output instead of the original
+# uniform_h14 retarget that the warm-start was trained on.
+#
+# Three deltas vs. ``sonic_x2_ultra_bones_seed_sphere_feet``:
+#
+#   1. CORPUS: ``x2_ultra_bones_seed_chain_matched_v2.pkl`` (49,790 clips =
+#      37,968 base + halfspeed locowalk merge from the chain_matched retarget).
+#      Same SOMA source identities as the H200 warm-start saw, but fixed
+#      Groucho-Marx crouch + better deep-stance fidelity, plus halfspeed
+#      locowalk variants for richer slow-gait coverage.
+#
+#   2. OBS NOISE: 2× wider ranges than level0_4 (gravity_dir ±0.10,
+#      base_ang_vel ±0.4 rad/s, joint_pos ±0.02 rad, joint_vel ±1.0 rad/s)
+#      — see local_dir_hist_v2.yaml. Same envelope demo_v2 introduced; this
+#      run is the proper budget to let those wider ranges actually converge.
+#
+#   3. PD GAINS: per-episode actuator KP/KD scaled to 0.85–1.15× via the
+#      randomize_actuator_gains event term wired into the level0_4_pd preset.
+#
+# Critic + obs RunningMeanStd will need ~200-500 iters to re-fit against the
+# new joint-trajectory distribution from chain_matched. Expect a brief reward
+# dip in that window; if curves haven't recovered by iter 1k, abort.
+#
+# Recommended launch (cloud, from train-on-cloud.md §11b pattern):
+#
+#   tmux new -d -s chain_matched "
+#     NUM_ENVS=12288 \\
+#     NUM_ITERS=15000 \\
+#     EXP_NAME=sonic_x2_ultra_bones_seed_chain_matched_sphere_feet \\
+#     EXTRA_FLAGS='+checkpoint=\$HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt' \\
+#     USE_WANDB=True \\
+#     LOG_FILE=\$HOME/chain_matched.log \\
+#     bash gear_sonic/scripts/cloud/run_smoke_8gpu.sh
+#   "
+#
+# Or use the dedicated launcher (same invocation, defaults baked in):
+#
+#   bash gear_sonic/scripts/cloud/run_bones_seed_chain_matched_8gpu.sh
+#
+# Side-channel bundle (gitignored files that must scp from workstation —
+# everything else, including the sphere URDF, rides in via the bootstrap
+# script's git clone):
+#   - gear_sonic/data/motions/x2_ultra_bones_seed_chain_matched_v2.pkl (~3.8 GB)
+#   - gear_sonic/data/motions/x2_ultra_body_check.pkl                   (small)
+#
+# NUM_ENVS sizing: original sphere-feet run used NUM_ENVS=16384 against a
+# 2.5 GB PKL on 8× H200 with ~48 GB VRAM used. The chain_matched_v2 PKL is
+# ~3.8 GB (+1.3 GB), so dropping to NUM_ENVS=12288 keeps VRAM headroom; this
+# gives ~75% of the per-iter throughput. Bump back to 16384 if you observe
+# VRAM is fine after the first 200 iters (smoke run will reveal it).
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet
+  - override /manager_env/events: tracking/level0_4_pd
+  - override /manager_env/observations/policy: local_dir_hist_v2
+  - _self_
+
+exp_var: bones_seed_chain_matched_sphere_feet
+project_name: TRL_X2Ultra_BonesSeed_ChainMatched_SphereFeet
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_ultra_bones_seed_chain_matched_v2.pkl
+
+algo:
+  config:
+    # Continuation budget — start from the H200 25k sphere-feet checkpoint
+    # and train another 15k iters on the chain_matched corpus + wider DR.
+    # ~29 h wall-clock on 8× H200 at NUM_ENVS=12288. Resume from last.pt if
+    # the curves are still climbing at 15k.
+    num_learning_iterations: 15000
