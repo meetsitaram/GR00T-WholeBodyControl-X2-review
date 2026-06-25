@@ -186,6 +186,25 @@ def main(config: OmegaConf):
         kwargs_handlers=[ddp_kwargs, kwargs],
     )
 
+    # NCCL prime-barrier — must fire BEFORE any IsaacSim/Warp import below.
+    #
+    # On nodes where the CUDA driver and PyTorch's bundled NCCL differ at the
+    # minor version (e.g. driver 580/CUDA 13.0 vs. NCCL built against CUDA 13.2),
+    # the first NCCL kernel launch fails with `Cuda failure 'invalid argument'`
+    # at >=4 GPUs IF IsaacSim has already been imported. IsaacSim/PhysX populates
+    # CUDA state in a way that makes the very first cudaLaunchKernel through
+    # NCCL trip the driver's argument validation.
+    #
+    # The fix: warm up NCCL with a barrier RIGHT NOW, while the CUDA context is
+    # still pristine. After this point IsaacSim can do whatever it wants — NCCL
+    # has already JIT-cached its kernels and subsequent collectives work fine.
+    #
+    # Symptom you'd see without this barrier (in train_agent log on >=4 GPUs):
+    #   [N] enqueue.cc:76 NCCL WARN Cuda failure 'invalid argument'
+    # Repro/diagnosis history: 2026-06-25 chain_matched bringup on H100 8x.
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
+
     device = str(accelerator.device)
     if device == "cuda":
         device = "cuda:0"

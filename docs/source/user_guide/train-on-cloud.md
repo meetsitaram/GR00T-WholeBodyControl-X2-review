@@ -608,6 +608,55 @@ and Open Work #1 in [`sim2sim_mujoco.md`](sim2sim_mujoco.md) graduates
 from "diagnosed" to "fixed". Walking motions (G17) are a separate bucket
 and likely still need the joint-DR pass from Open Work #2.
 
+### 11e. Continuation run on a larger chain-matched corpus (2026-06-25, H100)
+
+The natural follow-up to §11b is to scale the sphere-feet checkpoint
+from the original 2,550-motion BONES-SEED retarget to the **49,790-clip
+chain-matched corpus** (37,968 base + 11,822 halfspeed-locowalk merge,
+3.8 GB PKL) produced by the planner-retargeter overhaul described in
+[`kplanner_training_runs.md`](kplanner_training_runs.md). The chain-matched
+retarget fixes the "Groucho-Marx crouch" and deep-stance fidelity issues
+that plagued the original BONES-SEED retarget, and adds wider DR on top.
+
+The repo ships a dedicated experiment + launcher for this run, both with
+inline documentation:
+
+| File | Purpose |
+|---|---|
+| `gear_sonic/config/exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_chain_matched_sphere_feet.yaml` | Hydra exp: inherits sphere-feet config, overrides motion file + adds wider obs noise (`local_dir_hist_v2`) + KP/KD randomization (`tracking/level0_4_pd`). |
+| `gear_sonic/scripts/cloud/run_bones_seed_chain_matched_8gpu.sh` | 8-GPU launcher with defaults baked in (NUM_ITERS=15000, NUM_ENVS=12288, MOTION_FILE=chain_matched_v2, warm-start from the H200 25k sphere-feet checkpoint, USE_WANDB=True). Pre-flight checks refuse to launch if the warm-start ckpt or the PKL is missing. |
+
+Operator flow (after bootstrap + side-channel bundle have landed):
+
+```bash
+# (cloud) Sanity-check the warm-start ckpt + chain_matched PKL are on disk.
+ls -lh ~/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/model_step_025000.pt
+ls -lh gear_sonic/data/motions/x2_ultra_bones_seed_chain_matched_v2.pkl
+
+# (cloud) ~3-min smoke (10 iters @ NUM_ENVS=12288) before committing 35 h.
+NUM_ITERS=10 USE_WANDB=False LOG_FILE=$HOME/smoke.log \
+  bash gear_sonic/scripts/cloud/run_bones_seed_chain_matched_8gpu.sh
+
+# (cloud) Real run.
+tmux new -d -s chain_matched "bash gear_sonic/scripts/cloud/run_bones_seed_chain_matched_8gpu.sh"
+tmux a -t chain_matched
+```
+
+Budget envelope (8× H100 SXM, NUM_ENVS=12288, ~8.5 s/iter at the
+chain-matched scale):
+
+| Iters | Wall clock | Cost @ ~$22/hr (Nebius H100) |
+|---|---|---|
+| 200 (smoke + first reward signal) | ~30 min | ~$10 |
+| 15,000 (full continuation) | ~36–40 hr | ~$800–900 |
+
+> **NCCL prime-barrier required.** This was the first 8-GPU sonic run on
+> a CUDA-13.0 driver node; it surfaced an interaction between IsaacSim
+> CUDA-context initialization and NCCL's lazy kernel JIT that crashes the
+> first DDP collective at ≥4 GPUs. See **B.15** below for the full bisect
+> and the in-tree fix (already committed; no operator action needed on
+> fresh clones).
+
 ## Adapting this guide to a different embodiment / dataset
 
 Everything in this document generalizes — only the bundle contents change.
@@ -1195,3 +1244,133 @@ Two things on the cloud node are worth keeping across instances:
 If you're going to delete the instance and recreate it, **stop** rather
 than `delete` whenever possible — stop releases the GPU charges but keeps
 the boot disk attached.
+
+### B.15. NCCL "Cuda failure 'invalid argument'" at ≥4 GPUs after IsaacSim init
+
+> **TL;DR.** Multi-GPU sonic training (`--num_processes ≥ 4`) crashes at
+> the first DDP collective with `NCCL WARN Cuda failure 'invalid argument'`
+> on nodes whose CUDA driver / NCCL minor versions don't line up — but
+> only when IsaacSim has already initialized first. The repo-committed
+> fix (an NCCL prime-barrier in `gear_sonic/train_agent_trl.py`) makes
+> this go away. Don't try to "fix it" with a `CUDA_VISIBLE_DEVICES`
+> wrapper — that creates a different, more confusing failure.
+
+**Symptom.** A few seconds after IsaacSim finishes building the env,
+right before the first PPO iteration, NCCL spams (timestamps and PIDs
+elided):
+
+```
+[N] enqueue.cc:76 NCCL WARN Cuda failure 'invalid argument'
+[N] enqueue.cc:76 NCCL WARN Cuda failure 'invalid argument'
+...
+torch.distributed.DistBackendError: NCCL error in: .../NCCLUtils.cpp:93,
+unhandled cuda error
+Cuda failure 'invalid argument'
+```
+
+The Python traceback points at the first `accelerator.wait_for_everyone()`
+call after env construction (the one right before the PPO loop starts).
+**2-GPU runs survive cleanly.** Single-GPU runs are obviously
+unaffected. The failure is deterministic at 4 and 8 GPUs.
+
+**Root cause.** A subtle interaction between three things, only one of
+which is "wrong":
+
+1. PyTorch's bundled NCCL is built against a slightly newer CUDA minor
+   version than the node's driver supports — e.g. driver 580 / CUDA 13.0
+   vs. NCCL 2.29.7 built against CUDA 13.2 (`pip show nvidia-nccl-cu13`
+   labels the package "cu13" even though the runtime banner reports
+   `NCCL version 2.29.7+cuda13.2`). NVIDIA forward-compat normally
+   handles this fine.
+
+2. IsaacSim/Warp/PhysX initialization touches CUDA state on every
+   visible GPU during `SimulationApp(...)`, populating per-device
+   contexts in a way that's normally harmless.
+
+3. NCCL lazy-initializes its ProcessGroup and JIT-loads its collective
+   kernels on the *first* `cudaLaunchKernel` after `Accelerator(...)`.
+   If that first launch happens **after** IsaacSim has already
+   populated CUDA state, the kernel-launch arg validation in the older
+   driver trips and returns `cudaErrorInvalidValue` — but only on ≥4
+   ranks (2-rank ring topology doesn't exercise the failing code path).
+
+Validated bisect (H100 8× SXM, 2026-06-25):
+
+| Configuration | 2 GPUs | 4 GPUs | 8 GPUs |
+|---|:---:|:---:|:---:|
+| Bare NCCL test (`dist.init_process_group` + `dist.barrier()`) | PASS | PASS | PASS |
+| Bare `Accelerator` + `wait_for_everyone()` (no IsaacSim) | PASS | PASS | PASS |
+| Full sonic stack, no prime-barrier (baseline) | PASS | **FAIL** | **FAIL** |
+| Full sonic stack, with prime-barrier (the fix) | PASS | PASS | PASS |
+
+**Fix — NCCL prime-barrier in `train_agent_trl.py`.** Already committed;
+no operator action required for fresh clones. The fix is a 2-line block
+right after the `Accelerator(...)` construction and **before** the
+IsaacSim/Warp imports further down the file:
+
+```python
+accelerator = Accelerator(
+    gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+    kwargs_handlers=[ddp_kwargs, kwargs],
+)
+
+# Warm up NCCL while the CUDA context is still pristine — see the
+# block comment in the file for the full diagnosis.
+if accelerator.num_processes > 1:
+    accelerator.wait_for_everyone()
+```
+
+This forces NCCL to initialize its ProcessGroup and JIT-cache its
+kernels *before* IsaacSim gets a chance to populate CUDA state.
+Subsequent collectives reuse the cached kernels and never re-trip the
+driver's arg validation.
+
+**What NOT to do — `CUDA_VISIBLE_DEVICES` masking via a launcher wrapper.**
+An obvious-looking workaround is to wrap the trainer with a shell script
+that sets `CUDA_VISIBLE_DEVICES=$LOCAL_RANK` before Python starts (so
+each rank only sees one GPU and IsaacSim can't pollute the others).
+**This makes things worse**, because `accelerate` calls
+`torch.distributed.barrier(device_ids=[self.local_process_index])` —
+which for rank 1 becomes `device_ids=[1]`, out of range for a process
+that now only sees one device as index 0. You'll see:
+
+```
+torch.AcceleratorError: CUDA error: invalid device ordinal
+GPU device may be out of range, do you have enough GPUs?
+```
+
+This error is *correctly attributed* to your wrapper, but accelerate's
+distributed-launch error summary tends to mask it behind the same
+"ChildFailedError" envelope as the original NCCL bug, which makes the
+two problems look identical from the outside. You can also try patching
+`accelerate/state.py` to drop the `device_ids` arg from the barrier —
+that also fails, with the same "invalid argument" error, because PhysX
+internally uses `cuda:LOCAL_RANK` (an absolute ordinal) regardless of
+the CVD mask. Don't go down either path; the prime-barrier above is the
+clean fix.
+
+**Future-proofing.** If you upgrade either the driver (e.g. to a
+CUDA-13.2-capable build) or PyTorch's NCCL (e.g. install a CUDA-13.0
+build of `nvidia-nccl-cu13`), the prime-barrier becomes a no-op
+overhead of <50 ms — keep it in place, it costs nothing and protects
+the next operator who lands on a mismatched node.
+
+**Diagnosis cheat-sheet.** If the prime-barrier somehow gets reverted
+and you see the symptom again:
+
+```bash
+# 1. Confirm the driver/NCCL minor-version mismatch.
+nvidia-smi | head -4                                           # driver + max CUDA
+python -c "import torch; print(torch.cuda.nccl.version())"     # NCCL build
+
+# 2. Capture the actual failing op (the agent summary hides per-rank stderr).
+torchrun --nproc-per-node=4 --log_dir=/tmp/nccl_dbg \
+  --redirects=3 --tee=3 \
+  gear_sonic/train_agent_trl.py --config-name=base ...
+cat /tmp/nccl_dbg/*/attempt_0/0/stderr.log    # rank-0 actual traceback
+
+# 3. Verify the prime-barrier patch is in place.
+grep -n "NCCL prime-barrier" gear_sonic/train_agent_trl.py
+# Expect: a block comment + `accelerator.wait_for_everyone()` right
+# after the Accelerator() construction (around line 188-207).
+```

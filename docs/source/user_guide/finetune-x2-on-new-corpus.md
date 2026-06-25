@@ -336,6 +336,7 @@ For the full step-by-step commands, including the `EventCfg` patch and the
 | `TypeError: EventCfg.__init__() got an unexpected keyword argument '<term>'` | Added a new event term without declaring its slot in `EventCfg` | Add `<term_name> = None` to the `EventCfg` configclass in `gear_sonic/envs/manager_env/mdp/events.py`. |
 | Log has every line doubled | Both nohup redirect and the launcher's internal `tee` wrote to the same file | Don't add `>>$LOG` to the nohup line — `run_local_finetune_*.sh` handles logging via its own `tee`. |
 | Trained policy regresses on walking after a demo-corpus fine-tune | The new corpus had no walking motions — catastrophic forgetting on the broader skillset | Add a few representative walks to the corpus before re-running, or accept the regression if walking isn't a demo requirement. The regression eval in Stage 5 (b) quantifies it. |
+| `NCCL WARN Cuda failure 'invalid argument'` at the first DDP collective on a ≥4-GPU cloud run | CUDA driver / bundled-NCCL minor-version mismatch interacting with IsaacSim CUDA-context init | Already fixed in-tree via an NCCL prime-barrier in `train_agent_trl.py`; if the patch is missing, see [`train-on-cloud.md` §B.15](train-on-cloud.md). Does not affect single-GPU local fine-tunes. |
 
 ## Compute and cost ballpark
 
