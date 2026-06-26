@@ -50,6 +50,9 @@ def load_config(
   devices: int = 1,
   num_nodes: int = 1,
   strategy: str = "auto",
+  peak_lr: float | None = None,
+  warmup_steps: int | None = None,
+  final_lr: float | None = None,
 ):
   version_dir = result_dir / "motionbricks_root_x2" / "version_1"
   hparams_path = version_dir / "hparams.yaml"
@@ -73,6 +76,12 @@ def load_config(
     conf.trainer.val_check_interval = max_steps
     conf.trainer.num_sanity_val_steps = 0
     conf.model.scheduler.num_training_steps = max_steps
+    if peak_lr is not None:
+      conf.model.optimizer.lr = float(peak_lr)
+    if warmup_steps is not None:
+      conf.model.scheduler.num_warmup_steps = int(warmup_steps)
+    if final_lr is not None:
+      conf.model.scheduler.final_lr = float(final_lr)
     conf.id = "x2"
     conf.run_dir = "."
     conf.out_dir = str(result_dir / "motionbricks_root_x2")
@@ -110,6 +119,14 @@ def main() -> None:
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--save-every-n-steps", type=int, default=200)
   parser.add_argument("--save-top-k", type=int, default=-1)
+  parser.add_argument(
+    "--ckpt-subdir",
+    type=str,
+    default="checkpoints",
+    help="Subdirectory under version_1/ where new checkpoints are written. "
+    "Use a different subdir (e.g. 'checkpoints_ft2') for follow-up "
+    "fine-tunes to avoid colliding with prior model-step=*.ckpt files.",
+  )
   parser.add_argument("--no-progress-bar", action="store_true")
   parser.add_argument(
     "--devices",
@@ -127,12 +144,47 @@ def main() -> None:
     "--resume",
     type=Path,
     default=None,
-    help="Resume training from a Lightning checkpoint.",
+    help="Resume training from a Lightning checkpoint (FULL state: weights + "
+    "optimizer + LR scheduler + global_step). Use this only if you want to "
+    "continue the exact same training run.",
+  )
+  parser.add_argument(
+    "--init-from",
+    type=Path,
+    default=None,
+    help="Weights-only init from a Lightning checkpoint: loads model.state_dict "
+    "but starts a FRESH optimizer, FRESH LR scheduler, and step counter at 0. "
+    "Use for fine-tuning when the previous run's cosine schedule has bottomed "
+    "out. Mutually exclusive with --resume.",
+  )
+  parser.add_argument(
+    "--peak-lr",
+    type=float,
+    default=None,
+    help="Override optimizer peak LR (hparams.yaml: model.optimizer.lr). "
+    "Useful for fine-tunes that want a lower peak than the original run.",
+  )
+  parser.add_argument(
+    "--warmup-steps",
+    type=int,
+    default=None,
+    help="Override LR scheduler warmup steps "
+    "(hparams.yaml: model.scheduler.num_warmup_steps).",
+  )
+  parser.add_argument(
+    "--final-lr",
+    type=float,
+    default=None,
+    help="Override LR scheduler final/floor LR after cosine decay "
+    "(hparams.yaml: model.scheduler.final_lr).",
   )
   parser.add_argument("--use-wandb", action="store_true")
   parser.add_argument("--wandb-project", default="TRL_X2Ultra_Planner")
   parser.add_argument("--wandb-name", default=None)
   args = parser.parse_args()
+
+  if args.resume is not None and args.init_from is not None:
+    raise SystemExit("--resume and --init-from are mutually exclusive")
 
   pl.seed_everything(args.seed, workers=True)
   strategy = args.strategy or ("ddp" if args.devices > 1 else "auto")
@@ -142,6 +194,9 @@ def main() -> None:
     devices=args.devices,
     num_nodes=args.num_nodes,
     strategy=strategy,
+    peak_lr=args.peak_lr,
+    warmup_steps=args.warmup_steps,
+    final_lr=args.final_lr,
   )
 
   motion_rep = load_motion_rep(conf)
@@ -202,7 +257,7 @@ def main() -> None:
       _recursive_=False,
     )
 
-  ckpt_dir = version_dir / "checkpoints"
+  ckpt_dir = version_dir / args.ckpt_subdir
   ckpt_dir.mkdir(parents=True, exist_ok=True)
   ckpt_callback = ModelCheckpoint(
     dirpath=str(ckpt_dir),
@@ -240,11 +295,35 @@ def main() -> None:
   )
 
   resume_path = str(args.resume) if args.resume else None
+
+  if args.init_from is not None:
+    init_path = Path(args.init_from).resolve()
+    if not init_path.is_file():
+      raise FileNotFoundError(f"--init-from path not found: {init_path}")
+    print(f"Loading weights-only from {init_path} (fresh optimizer + scheduler)")
+    init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+    state_dict = init_ckpt.get("state_dict", init_ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+      print(f"  WARN missing keys ({len(missing)}); first 5: {missing[:5]}")
+    if unexpected:
+      print(f"  WARN unexpected keys ({len(unexpected)}); first 5: {unexpected[:5]}")
+    print(f"  loaded; resetting optimizer/scheduler/step_counter to step 0")
+
+  lr_msg = ""
+  with open_dict(conf):
+    lr_msg = (
+      f" peak_lr={conf.model.optimizer.lr}"
+      f" warmup={conf.model.scheduler.num_warmup_steps}"
+      f" final_lr={conf.model.scheduler.final_lr}"
+    )
   print(
     f"Starting X2 root training: max_steps={args.max_steps} "
     f"devices={args.devices} num_nodes={args.num_nodes} strategy={strategy} "
     f"batch_per_dev={effective_batch} ckpt_every={args.save_every_n_steps}"
+    + lr_msg
     + (f" resume={resume_path}" if resume_path else "")
+    + (f" init_from={args.init_from}" if args.init_from else "")
   )
   trainer.fit(model, train_dataloaders=dataloader, ckpt_path=resume_path)
   print(f"Done. Final ckpt -> {ckpt_callback.last_model_path}")

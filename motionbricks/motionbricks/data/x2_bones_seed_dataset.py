@@ -105,6 +105,12 @@ class X2MotionDataset(Dataset):
     else:
       hit = (cache_dir / "manifest.json").is_file() and not recompute_cache
       print(f"  cache_dir:  {cache_dir}  ({'HIT' if hit else 'MISS / will build'})")
+      if include_patterns is not None or exclude_patterns is not None:
+        print(
+          f"  cache filter: include={len(include_patterns) if include_patterns else 0}"
+          f" exclude={len(exclude_patterns) if exclude_patterns else 0}"
+          " (applied to manifest on cache HIT)"
+        )
       # Cross-check: the cache_dir basename should match (one of) the PKL
       # stems under the per-PKL convention. If it doesn't, warn loudly.
       pkl_stems = {p.stem for p in pkl_list}
@@ -122,7 +128,13 @@ class X2MotionDataset(Dataset):
       cache_dir.mkdir(parents=True, exist_ok=True)
       manifest_path = cache_dir / "manifest.json"
       if manifest_path.is_file() and not recompute_cache:
-        if self._load_from_cache(manifest_path, cache_dir):
+        if self._load_from_cache(
+          manifest_path,
+          cache_dir,
+          include_patterns=include_patterns,
+          exclude_patterns=exclude_patterns,
+          max_clips=max_clips,
+        ):
           print(f"  loaded:     {len(self._keys):,} clips from cache")
           return
 
@@ -185,10 +197,37 @@ class X2MotionDataset(Dataset):
       exclude_patterns=exclude_patterns or (),
     )
 
-  def _load_from_cache(self, manifest_path: Path, cache_dir: Path) -> bool:
+  def _load_from_cache(
+    self,
+    manifest_path: Path,
+    cache_dir: Path,
+    *,
+    include_patterns: Optional[Sequence[str]] = None,
+    exclude_patterns: Optional[Sequence[str]] = None,
+    max_clips: Optional[int] = None,
+  ) -> bool:
+    """Load cached features, optionally re-applying the include/exclude filter.
+
+    The on-disk manifest stores every clip that was extracted at cache-build
+    time. Callers can request a subset by passing ``include_patterns`` /
+    ``exclude_patterns`` -- e.g. fine-tuning on a locomotion-only slice of a
+    full-corpus cache. Without this filter the cache HIT path would silently
+    ignore the caller's filter request and train on the full manifest. See
+    ``_select_keys`` for filter semantics.
+    """
     manifest = json.loads(manifest_path.read_text())
+    keys_all = list(manifest["keys"])
+    keys = self._select_keys(
+      keys_all,
+      include_patterns=include_patterns,
+      exclude_patterns=exclude_patterns,
+    )
+    if max_clips is not None:
+      keys = keys[:max_clips]
+    if (include_patterns is not None or exclude_patterns is not None) and len(keys) != len(keys_all):
+      print(f"  filter applied to cache: {len(keys_all):,} -> {len(keys):,} clips")
     loaded = 0
-    for key in manifest["keys"]:
+    for key in keys:
       path = cache_dir / f"{_safe_key(key)}.pt"
       if not path.is_file():
         continue

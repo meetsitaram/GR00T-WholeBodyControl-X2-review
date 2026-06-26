@@ -3064,7 +3064,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=(
             _REPO_ROOT
-            / "motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt"
+            / "motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0500000.ckpt"
         ),
     )
     p.add_argument(
@@ -3072,7 +3072,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=(
             _REPO_ROOT
-            / "motionbricks/out/motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt"
+            / "motionbricks/out/motionbricks_pose_x2/version_1/checkpoints/model-step=0500000.ckpt"
         ),
     )
     p.add_argument(
@@ -3080,7 +3080,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=(
             _REPO_ROOT
-            / "motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt"
+            / "motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0300000.ckpt"
         ),
     )
     p.add_argument(

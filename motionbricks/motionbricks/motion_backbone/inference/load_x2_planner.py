@@ -59,10 +59,10 @@ _DEFAULT_RESULT_DIR = (
 )  # motionbricks/out
 
 _DEFAULT_VQVAE_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_vqvae_x2/version_1"
-# Pose v2 directory: re-trained pose model with the post-100k keyframe-warmup
-# completed. ``skeleton/`` and ``stats/`` symlink back to motionbricks_pose_x2
-# so this dir is structurally a drop-in for the original.
-_DEFAULT_POSE_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_pose_x2_v2/version_1"
+# Round 2 (8-GPU Nebius run, 2026-06-24/25) re-trained the pose model end-to-end
+# in this base directory, so we no longer hop through motionbricks_pose_x2_v2
+# (which held the Round 1 post-100k keyframe-warmup pose).
+_DEFAULT_POSE_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_pose_x2/version_1"
 _DEFAULT_ROOT_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_root_x2/version_1"
 
 
@@ -99,9 +99,9 @@ class X2PlannerPaths:
         switching to a newer checkpoint.
         """
         return cls(
-            vqvae_ckpt=_DEFAULT_VQVAE_VERSION / "checkpoints/model-step=0200000.ckpt",
-            pose_ckpt=_DEFAULT_POSE_VERSION / "checkpoints/model-step=0250000.ckpt",
-            root_ckpt=_DEFAULT_ROOT_VERSION / "checkpoints/model-step=0235000.ckpt",
+            vqvae_ckpt=_DEFAULT_VQVAE_VERSION / "checkpoints/model-step=0500000.ckpt",
+            pose_ckpt=_DEFAULT_POSE_VERSION / "checkpoints/model-step=0500000.ckpt",
+            root_ckpt=_DEFAULT_ROOT_VERSION / "checkpoints/model-step=0300000.ckpt",
         )
 
     def validate(self) -> None:

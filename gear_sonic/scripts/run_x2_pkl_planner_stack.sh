@@ -464,9 +464,9 @@ if [[ ! -f "${PKL}" ]]; then
 fi
 
 # kplanner checkpoint preflight (mirrors run_x2_quest3_planner_stack.sh).
-KPL_VQVAE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt"
-KPL_POSE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt"
-KPL_ROOT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt"
+KPL_VQVAE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0500000.ckpt"
+KPL_POSE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2/version_1/checkpoints/model-step=0500000.ckpt"
+KPL_ROOT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0300000.ckpt"
 for ck in "${KPLANNER_VQVAE_CKPT:-${KPL_VQVAE_DEFAULT}}" \
           "${KPLANNER_POSE_CKPT:-${KPL_POSE_DEFAULT}}" \
           "${KPLANNER_ROOT_CKPT:-${KPL_ROOT_DEFAULT}}"; do

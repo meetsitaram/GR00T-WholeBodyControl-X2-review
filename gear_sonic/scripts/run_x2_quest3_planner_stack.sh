@@ -1485,9 +1485,9 @@ if [[ "${VLA_MODE}" -eq 0 && "${PLANNER_KIND}" == "kplanner" ]]; then
     # X2PlannerPaths.default(). Pinned step checkpoints (not last.ckpt) so
     # a fresh training run doesn't silently re-point inference at an
     # unverified checkpoint.
-    KPL_VQVAE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0200000.ckpt"
-    KPL_POSE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2_v2/version_1/checkpoints/model-step=0250000.ckpt"
-    KPL_ROOT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0235000.ckpt"
+    KPL_VQVAE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_vqvae_x2/version_1/checkpoints/model-step=0500000.ckpt"
+    KPL_POSE_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_pose_x2/version_1/checkpoints/model-step=0500000.ckpt"
+    KPL_ROOT_DEFAULT="${REPO_ROOT}/motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0300000.ckpt"
     for ck in "${KPLANNER_VQVAE_CKPT:-${KPL_VQVAE_DEFAULT}}" \
               "${KPLANNER_POSE_CKPT:-${KPL_POSE_DEFAULT}}" \
               "${KPLANNER_ROOT_CKPT:-${KPL_ROOT_DEFAULT}}"; do

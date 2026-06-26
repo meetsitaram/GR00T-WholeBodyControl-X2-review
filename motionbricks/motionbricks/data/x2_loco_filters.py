@@ -10,26 +10,33 @@ import re
 from typing import Iterable, Sequence
 
 # Keys must match at least one include pattern (case-insensitive).
+#
+# 2026-06-25: Replaced ``\b`` with letter-only boundaries
+# ``(?<![A-Za-z])`` / ``(?![A-Za-z])``. Python's ``\b`` treats underscore
+# as a word character, so ``\bwalk\b`` could not match
+# ``Loop_Forward_Walk_001__A018`` (the chain_matched_v2 naming convention).
+# Letter-boundaries match across underscores / digits while still
+# preventing partial-word matches (e.g. ``walker``, ``boardwalk``).
 DEFAULT_INCLUDE_PATTERNS: tuple[str, ...] = (
-    r"(?i)\b(walk|stride|pace|gait)\b",
-    r"(?i)\b(forward|backward|back_step|fwd_step)\b",
-    r"(?i)\b(sideway|sideways|lateral|straf)\b",
-    r"(?i)\b(turn|pivot|rotate)\b",
-    r"(?i)\b(idle|stand|rest|stationary)\b",
-    r"(?i)^loco__",
+    r"(?i)(?<![A-Za-z])(walk|stride|pace|gait)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(forward|backward|back_step|fwd_step|fwd|back)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(sideway|sideways|lateral|straf|side_step|side)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(turn|pivot|rotate)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(idle|stand|rest|stationary|relaxed)(?![A-Za-z])",
+    r"(?i)^loco(?![A-Za-z])",  # e.g. locowalk__, loco__
 )
 
 # Reject even if an include matched.
 DEFAULT_EXCLUDE_PATTERNS: tuple[str, ...] = (
-    r"(?i)\b(run|sprint|jog|dash)\b",
-    r"(?i)\b(crawl|kneel|crouch|squat|sit|lying|prone)\b",
-    r"(?i)\b(jump|hop|leap|vault|fall)\b",
-    r"(?i)\b(box|punch|kick|dance|zombie|injured|stealth|happy|scared|gun)\b",
-    r"(?i)\b(pick|place|grasp|carry|lift|throw|push|pull|open|close)\b",
-    r"(?i)\b(climb|stair|ladder|handstand|cartwheel)\b",
-    r"(?i)\b(manip|object|prop|tool|sword|bench|chair)\b",
-    r"(?i)\b(stoop|bend|reach|wave|gesture|point)\b",
-    r"(?i)standing__",  # standing-manipulation subset
+    r"(?i)(?<![A-Za-z])(run|sprint|jog|dash)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(crawl|kneel|crouch|squat|sit|lying|prone)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(jump|hop|leap|vault|fall)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(box|punch|kick|dance|zombie|injured|stealth|happy|scared|gun)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(pick|place|grasp|carry|lift|throw|push|pull|open|close)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(climb|stair|ladder|handstand|cartwheel)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(manip|object|prop|tool|sword|bench|chair)(?![A-Za-z])",
+    r"(?i)(?<![A-Za-z])(stoop|bend|reach|wave|gesture|point)(?![A-Za-z])",
+    r"(?i)standing(?![A-Za-z])",  # standing-manipulation subset
 )
 
 
