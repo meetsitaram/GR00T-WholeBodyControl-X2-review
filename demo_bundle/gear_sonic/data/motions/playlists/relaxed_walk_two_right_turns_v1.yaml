@@ -1,0 +1,67 @@
+name: x2_ultra_relaxed_walk_two_right_turns_v1
+output_key: relaxed_walk__v1__two_right_turns
+fps: 30
+
+# Two-right-turns subset of `relaxed_walk_loop_v1.yaml` (2026-06-26).
+# Drops the two walks, the two left pivots, and the third rest seam,
+# keeping only the `pivot_right_1`/`pivot_right_2` pair wrapped in the
+# same neutral_idle anchors and 2.5 s rest seams the parent uses.
+#
+# Reel:
+#   1. neutral_idle anchor                  (1.00 s)
+#   2. step_rotate_idle_090_002__A026_M     (5.17 s, -90 deg right)
+#   3. step_rotate_idle_090_002__A026_M     (5.17 s, -90 deg right,
+#                                            cumulative -180 deg)
+#   4. neutral_idle anchor                  (1.00 s)
+#
+# Plus three 2.5 s rest seams between segments -> 19.84 s total
+# (595 frames @ 30 fps). End yaw: -180 deg (about-face).
+#
+# XY drift: each pivot drifts ~0.30 m laterally during rotation per the
+# parent's notes; the second pivot partly cancels the first because the
+# body has flipped 90 deg, so net XY closure is bounded. Confirm exact
+# numbers from the make_warehouse_motion build log.
+#
+# Track: uniform_h14 (matches the parent). For a chain_matched variant,
+# copy this YAML and swap `x2_ultra_retarget_uniform_h14.pkl` ->
+# `x2_ultra_retarget_chain_matched.pkl` and the rest source to
+# `x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl`.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose (2026-06-24) so segment_start <-> rest pose
+  # distance is small; kills the visible "snap to default pose" between
+  # segments.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: pivot_right_1
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg
+
+  - name: pivot_right_2
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: step_rotate_idle_090_002__A026_M__speed_1.0
+    start_frame: 0
+    n_frames: 155                # 5.17 s, -90 deg (cumulative -180 from prev)
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

@@ -22,9 +22,12 @@ into sonic training alongside the bones-seed corpus.
 .venv/bin/python gear_sonic/scripts/play_x2_motion_mujoco.py     --motion gear_sonic/data/motions/x2_recorded/mc_gestures/hug_001.pkl    --motion-key hug_001
 
 ### play gesture onto the sonic stack in sim
-gear_sonic/scripts/run_x2_quest3_planner_stack.sh
+gear_sonic/scripts/run_x2_quest3_planner_stack.sh --model /home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx
 
 python -m gear_sonic.scripts.play_gesture     --pkl gear_sonic/data/motions/x2_recorded/mc_gestures/left_kiss_001.pkl
+
+python -m gear_sonic.scripts.play_gesture \
+    --pkl gear_sonic/data/motions/x2_recorded/demo_gestures/wave_hello_with_right_hand_001.pkl
 
 
 ### play gesture onto the sonic stack on real robot

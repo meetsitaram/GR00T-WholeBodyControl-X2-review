@@ -64,9 +64,13 @@ Root rebase
 The recorder ``pose`` wire only carries ``joint_pos_mj`` (31,) and
 ``root_quat_xyzw`` (4,) -- no root translation. ``MotionClipSession``
 yaw-rebases the PKL's root quaternion so frame 0 matches the
-operator-supplied ``robot_root_yaw`` (whatever the kplanner /
-robot_pose SUB last saw). Roll and pitch pass through verbatim, so
-a sit-down motion genuinely lowers the pelvis. Joint angles are
+operator-supplied ``robot_root_yaw``. The recorder chooses that
+value at play-time off the same x2_debug ``base_quat`` it uses for
+the idle-stand pose (with the kplanner body_pose snap as a stale-
+x2_debug fallback) so the takeover from idle to clip is
+C0-continuous in yaw on tick zero -- whether or not a kplanner is
+running upstream. Roll and pitch pass through verbatim, so a
+sit-down motion genuinely lowers the pelvis. Joint angles are
 frame-invariant and need no rebasing.
 
 The rebase is one rigid ``Rz(dyaw)`` applied uniformly to every

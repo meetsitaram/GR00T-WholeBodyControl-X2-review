@@ -1,0 +1,178 @@
+{
+  "built_at": "2026-06-26 02:35:27 PDT",
+  "repo_root": "/home/stickbot/Projects/GR00T-WholeBodyControl",
+  "bundle_root": "/home/stickbot/Projects/GR00T-WholeBodyControl/demo_bundle",
+  "entry_count": 20,
+  "total_bytes": 612748,
+  "estop_followup": "gear_sonic/data/motions/x2_recorded/mc_gestures/shake_head_001.pkl",
+  "bindings_locomotion": {
+    "UP": "gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl",
+    "LEFT": "gear_sonic/data/motions/x2_ultra_relaxed_walk_one_left_turn_v1.pkl",
+    "RIGHT": "gear_sonic/data/motions/x2_ultra_relaxed_walk_one_right_turn_v1.pkl",
+    "DOWN": "gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl"
+  },
+  "bindings_gestures": {
+    "A": "gear_sonic/data/motions/x2_recorded/demo_gestures/hug3_001.pkl",
+    "B": "gear_sonic/data/motions/x2_recorded/demo_gestures/hand_on_shoulder_001.pkl",
+    "X": "gear_sonic/data/motions/x2_recorded/demo_gestures/what_can_i_do_001.pkl",
+    "Y": "gear_sonic/data/motions/x2_recorded/demo_gestures/come_here_001.pkl",
+    "A+L1": null,
+    "B+L1": null,
+    "X+L1": null,
+    "Y+L1": "gear_sonic/data/motions/x2_recorded/mc_gestures/bow_001.pkl",
+    "A+R1": null,
+    "B+R1": null,
+    "X+R1": null,
+    "Y+R1": "gear_sonic/data/motions/x2_recorded/mc_gestures/right_shake_001.pkl",
+    "A+L2": null,
+    "B+L2": null,
+    "X+L2": null,
+    "Y+L2": "gear_sonic/data/motions/x2_recorded/demo_gestures/left_wave_high_001.pkl",
+    "A+R2": null,
+    "B+R2": null,
+    "X+R2": "gear_sonic/data/motions/x2_recorded/demo_gestures/chicken_001.pkl",
+    "Y+R2": "gear_sonic/data/motions/x2_recorded/demo_gestures/right_wave_001.pkl"
+  },
+  "entries": [
+    {
+      "category": "locomotion",
+      "chord": "UP",
+      "src_rel": "gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl",
+      "size_bytes": 60947,
+      "sha256": "7bc27ea0c5d8a0e3e46bd5e7d57a15c638dd3d369b6aac8a66760b097bda35ca"
+    },
+    {
+      "category": "locomotion",
+      "chord": "LEFT",
+      "src_rel": "gear_sonic/data/motions/x2_ultra_relaxed_walk_one_left_turn_v1.pkl",
+      "size_bytes": 54711,
+      "sha256": "8aff545ffb609d6e2a0623c73c228f50549cd9b71193f85896556108e9621884"
+    },
+    {
+      "category": "locomotion",
+      "chord": "RIGHT",
+      "src_rel": "gear_sonic/data/motions/x2_ultra_relaxed_walk_one_right_turn_v1.pkl",
+      "size_bytes": 55927,
+      "sha256": "961430ca479046670291e6937117c602f60255c38282520d479892a12f947f09"
+    },
+    {
+      "category": "locomotion",
+      "chord": "DOWN",
+      "src_rel": "gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl",
+      "size_bytes": 90879,
+      "sha256": "05107fb8b5101ae359d5ac4527b196bf004b7f57b57c48cf33af710092f212e2"
+    },
+    {
+      "category": "gesture",
+      "chord": "A",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/hug3_001.pkl",
+      "size_bytes": 48708,
+      "sha256": "425cf2c3a8ace51a22c1e3fe7a672b30d8de689aa6085f61090306a8b2c9d68d"
+    },
+    {
+      "category": "gesture",
+      "chord": "B",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/hand_on_shoulder_001.pkl",
+      "size_bytes": 53162,
+      "sha256": "094f1a63663f7b8c33b145a7130a464e6b8424fcd983a26ea14a140fe50f0744"
+    },
+    {
+      "category": "gesture",
+      "chord": "X",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/what_can_i_do_001.pkl",
+      "size_bytes": 29060,
+      "sha256": "1e9317ad229fb6f64211fa139111dcf2193a161db081922d2e0d5676aa15ba3f"
+    },
+    {
+      "category": "gesture",
+      "chord": "Y",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/come_here_001.pkl",
+      "size_bytes": 25328,
+      "sha256": "30feddc827a416b3f787b2f57034fcc5c3772206e803af68800c113c32609f86"
+    },
+    {
+      "category": "gesture",
+      "chord": "Y+L1",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/mc_gestures/bow_001.pkl",
+      "size_bytes": 25414,
+      "sha256": "5eebd9df3a76daee041495c002f6397f6f5bb2a74d623c5a14b6dfac24f0689b"
+    },
+    {
+      "category": "gesture",
+      "chord": "Y+R1",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/mc_gestures/right_shake_001.pkl",
+      "size_bytes": 17334,
+      "sha256": "b87668075586988d08d5d91fa7c60e75cb2e0449371f77850c84152cfc94848f"
+    },
+    {
+      "category": "gesture",
+      "chord": "Y+L2",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/left_wave_high_001.pkl",
+      "size_bytes": 34041,
+      "sha256": "6e7dc5d3bd14a2d82ff40e9f6b4be3ab874853580cd0b5ad2f2848b23b5ed7f9"
+    },
+    {
+      "category": "gesture",
+      "chord": "X+R2",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/chicken_001.pkl",
+      "size_bytes": 35520,
+      "sha256": "5ef2baf6710e8554dbaebc8b7edfcbe6d0ed64a74f976b10c196732a4f208347"
+    },
+    {
+      "category": "gesture",
+      "chord": "Y+R2",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/demo_gestures/right_wave_001.pkl",
+      "size_bytes": 15839,
+      "sha256": "525c50b12ddac43dbaf0725bbd0a913d1cad2df7399992c227a3aca8d79ffafd"
+    },
+    {
+      "category": "estop_followup",
+      "chord": "L1+R1+L2+R2 ack",
+      "src_rel": "gear_sonic/data/motions/x2_recorded/mc_gestures/shake_head_001.pkl",
+      "size_bytes": 3539,
+      "sha256": "f796b56142832e6d0d2a1f34d09298b4514bcb8f658933f8ab62cec69bb0083a"
+    },
+    {
+      "category": "playlist",
+      "chord": null,
+      "src_rel": "gear_sonic/data/motions/playlists/relaxed_walk_forward_v1.yaml",
+      "size_bytes": 2793,
+      "sha256": "57c8efea083abf7adc970cb2ea920c0a8a6dba7326ba521ee3c4c606faa5eff1"
+    },
+    {
+      "category": "playlist",
+      "chord": null,
+      "src_rel": "gear_sonic/data/motions/playlists/relaxed_walk_one_left_turn_v1.yaml",
+      "size_bytes": 2227,
+      "sha256": "df69c6e2f27b7a1d3196e29ad268d3071113eef660a7f6a04319cc7fbd77756d"
+    },
+    {
+      "category": "playlist",
+      "chord": null,
+      "src_rel": "gear_sonic/data/motions/playlists/relaxed_walk_one_right_turn_v1.yaml",
+      "size_bytes": 2227,
+      "sha256": "8c4d1e33348b74960089d0d67d970c6f0e8688fa22aa810e9ef7dabdf40d47af"
+    },
+    {
+      "category": "playlist",
+      "chord": null,
+      "src_rel": "gear_sonic/data/motions/playlists/relaxed_walk_two_right_turns_v1.yaml",
+      "size_bytes": 2658,
+      "sha256": "e9a25bd32be722f151551377962b866f75368a125db79f33d444b1ba85e3f47e"
+    },
+    {
+      "category": "script",
+      "chord": null,
+      "src_rel": "gear_sonic/scripts/play_xbox_controller.py",
+      "size_bytes": 41740,
+      "sha256": "42d68ee4fba8fd59265a10998c36d44c5d038a99ea68dae38de65328a6ecccfe"
+    },
+    {
+      "category": "doc",
+      "chord": null,
+      "src_rel": "xbox_controller_commands.md",
+      "size_bytes": 10694,
+      "sha256": "15ff696b26b978a42b096e0fb5721c2666ccd30fe7bd4fbf0aa909ded24fc2e0"
+    }
+  ]
+}

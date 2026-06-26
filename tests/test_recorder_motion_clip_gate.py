@@ -389,12 +389,27 @@ class _ClipHarness:
         # tests can assert what the held-frame branch emitted.
         self._zero_motion_token = np.zeros(64, dtype=np.float64)
         self.publish_calls: list[dict[str, Any]] = []
+        # Override knob for the live-deploy yaw source. The real
+        # method drains ``self._latest_state.snapshot()`` which needs
+        # a full subscriber thread; tests set this to ``None`` (the
+        # default) to simulate ``x2_debug`` stale -- which forces the
+        # ladder down to the kplanner-snap branch, matching the
+        # pre-2026-06 behaviour all the original tests pinned. Tests
+        # exercising the live-yaw branch (e.g. the unified gesture +
+        # locomotion ladder) override this to a float.
+        self._live_deploy_yaw_override: float | None = None
 
     # Bind the real recorder methods under test.
     _snapshot_robot_yaw = X2DatasetRecorder._snapshot_robot_yaw
     _resolve_clip_entry = X2DatasetRecorder._resolve_clip_entry
     _drain_clip_commands = X2DatasetRecorder._drain_clip_commands
     _publish_held_clip_frame = X2DatasetRecorder._publish_held_clip_frame
+
+    def _snapshot_live_deploy_yaw(self) -> float | None:
+        # Test stub: the real method reads ``self._latest_state``,
+        # which would require a full PC2 SUB thread. Tests dial the
+        # branch via ``_live_deploy_yaw_override``.
+        return self._live_deploy_yaw_override
 
     def _publish_pose(self, **kwargs: Any) -> None:
         # Snapshot whatever the under-test method passed in.
@@ -527,6 +542,122 @@ def test_drain_play_during_hold_seeds_yaw_from_held_frame() -> None:
     # Starting a new play clears the latched held frame: the new
     # session owns the publish path now.
     assert h_held._clip_held_frame is None
+
+
+@pytest.mark.parametrize("clip_kind", ["gesture", "locomotion"])
+def test_drain_play_prefers_live_deploy_yaw_over_kplanner_snap(clip_kind: str) -> None:
+    """When ``x2_debug`` is alive, the yaw rebase target must be the
+    live ``base_quat`` yaw -- NOT the kplanner body_pose snap. This is
+    the direct-PKL-stack bug operators kept hitting in 2026-06: the
+    snap dict stays empty (no kplanner publishing), the recorder's
+    legacy ``_snapshot_robot_yaw`` fallback returned ``yaw=0``, and
+    every clip teleported the world to its authored heading at
+    takeover. The fix was to gate both the locomotion (2026-06) and
+    gesture (2026-06-26) branches onto the live ``x2_debug`` yaw,
+    falling back to the snap only when the SUB is stale.
+
+    We pin both kinds against the same parametric case so the gesture
+    branch can't regress to the snap-only path without taking the
+    locomotion branch with it.
+    """
+    catalog = _shipped_catalog()
+    live_yaw = 0.7  # rad; arbitrary, just must differ from snap
+
+    # Run 1: x2_debug alive -- ladder must pick the live yaw.
+    h_live = _ClipHarness(catalog)
+    h_live._live_deploy_yaw_override = live_yaw
+    if clip_kind == "gesture":
+        req_live: Any = MotionClipPlayRequest(name="stand_up_A540")
+    else:
+        # Catalog is gesture-only, but the held-vs-live branch logic
+        # we're pinning is identical for ad-hoc locomotion entries, so
+        # reuse the same source PKL with ``kind="locomotion"``.
+        req_live = MotionClipPlayRequest(
+            pkl_path=catalog["stand_up_A540"].resolved_source(),
+            kind="locomotion",
+        )
+    h_live._motion_clip_request_queue.put(req_live)
+    h_live._drain_clip_commands(_identity_snap())
+    assert h_live._active_clip is not None
+    assert h_live._active_clip.kind == clip_kind
+
+    # Run 2: x2_debug stale (override None) -- ladder must fall
+    # through to the kplanner snap (yaw=0 here because the snap is
+    # the identity quat).
+    h_snap = _ClipHarness(catalog)
+    if clip_kind == "gesture":
+        req_snap: Any = MotionClipPlayRequest(name="stand_up_A540")
+    else:
+        req_snap = MotionClipPlayRequest(
+            pkl_path=catalog["stand_up_A540"].resolved_source(),
+            kind="locomotion",
+        )
+    h_snap._motion_clip_request_queue.put(req_snap)
+    h_snap._drain_clip_commands(_identity_snap())
+    assert h_snap._active_clip is not None
+
+    # The two sessions' published quats must differ by exactly
+    # R_z(live_yaw) on every frame: same dyaw math, just different
+    # rebase targets (live_yaw vs 0).
+    qa = Rot.from_quat(
+        h_snap._active_clip.root_quat_xyzw.astype(np.float64)
+    )
+    qb = Rot.from_quat(
+        h_live._active_clip.root_quat_xyzw.astype(np.float64)
+    )
+    q_delta = (qb * qa.inv()).as_rotvec()
+    np.testing.assert_allclose(q_delta[:, 0], 0.0, atol=1e-5)
+    np.testing.assert_allclose(q_delta[:, 1], 0.0, atol=1e-5)
+    np.testing.assert_allclose(q_delta[:, 2], live_yaw, atol=1e-5)
+
+
+def test_drain_play_held_frame_beats_live_deploy_yaw() -> None:
+    """The held-frame branch must still win over the live ``x2_debug``
+    yaw: when an operator chains two halves of the same source PKL via
+    ``hold_after``, the second half's rebase needs to seed off the
+    held quat (so the clip stays continuous in body frame), NOT off
+    the live yaw (which may have drifted while the held pose was
+    sitting). Keeps the unified ladder from breaking the chained-PKL
+    semantics the held-frame test pins.
+    """
+    catalog = _shipped_catalog()
+    held_yaw = 1.0
+    live_yaw = -0.3  # decoy; must be ignored when held_frame is set
+    held_quat = Rot.from_euler("z", held_yaw).as_quat()
+
+    h = _ClipHarness(catalog)
+    h._live_deploy_yaw_override = live_yaw
+    h._clip_held_frame = {
+        "body_q_mj": np.zeros(31, dtype=np.float64),
+        "root_quat_xyzw": held_quat.astype(np.float32),
+    }
+    h._active_clip_hold_after = True
+    h._motion_clip_request_queue.put(
+        MotionClipPlayRequest(name="stand_up_A540")
+    )
+    h._drain_clip_commands(_identity_snap())
+    assert h._active_clip is not None
+
+    # Baseline: same play, no held frame, no live yaw -- snap=identity
+    # -> dyaw seed = 0.
+    h0 = _ClipHarness(catalog)
+    h0._motion_clip_request_queue.put(
+        MotionClipPlayRequest(name="stand_up_A540")
+    )
+    h0._drain_clip_commands(_identity_snap())
+    assert h0._active_clip is not None
+
+    qa = Rot.from_quat(
+        h0._active_clip.root_quat_xyzw.astype(np.float64)
+    )
+    qb = Rot.from_quat(
+        h._active_clip.root_quat_xyzw.astype(np.float64)
+    )
+    q_delta = (qb * qa.inv()).as_rotvec()
+    # Held yaw wins; live_yaw is NOT applied.
+    np.testing.assert_allclose(q_delta[:, 0], 0.0, atol=1e-5)
+    np.testing.assert_allclose(q_delta[:, 1], 0.0, atol=1e-5)
+    np.testing.assert_allclose(q_delta[:, 2], held_yaw, atol=1e-5)
 
 
 def test_resolve_clip_entry_forwards_kind_on_adhoc_pkl_play(tmp_path: Path) -> None:

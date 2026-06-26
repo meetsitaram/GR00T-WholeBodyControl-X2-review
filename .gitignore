@@ -263,6 +263,12 @@ sonic_release/
 # (see gear_sonic/data/x2_planner_primitives_recipes.yaml etc).
 gear_sonic/data/motions/*.pkl
 
+# Demo-day sync bundle assembled by gear_sonic/scripts/build_demo_bundle.py.
+# The demo_bundle/ directory itself IS tracked so the demo machine can
+# `git pull` the same data the build machine snapshotted; the gzipped
+# tarball next to it (--tar) is a redundant archive and stays ignored.
+/demo_bundle.tar.gz
+
 # Synthetic-data-generation (SDG) USD assets. The `grab/` subtree is the
 # upstream GRAB hand-object capture archive (~855 MB, CC-BY-NC, fetched
 # externally), and `simple/` holds bulky binary `.usd` props (table /

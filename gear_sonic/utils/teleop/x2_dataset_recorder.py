@@ -3502,15 +3502,18 @@ class X2DatasetRecorder:
         """Best-effort estimate of the robot's current world-frame yaw.
 
         Used as the rebase target for the PKL's frame-0 yaw so a
-        gesture clip starts at the operator's current heading. Falls
+        motion clip starts at the operator's current heading. Falls
         back to 0 rad when the body_pose snapshot has no root quat
         yet (e.g. clip triggered before kplanner publishes anything).
 
-        Scope note: only consulted by the gesture branch of
-        :meth:`_drain_clip_commands`. The locomotion branch reads
-        :meth:`_snapshot_live_deploy_yaw` first so it works in stacks
-        that have no kplanner publishing body_pose (see the direct-
-        PKL launcher).
+        Scope note: this is the SECOND-CHOICE source consulted by both
+        the gesture and locomotion branches of
+        :meth:`_drain_clip_commands`. Both branches read
+        :meth:`_snapshot_live_deploy_yaw` first (so they work in the
+        direct-PKL launcher where no kplanner publishes body_pose) and
+        only fall through to this kplanner-snap-derived yaw when the
+        ``x2_debug`` cache is stale. The 2026-06-26 unification of the
+        gesture path matches the earlier (2026-06) locomotion fix.
         """
         rq = snap.get("root_quat_xyzw")
         if rq is None:
@@ -3527,13 +3530,18 @@ class X2DatasetRecorder:
         ``x2_debug`` SUB thread is alive, else ``None`` so the caller
         can fall back to the kplanner body_pose snap. Mirrors the
         liveness gating used by :meth:`_compute_idle_root_quat_xyzw`
-        so the locomotion rebase target and the idle-stand pose are
+        so the motion-clip rebase target and the idle-stand pose are
         derived from the same source -- which means the transition
         from idle to clip is C0-continuous in yaw on tick zero.
 
-        Scoped to the locomotion clip branch on purpose: gestures
-        keep using :meth:`_snapshot_robot_yaw` to preserve their
-        legacy shipping behaviour per operator request.
+        Consulted by BOTH the gesture and locomotion branches of
+        :meth:`_drain_clip_commands` (the gesture branch was unified
+        onto this ladder on 2026-06-26 after the operator hit the same
+        ``snap-empty -> yaw=0 teleport`` failure mode in the direct-
+        PKL stack that the locomotion branch had already been fixed
+        for in 2026-06). The held-frame branch still wins over this
+        because mid-PKL handoffs need quat continuity, not robot-frame
+        truth.
         """
         try:
             (
@@ -3690,24 +3698,21 @@ class X2DatasetRecorder:
             #      kplanner has no idea we're holding; using its
             #      idle-stand snap would re-rotate the world at
             #      takeover).
-            #   2. Locomotion (no held frame): use the live x2_debug
-            #      base_quat yaw -- the recorder's own subscriber to
-            #      the deploy. This is the ground truth for the
-            #      robot's current world-frame heading, and it works
-            #      whether or not a kplanner is running upstream. In
-            #      the kplanner stack it converges to the same value
-            #      as snap['root_quat_xyzw'] (the kplanner subscribes
-            #      to x2_debug too); in the direct-PKL stack there is
-            #      no kplanner publishing body_pose, so the snap dict
-            #      stays empty and the legacy code path silently fell
-            #      back to yaw=0 -- which is exactly the teleport-to-
-            #      authored-heading failure mode the operator was
-            #      seeing. Falls back to the snap-based yaw if
-            #      x2_debug has gone stale.
-            #   3. Gesture (no held frame): unchanged from the legacy
-            #      shipping behaviour -- read from the kplanner snap.
-            #      Scoped narrowly per operator request; the legacy
-            #      path is what gestures have been tested against.
+            #   2. No held frame (gesture OR locomotion): use the live
+            #      x2_debug base_quat yaw -- the recorder's own
+            #      subscriber to the deploy. This is the ground truth
+            #      for the robot's current world-frame heading, and it
+            #      works whether or not a kplanner is running
+            #      upstream. In the kplanner stack it converges to the
+            #      same value as snap['root_quat_xyzw'] (the kplanner
+            #      subscribes to x2_debug too); in the direct-PKL
+            #      stack there is no kplanner publishing body_pose, so
+            #      the snap dict stays empty and the legacy code path
+            #      silently fell back to yaw=0 -- exactly the teleport-
+            #      to-authored-heading failure mode operators reported
+            #      first for locomotion clips (2026-06) and then for
+            #      gestures (2026-06-26). Falls back to the snap-based
+            #      yaw if x2_debug has gone stale.
             if self._clip_held_frame is not None:
                 yaw = float(
                     yaw_of_quat_xyzw(
@@ -3718,7 +3723,7 @@ class X2DatasetRecorder:
                     )
                 )
                 yaw_source = "held-frame"
-            elif entry.kind == "locomotion":
+            else:
                 live_yaw = self._snapshot_live_deploy_yaw()
                 if live_yaw is not None:
                     yaw = live_yaw
@@ -3726,9 +3731,6 @@ class X2DatasetRecorder:
                 else:
                     yaw = self._snapshot_robot_yaw(snap)
                     yaw_source = "kplanner-snap-fallback"
-            else:
-                yaw = self._snapshot_robot_yaw(snap)
-                yaw_source = "kplanner-snap"
             try:
                 self._active_clip = MotionClipSession(
                     entry=entry,

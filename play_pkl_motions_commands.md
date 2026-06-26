@@ -14,9 +14,26 @@
 ./gear_sonic/scripts/run_x2_pkl_direct_stack.sh \
     --pc2-host 192.168.86.32
 
+### xbox controller
+.venv/bin/python -m gear_sonic.scripts.play_xbox_controller
+
 ### play pkl motion
 python -m gear_sonic.scripts.play_locomotion \
     --pkl gear_sonic/data/motions/x2_ultra_in_place_turns_v1_chain_matched.pkl
+
+python -m gear_sonic.scripts.play_locomotion \
+    --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl
+
+python -m gear_sonic.scripts.play_locomotion \
+    --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl
+
+python -m gear_sonic.scripts.play_locomotion \
+    --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_one_left_turn_v1.pkl
+
+python -m gear_sonic.scripts.play_locomotion \
+    --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_one_right_turn_v1.pkl
+
+python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_loop_v1.pkl 
 
 ### run in kinematic viewer
 conda run -n env_isaaclab --no-capture-output python \
@@ -29,30 +46,32 @@ x2_ultra_relaxed_walk_loop_v1_halfspeed_walks.pkl
 
 ### run with sonic in sim directly (without full stack piipeline)
 gear_sonic_deploy/deploy_x2.sh sim \
-    --model logs_rl/TRL_X2Ultra_DemoV1/manager/universal_token/all_modes/sonic_x2_ultra_demo_v1_demo_v1-20260623_231221/exported/model_step_004000_g1.onnx \
+    --model /home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx  \
     --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_loop_v1.pkl \
     --sim-viewer --no-confirm \
     --max-duration 60
 
 ### run with sonic in sim and full stack
-gear_sonic/scripts/run_x2_pkl_direct_stack.sh
-
-python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_walk_demo_v6.pkl
-
-### run with sonic on the robot
-gear_sonic/scripts/run_x2_pkl_direct_stack.sh
+gear_sonic/scripts/run_x2_pkl_direct_stack.sh --model /home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx
 
 python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_walk_demo_v6.pkl
 
 
 ### trained sonic models
+M25K=/home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx
+M3339=/home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_003339/exported/model_step_003339_g1.onnx
+M4000=/home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx
+
 -- base model
 /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx
 backed up as agibot_x2_sonic_base_version.onnx
 
 -- good for walks
-logs_rl/TRL_X2Ultra_DemoV1/manager/universal_token/all_modes/sonic_x2_ultra_demo_v1_demo_v1-20260623_231221/exported/model_step_004000_g1.onnx
-copied as /home/run/getsolo/policies/agibot_x2_sonic.onnx
+<!-- logs_rl/TRL_X2Ultra_DemoV1/manager/universal_token/all_modes/sonic_x2_ultra_demo_v1_demo_v1-20260623_231221/exported/model_step_004000_g1.onnx
+copied as /home/run/getsolo/policies/agibot_x2_sonic.onnx -->
+/home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx 
+copied as
+/home/run/getsolo/policies/agibot_x2_sonic.onnx
 
 gear_sonic_deploy/deploy_x2.sh sim     --model logs_rl/TRL_X2Ultra_DemoV1/manager/universal_token/all_modes/sonic_x2_ultra_demo_v1_demo_v1-20260623_231221/exported/model_step_004000_g1.onnx     --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_loop_v1_halfspeed_walks_chain_matched.pkl     --sim-viewer --no-confirm     --max-duration 60
 
@@ -62,6 +81,12 @@ copied as /home/run/getsolo/policies/agibot_x2_sonic_dance_fine_tuned.onnx
 
 
 gear_sonic_deploy/deploy_x2.sh sim     --model logs_rl/TRL_X2Ultra_DemoV2/manager/universal_token/all_modes/sonic_x2_ultra_demo_v2_demo_v2-20260624_130315/exported/model_step_004000_g1.onnx     --motion gear_sonic/data/motions/dance_singles/dance_latino_kick_kick_R_001__A313.pkl     --sim-viewer --no-confirm     --max-duration 60
+
+### trained models v2
+M25K=/home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx
+M3339=/home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_003339/exported/model_step_003339_g1.onnx
+M4000=/home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx
+
 
 ##### v2 — walk forward -> turn 90 -> turn 90 -> walk back (~34.5 s; ends ~29 cm off origin)
 gear_sonic_deploy/deploy_x2.sh sim \
@@ -190,6 +215,59 @@ conda run -n env_isaaclab --no-capture-output python \
     --playlist gear_sonic/data/motions/playlists/relaxed_walk_loop_v1_halfspeed_walks.yaml \
     --out      gear_sonic/data/motions/x2_ultra_relaxed_walk_loop_v1_halfspeed_walks.pkl \
     --check-runtime-parity
+
+### relaxed-walk v1 — split into walk-forward + two-right-turns (2026-06-26)
+
+Two standalone PKLs carved out of the parent `relaxed_walk_loop_v1.yaml` so each motion can be played on its own via `play_locomotion`. Same `uniform_h14` retarget track, same track-matched rest seams, same primitives — just smaller subsets wrapped in the same neutral_idle anchors the parent uses.
+
+| Variant | PKL | Frames @ 30 fps | Duration | End XY | End yaw | XY path | Worst seam max\|d_dof\|/tick |
+|---|---|---|---|---|---|---|---|
+| walk forward only | `x2_ultra_relaxed_walk_forward_v1.pkl` | 398 | 13.27 s | (+3.36, +0.98) m | -0.4 deg | 3.58 m | 0.027 rad (walk -> rest) |
+| two right turns (about-face) | `x2_ultra_relaxed_walk_two_right_turns_v1.pkl` | 595 | 19.83 s | (+0.02, -0.13) m | +177.2 deg (= -182.8, about-face -2.8 deg drift) | 0.84 m | 0.011 rad |
+
+Single-key bundles: `relaxed_walk__v1__walk_forward` and `relaxed_walk__v1__two_right_turns`. Both built with the 2026-06-24 track-matched rest source `x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl` (no "snap to default pose" between anchors and the motion segment).
+
+The two-right-turns PKL gets much cleaner seams (0.010-0.011 rad) than the walk-forward PKL (0.027 rad on the walk-end seam) because both pivots start and end in idle pose, while the walk-end always leaves the legs mid-gait relative to idle stance. That 0.027 rad is the same value the parent loop hits at the same seam — it's the foot-slide cost the parent's YAML header comment calls out.
+
+#### kinematic viewer
+conda run -n env_isaaclab --no-capture-output python \
+    gear_sonic/scripts/play_x2_motion_mujoco.py \
+    --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl \
+    --no-loop
+
+conda run -n env_isaaclab --no-capture-output python \
+    gear_sonic/scripts/play_x2_motion_mujoco.py \
+    --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl \
+    --no-loop
+
+#### sonic in sim (--max-duration sized to ~1 s margin)
+gear_sonic_deploy/deploy_x2.sh sim \
+    --model /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx \
+    --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl \
+    --sim-viewer --no-confirm \
+    --max-duration 15
+
+gear_sonic_deploy/deploy_x2.sh sim \
+    --model /home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx \
+    --motion gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl \
+    --sim-viewer --no-confirm \
+    --max-duration 22
+
+#### real-robot playback
+python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl
+
+python -m gear_sonic.scripts.play_locomotion --pkl gear_sonic/data/motions/x2_ultra_relaxed_walk_two_right_turns_v1.pkl
+
+#### rebuild both from the YAMLs (e.g. after editing trim or swapping retarget track)
+for NAME in relaxed_walk_forward_v1 relaxed_walk_two_right_turns_v1 ; do
+  conda run -n env_isaaclab --no-capture-output python \
+    gear_sonic/scripts/make_warehouse_motion.py \
+      --playlist gear_sonic/data/motions/playlists/${NAME}.yaml \
+      --out      gear_sonic/data/motions/x2_ultra_${NAME}.pkl \
+      --check-runtime-parity
+done
+
+For a `chain_matched` variant: copy each YAML to `<name>_chain_matched.yaml`, swap `x2_ultra_retarget_uniform_h14.pkl` -> `x2_ultra_retarget_chain_matched.pkl` and the rest source to `x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl`, then rebuild.
 
 ### relaxed-walk closed loop v1 — chain_matched retarget A/B  (rebuilt 2026-06-24)
 
@@ -474,6 +552,23 @@ The "in-stack stiffness" — body feels springy when you push it by hand DURING 
 1. **Tolerate it** — the body still settles at the new heading once you stop pushing; it just resists during the rotation itself.
 2. **`--no-idle-publish`** — already wired into `run_x2_pkl_direct_stack.sh` via the same-named flag. When idle (no clip playing) the recorder stays silent on the pose wire and the PC2 watchdog's `IDLE_CLIP` (which also yaw-rebases per tick from `x2_debug`) takes over. Acceptable for preview-only sessions; the joint targets come from the baked idle stand instead of the recorder's `DEFAULT_STAND_POSE_MUJOCO_RAD` (visually similar, semantically slightly different).
 3. **Future: yaw lookahead** — predict yaw forward by `measured_yaw_rate * lag_compensation_s` in the recorder. Not implemented yet. Track via [`2026-06-24_pose_watchdog_hold_yaw_rebase`](docs/source/user_guide/milestones/2026-06-24_pose_watchdog_hold_yaw_rebase.md) "Open follow-ups".
+
+### play_gesture yaw rebase parity (2026-06-26) — fixes "every gesture teleports the robot to world +X"
+
+Companion recorder-side fix to the watchdog HOLD-rebase above. The PC2 watchdog patch handled stale-frame republishing; this one closes the remaining gap on the laptop side: **gesture playback used to teleport the body to the PKL's authored heading at takeover**, even when the robot was facing some arbitrary live yaw. (Locomotion clips already got this right since 2026-06; gestures had been intentionally left on the legacy code path.)
+
+Root cause: `X2DatasetRecorder._drain_clip_commands` picked its yaw rebase target from one of three sources — held-frame, live `x2_debug` `base_quat`, or kplanner `body_pose` snap. The locomotion branch tried the live deploy yaw first and fell back to the kplanner snap. The gesture branch went **straight to the kplanner snap**, which is empty in the direct-PKL stack (no kplanner publishing). Empty snap silently fell back to `yaw=0` → every gesture rebased onto world +X → teleport at takeover.
+
+Fix: gesture branch now follows the same ladder as locomotion — `held-frame > live x2_debug > kplanner snap (stale-x2_debug fallback)`. Held-frame still wins so chained `hold_after` PKLs stay continuous in body frame across the handoff. The new log line at PLAY time tells you which source fed the rebase seed:
+
+```
+[recorder] motion-clip PLAY (kind=gesture) 'wave_R_001__A074': 632 frames @ 50.0 Hz (~12.6s) rebased_yaw=-58.4deg [x2_debug-base_quat]
+[recorder] motion-clip PLAY (kind=gesture) 'sit_down_A540':    214 frames @ 50.0 Hz (~4.3s)  rebased_yaw=+12.1deg [kplanner-snap-fallback]   # only when x2_debug SUB is stale
+```
+
+The yaw-rebase math itself is unchanged (single rigid `Rz(dyaw)` over every frame), so authored arm/wrist/hip motion is bit-identical to before — only the world frame shifts. Tests pin the new behaviour for both kinds in `tests/test_recorder_motion_clip_gate.py::test_drain_play_prefers_live_deploy_yaw_over_kplanner_snap` (parametrized over gesture/locomotion) plus `test_drain_play_held_frame_beats_live_deploy_yaw` to lock in the chained-PKL semantics.
+
+No PC2 redeploy needed — this fix is purely on the laptop recorder, takes effect on the next `run_x2_pkl_direct_stack.sh` (or any other launcher that runs the recorder).
 
 ### rest-pose match for stitched loops (2026-06-24) — fixes "snap to default pose" between segments
 
