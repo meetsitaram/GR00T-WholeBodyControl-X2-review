@@ -59,6 +59,11 @@
 #       [--kplanner-device DEV] [--kplanner-replan-threshold-frames N]
 #       [--kplanner-python PATH]    # e.g. ~/miniconda3/envs/env_isaaclab/bin/python
 #                                   # for Blackwell (RTX 5090) sm_120 support
+#       [--kplanner-planner-mode {idle|slow_walk|walk|run_proxy}]
+#                                   # enable the pose-template inference
+#                                   # path (X2-clip.ckpt library). Default
+#                                   # unset -> legacy velocity-only path.
+#                                   # 'walk' is the validated demo config.
 #       [--kplanner-stick-shape-exp FLOAT]
 #                                   # locomotion/continuous stick power-curve
 #                                   # exponent (>0). 1.0=linear (default),
@@ -480,6 +485,13 @@ KPLANNER_STICK_SHAPE_EXP="${KPLANNER_STICK_SHAPE_EXP:-}"
 # Set ``KPLANNER_COLD_START_RAMP_TAU_S=0`` to disable the ramp and
 # reproduce the pre-fix behaviour.
 KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
+# Pose-template planner mode (idle|slow_walk|walk|run_proxy). Empty -> the
+# kplanner uses the legacy velocity-only path (target joint poses masked
+# off). Set this to ``walk`` (etc.) to enable the pose-template inference
+# path validated in 2026-06-24_pose_template_gate (3x forward locomotion,
+# ~6x better yaw stability when paired with smoothed intent). Requires
+# the X2-clip.ckpt library (motionbricks/scripts/build_x2_planner_clips.py).
+KPLANNER_PLANNER_MODE="${KPLANNER_PLANNER_MODE:-}"
 # Yaw-rate ceiling for continuous-locomotion R-stick turns (rad/s at
 # full deflection). Default empty -> daemon default 0.75 rad/s (~43
 # deg/s, a 90-deg turn in ~2.1 s). The legacy bucketed path stays at
@@ -870,6 +882,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-lateral-scale) KPLANNER_LATERAL_SCALE="$2"; shift 2 ;;
         --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
+        --kplanner-planner-mode) KPLANNER_PLANNER_MODE="$2"; shift 2 ;;
         --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
         --kplanner-continuous-forward-min-mps) KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="$2"; shift 2 ;;
         --kplanner-ref-smoother-ms) KPLANNER_REF_SMOOTHER_MS="$2"; shift 2 ;;
@@ -1987,7 +2000,8 @@ ${C_GREEN}┌──────────────────────�
   task             : ${TASK:-(none -- robocasa auto-fills from scene metadata)}
   scene            : $([[ "${ROBOCASA_ENV}" == "none" ]] && echo "(flat floor, no robocasa scene)" || echo "${ROBOCASA_ENV} -> ${ROBOCASA_SCENE_XML}")
   planner kind     : ${PLANNER_KIND}$([[ "${PLANNER_KIND}" == "kplanner" ]] && echo "  (neural; INTENT_VELOCITY_MAP -> motion_inference.predict)" || echo "  (curated primitives + bins state machine)")$([[ "${PLANNER_KIND}" == "kplanner" ]] && echo "
-  kplanner device  : ${KPLANNER_DEVICE}  python: ${KPLANNER_PYTHON}" || true)
+  kplanner device  : ${KPLANNER_DEVICE}  python: ${KPLANNER_PYTHON}
+  planner mode     : ${KPLANNER_PLANNER_MODE:-velocity-only (legacy)}" || true)
   planner demo     : ${PLANNER_DEMO:-(none -- planner sits in IDLE_LOOP at startup, awaits VR planner_cmd)}
   finger comp      : curl=$([[ "${APPLY_CURL_COMP}" -eq 1 ]] && echo on || echo off)  oppose=$([[ "${APPLY_OPPOSE_COMP}" -eq 1 ]] && echo on || echo off)$([[ -n "${ROBOCASA_SCENE_XML}" ]] && echo "  (robocasa default; pass --no-apply-{curl,oppose}-compensation to override)" || echo "  (pass --apply-{curl,oppose}-compensation to enable)")
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external)")
@@ -2371,6 +2385,9 @@ else
     fi
     if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
         PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
+    fi
+    if [[ -n "${KPLANNER_PLANNER_MODE}" ]]; then
+        PLANNER_ARGS+=(--planner-mode "${KPLANNER_PLANNER_MODE}")
     fi
     if [[ -n "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}" ]]; then
         PLANNER_ARGS+=(--continuous-turn-max-rad-s "${KPLANNER_CONTINUOUS_TURN_MAX_RAD_S}")

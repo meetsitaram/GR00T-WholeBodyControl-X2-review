@@ -1,0 +1,78 @@
+{
+  "pkl_clip_id": "Loop_Forward_Walk_001__A018",
+  "pkl_fps": 30.0,
+  "pkl_path": "gear_sonic/data/motions/x2_ultra_locowalk.pkl",
+  "pkl_velocity_integrated": {
+    "duration_s": 21.798622822010657,
+    "fwd_disp_m": 8.392780483670435,
+    "side_disp_m": -0.4330784016761269,
+    "yaw_disp_deg": 5.797507605567453,
+    "path_length_m": 8.407533000328911,
+    "fwd_speed_mean_mps": 0.38501425306538256,
+    "side_speed_mean_mps": -0.019867236807218663,
+    "yaw_speed_mean_dps": 0.26595751726634553,
+    "pelvis_z_mean_m": 0.6873457503729855,
+    "pelvis_z_min_m": 0.6873457503729853,
+    "pelvis_z_max_m": 0.6873457503729853,
+    "n_samples": 4360
+  },
+  "pkl_literal": {
+    "duration_s": 21.798622822010657,
+    "fwd_disp_m": 10.375275315719865,
+    "side_disp_m": 0.23003506052085415,
+    "yaw_disp_deg": 2.2075852033878163,
+    "path_length_m": 10.609109968501333,
+    "fwd_speed_mean_mps": 0.4759601283271744,
+    "side_speed_mean_mps": 0.01055273364740187,
+    "yaw_speed_mean_dps": 0.10127177397458145,
+    "pelvis_z_mean_m": 0.6794391883639241,
+    "pelvis_z_min_m": 0.6296816961805028,
+    "pelvis_z_max_m": 0.7263606439605896,
+    "n_samples": 4360
+  },
+  "sim": {
+    "duration_s": 21.798622822010657,
+    "fwd_disp_m": 0.28345262980648117,
+    "side_disp_m": -0.1610899407786485,
+    "yaw_disp_deg": 52.4232369366809,
+    "path_length_m": 1.6521029395460574,
+    "fwd_speed_mean_mps": 0.013003235668643774,
+    "side_speed_mean_mps": -0.0073899136699586195,
+    "yaw_speed_mean_dps": 2.4048875639862786,
+    "pelvis_z_mean_m": 0.6691377462625384,
+    "pelvis_z_min_m": 0.6630004466357371,
+    "pelvis_z_max_m": 0.6849516648499474,
+    "n_samples": 4360
+  },
+  "planner_published": {
+    "duration_s": 19.540317701990716,
+    "fwd_disp_m": 0.5406136720221565,
+    "side_disp_m": 0.20324984342906577,
+    "yaw_disp_deg": 45.51341133675608,
+    "path_length_m": 17.547901526944166,
+    "fwd_speed_mean_mps": 0.027666575347804104,
+    "side_speed_mean_mps": 0.01040156288801585,
+    "yaw_speed_mean_dps": 2.329205288822878,
+    "pelvis_z_mean_m": 0.6873457503729854,
+    "pelvis_z_min_m": 0.6873457503729853,
+    "pelvis_z_max_m": 0.6873457503729853,
+    "n_samples": 978
+  },
+  "delta": {
+    "fwd_disp_m": -8.109327853863954,
+    "side_disp_m": 0.2719884608974784,
+    "yaw_disp_deg": 46.62572933111345,
+    "fwd_speed_mean_mps": -0.3720110173967388,
+    "side_speed_mean_mps": 0.012477323137260044,
+    "yaw_speed_mean_dps": 2.138930046719933,
+    "pelvis_z_mean_m": -0.018208004110447096,
+    "fwd_disp_ratio": 0.03377338777750543,
+    "yaw_disp_ratio": 9.042374845069268
+  },
+  "mean_velocity_intent": [
+    0.004641834346727387,
+    -0.0393336875871972,
+    0.3836801029961092,
+    0.6873457503729853
+  ]
+}

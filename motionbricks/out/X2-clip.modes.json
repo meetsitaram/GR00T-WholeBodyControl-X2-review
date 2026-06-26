@@ -1,0 +1,46 @@
+{
+  "modes": [
+    {
+      "index": 0,
+      "name": "idle",
+      "clip_key": "Idle_Right_001__A019",
+      "start_frame": 0,
+      "end_frame": 200,
+      "avg_root_vel": 0.0,
+      "num_frames": 200,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+    },
+    {
+      "index": 1,
+      "name": "slow_walk",
+      "clip_key": "Loop_Forward_Walk_001__A018",
+      "start_frame": 0,
+      "end_frame": 174,
+      "avg_root_vel": 0.4,
+      "num_frames": 174,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+    },
+    {
+      "index": 2,
+      "name": "walk",
+      "clip_key": "relaxed_walk__v1__walk_forward",
+      "start_frame": 0,
+      "end_frame": 398,
+      "avg_root_vel": 0.27,
+      "num_frames": 398,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl"
+    },
+    {
+      "index": 3,
+      "name": "run_proxy",
+      "clip_key": "walk_forward_confident_impro_001__A002_M",
+      "start_frame": 0,
+      "end_frame": 200,
+      "avg_root_vel": 0.97,
+      "num_frames": 200,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+    }
+  ],
+  "num_joints": 34,
+  "default_source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+}

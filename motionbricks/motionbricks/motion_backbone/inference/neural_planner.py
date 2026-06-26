@@ -1,20 +1,29 @@
 """Robot-agnostic streaming wrapper around motion_inference for velocity-intent control.
 
 This module is the neural counterpart to the G1 demo's `full_navigation_agent`
-([`motionbricks/motionbricks/motion_backbone/demo/full_agent.py`](../../demo/full_agent.py)),
-stripped of G1-specific clip blendspace / WASD controller / spring-root world-target
-model. What remains is the robot-agnostic predict-and-decode core:
+([`motionbricks/motionbricks/motion_backbone/demo/full_agent.py`](../../demo/full_agent.py)).
 
-  - Maintain a ring buffer of upcoming MuJoCo qpos frames decoded from the network.
-  - On replan, take the last 4 qpos frames as past context, build the predict()
-    input tensors (8-frame constraint window: past 4 + target 4), and feed a
-    desired velocity intent (yaw_rate, vel_x, vel_z, hip_height) as the
-    target_local_root_values constraint.
-  - Mask off target_local_poses so the VQVAE free-samples poses consistent with
-    the velocity constraint (i.e., no target keyframe pose to interpolate to).
-  - Decode pred_global_poses -> MuJoCo qpos via the robot-specific converter
-    (e.g. X2MujocoQposConverter, G1's get_mujoco_converter); the converter is
-    the only robot-specific dependency.
+Two prediction paths are supported:
+
+  1. ``replan_with_velocity(intent)`` — velocity-only inference. Target body
+     poses are zeroed and masked off; only the velocity intent (and optionally
+     the implied target world-frame position) constrains the target window.
+     This was the original X2 path; it's kept for ablation and as a fallback
+     when no clip library is loaded.
+  2. ``replan_with_pose_template(intent, mode_idx)`` — pose-template
+     inference matching the SONIC / MotionBricks paper design and the G1
+     demo. A representative 4-frame segment from the mode's reference clip
+     is sampled, realigned to the implied target root position / heading,
+     and fed as the target keyframe constraint to the in-betweener.
+     Requires a baked clip library (``out/X2-clip.ckpt`` for X2, produced
+     by ``motionbricks/scripts/build_x2_planner_clips.py``).
+
+Both paths share:
+
+  - The 4-frame past-context window (canonicalized + converted from MuJoCo qpos).
+  - The implied target root xz / heading computed by integrating
+    ``velocity_intent`` over ``TARGET_HORIZON_S``.
+  - The post-prediction decode / uncanonicalize / FILTER_QPOS blend.
 
 The 8-frame constraint window and the constraint-mask convention follow the
 inference contract documented in
@@ -26,26 +35,18 @@ inference contract documented in
   - num_tokens drives how many tokens (=4 frames each) the model generates
     between the past context and the target keyframe.
 
-For Quest3 velocity-intent teleop we provide:
-  - global_root_values past 4: from `_canonicalize_mujoco_qpos`'d context
-  - local_root_values past 4: differenced from context positions (matches the
-    layout in `LocalRootLocalBody.compute_root_rep_from_root_pos_and_rot`)
-  - local_root_values target 4: filled from the velocity intent (broadcast)
-  - local_poses past 4: from converted context joint positions+rotations
-  - local_poses target 4: zeros, but has_local_poses[:, -4:] = False (masked)
-  - has_local_root_values[:, NUM_FRAMES_PER_TOKEN-1] = False (last differenced
-    velocity in the context window is invalid; see full_agent.py:457)
-  - has_global_root_values[:, -4:] = False (no target world-frame position)
-
 Constructor takes the robot-specific MuJoCo converter (must implement
 `convert_motion_features_to_mujoco_qpos` and
 `convert_mujoco_qpos_to_motion_transforms`) plus the `motion_inference` wrapper.
+Optionally takes a path to the pose-template clip library; if omitted, only
+the velocity-only path is available.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import torch as t
 from torch import nn
@@ -53,6 +54,7 @@ from torch import nn
 from motionbricks.geometry.quaternions import matrix_to_quaternion
 from motionbricks.motion_backbone.inference.motion_inference import motion_inference
 from motionbricks.motionlib.core.utils.rotations import (
+    angle_to_Y_rotation_matrix,
     matrix_to_cont6d,
     quaternion_to_matrix,
 )
@@ -71,6 +73,114 @@ def angle_to_Z_rotation_matrix(angle: t.Tensor) -> t.Tensor:
     mat = t.stack((cos, -sin, zero, sin, cos, zero, zero, zero, one), -1)
     mat = mat.reshape(angle.shape + (3, 3))
     return mat
+
+
+# ---------------------------------------------------------------------------
+# X2 mode-indexed clip library (analogous to G1's `clip_holder_G1`).
+#
+# The on-disk ckpt is produced by
+# ``motionbricks/scripts/build_x2_planner_clips.py`` and stores stacked
+# per-mode buffers in motion-rep Y-up coordinates. Buffer layout matches
+# what ``clip_holder._preprocess_clips_from_dataloader`` (G1) produces:
+#
+#   global_root_positions   [num_modes, max_frames, 3]   # Y=0 (gravity zeroed)
+#   global_joint_positions  [num_modes, max_frames, J, 3] # root-XZ-relative
+#   global_joint_rotations  [num_modes, max_frames, J, 3, 3]
+#   global_headings         [num_modes, max_frames]
+#   mujoco_qpos             [num_modes, max_frames, 38]
+#   num_frames_per_clip     [num_modes]                   # int32
+# ---------------------------------------------------------------------------
+
+
+class _X2ClipLibrary(nn.Module):
+    """Loaded clip library for pose-template inference.
+
+    Modes are addressed by integer index; the binding contract between
+    indices and mode names is defined by the bake script's ``DEFAULT_MODES``
+    tuple (in ``motionbricks/scripts/build_x2_planner_clips.py``) and
+    captured in the sidecar JSON next to the ckpt. The library does NOT
+    read the sidecar — the caller is responsible for passing the right
+    integer.
+
+    Sampling: ``sample_target_segment(mode_idx, random_seed)`` returns a
+    4-frame slice of the buffers, with frame-start chosen deterministically
+    by ``random_seed % (num_frames - NUM_FRAMES_PER_TOKEN)``. This matches
+    the segment-sampling logic in
+    ``full_navigation_agent._generate_target_joint_transforms``
+    (full_agent.py:328-338).
+    """
+
+    NUM_FRAMES_PER_TOKEN: int = 4
+
+    def __init__(self, ckpt_path: Union[str, Path], device: str = "cuda") -> None:
+        super().__init__()
+        state = t.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        required = (
+            "global_root_positions",
+            "global_joint_positions",
+            "global_joint_rotations",
+            "global_headings",
+            "mujoco_qpos",
+            "num_frames_per_clip",
+        )
+        for key in required:
+            if key not in state:
+                raise KeyError(
+                    f"X2 clip library at {ckpt_path} missing buffer {key!r}"
+                )
+            self.register_buffer(key, state[key].to(device))
+        self._device = device
+        self._num_modes = int(self.num_frames_per_clip.shape[0])
+        self._num_joints = int(self.global_joint_positions.shape[2])
+
+    @property
+    def num_modes(self) -> int:
+        return self._num_modes
+
+    @property
+    def num_joints(self) -> int:
+        return self._num_joints
+
+    def clamp_mode_idx(self, mode_idx: int) -> int:
+        """Clamp a mode index into ``[0, num_modes)``. Matches G1 demo safety."""
+        if mode_idx < 0:
+            return 0
+        if mode_idx >= self._num_modes:
+            return self._num_modes - 1
+        return int(mode_idx)
+
+    def sample_target_segment(
+        self, mode_idx: int, random_seed: Optional[int] = None
+    ) -> dict:
+        """Return a 4-frame slice of buffers for ``mode_idx`` at a random start.
+
+        Args:
+            mode_idx: integer index into the mode table.
+            random_seed: Python int. ``None`` -> torch.randint at call time.
+
+        Returns:
+            dict with keys (each tensor lives on ``self._device``):
+
+                root_positions      [4, 3]       # Y=0
+                joint_positions     [4, J, 3]    # root-XZ-relative, full Y
+                joint_rotations     [4, J, 3, 3]
+                headings            [4]
+        """
+        m = self.clamp_mode_idx(int(mode_idx))
+        n = int(self.num_frames_per_clip[m].item())
+        max_start = max(1, n - self.NUM_FRAMES_PER_TOKEN)
+        if random_seed is None:
+            seed = int(t.randint(0, 1_000_000, (1,)).item())
+        else:
+            seed = int(random_seed)
+        start = seed % max_start
+        sl = slice(start, start + self.NUM_FRAMES_PER_TOKEN)
+        return {
+            "root_positions": self.global_root_positions[m, sl].clone(),
+            "joint_positions": self.global_joint_positions[m, sl].clone(),
+            "joint_rotations": self.global_joint_rotations[m, sl].clone(),
+            "headings": self.global_headings[m, sl].clone(),
+        }
 
 
 class NeuralPlannerCore(nn.Module):
@@ -109,6 +219,7 @@ class NeuralPlannerCore(nn.Module):
         replan_threshold_frames: int = 16,
         use_implied_target_pos: bool = True,
         target_horizon_s: float = DEFAULT_TARGET_HORIZON_S,
+        clip_library_ckpt: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
         self._inferencer = inferencer.eval().to(device)
@@ -131,6 +242,13 @@ class NeuralPlannerCore(nn.Module):
         self.USE_IMPLIED_TARGET_POS = use_implied_target_pos
         self.TARGET_HORIZON_S = float(target_horizon_s)
         self.REPLAN_THRESHOLD_FRAMES = replan_threshold_frames
+
+        # Optional clip library for pose-template inference. When loaded,
+        # ``replan_with_pose_template(intent, mode_idx)`` becomes available.
+        # The velocity-only path (``replan_with_velocity``) does not use it.
+        self._clip_library: Optional[_X2ClipLibrary] = None
+        if clip_library_ckpt is not None:
+            self._clip_library = _X2ClipLibrary(clip_library_ckpt, device=device)
 
         self.frames: dict = {
             "model_features": None,  # [B, T, feat_dim]
@@ -310,6 +428,90 @@ class NeuralPlannerCore(nn.Module):
         return model_features, mujoco_qpos, int(num_pred_frames)
 
     # ------------------------------------------------------------------
+    # Pose-template-intent replan (SONIC / MotionBricks paper design)
+    # ------------------------------------------------------------------
+
+    @t.no_grad()
+    def replan_with_pose_template(
+        self,
+        velocity_intent: t.Tensor,
+        mode_idx: int,
+        num_tokens: Optional[int] = None,
+        random_seed: Optional[int] = None,
+    ) -> tuple[t.Tensor, t.Tensor, int]:
+        """Replan with a 4-D velocity vector AND a discrete pose-template mode.
+
+        This is the paper's "navigation keyframes from clip library" path.
+        Unlike ``replan_with_velocity`` (which masks ``has_local_poses[:, -4:]``
+        off and asks the in-betweener to free-sample target poses), this
+        method samples a 4-frame segment from the mode's reference clip,
+        realigns it to the implied target root xz / heading, and feeds it
+        as the target keyframe to the in-betweener.
+
+        Args:
+            velocity_intent: same 4-tuple as ``replan_with_velocity``:
+                ``[yaw_rate_rad_s, vel_x_m_s, vel_z_m_s, hip_height_m]``.
+                Drives the spring-style target-root integration over
+                ``TARGET_HORIZON_S``; the model still sees the broadcast
+                velocity in ``target_local_root_values``.
+            mode_idx: integer index into the loaded clip library's mode
+                table. The bake script's ``DEFAULT_MODES`` defines the
+                binding (e.g. 0=idle, 1=slow_walk, 2=walk, 3=run_proxy);
+                see ``out/X2-clip.modes.json``.
+            num_tokens: override the model's MASKED_NUM_TOKENS sentinel.
+            random_seed: int controlling which 4-frame window of the
+                mode's clip is sampled. ``None`` -> randomly drawn at
+                call time (matches G1 demo). Pass a fixed value for
+                deterministic replays (test fixtures etc.).
+
+        Returns:
+            ``(model_features [1, T, D], mujoco_qpos [1, T, qpos_dim],
+            num_pred_frames)``. Same shape contract as ``replan_with_velocity``.
+        """
+        if self.frames["mujoco_qpos"] is None:
+            raise RuntimeError(
+                "NeuralPlannerCore.replan_with_pose_template() called before reset()"
+            )
+        if self._clip_library is None:
+            raise RuntimeError(
+                "NeuralPlannerCore was constructed without a clip_library_ckpt; "
+                "pose-template inference is unavailable. Pass clip_library_ckpt "
+                "to the constructor (e.g. via load_x2_planner) or use "
+                "replan_with_velocity()."
+            )
+
+        velocity_intent = self._coerce_velocity_intent(velocity_intent)
+        context_mujoco_qpos = self.get_context_mujoco_qpos()
+        input_state: dict = {
+            "context_mujoco_qpos": context_mujoco_qpos,
+            "raw_context_mujoco_qpos": context_mujoco_qpos.clone(),
+            "velocity_intent": velocity_intent,
+        }
+
+        if self.FORCE_CANONICALIZATION:
+            self._canonicalize_mujoco_qpos(input_state)
+
+        (
+            input_state["context_global_joint_positions"],
+            input_state["context_global_joint_rotations"],
+        ) = self._converter.convert_mujoco_qpos_to_motion_transforms(
+            input_state["context_mujoco_qpos"]
+        )
+
+        model_features, mujoco_qpos, num_pred_frames = self._predict_with_pose_template(
+            input_state,
+            mode_idx=int(mode_idx),
+            num_tokens=num_tokens,
+            random_seed=random_seed,
+        )
+
+        self.frames["model_features"] = model_features[:, : int(num_pred_frames), :]
+        self.frames["mujoco_qpos"] = mujoco_qpos[:, : int(num_pred_frames), :]
+        self._current_frame_idx = self.NUM_FRAMES_PER_TOKEN - self.PRED_OFFSETS
+
+        return model_features, mujoco_qpos, int(num_pred_frames)
+
+    # ------------------------------------------------------------------
     # Internal: predict + decode (forked from full_navigation_agent
     # ._generate_inbetween_frames). The differences from G1 demo:
     #   - target_local_root_values is constructed from velocity_intent, not
@@ -407,17 +609,34 @@ class NeuralPlannerCore(nn.Module):
         target_local_root_values = velocity_intent[:, None, :].expand([batch_size, NUM_FT, 4]).contiguous()
 
         if self.USE_IMPLIED_TARGET_POS:
-            # Build implied target_global_root_values from velocity intent.
-            # Layout: [x, y_up_hip_height, z, cos_heading, sin_heading].
-            implied_target_x = context_global_root_pos[:, -1:, 0] + velocity_intent[:, 1:2] * self.TARGET_HORIZON_S
-            implied_target_z = context_global_root_pos[:, -1:, 2] + velocity_intent[:, 2:3] * self.TARGET_HORIZON_S
-            implied_target_y = velocity_intent[:, 3:4]  # hip_height (channel 3 of intent)
-            implied_target_pos = t.cat([implied_target_x, implied_target_y, implied_target_z], dim=-1)
-            implied_target_pos = implied_target_pos[:, None, :].expand([batch_size, NUM_FT, 3])
+            # Progressive target trajectory across the NUM_FT target frames.
+            # See ``_predict_with_pose_template`` for the rationale (TL;DR:
+            # broadcasting one end-of-horizon waypoint to all 4 target
+            # frames makes the model "park" at the waypoint, suppressing
+            # locomotion). Frame time offsets:
+            #     t_3 = TARGET_HORIZON_S        t_2 = TARGET_HORIZON_S - 1/fps
+            #     t_1 = TARGET_HORIZON_S - 2/fps  t_0 = TARGET_HORIZON_S - 3/fps
+            _MOTION_FPS = 30.0
+            _frame_dt = 1.0 / _MOTION_FPS
+            t_offsets = t.tensor(
+                [self.TARGET_HORIZON_S - (NUM_FT - 1 - k) * _frame_dt for k in range(NUM_FT)],
+                device=device,
+                dtype=t.float32,
+            )  # [NUM_FT]
+            implied_x = (
+                context_global_root_pos[:, -1:, 0]
+                + velocity_intent[:, 1:2] * t_offsets[None, :]
+            )  # [B, NUM_FT]
+            implied_z = (
+                context_global_root_pos[:, -1:, 2]
+                + velocity_intent[:, 2:3] * t_offsets[None, :]
+            )  # [B, NUM_FT]
+            implied_y = velocity_intent[:, 3:4].expand([batch_size, NUM_FT])  # hip_height
+            implied_target_pos = t.stack([implied_x, implied_y, implied_z], dim=-1)  # [B, NUM_FT, 3]
             implied_target_heading = (
-                context_rotation_angle[:, -1:] + velocity_intent[:, 0:1] * self.TARGET_HORIZON_S
-            )
-            implied_target_heading = implied_target_heading.expand([batch_size, NUM_FT])
+                context_rotation_angle[:, -1:]
+                + velocity_intent[:, 0:1] * t_offsets[None, :]
+            )  # [B, NUM_FT]
             target_global_root_values = t.cat(
                 [
                     implied_target_pos,
@@ -501,6 +720,272 @@ class NeuralPlannerCore(nn.Module):
         # planner's convention (build_pose_payload reads root_quat_xyzw, but
         # the X2 converter has root_quat_w_first=False by default in the demo
         # path -- match that here).
+        root_rot = mujoco_qpos[:, :, 3:7].clone()
+        mujoco_qpos[:, :, 3:7] = root_rot[:, :, [3, 0, 1, 2]]
+
+        if self.FORCE_CANONICALIZATION:
+            input_state["mujoco_qpos"] = mujoco_qpos
+            mujoco_qpos = self._uncanonicalize_mujoco_qpos(input_state)
+
+        if self.FILTER_QPOS:
+            self.frames["raw_mujoco_qpos"] = mujoco_qpos.clone()
+            ctx = input_state["raw_context_mujoco_qpos"]
+            num_ctx = ctx.shape[1]
+            blend = t.linspace(0.3, 0.7, num_ctx)[None, :, None].to(ctx.device)
+            mujoco_qpos[:, :num_ctx, :3] = (
+                ctx[:, :, :3] * (1 - blend) + mujoco_qpos[:, :num_ctx, :3] * blend
+            )
+            mujoco_qpos[:, :num_ctx, 7:] = (
+                ctx[:, :, 7:] * (1 - blend) + mujoco_qpos[:, :num_ctx, 7:] * blend
+            )
+
+        return model_features, mujoco_qpos, num_pred_frames
+
+    # ------------------------------------------------------------------
+    # Internal: pose-template prediction path. Mirrors
+    # `_predict_with_velocity` (kept side-by-side rather than refactored
+    # into a shared helper so the velocity-only fallback stays
+    # byte-equivalent to its tested form). The only differences are in
+    # the target window:
+    #   - target_local_poses is filled from the realigned clip segment.
+    #   - has_local_poses[:, -NUM_FT:] = True (not False).
+    # `target_global_root_values` still comes from USE_IMPLIED_TARGET_POS
+    # integration of velocity_intent.
+    # ------------------------------------------------------------------
+
+    @t.no_grad()
+    def _predict_with_pose_template(
+        self,
+        input_state: dict,
+        mode_idx: int,
+        num_tokens: Optional[int] = None,
+        random_seed: Optional[int] = None,
+    ) -> tuple[t.Tensor, t.Tensor, t.Tensor]:
+        assert self._clip_library is not None
+        batch_size = 1
+        MASKED_NUM_TOKENS = self._inferencer._root_model.backbone_net.MASKED_NUM_TOKENS
+        fps = self._inferencer.local_motion_rep.fps
+        root_joint_idx = 0
+        device = self._device
+        NUM_FT = self.NUM_FRAMES_PER_TOKEN
+
+        ctx_joint_pos = input_state["context_global_joint_positions"]   # [B, 4, J, 3]
+        ctx_joint_rot = input_state["context_global_joint_rotations"]   # [B, 4, J, 3, 3]
+        velocity_intent = input_state["velocity_intent"]                # [B, 4]
+
+        # ----------------------------------------------------------------
+        # Past 4 frames — identical to _predict_with_velocity.
+        # ----------------------------------------------------------------
+        context_global_root_pos = ctx_joint_pos[:, :, root_joint_idx, :]  # [B, 4, 3]
+        context_rotation_angle = t.atan2(
+            ctx_joint_rot[:, :, root_joint_idx, 0, 2],
+            ctx_joint_rot[:, :, root_joint_idx, 2, 2],
+        )  # [B, 4]
+        context_global_root_values = t.cat(
+            [
+                context_global_root_pos,
+                t.cos(context_rotation_angle)[..., None],
+                t.sin(context_rotation_angle)[..., None],
+            ],
+            dim=-1,
+        )  # [B, 4, 5]
+
+        context_local_root_values = t.zeros([batch_size, NUM_FT, 4], device=device)
+        context_local_root_values[:, : NUM_FT - 1, 0] = (
+            ((context_rotation_angle[:, 1:] - context_rotation_angle[:, :-1] + t.pi) % (2 * t.pi))
+            - t.pi
+        ) * fps
+        context_local_root_values[:, : NUM_FT - 1, 1:3] = (
+            context_global_root_pos[:, 1:, [0, 2]] - context_global_root_pos[:, :-1, [0, 2]]
+        ) * fps
+        context_local_root_values[:, : NUM_FT - 1, 3] = (
+            context_global_root_values[:, : NUM_FT - 1, 1]
+        )
+        context_local_root_values[:, NUM_FT - 1, :] = context_local_root_values[:, NUM_FT - 2, :]
+
+        joint_positions_ctx = ctx_joint_pos[:, :, 1:, :].clone()
+        joint_positions_ctx[..., 0] = ctx_joint_pos[:, :, 1:, 0] - ctx_joint_pos[:, :, :1, 0]
+        joint_positions_ctx[..., 2] = ctx_joint_pos[:, :, 1:, 2] - ctx_joint_pos[:, :, :1, 2]
+        joint_rotation_ortho6d_ctx = matrix_to_cont6d(ctx_joint_rot)
+        context_local_poses = t.cat(
+            [
+                joint_positions_ctx.view([batch_size, NUM_FT, -1]),
+                joint_rotation_ortho6d_ctx.view([batch_size, NUM_FT, -1]),
+            ],
+            dim=-1,
+        )
+
+        # ----------------------------------------------------------------
+        # Target 4 frames (pose-template path):
+        #   1. Compute the SCALAR implied target xz / heading from velocity
+        #      intent (current pos + velocity * TARGET_HORIZON_S).
+        #   2. Sample a 4-frame segment from the mode's clip.
+        #   3. Compute a SINGLE diff_heading from the segment's FIRST frame
+        #      heading and rotate ALL 4 frames by that same Y-rotation.
+        #      Mirrors the uniform-rotation branch in
+        #      ``full_navigation_agent._generate_target_joint_transforms``
+        #      (full_agent.py:362-375). The clip's natural per-frame heading
+        #      drift survives the alignment, so the model sees a consistent
+        #      pose evolution within the target window.
+        #   4. ``target_global_root_values`` broadcasts the implied target
+        #      xz + hip + heading across all 4 frames (G1's spring model
+        #      uses critical damping with ~0.4s halflife, so by t=1s the
+        #      4-frame spring trajectory has effectively converged to the
+        #      steady-state target; broadcasting matches that limit and
+        #      avoids hand-rolling a spring here).
+        #   5. ``target_local_root_values`` broadcasts ``velocity_intent``
+        #      across all 4 frames (same convention as
+        #      ``_predict_with_velocity``). Both the spatial target and
+        #      the velocity target then agree.
+        #   6. ``target_local_poses`` is built from the rotated clip
+        #      joint positions (J-1 root-relative xyz, Y absolute) and
+        #      the rotated joint rotations (cont6d). ``has_local_poses[:, -4:] = True``.
+        # ----------------------------------------------------------------
+        target_local_root_values = (
+            velocity_intent[:, None, :].expand([batch_size, NUM_FT, 4]).contiguous()
+        )
+
+        # Progressive target trajectory across the 4 target frames.
+        # The 4 target frames are the LAST NUM_FT frames of a TARGET_HORIZON_S
+        # prediction horizon at the motion-rep native fps (30 Hz; matches
+        # clip data fps and the model's training distribution). Frame
+        # offsets from "now":
+        #     t_3 = TARGET_HORIZON_S         (final target frame)
+        #     t_2 = TARGET_HORIZON_S - 1/fps
+        #     t_1 = TARGET_HORIZON_S - 2/fps
+        #     t_0 = TARGET_HORIZON_S - 3/fps
+        # Broadcasting the same end-of-horizon position to all 4 frames
+        # (the previous MVP) forced the root to "stand still at the
+        # waypoint" while the target joint poses showed a stepping gait;
+        # the model resolved that conflict by walking-in-place. With a
+        # progressive trajectory the spatial diff between adjacent
+        # target frames matches the gait's forward push, so the model
+        # can commit to actual locomotion at the commanded velocity.
+        _MOTION_FPS = 30.0
+        _frame_dt = 1.0 / _MOTION_FPS
+        t_offsets = t.tensor(
+            [self.TARGET_HORIZON_S - (NUM_FT - 1 - k) * _frame_dt for k in range(NUM_FT)],
+            device=device,
+            dtype=t.float32,
+        )  # [NUM_FT]
+
+        implied_x_4 = (
+            context_global_root_pos[:, -1:, 0]
+            + velocity_intent[:, 1:2] * t_offsets[None, :]
+        )  # [B, NUM_FT]
+        implied_z_4 = (
+            context_global_root_pos[:, -1:, 2]
+            + velocity_intent[:, 2:3] * t_offsets[None, :]
+        )  # [B, NUM_FT]
+        implied_hip_4 = velocity_intent[:, 3:4].expand([batch_size, NUM_FT])  # [B, NUM_FT]
+        implied_heading_4 = (
+            context_rotation_angle[:, -1:]
+            + velocity_intent[:, 0:1] * t_offsets[None, :]
+        )  # [B, NUM_FT]
+
+        implied_target_pos_4 = t.stack(
+            [implied_x_4, implied_hip_4, implied_z_4], dim=-1
+        )  # [B, NUM_FT, 3]
+
+        # Final-frame heading is the alignment reference for the clip rotation step below.
+        implied_target_heading = implied_heading_4[:, -1]  # [B]
+
+        target_global_root_values = t.cat(
+            [
+                implied_target_pos_4,
+                t.cos(implied_heading_4)[..., None],
+                t.sin(implied_heading_4)[..., None],
+            ],
+            dim=-1,
+        )  # [B, NUM_FT, 5]
+
+        # Sample a clip segment and apply a uniform Y-rotation.
+        segment = self._clip_library.sample_target_segment(
+            mode_idx=mode_idx, random_seed=random_seed
+        )
+        clip_joint_pos = segment["joint_positions"][None].to(device)   # [1, 4, J, 3]
+        clip_joint_rot = segment["joint_rotations"][None].to(device)   # [1, 4, J, 3, 3]
+        clip_headings = segment["headings"][None].to(device)           # [1, 4]
+
+        # Single diff_heading: target_heading vs clip's FIRST-frame heading.
+        diff_heading_single = (
+            (implied_target_heading - clip_headings[:, 0] + t.pi) % (2 * t.pi) - t.pi
+        )  # [B]
+        corrective_mat = angle_to_Y_rotation_matrix(diff_heading_single).to(device).float()  # [B, 3, 3]
+        corrective_mat_jnt = corrective_mat[:, None, None, :, :]  # broadcast over 4 frames, J joints
+
+        aligned_joint_rot = t.matmul(corrective_mat_jnt, clip_joint_rot)
+        aligned_joint_pos = t.matmul(
+            corrective_mat_jnt, clip_joint_pos[..., None]
+        )[..., 0]
+
+        # Build target_local_poses with the realigned segment. joint_positions[:, 1:, :]
+        # is root-XZ-relative (Y absolute, from the clip). Root rotation (joint 0)
+        # IS included in the cont6d block.
+        target_joint_positions = aligned_joint_pos[:, :, 1:, :]
+        target_joint_rotation_ortho6d = matrix_to_cont6d(aligned_joint_rot)
+        target_local_poses = t.cat(
+            [
+                target_joint_positions.reshape([batch_size, NUM_FT, -1]),
+                target_joint_rotation_ortho6d.reshape([batch_size, NUM_FT, -1]),
+            ],
+            dim=-1,
+        )
+
+        # ----------------------------------------------------------------
+        # Concatenate -> 8-frame constraint window.
+        # ----------------------------------------------------------------
+        local_root_values = t.cat([context_local_root_values, target_local_root_values], dim=1)
+        global_root_values = t.cat([context_global_root_values, target_global_root_values], dim=1)
+        local_poses = t.cat([context_local_poses, target_local_poses], dim=1)
+
+        has_global_root_values = t.ones_like(global_root_values[:, :, 0], dtype=t.bool)
+        has_local_root_values = t.ones_like(local_root_values[:, :, 0], dtype=t.bool)
+        has_local_poses = t.ones_like(local_poses[:, :, 0], dtype=t.bool)
+        has_local_root_values[:, NUM_FT - 1] = False
+        # Target keyframe pose IS provided -> keep has_local_poses[:, -NUM_FT:] True.
+
+        if self.diagnostic_mask_hook is not None:
+            has_global_root_values, has_local_root_values, has_local_poses = (
+                self.diagnostic_mask_hook(
+                    has_global_root_values,
+                    has_local_root_values,
+                    has_local_poses,
+                    NUM_FT,
+                )
+            )
+
+        if num_tokens is None:
+            num_tokens_t = t.full([batch_size, 1], MASKED_NUM_TOKENS, dtype=t.int, device=device)
+        else:
+            num_tokens_t = t.full([batch_size, 1], int(num_tokens), dtype=t.int, device=device)
+
+        config = {
+            "num_inference_step": 1,
+            "smooth_root_traj": False,
+            "allow_pred_out_of_reach_num_tokens": False,
+            "pose_token_sampling_use_argmax": True,
+            "skip_ending_target_cond": self.SKIP_ENDING_TARGET_COND,
+        }
+        info: dict = {}
+        pred_global_motions, num_pred_tokens = self._inferencer.predict(
+            global_root_values,
+            has_global_root_values,
+            local_root_values,
+            has_local_root_values,
+            local_poses,
+            has_local_poses,
+            num_tokens_t,
+            config=config,
+            info=info,
+        )
+
+        model_features = pred_global_motions
+        num_pred_frames = NUM_FT * num_pred_tokens
+
+        mujoco_qpos = self._converter.convert_motion_features_to_mujoco_qpos(
+            model_features, self._motion_rep, False
+        )
         root_rot = mujoco_qpos[:, :, 3:7].clone()
         mujoco_qpos[:, :, 3:7] = root_rot[:, :, [3, 0, 1, 2]]
 

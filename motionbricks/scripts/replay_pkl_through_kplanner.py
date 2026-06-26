@@ -201,6 +201,8 @@ def _run_full_clip_replay(
     n_context: int,
     device: str,
     override: tuple[float, float, float, float] | None,
+    planner_mode_idx: int | None = None,
+    random_seed: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Drive the planner for the full duration of the clip.
 
@@ -208,6 +210,10 @@ def _run_full_clip_replay(
     one frame at a time. Whenever the planner asks to replan, feed
     it the clip's instantaneous rolling velocity at the current
     playback position.
+
+    If ``planner_mode_idx`` is provided, the SONIC pose-template
+    inference path is used (``replan_with_pose_template``); otherwise the
+    legacy velocity-only path (``replan_with_velocity``) runs.
     """
     total = qpos_clip.shape[0]
     n_predict = total - n_context
@@ -223,9 +229,17 @@ def _run_full_clip_replay(
     print(f"  intent[t=0]     = (yaw_rate={intent0[0]:+.3f}, "
           f"vel_x={intent0[1]:+.3f}, vel_z={intent0[2]:+.3f}, "
           f"hip_h={intent0[3]:.3f})")
-    planner.replan_with_velocity(
-        torch.tensor(list(intent0), dtype=torch.float32, device=device),
-    )
+
+    def _replan(intent_tuple):
+        v = torch.tensor(list(intent_tuple), dtype=torch.float32, device=device)
+        if planner_mode_idx is None:
+            planner.replan_with_velocity(v)
+        else:
+            planner.replan_with_pose_template(
+                v, mode_idx=planner_mode_idx, random_seed=random_seed,
+            )
+
+    _replan(intent0)
 
     pred = np.zeros((n_predict, 38), dtype=np.float32)
     intent_log = []
@@ -239,9 +253,7 @@ def _run_full_clip_replay(
                     qpos_clip, fps, playback_frame,
                 )
             intent_log.append((playback_frame, intent))
-            planner.replan_with_velocity(
-                torch.tensor(list(intent), dtype=torch.float32, device=device),
-            )
+            _replan(intent)
         pred[i] = planner.get_next_frame().detach().cpu().numpy()
 
     print(f"  replans         = {len(intent_log)} over {n_predict} frames")
@@ -308,6 +320,19 @@ def main() -> int:
              "training step <= 100k. Default behavior (None) feeds 4-of-4 "
              "keyframes which is what production inference does and what "
              "the 100k checkpoint has never been trained on.",
+    )
+    p.add_argument(
+        "--planner-mode", type=str, default=None,
+        choices=("idle", "slow_walk", "walk", "run_proxy"),
+        help="Use the SONIC pose-template inference path with the named mode "
+             "from the baked X2-clip.ckpt library. Default None -> legacy "
+             "velocity-only path. (See motionbricks/scripts/build_x2_planner_clips.py "
+             "for the mode -> clip binding.)",
+    )
+    p.add_argument(
+        "--planner-random-seed", type=int, default=None,
+        help="(pose-template mode) seed for the clip-segment sampler. None -> "
+             "torch.randint per replan (matches G1 demo).",
     )
     p.add_argument("--device", default="cuda")
     p.add_argument(
@@ -388,6 +413,23 @@ def main() -> int:
 
     planner = load_x2_planner(paths, device=device, replan_threshold_frames=16)
 
+    # Resolve --planner-mode to integer index using the clip library sidecar.
+    planner_mode_idx: int | None = None
+    if args.planner_mode is not None:
+        if planner._clip_library is None:
+            raise SystemExit(
+                "--planner-mode requires a baked clip library. "
+                "Run motionbricks/scripts/build_x2_planner_clips.py first."
+            )
+        # Bake script's DEFAULT_MODES insertion order defines indices.
+        _MODE_NAMES = ("idle", "slow_walk", "walk", "run_proxy")
+        planner_mode_idx = _MODE_NAMES.index(args.planner_mode)
+        print(f"  planner_mode    = {args.planner_mode} (idx={planner_mode_idx})")
+        if args.planner_random_seed is not None:
+            print(f"  planner_seed    = {args.planner_random_seed}")
+    else:
+        print(f"  planner_mode    = velocity-only (legacy)")
+
     if args.mask_start_keyframes is not None:
         n_keep = int(args.mask_start_keyframes)
         print(f"  [diag] downgrading start-window to {n_keep}/4 keyframes "
@@ -413,6 +455,8 @@ def main() -> int:
     if args.mode == "full-clip":
         pred, actual = _run_full_clip_replay(
             planner, qpos_clip, fps, args.n_context, device, override,
+            planner_mode_idx=planner_mode_idx,
+            random_seed=args.planner_random_seed,
         )
     else:
         if args.window_start + args.n_context >= qpos_clip.shape[0]:
@@ -438,11 +482,23 @@ def main() -> int:
         seed_qpos = torch.from_numpy(seed_slice)
         planner.reset(seed_qpos)
         velocity = torch.tensor(list(intent), dtype=torch.float32, device=device)
-        planner.replan_with_velocity(velocity)
+        if planner_mode_idx is None:
+            planner.replan_with_velocity(velocity)
+        else:
+            planner.replan_with_pose_template(
+                velocity, mode_idx=planner_mode_idx,
+                random_seed=args.planner_random_seed,
+            )
         pred = np.zeros((args.n_predict, 38), dtype=np.float32)
         for i in range(args.n_predict):
             if planner.should_replan():
-                planner.replan_with_velocity(velocity)
+                if planner_mode_idx is None:
+                    planner.replan_with_velocity(velocity)
+                else:
+                    planner.replan_with_pose_template(
+                        velocity, mode_idx=planner_mode_idx,
+                        random_seed=args.planner_random_seed,
+                    )
             pred[i] = planner.get_next_frame().detach().cpu().numpy()
         actual_start = args.window_start + args.n_context
         actual = qpos_clip[actual_start : actual_start + args.n_predict]

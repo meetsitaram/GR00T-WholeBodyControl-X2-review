@@ -65,6 +65,12 @@ _DEFAULT_VQVAE_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_vqvae_x2/version_1"
 _DEFAULT_POSE_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_pose_x2/version_1"
 _DEFAULT_ROOT_VERSION = _DEFAULT_RESULT_DIR / "motionbricks_root_x2/version_1"
 
+# Default location for the baked pose-template clip library, produced by
+# ``motionbricks/scripts/build_x2_planner_clips.py``. Optional — when this
+# file is missing, ``load_x2_planner`` skips clip-library loading and the
+# returned ``NeuralPlannerCore`` only exposes the velocity-only path.
+_DEFAULT_CLIP_LIBRARY = _DEFAULT_RESULT_DIR / "X2-clip.ckpt"
+
 
 @dataclass
 class X2PlannerPaths:
@@ -101,7 +107,7 @@ class X2PlannerPaths:
         return cls(
             vqvae_ckpt=_DEFAULT_VQVAE_VERSION / "checkpoints/model-step=0500000.ckpt",
             pose_ckpt=_DEFAULT_POSE_VERSION / "checkpoints/model-step=0500000.ckpt",
-            root_ckpt=_DEFAULT_ROOT_VERSION / "checkpoints/model-step=0300000.ckpt",
+            root_ckpt=_DEFAULT_ROOT_VERSION / "checkpoints/model-step=0315000.ckpt",
         )
 
     def validate(self) -> None:
@@ -288,6 +294,7 @@ def load_x2_models(
 def load_x2_planner(
     paths: Optional[X2PlannerPaths] = None,
     device: str = "cuda",
+    clip_library_ckpt: Optional[Path] = "auto",
     **kwargs,
 ) -> NeuralPlannerCore:
     """One-shot helper: load the X2 stack and wrap it in a NeuralPlannerCore.
@@ -296,13 +303,45 @@ def load_x2_planner(
         paths: Optional path override; defaults to ``X2PlannerPaths.default()``
             (pinned step checkpoints in each ``version_1`` dir).
         device: torch device (cuda / cpu).
+        clip_library_ckpt: Optional path to a baked pose-template clip
+            library (see ``motionbricks/scripts/build_x2_planner_clips.py``).
+            * ``"auto"`` (default): use the canonical ``out/X2-clip.ckpt``
+              if it exists; otherwise skip clip loading silently. Lets
+              the velocity-only path keep working when the library has
+              not been baked yet.
+            * ``Path``: explicit path; missing file raises FileNotFoundError.
+            * ``None``: never load a clip library; only ``replan_with_velocity``
+              will be available.
         **kwargs: Forwarded to NeuralPlannerCore (e.g. filter_qpos=True).
 
     Returns:
         Ready-to-stream NeuralPlannerCore (call .reset(init_qpos) before
-        the first .replan_with_velocity(...)).
+        the first .replan_with_velocity(...) or .replan_with_pose_template(...)).
     """
     if paths is None:
         paths = X2PlannerPaths.default()
     inferencer, converter = load_x2_models(paths, device=device)
-    return NeuralPlannerCore(inferencer, converter, device=device, **kwargs)
+
+    resolved_clip_ckpt: Optional[Path]
+    if clip_library_ckpt == "auto":
+        if _DEFAULT_CLIP_LIBRARY.is_file():
+            resolved_clip_ckpt = _DEFAULT_CLIP_LIBRARY
+        else:
+            resolved_clip_ckpt = None
+    elif clip_library_ckpt is None:
+        resolved_clip_ckpt = None
+    else:
+        resolved_clip_ckpt = Path(clip_library_ckpt)
+        if not resolved_clip_ckpt.is_file():
+            raise FileNotFoundError(
+                f"clip_library_ckpt={resolved_clip_ckpt} not found. Run "
+                "motionbricks/scripts/build_x2_planner_clips.py first."
+            )
+
+    return NeuralPlannerCore(
+        inferencer,
+        converter,
+        device=device,
+        clip_library_ckpt=resolved_clip_ckpt,
+        **kwargs,
+    )

@@ -136,10 +136,10 @@ log = logging.getLogger("x2_kplanner")
 # raise them once the deploy is verified stable on each direction.
 # ---------------------------------------------------------------------------
 
-_WALK_SPEED_MPS: float = 0.5
+_WALK_SPEED_MPS: float = 0.6
 _FAST_WALK_SPEED_MPS: float = 0.9
 _SIDE_SPEED_MPS: float = 0.4
-_BACK_SPEED_MPS: float = 0.35
+_BACK_SPEED_MPS: float = 0.45
 
 # Minimum forward velocity command (m/s) emitted whenever the operator
 # commits any non-zero forward stick deflection in the
@@ -209,7 +209,7 @@ _TURN_90_RAD_S: float = 3.0
 # the Quest 3 / PKL wrappers. The per-side ``_RUNTIME_TURN_LEFT_SCALE
 # / _RIGHT_SCALE`` runtime scales still apply on top (default 1.0)
 # so the operator can compensate for any L/R asymmetry independently.
-_DEFAULT_CONTINUOUS_TURN_MAX_RAD_S: float = 0.75
+_DEFAULT_CONTINUOUS_TURN_MAX_RAD_S: float = 0.50
 
 # Mutable runtime knob, mutated by ``run()`` per CLI flag. Reads in
 # ``_resolve_locomotion_continuous`` pick up the override at every
@@ -1890,6 +1890,7 @@ def _planner_worker(
     pose_max_age_s: float = 0.5,
     pose_reseed_scope: str = _RESEED_SCOPE_FULL_ROOT,
     cold_start_ramp_tau_s: float = _DEFAULT_COLD_START_RAMP_TAU_S,
+    planner_mode_idx: Optional[int] = None,
 ) -> None:
     """Replan refill loop. Runs predict() each time the buffer drops below
     threshold, holding ``replan_lock`` only for the cursor swap (the predict
@@ -2033,7 +2034,12 @@ def _planner_worker(
         t0 = time.monotonic()
         try:
             with replan_lock:
-                planner_core.replan_with_velocity(list(target))
+                if planner_mode_idx is None:
+                    planner_core.replan_with_velocity(list(target))
+                else:
+                    planner_core.replan_with_pose_template(
+                        list(target), mode_idx=planner_mode_idx,
+                    )
         except Exception:
             log.exception("worker: replan failed; will retry next cycle")
             time.sleep(0.05)
@@ -2077,6 +2083,7 @@ def run(
     body_pose_port: Optional[int],
     device: str,
     replan_threshold_frames: int,
+    planner_mode: Optional[str] = None,
     yaw_lock_epsilon_rad_s: float = 0.0,
     turn_left_scale: float = 1.0,
     turn_right_scale: float = 1.0,
@@ -2258,6 +2265,9 @@ def run(
 
     # ---- Load model + planner core (this is the slow part: ~5--10s on cold start)
     log.info("loading X2 kplanner stack on device=%s ...", device)
+    log.info("  vqvae ckpt : %s", vqvae_ckpt)
+    log.info("  pose  ckpt : %s", pose_ckpt)
+    log.info("  root  ckpt : %s", root_ckpt)
     from motionbricks.motion_backbone.inference.load_x2_planner import (
         X2PlannerPaths,
         load_x2_planner,
@@ -2279,13 +2289,50 @@ def run(
     )
     log.info("kplanner stack loaded.")
 
+    # ---- Pose-template inference path resolution.
+    # ``--planner-mode`` maps the mode NAME to the integer index baked into
+    # X2-clip.ckpt by motionbricks/scripts/build_x2_planner_clips.py
+    # (DEFAULT_MODES insertion order = canonical binding). If the user
+    # asked for pose-template mode but no clip library is loaded, fail
+    # loudly here rather than silently falling back to velocity-only.
+    _PLANNER_MODE_INDICES = ("idle", "slow_walk", "walk", "run_proxy")
+    planner_mode_idx: Optional[int] = None
+    if planner_mode is not None:
+        if planner_core._clip_library is None:
+            log.error(
+                "--planner-mode=%s requested but NeuralPlannerCore has no "
+                "clip library loaded. Run motionbricks/scripts/build_x2_planner_clips.py "
+                "to bake out/X2-clip.ckpt first.",
+                planner_mode,
+            )
+            return 2
+        planner_mode_idx = _PLANNER_MODE_INDICES.index(planner_mode)
+        log.info(
+            "pose-template inference enabled: mode=%s (idx=%d, library has "
+            "%d modes / %d joints)",
+            planner_mode, planner_mode_idx,
+            planner_core._clip_library.num_modes,
+            planner_core._clip_library.num_joints,
+        )
+    else:
+        log.info("planner path: legacy replan_with_velocity (velocity-only)")
+
+    def _dispatch_replan(target_vec) -> None:
+        """Call the right replan method based on --planner-mode."""
+        if planner_mode_idx is None:
+            planner_core.replan_with_velocity(list(target_vec))
+        else:
+            planner_core.replan_with_pose_template(
+                list(target_vec), mode_idx=planner_mode_idx
+            )
+
     # ---- Warmup anchor + first replan
     import torch
     warmup_qpos = _load_warmup_qpos(warmup_qpos_path)
     planner_core.reset(torch.from_numpy(warmup_qpos))
     intent_state = IntentState(_IDLE_INTENT)
     # First replan synchronously so the publish thread has frames immediately.
-    planner_core.replan_with_velocity(list(_IDLE_INTENT))
+    _dispatch_replan(_IDLE_INTENT)
     log.info(
         "first replan complete; ring buffer has %d frames",
         planner_core.frames_remaining,
@@ -2378,6 +2425,7 @@ def run(
             "pose_max_age_s": float(pose_feedback_max_age_s),
             "pose_reseed_scope": pose_reseed_scope,
             "cold_start_ramp_tau_s": float(cold_start_ramp_tau_s),
+            "planner_mode_idx": planner_mode_idx,
         },
         name="kplanner-worker",
         daemon=True,
@@ -3080,7 +3128,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=(
             _REPO_ROOT
-            / "motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0300000.ckpt"
+            / "motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0315000.ckpt"
         ),
     )
     p.add_argument(
@@ -3146,6 +3194,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Worker thread refills the ring buffer when frames_remaining < this "
             "value. With OUTPUT_FPS=50, 16 frames = 0.32 s of headroom -- safe "
             "even with 5--15 ms predict() jitter."
+        ),
+    )
+    p.add_argument(
+        "--planner-mode",
+        type=str,
+        default=None,
+        choices=("idle", "slow_walk", "walk", "run_proxy"),
+        help=(
+            "When set, replan via NeuralPlannerCore.replan_with_pose_template() "
+            "using the named mode from the baked X2-clip.ckpt library "
+            "(see motionbricks/scripts/build_x2_planner_clips.py for the bake "
+            "and the mode -> clip binding). Default None preserves the legacy "
+            "velocity-only replan_with_velocity() path. Phase 2 of the "
+            "x2_kplanner_pose-template_inference plan."
         ),
     )
     tune_grp = p.add_argument_group(
@@ -3408,6 +3470,7 @@ def main(argv: list[str] | None = None) -> int:
         body_pose_port=args.body_pose_port,
         device=args.device,
         replan_threshold_frames=args.replan_threshold_frames,
+        planner_mode=args.planner_mode,
         yaw_lock_epsilon_rad_s=args.yaw_lock_epsilon,
         turn_left_scale=args.turn_left_scale,
         turn_right_scale=args.turn_right_scale,

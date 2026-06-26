@@ -57,6 +57,7 @@
 #       [--kplanner-root-ckpt PATH] [--kplanner-warmup-qpos PATH]
 #       [--kplanner-device DEV] [--kplanner-replan-threshold-frames N]
 #       [--kplanner-python PATH]
+#       [--kplanner-planner-mode {idle|slow_walk|walk|run_proxy}]
 #       [--model PATH]
 #       [--velocity-window N]
 #       [--with-capture] [--capture-out DIR]
@@ -163,6 +164,13 @@ KPLANNER_WARMUP_QPOS=""
 KPLANNER_DEVICE="cuda"
 KPLANNER_REPLAN_THRESHOLD_FRAMES="16"
 KPLANNER_YAW_LOCK_EPSILON="0.0"
+# Pose-template inference mode. When set, the kplanner replans via
+# replan_with_pose_template() using the named clip from the baked
+# X2-clip.ckpt library instead of replan_with_velocity(). Default
+# empty -> velocity-only (legacy). See Phase 2 of the
+# x2_kplanner_pose-template_inference plan + the bake script at
+# motionbricks/scripts/build_x2_planner_clips.py for the mode set.
+KPLANNER_PLANNER_MODE=""
 # Cold-start velocity ramp time constant (s). PKL replay uses
 # constant-intent / mean-intent which already produces a steady
 # velocity, so the ramp matters less here than for Quest 3 -- but
@@ -207,6 +215,7 @@ while [[ $# -gt 0 ]]; do
         --kplanner-replan-threshold-frames) KPLANNER_REPLAN_THRESHOLD_FRAMES="$2"; shift 2 ;;
         --kplanner-yaw-lock-epsilon) KPLANNER_YAW_LOCK_EPSILON="$2"; shift 2 ;;
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
+        --kplanner-planner-mode) KPLANNER_PLANNER_MODE="$2"; shift 2 ;;
         --kplanner-python) KPLANNER_PYTHON="$2"; shift 2 ;;
         --model) SIM_MODEL="$2"; shift 2 ;;
         --log-dir) LOG_DIR="$2"; shift 2 ;;
@@ -528,6 +537,7 @@ ${C_GREEN}┌──────────────────────�
   velocity-window  : ${VELOCITY_WINDOW} frames
   deploy           : $([[ "${WITH_DEPLOY}" -eq 1 ]] && echo "ON  (sim --vla, profile=${SIM_PROFILE}, viewer=$([[ "${SIM_VIEWER}" -eq 1 ]] && echo on || echo off))" || echo "OFF (assume external deploy SUBs pose:${POSE_PORT})")
   kplanner device  : ${KPLANNER_DEVICE}  python: ${KPLANNER_PYTHON}
+  planner mode     : ${KPLANNER_PLANNER_MODE:-velocity-only (legacy)}
   ports            : pose=${POSE_PORT}  x2_debug=${DEBUG_PORT}  planner_cmd=${PLANNER_CMD_PORT}
   capture          : $([[ "${WITH_CAPTURE}" -eq 1 ]] && echo "ON  -> ${CAPTURE_OUT}" || echo "OFF (pass --with-capture to record sim motion + compare to pkl)")
   pose feedback    : $([[ "${WITH_POSE_FEEDBACK}" -eq 1 ]] && echo "ON  (closed-loop reseed scope=${POSE_RESEED_SCOPE} from ${POSE_FEEDBACK_HOST}:${POSE_FEEDBACK_PORT}/${POSE_FEEDBACK_TOPIC}, max_age=${POSE_FEEDBACK_MAX_AGE_S}s)" || echo "OFF (open-loop baseline; pass --no-pose-feedback to keep this)")
@@ -694,6 +704,9 @@ PLANNER_ARGS=(
 )
 if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
     PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
+fi
+if [[ -n "${KPLANNER_PLANNER_MODE}" ]]; then
+    PLANNER_ARGS+=(--planner-mode "${KPLANNER_PLANNER_MODE}")
 fi
 if [[ "${WITH_POSE_FEEDBACK}" -eq 1 ]]; then
     PLANNER_ARGS+=(
