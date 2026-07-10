@@ -257,6 +257,23 @@ class Quest3Reader:
         with self._lock:
             return self._latest
 
+    def get_last_message_age_s(self) -> float:
+        """Seconds since the last WebSocket packet was ingested into
+        ``_latest``. Returns ``math.inf`` while no message has ever
+        arrived. Used by upstream consumers (e.g. quest3_manager_x2)
+        to detect Quest 3 sleep / browser tab background / WS drop
+        and force a safe idle command so the robot doesn't keep
+        executing the last stale stick value forever.
+        """
+        with self._lock:
+            sample = self._latest
+        if sample is None:
+            return float("inf")
+        ts = sample.get("timestamp_monotonic")
+        if ts is None:
+            return float("inf")
+        return time.monotonic() - float(ts)
+
     def get_3pt_pose(self) -> np.ndarray | None:
         sample = self.get_latest()
         if sample is None:

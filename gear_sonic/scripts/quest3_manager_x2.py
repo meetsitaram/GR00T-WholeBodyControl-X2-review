@@ -139,6 +139,23 @@ class ManagerConfig:
     # Tick rate (Hz). The planner runs at 50 Hz; we match.
     publish_rate_hz: float = 50.0
 
+    # Quest 3 input staleness gate. The Quest 3 browser app stops
+    # streaming WebSocket packets when the headset goes to sleep, the
+    # tab moves to the background, or the network drops. ``Quest3Reader``
+    # would otherwise keep returning the *last* (lx, ly, rx, ry) for the
+    # rest of the session, and the manager would happily decode that
+    # into a locomotion command and publish it forever -- the robot
+    # keeps walking on a stale stick value. When the most recent WS
+    # packet is older than this threshold, the manager:
+    #   - Forces the decoder's stick / button inputs to neutral so any
+    #     emitted command collapses to idle.
+    #   - Logs a throttled WARNING with the current age.
+    # In addition, x2_kplanner.py has its own ``--command-watchdog-s``
+    # that snaps its internal IntentState to _IDLE_INTENT when no
+    # planner_cmd has arrived for the same duration; the two combine
+    # into defence-in-depth.
+    vr_input_max_age_s: float = 0.5
+
     # PUB sockets
     planner_cmd_host: str = "*"
     planner_cmd_port: int = 5563
@@ -1014,6 +1031,10 @@ class Quest3ManagerX2:
             "ON" if self._cfg.recorder_enabled else "OFF",
         )
 
+        vr_input_max_age_s = float(self._cfg.vr_input_max_age_s)
+        vr_input_stale_active = False
+        vr_input_last_warn_t = 0.0
+
         try:
             while not self._stop.is_set():
                 tick_now = time.monotonic()
@@ -1029,6 +1050,55 @@ class Quest3ManagerX2:
                     rx = -rx
                 if self._cfg.invert_ry:
                     ry = -ry
+
+                # Quest 3 input freshness gate. When the WebSocket goes
+                # silent (headset to sleep, tab in background, WS drop)
+                # the Quest3Reader keeps returning the last cached
+                # snapshot, so without this check the manager would
+                # publish the stale stick values forever. We snap inputs
+                # to neutral so the decoder emits idle; the kplanner's
+                # own command-watchdog (--command-watchdog-s) is the
+                # second line of defence. ``vr_pose is None`` (no
+                # packet at all yet) is handled separately just below.
+                # Log cadence: WARNING once on the rising edge of the
+                # stale state (operator notices immediately), then drop
+                # to a quiet INFO reminder at a much lower rate so a
+                # long-idle session (headset on charger, lunch break)
+                # doesn't paint the terminal red for 10+ minutes.
+                vr_age_s = self._quest.get_last_message_age_s()
+                if (
+                    vr_pose is not None
+                    and vr_input_max_age_s > 0.0
+                    and vr_age_s > vr_input_max_age_s
+                ):
+                    lx = ly = rx = ry = 0.0
+                    buttons = (False, False, False, False)
+                    triggers = (0.0, 0.0, 0.0, 0.0)
+                    if not vr_input_stale_active:
+                        log.warning(
+                            "[manager-x2] Quest 3 input stale: last WS "
+                            "packet was %.2fs ago (threshold %.2fs); "
+                            "forcing sticks/buttons to neutral. Headset "
+                            "asleep, tab in background, or WS dropped?",
+                            vr_age_s, vr_input_max_age_s,
+                        )
+                        vr_input_last_warn_t = tick_now
+                    elif tick_now - vr_input_last_warn_t > 30.0:
+                        log.info(
+                            "[manager-x2] Quest 3 input still stale "
+                            "(age %.1fs); awaiting WS reconnect.",
+                            vr_age_s,
+                        )
+                        vr_input_last_warn_t = tick_now
+                    vr_input_stale_active = True
+                else:
+                    if vr_input_stale_active:
+                        log.info(
+                            "[manager-x2] Quest 3 input recovered "
+                            "(age %.2fs <= %.2fs); resuming normal input.",
+                            vr_age_s, vr_input_max_age_s,
+                        )
+                    vr_input_stale_active = False
 
                 # Quest3 raw capture sidecar -- one row per tick the
                 # manager actually saw a Quest sample. We snapshot
@@ -2288,6 +2358,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Cadence
     p.add_argument("--rate", type=float, default=50.0, help="Publish rate Hz")
+    p.add_argument(
+        "--vr-input-max-age-s",
+        type=float,
+        default=0.5,
+        help=(
+            "Safety watchdog: when the Quest 3 WebSocket goes silent "
+            "(headset asleep, browser tab in background, network drop) "
+            "the WebXR app stops streaming and Quest3Reader keeps "
+            "returning the last cached stick values. Without this gate "
+            "the manager would happily publish those stale axes "
+            "forever and the robot would keep walking on a stale "
+            "input. When the most recent WS packet is older than this "
+            "many seconds, sticks/buttons/triggers are snapped to "
+            "neutral before they reach the decoder so the published "
+            "intent collapses to idle. Pair with --command-watchdog-s "
+            "on x2_kplanner.py for defence in depth. Default 0.5 s "
+            "matches the kplanner pose-feedback staleness gate. Set "
+            "0.0 to disable (pre-2026-06-26 behaviour)."
+        ),
+    )
 
     # IntentDecoder
     p.add_argument("--stick-deadzone", type=float, default=0.30)
@@ -2757,6 +2847,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         quest3_use_ssl=not args.no_ssl,
         calibration_path=args.calibration,
         publish_rate_hz=args.rate,
+        vr_input_max_age_s=args.vr_input_max_age_s,
         planner_cmd_host=args.planner_cmd_host,
         planner_cmd_port=args.planner_cmd_port,
         planner_cmd_topic=args.planner_cmd_topic,

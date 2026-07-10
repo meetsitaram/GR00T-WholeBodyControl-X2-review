@@ -492,6 +492,22 @@ KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
 # ~6x better yaw stability when paired with smoothed intent). Requires
 # the X2-clip.ckpt library (motionbricks/scripts/build_x2_planner_clips.py).
 KPLANNER_PLANNER_MODE="${KPLANNER_PLANNER_MODE:-}"
+# Opt-in safety watchdog (seconds) for stale upstream intents. **OFF by
+# default for Quest 3 live control** because the IntentDecoder emits new
+# planner_cmd messages only when the stick value changes; a held stick
+# during a real-world gesture (continuous turn, sustained walk) can leave
+# the wire quiet for multiple seconds and would otherwise trip a short
+# watchdog and abort the gesture mid-motion. Upstream-silence detection
+# for Quest 3 lives at ``--vr-input-max-age-s`` on quest3_manager_x2.py
+# instead, where the raw WebSocket packet rate is observable. Empty ->
+# daemon default 0.0 (disabled). Set to a positive value (e.g. 1.0 s) only
+# for upstream sources that emit a steady heartbeat, such as PKL replay.
+KPLANNER_COMMAND_WATCHDOG_S="${KPLANNER_COMMAND_WATCHDOG_S:-}"
+# Quest 3 input freshness threshold (seconds). When the WebSocket from the
+# headset goes silent for longer than this, the manager forces stick /
+# button inputs to neutral so the decoder emits idle. Empty -> manager
+# default 0.5 s. Set to 0.0 to disable.
+VR_INPUT_MAX_AGE_S="${VR_INPUT_MAX_AGE_S:-}"
 # Yaw-rate ceiling for continuous-locomotion R-stick turns (rad/s at
 # full deflection). Default empty -> daemon default 0.75 rad/s (~43
 # deg/s, a 90-deg turn in ~2.1 s). The legacy bucketed path stays at
@@ -883,6 +899,8 @@ while [[ $# -gt 0 ]]; do
         --kplanner-stick-shape-exp) KPLANNER_STICK_SHAPE_EXP="$2"; shift 2 ;;
         --kplanner-cold-start-ramp-tau-s) KPLANNER_COLD_START_RAMP_TAU_S="$2"; shift 2 ;;
         --kplanner-planner-mode) KPLANNER_PLANNER_MODE="$2"; shift 2 ;;
+        --kplanner-command-watchdog-s) KPLANNER_COMMAND_WATCHDOG_S="$2"; shift 2 ;;
+        --vr-input-max-age-s) VR_INPUT_MAX_AGE_S="$2"; shift 2 ;;
         --kplanner-continuous-turn-max-rad-s) KPLANNER_CONTINUOUS_TURN_MAX_RAD_S="$2"; shift 2 ;;
         --kplanner-continuous-forward-min-mps) KPLANNER_CONTINUOUS_FORWARD_MIN_MPS="$2"; shift 2 ;;
         --kplanner-ref-smoother-ms) KPLANNER_REF_SMOOTHER_MS="$2"; shift 2 ;;

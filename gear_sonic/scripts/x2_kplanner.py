@@ -1862,21 +1862,62 @@ class _ReferenceStepSmoother:
 
 
 class IntentState:
-    """Thread-safe holder for the current velocity-intent target."""
+    """Thread-safe holder for the current velocity-intent target.
+
+    Tracks both the target value and the wall-clock time of the last
+    update. The publish loop uses ``seconds_since_last_set`` to detect
+    upstream silence (Quest 3 headset asleep, network drop, manager
+    crash...) and force ``_IDLE_INTENT`` via ``force_idle_if_stale`` so
+    the robot stops moving when commands stop arriving. Without this
+    watchdog the planner would keep walking on the last non-idle intent
+    indefinitely.
+    """
 
     def __init__(self, initial: tuple[float, float, float, float]) -> None:
         self._target = initial
         self._lock = threading.Lock()
         self._version = 0  # bumped on every update; worker reads for logging
+        # Initialise the "last set" timestamp to "now" so the watchdog
+        # doesn't immediately trip during startup before any command
+        # has arrived.
+        self._last_set_t = time.monotonic()
 
     def set(self, target: tuple[float, float, float, float]) -> None:
         with self._lock:
             self._target = tuple(target)
             self._version += 1
+            self._last_set_t = time.monotonic()
 
     def get(self) -> tuple[tuple[float, float, float, float], int]:
         with self._lock:
             return self._target, self._version
+
+    def seconds_since_last_set(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._last_set_t
+
+    def force_idle_if_stale(
+        self,
+        max_age_s: float,
+        idle_target: tuple[float, float, float, float],
+    ) -> bool:
+        """Snap target to ``idle_target`` if no command has arrived in
+        ``max_age_s`` seconds AND the current target is non-idle.
+        Returns True iff the watchdog tripped on this call.
+        """
+        with self._lock:
+            age = time.monotonic() - self._last_set_t
+            if age < max_age_s:
+                return False
+            if tuple(self._target) == tuple(idle_target):
+                return False
+            self._target = tuple(idle_target)
+            self._version += 1
+            # Do NOT bump ``_last_set_t``: we want subsequent ticks to
+            # keep reporting the staleness so a periodic warning fires
+            # while the upstream is silent. The next genuine command
+            # from the manager will refresh both fields via ``set``.
+            return True
 
 
 def _planner_worker(
@@ -2104,6 +2145,7 @@ def run(
     ref_smoother_trigger_rad: float = _DEFAULT_REF_SMOOTHER_TRIGGER_RAD,
     ref_smoother_shape: str = _DEFAULT_REF_SMOOTHER_SHAPE,
     ref_smoother_joints: str = _DEFAULT_REF_SMOOTHER_JOINTS,
+    command_watchdog_s: float = 0.0,
 ) -> int:
     _setup_logging(verbose)
 
@@ -2694,6 +2736,12 @@ def run(
                     for k in range(num_future)
                 ]
 
+            # Per-loop watchdog state -- only used when the upstream
+            # source is the Quest 3 manager (or any other live source).
+            # Throttled at ~1 Hz so an asleep/disconnected operator
+            # doesn't flood the log.
+            _watchdog_last_log_t = 0.0
+
             while not stop_event.is_set() and time.monotonic() < end_at:
                 # ---- Drain command queue and apply the latest intent.
                 latest_cmd: Optional[LocomotionCommand] = None
@@ -2713,6 +2761,7 @@ def run(
                             target,
                         )
                         last_intent_log = target
+
                     # Waist-overlay target update. Honour every
                     # ``hold_torso`` command (continuous waist intent
                     # from the operator's R-stick / ARM_MAN L-stick);
@@ -2722,6 +2771,17 @@ def run(
                     # slew limit handles the cross-tick smoothness;
                     # there's no need to debounce here because the
                     # decoder already throttles publishing.
+                    #
+                    # Scope: this branch only fires when a fresh
+                    # ``latest_cmd`` was dequeued this tick. The
+                    # watchdog branch below resets to neutral on
+                    # upstream silence -- so we don't need (and must
+                    # not duplicate) a NULL-cmd code path here.
+                    # Regression note: pre-2026-06-26, this block was
+                    # accidentally nested into the watchdog branch by
+                    # the watchdog-introducing diff, causing a
+                    # ``latest_cmd.intent`` AttributeError as soon as
+                    # the operator went idle for >0.5 s.
                     if latest_cmd.intent == HOLD_TORSO_INTENT:
                         new_waist_target = (
                             float(latest_cmd.waist_pitch_deg),
@@ -2739,6 +2799,52 @@ def run(
                             *new_waist_target,
                         )
                         last_waist_target_log = new_waist_target
+
+                # ---- Stale-command watchdog (opt-in; default OFF).
+                # If the upstream stops publishing, the last non-IDLE
+                # intent would otherwise keep driving locomotion forever.
+                # Snap to IDLE after ``command_watchdog_s`` seconds of
+                # silence and reset the waist target to neutral so a
+                # stuck ``hold_torso`` lean relaxes too.
+                #
+                # **Why default OFF**: the Quest 3 manager's IntentDecoder
+                # is event-driven -- it publishes a new planner_cmd only
+                # when the stick value changes meaningfully (see
+                # ``intent_decoder._maybe_emit`` + ``_is_significant_change``).
+                # A held stick can therefore produce inter-arrival gaps
+                # of multiple seconds during NORMAL operation. We measured
+                # gaps up to ~4 s with the operator actively turning at
+                # constant rate (manager_sidecar.jsonl, 2026-06-26 stack).
+                # A watchdog at 0.5 s would abort every locomotion gesture
+                # after ~0.5 s -- exactly the bug observed on the real
+                # robot before this knob was disabled.
+                #
+                # Upstream-silence detection therefore belongs in the
+                # manager (``quest3_manager_x2.py --vr-input-max-age-s``),
+                # which has access to the raw WebSocket packet rate and
+                # forces sticks to neutral when the WS goes silent.
+                # The decoder then emits an explicit idle command and
+                # the kplanner stops cleanly.
+                #
+                # Enable this knob only for upstream sources that DO emit
+                # a steady heartbeat at a known rate (e.g. PKL replay,
+                # scripted demos publishing every tick).
+                if command_watchdog_s > 0.0 and intent_state.force_idle_if_stale(
+                    max_age_s=command_watchdog_s,
+                    idle_target=_IDLE_INTENT,
+                ):
+                    waist_tracker.set_target(0.0, 0.0, 0.0)
+                    last_intent_log = _IDLE_INTENT
+                    last_waist_target_log = (0.0, 0.0, 0.0)
+                    now_t = time.monotonic()
+                    if now_t - _watchdog_last_log_t > 1.0:
+                        log.warning(
+                            "command watchdog: no upstream intent for "
+                            "%.2fs (threshold %.2fs); forcing IDLE",
+                            intent_state.seconds_since_last_set(),
+                            command_watchdog_s,
+                        )
+                        _watchdog_last_log_t = now_t
 
                 # ---- Resolve high-level state from current intent.
                 # IDLE_LOOP <-> PLAYING transitions are edge-triggered
@@ -3377,6 +3483,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--command-watchdog-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Opt-in safety watchdog: when the upstream intent source "
+            "stops publishing for this many seconds, the kplanner forces "
+            "its internal intent state back to _IDLE_INTENT so the robot "
+            "does not keep walking on a stale non-idle target. "
+            "DISABLED BY DEFAULT (0.0) because the Quest 3 manager's "
+            "IntentDecoder is event-driven: it emits a new planner_cmd "
+            "only when the stick value changes, so a held stick produces "
+            "inter-arrival gaps of multiple seconds during NORMAL "
+            "operation. A low watchdog threshold here would abort "
+            "locomotion every time the operator holds the stick steady. "
+            "Upstream-silence detection belongs in the manager (see "
+            "quest3_manager_x2.py --vr-input-max-age-s), which has "
+            "access to the raw WebSocket liveness signal. Enable this "
+            "knob only for upstream sources that DO emit a steady "
+            "heartbeat at a known rate -- e.g. x2_pkl_command_source "
+            "replaying recorded clips, or scripted demos that publish "
+            "every tick. Set to ~3x the expected heartbeat period."
+        ),
+    )
+    p.add_argument(
         "--ref-smoother-ms",
         type=float,
         default=_DEFAULT_REF_SMOOTHER_MS,
@@ -3491,6 +3621,7 @@ def main(argv: list[str] | None = None) -> int:
         ref_smoother_trigger_rad=args.ref_smoother_trigger_rad,
         ref_smoother_shape=args.ref_smoother_shape,
         ref_smoother_joints=args.ref_smoother_joints,
+        command_watchdog_s=args.command_watchdog_s,
     )
 
 

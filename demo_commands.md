@@ -2,7 +2,7 @@
 ## SIM Only Mode
 
 ### launch pkl direct stack
-gear_sonic/scripts/run_x2_pkl_direct_stack.sh --model /home/stickbot/x2_cloud_checkpoints/chain_matched_v2_iter_004000/exported/model_step_004000_g1.onnx
+gear_sonic/scripts/run_x2_pkl_direct_stack.sh --model ~/getsolo/policies/agibot_x2_sonic.onnx
 
 ## Launch Gamepad Controler
 .venv/bin/python -m gear_sonic.scripts.play_xbox_controller
@@ -22,12 +22,15 @@ gear_sonic/scripts/run_x2_pkl_direct_stack.sh --model /home/stickbot/x2_cloud_ch
 ./gear_sonic/scripts/run_x2_pkl_direct_stack.sh \
     --pc2-host 192.168.86.32
 
+### run the vr planner stack
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+    --pc2-host 192.168.86.32 
+
 ### launch xbox controller run
 .venv/bin/python -m gear_sonic.scripts.play_xbox_controller
 
 ### To Stop sonic on robot (*** this will collapse the robot and needs to be held)
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh stop --pc2-host 192.168.86.32
-
+          
 ===================================================================
 
 
