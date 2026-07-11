@@ -30,6 +30,8 @@ connect the WebSocket, and start the VR session.
 """
 
 import argparse
+import json
+import logging
 import time
 
 import numpy as np
@@ -49,11 +51,80 @@ from gear_sonic.utils.teleop.vr.joystick_mapping import (
     YawAccumulator,
     apply_radial_deadzone,
 )
+from gear_sonic.utils.teleop.vr.stick_smoother import StickFilter, StickFilterConfig
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     build_planner_message,
 )
 from gear_sonic.utils.teleop.vr.quest3_reader import Quest3Reader
+
+log = logging.getLogger("quest3_manager")
+
+
+# Mild default stick smoothing ported from the X2 stack: a light LPF plus a
+# slew cap removes WebXR jitter without feeling sluggish. Channels map
+# fwd<-ly, side<-lx, yaw<-rx. Tune live; pass a no-op StickFilterConfig() (or
+# --no-stick-filter) to disable.
+_DEFAULT_STICK_FILTER = StickFilterConfig(
+    tau_lpf_fwd_s=0.06, slew_max_fwd_per_s=8.0, return_to_zero_tau_fwd_s=0.10,
+    tau_lpf_side_s=0.06, slew_max_side_per_s=8.0, return_to_zero_tau_side_s=0.10,
+    tau_lpf_yaw_s=0.05, slew_max_yaw_per_s=10.0, return_to_zero_tau_yaw_s=0.08,
+)
+
+
+# Angular deadband on the left-stick MOVEMENT direction. Humans can't hold a
+# precise heading on an analog stick, and near a cardinal the *normalized*
+# direction wobbles by 5-10 deg -> every wobble trips the G1 deploy's exact-`!=`
+# replan trigger -> replan storm -> overshoot strides. Fix: keep analog SPEED
+# but snap the DIRECTION to the nearest 8-way axis (fwd/back/strafe/diagonal)
+# when within +/- the band. Snapping is in the FACING frame, so a curved walk
+# (left stick forward + right stick steering) still works: the local dir stays
+# "forward" while facing rotates smoothly.
+_STICK_SNAP_BAND_RAD = float(np.radians(15.0))
+
+
+def _snap_dir_8way(vx: float, vy: float, band_rad: float) -> tuple[float, float]:
+    """Snap a 2-D vector's angle to the nearest 8-way axis when within
+    ``band_rad``; magnitude preserved. Outside the band, returned unchanged."""
+    mag = float(np.hypot(vx, vy))
+    if mag < 1e-9 or band_rad <= 0.0:
+        return vx, vy
+    ang = float(np.arctan2(vy, vx))
+    sector = np.pi / 4.0  # 45 deg between 8-way axes
+    nearest = round(ang / sector) * sector
+    diff = (ang - nearest + np.pi) % (2.0 * np.pi) - np.pi  # signed dist to axis
+    if abs(diff) <= band_rad:
+        return mag * float(np.cos(nearest)), mag * float(np.sin(nearest))
+    return vx, vy
+
+
+# Discretized SLOW_WALK speed vs left-stick magnitude. Instead of a continuous
+# analog speed (which jitters and storms the deploy's exact-`!=` replan trigger),
+# quantize to 3 levels so movement_speed only changes on a deliberate band
+# crossing:
+#   mag in (0, 0.5) -> 0.25  (lower ~50%; 0.2 is below the kplanner's stepping
+#                             threshold and doesn't translate, so floor at 0.25)
+#   mag in [0.5,0.8) -> 0.4  (next ~30%)
+#   mag in [0.8, 1.0] -> 0.6 (top ~20%, "maxing it out")
+# EDGES are the up-boundaries between adjacent levels. HYST widens each edge into
+# a dead band so noise sitting on a boundary can't flicker the level.
+_SLOW_WALK_LEVELS = (0.25, 0.4, 0.6)
+_SLOW_WALK_EDGES = (0.5, 0.8)   # len == len(_SLOW_WALK_LEVELS) - 1
+_SLOW_WALK_HYST = 0.04
+
+
+def _discretize_slow_walk_speed(mag: float, prev_speed: float) -> float:
+    """3-level stepped speed with hysteresis. ``prev_speed`` is the last emitted
+    level (for the dead band); ``mag`` is the deadzoned+rescaled stick magnitude
+    in (0, 1]. Stepping up needs mag >= edge + HYST; stepping down needs
+    mag < edge - HYST."""
+    lvl = min(range(len(_SLOW_WALK_LEVELS)),
+              key=lambda i: abs(_SLOW_WALK_LEVELS[i] - prev_speed))
+    while lvl < len(_SLOW_WALK_EDGES) and mag >= _SLOW_WALK_EDGES[lvl] + _SLOW_WALK_HYST:
+        lvl += 1
+    while lvl > 0 and mag < _SLOW_WALK_EDGES[lvl - 1] - _SLOW_WALK_HYST:
+        lvl -= 1
+    return _SLOW_WALK_LEVELS[lvl]
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +144,16 @@ class Quest3PlannerStreamer:
         socket,
         reader: Quest3Reader,
         three_point: ThreePointPose,
-        poll_hz: int = 20,
+        poll_hz: int = 50,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        vr_input_max_age_s: float = 0.5,
+        invert_lx: bool = False,
+        invert_ly: bool = False,
+        invert_rx: bool = False,
+        invert_ry: bool = False,
+        stick_filter_cfg: StickFilterConfig | None = None,
+        sidecar_path: str | None = None,
     ):
         self.socket = socket
         self.reader = reader
@@ -94,8 +172,31 @@ class Quest3PlannerStreamer:
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
 
+        # --- ported from X2 stack (Phase A teleop upgrades) ---
+        # Input freshness gate: when the WebSocket goes silent (headset asleep,
+        # tab backgrounded, WS drop) Quest3Reader keeps returning its last
+        # cached snapshot, so without this the manager would publish stale
+        # sticks forever and the robot would keep walking. Snap locomotion
+        # inputs to neutral when the last packet is older than this.
+        self.vr_input_max_age_s = float(vr_input_max_age_s)
+        self._vr_stale_active = False
+        self._vr_last_warn_t = 0.0
+        # Per-axis stick inversion (was hardcoded before).
+        self.invert_lx, self.invert_ly = invert_lx, invert_ly
+        self.invert_rx, self.invert_ry = invert_rx, invert_ry
+        # Stick smoothing (LPF + slew). Default mild; None -> disabled.
+        self._stick_filter = (
+            StickFilter(stick_filter_cfg) if stick_filter_cfg is not None else None
+        )
+        self._last_tick_t = None
+        # Optional per-tick sidecar JSONL of what we published (headset-free
+        # replay / tuning). None -> disabled.
+        self._sidecar = open(sidecar_path, "w") if sidecar_path else None
+
     def reset_yaw(self):
         self.yaw_accumulator.reset()
+        if self._stick_filter is not None:
+            self._stick_filter.reset()
 
     def save_upper_body_position_target(self):
         self.feedback_reader.poll_feedback()
@@ -111,10 +212,57 @@ class Quest3PlannerStreamer:
 
     def run_once(self, stream_mode: StreamMode):
         try:
-            # --- button state (edge-triggered mode switching) -----------------
-            a, b, x, y = self.reader.get_buttons()
-            ev = self.button_sm.tick(a, b, x, y)
+            tick_now = time.monotonic()
+            dt_tick = self.dt if self._last_tick_t is None \
+                else max(1e-4, min(0.1, tick_now - self._last_tick_t))
+            self._last_tick_t = tick_now
 
+            # --- read all inputs once -----------------------------------------
+            a, b, x, y = self.reader.get_buttons()
+            lx, ly, rx, ry = self.reader.get_controller_axes()
+            lt, rt, lg, rg = self.reader.get_controller_inputs()
+
+            # per-axis stick inversion (was hardcoded before)
+            if self.invert_lx:
+                lx = -lx
+            if self.invert_ly:
+                ly = -ly
+            if self.invert_rx:
+                rx = -rx
+            if self.invert_ry:
+                ry = -ry
+
+            # --- Quest 3 input freshness gate (safety) ------------------------
+            # If the WS goes silent the reader keeps returning its last cached
+            # snapshot; without this the robot keeps walking on stale sticks.
+            vr_age_s = self.reader.get_last_message_age_s()
+            if self.vr_input_max_age_s > 0.0 and vr_age_s > self.vr_input_max_age_s:
+                lx = ly = rx = ry = 0.0
+                a = b = x = y = False
+                lt = rt = lg = rg = 0.0
+                if not self._vr_stale_active:
+                    log.warning(
+                        "[Quest3Planner] input stale: last WS packet %.2fs ago "
+                        "(threshold %.2fs); forcing sticks/buttons to neutral. "
+                        "Headset asleep, tab backgrounded, or WS dropped?",
+                        vr_age_s, self.vr_input_max_age_s,
+                    )
+                    self._vr_last_warn_t = tick_now
+                elif tick_now - self._vr_last_warn_t > 30.0:
+                    log.info("[Quest3Planner] input still stale (age %.1fs)", vr_age_s)
+                    self._vr_last_warn_t = tick_now
+                self._vr_stale_active = True
+            elif self._vr_stale_active:
+                log.info("[Quest3Planner] input recovered (age %.2fs); resuming", vr_age_s)
+                self._vr_stale_active = False
+
+            # --- stick smoothing (fwd<-ly, side<-lx, yaw<-rx) -----------------
+            if self._stick_filter is not None:
+                ly, lx, rx = self._stick_filter.step(
+                    stick_fwd=ly, stick_side=lx, stick_yaw=rx, dt=dt_tick)
+
+            # --- locomotion mode stepping (edge-triggered) --------------------
+            ev = self.button_sm.tick(a, b, x, y)
             if ev.ab_pressed:
                 self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
                 print(f"[Quest3Planner] Mode -> {self.mode.value}: {self.mode.name}")
@@ -122,13 +270,9 @@ class Quest3PlannerStreamer:
                 self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
                 print(f"[Quest3Planner] Mode -> {self.mode.value}: {self.mode.name}")
 
-            # --- joystick movement / facing -----------------------------------
-            lx, ly, rx, ry = self.reader.get_controller_axes()
-
-            # Log joystick + triggers periodically (every 0.5s, only when active)
+            # periodic input log (only when active)
             now = time.time()
             if now - self._last_axes_log > 0.5:
-                lt, rt, lg, rg = self.reader.get_controller_inputs()
                 has_stick = abs(lx) > JOYSTICK_DEADZONE or abs(ly) > JOYSTICK_DEADZONE or abs(rx) > JOYSTICK_DEADZONE or abs(ry) > JOYSTICK_DEADZONE
                 has_trigger = lt > 0.1 or rt > 0.1 or lg > 0.1 or rg > 0.1
                 if has_stick or has_trigger:
@@ -146,11 +290,19 @@ class Quest3PlannerStreamer:
             if mag == 0.0:
                 speed = -1.0
                 mode_to_send = LocomotionMode.IDLE
+                # reset the SLOW_WALK band so a resume from idle starts low
+                self._slow_walk_speed = _SLOW_WALK_LEVELS[0]
             else:
                 mode_to_send = self.mode
 
                 if self.mode == LocomotionMode.SLOW_WALK:
-                    speed = 0.1 + 0.5 * mag
+                    # discretize to 0.2 / 0.4 / 0.6 by stick magnitude (with
+                    # hysteresis) so movement_speed is stable and doesn't storm
+                    # the deploy's exact-`!=` replan trigger. See
+                    # _discretize_slow_walk_speed for the band edges.
+                    self._slow_walk_speed = _discretize_slow_walk_speed(
+                        mag, getattr(self, "_slow_walk_speed", _SLOW_WALK_LEVELS[0]))
+                    speed = self._slow_walk_speed
                 elif self.mode == LocomotionMode.WALK:
                     speed = -1.0
                 elif self.mode == LocomotionMode.RUN:
@@ -160,7 +312,11 @@ class Quest3PlannerStreamer:
 
             denom = raw_mag if raw_mag > 0.0 else 1.0
             scale = mag / denom
-            movement_local = np.array([-lx, ly]) * scale
+            # snap the movement direction to the nearest 8-way axis (facing
+            # frame) to kill near-cardinal angular wobble that storms the
+            # deploy's replan trigger; analog speed is unaffected.
+            snap_x, snap_y = _snap_dir_8way(-lx, ly, _STICK_SNAP_BAND_RAD)
+            movement_local = np.array([snap_x, snap_y]) * scale
             perp_x, perp_y = -facing[1], facing[0]
             rotation_facing = np.array([[perp_x, perp_y], [facing[0], facing[1]]])
             movement_global = rotation_facing @ movement_local
@@ -186,7 +342,7 @@ class Quest3PlannerStreamer:
                     vr_3pt_position = vr_3pt_pose[:, :3].flatten().tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                lt, rt, lg, rg = self.reader.get_controller_inputs()
+                # reuse the gated triggers read at the top of run_once
                 lh, rh = compute_hand_joints_from_inputs(
                     self.left_hand_ik_solver,
                     self.right_hand_ik_solver,
@@ -209,6 +365,18 @@ class Quest3PlannerStreamer:
                 vr_3pt_compliance=vr_3pt_compliance,
             )
             self.socket.send(msg)
+
+            # optional per-tick sidecar (headset-free replay / tuning)
+            if self._sidecar is not None:
+                self._sidecar.write(json.dumps({
+                    "t": tick_now, "stream_mode": stream_mode.name,
+                    "mode": int(mode_to_send.value), "speed": float(speed),
+                    "movement": [float(v) for v in movement],
+                    "facing": [float(v) for v in facing],
+                    "lx": float(lx), "ly": float(ly), "rx": float(rx),
+                    "vr_stale": bool(self._vr_stale_active), "vr_age_s": float(vr_age_s),
+                }) + "\n")
+                self._sidecar.flush()
 
         except Exception as e:
             import traceback
@@ -239,6 +407,14 @@ def run_quest3_manager(
     enable_vis_vr3pt: bool = False,
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
+    poll_hz: int = 50,
+    vr_input_max_age_s: float = 0.5,
+    invert_lx: bool = False,
+    invert_ly: bool = False,
+    invert_rx: bool = False,
+    invert_ry: bool = False,
+    stick_filter: bool = True,
+    sidecar_path: str | None = None,
 ):
     """Main manager loop for Quest 3 VR teleop.
 
@@ -291,9 +467,14 @@ def run_quest3_manager(
         socket=socket,
         reader=reader,
         three_point=three_point,
-        poll_hz=20,
+        poll_hz=poll_hz,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        vr_input_max_age_s=vr_input_max_age_s,
+        invert_lx=invert_lx, invert_ly=invert_ly,
+        invert_rx=invert_rx, invert_ry=invert_ry,
+        stick_filter_cfg=(_DEFAULT_STICK_FILTER if stick_filter else None),
+        sidecar_path=sidecar_path,
     )
 
     print("[Manager] Available locomotion modes:")
@@ -357,13 +538,15 @@ def run_quest3_manager(
             # -- send ZMQ command messages on transition ----------------------
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
+                    # Idle the robot but STAY RUNNING: the deploy treats this
+                    # stop command as a hold (operator_state.paused), not a
+                    # shutdown, so chord A+B+X+Y again to restart PLANNER and
+                    # keep capturing without relaunching. Ctrl-C fully quits.
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    print(f"[Manager] {current_mode.name} -> OFF (stopped)")
-                    break
+                    print(f"[Manager] {current_mode.name} -> OFF (idled; A+B+X+Y to restart, Ctrl-C to quit)")
                 else:
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-
-                print(f"[Manager] {current_mode.name} -> {new_mode.name}")
+                    print(f"[Manager] {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
     except KeyboardInterrupt:
@@ -371,6 +554,8 @@ def run_quest3_manager(
     finally:
         reader.stop()
         three_point.close()
+        if planner._sidecar is not None:
+            planner._sidecar.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -416,7 +601,24 @@ if __name__ == "__main__":
         "--waist-tracking", action="store_true",
         help="Enable waist tracking in VR 3pt visualization"
     )
+    # -- Phase A teleop upgrades (ported from the X2 stack) --
+    parser.add_argument("--poll-hz", type=int, default=50,
+                        help="Manager control rate (default 50; was 20)")
+    parser.add_argument("--vr-input-max-age-s", type=float, default=0.5,
+                        help="Snap sticks/buttons to neutral if the last WS packet "
+                             "is older than this (safety gate). 0 disables (default 0.5)")
+    parser.add_argument("--invert-lx", action="store_true", help="Invert left-stick X")
+    parser.add_argument("--invert-ly", action="store_true", help="Invert left-stick Y")
+    parser.add_argument("--invert-rx", action="store_true", help="Invert right-stick X")
+    parser.add_argument("--invert-ry", action="store_true", help="Invert right-stick Y")
+    parser.add_argument("--no-stick-filter", action="store_true",
+                        help="Disable stick smoothing (LPF+slew); default on")
+    parser.add_argument("--sidecar", type=str, default=None,
+                        help="Write a per-tick JSONL of published commands to this path")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
     run_quest3_manager(
         port=args.port,
@@ -428,4 +630,10 @@ if __name__ == "__main__":
         enable_vis_vr3pt=args.vis_vr3pt,
         with_g1_robot=not args.no_g1,
         enable_waist_tracking=args.waist_tracking,
+        poll_hz=args.poll_hz,
+        vr_input_max_age_s=args.vr_input_max_age_s,
+        invert_lx=args.invert_lx, invert_ly=args.invert_ly,
+        invert_rx=args.invert_rx, invert_ry=args.invert_ry,
+        stick_filter=not args.no_stick_filter,
+        sidecar_path=args.sidecar,
     )
