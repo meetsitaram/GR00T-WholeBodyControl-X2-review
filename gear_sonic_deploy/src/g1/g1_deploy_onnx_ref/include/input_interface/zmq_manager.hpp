@@ -339,14 +339,24 @@ class ZMQManager : public InputInterface {
         return;
       }
 
-      // Handle stop control
+      // Handle stop control -- operator idle/hold, NOT a shutdown. The deploy
+      // keeps running; the manager can send `start` again to resume without a
+      // relaunch. (Emergency-stop above still uses operator_state.stop = exit.)
       if (stop_control_) {
-        operator_state.stop = true;
-        if (planner_state.enabled) {
-          planner_state.enabled = false;
-          planner_state.initialized = false;
-        }
-        
+        operator_state.paused = true;
+        operator_state.start = false;  // reset so the next start re-engages
+        // NOTE: deliberately DO NOT tear down the planner here.
+        // Setting planner_state.enabled/initialized = false forced a full
+        // planner re-init on the next start. That re-init races: the start
+        // handler's wait loop breaks when current_motion->name flips to
+        // "planner_motion" BEFORE planner_state.initialized is set, so the
+        // subsequent "!initialized" check false-trips the
+        // "Planner failed to initialize -> operator_state.stop" path and the
+        // deploy exits on restart. Leaving the planner initialized lets the
+        // resume fast-path in the start handler re-engage cleanly. The manager
+        // stops streaming planner messages on OFF, so the planner times out to
+        // IDLE and Control() holds the robot while paused.
+
         // Clear planner buffer on stop
         {
           std::lock_guard<std::mutex> lock(planner_mutex_);
@@ -526,10 +536,28 @@ class ZMQManager : public InputInterface {
       // Handle start control
       if (start_control_ && !operator_state.start) {
         operator_state.start = true;
+        operator_state.paused = false;  // resume from an operator idle/hold
         {
           std::lock_guard<std::mutex> lock(current_motion_mutex);
           operator_state.play = false;
           reinitialize_heading = true;
+        }
+
+        // Resume-from-idle fast path: the planner is no longer torn down on
+        // pause, so on restart it is still enabled+initialized. Re-engage
+        // playback directly and skip the re-init wait loop below, which can
+        // observe current_motion->name == "planner_motion" before
+        // planner_state.initialized is set and false-trip the
+        // "failed to initialize -> stop" path (this killed the deploy on the
+        // A+B+X+Y restart chord).
+        if (planner_state.enabled && planner_state.initialized) {
+          is_planner_ready_ = true;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = true;
+          }
+          std::cout << "[ZMQManager] Resumed from idle (planner already initialized)" << std::endl;
+          return;
         }
 
         // Ensure planner is enabled

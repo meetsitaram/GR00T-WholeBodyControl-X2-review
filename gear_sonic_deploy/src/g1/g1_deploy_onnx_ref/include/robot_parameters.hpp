@@ -64,9 +64,13 @@ struct HeadingState {
  * @brief High-level operator signals (set by input interfaces, read by control loop).
  */
 struct OperatorState {
-  bool stop = false;   ///< Emergency stop requested.
+  bool stop = false;   ///< Emergency stop / shutdown requested (exits the deploy).
   bool start = false;  ///< Control-system start requested.
   bool play = false;   ///< Motion playback active.
+  bool paused = false; ///< Operator idle/hold: policy stops issuing commands but
+                       ///< the deploy KEEPS RUNNING (unlike `stop`). Set by the
+                       ///< manager's stop command so the operator can idle and
+                       ///< restart without relaunching the deploy.
 };
 
 /**

@@ -58,6 +58,7 @@
 #include <chrono>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 #include <fstream>
@@ -3795,7 +3796,9 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
-      if (operator_state.stop) { return; }
+      // `stop` exits the deploy (main loop); `paused` just idles the policy
+      // (robot holds) while the process stays alive for a later restart.
+      if (operator_state.stop || operator_state.paused) { return; }
 
       switch (program_state_) {
         case ProgramState::INIT:
@@ -4036,7 +4039,11 @@ class G1Deploy {
             return;
           }
 
-          if (logging_counter_ % 50 == 0) {
+          // Per-tick loop-timing log is throttled to every 50 ticks (~1/s).
+          // Set G1_QUIET_TIMING=1 to mute it entirely (e.g. during keyboard
+          // motion capture where it clutters the input terminal).
+          static const bool quiet_timing = std::getenv("G1_QUIET_TIMING") != nullptr;
+          if (logging_counter_ % 50 == 0 && !quiet_timing) {
             auto control_loop_end_time = std::chrono::steady_clock::now();
             auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
             auto policy_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);

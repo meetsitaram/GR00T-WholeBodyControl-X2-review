@@ -116,6 +116,13 @@ class SimpleKeyboard : public InputInterface {
     double movement_momentum = 0.0;
     const double momentum_decay_rate = 0.999;  ///< Per-frame multiplicative decay.
     const double momentum_threshold = 0.1;     ///< Below this, transition to IDLE.
+    /// A/D adjust-turn step per input event (rad). Was 0.1 (too aggressive on
+    /// long-press). Lower = gentler turns; raise for snappier turning.
+    const double adj_turn_step_rad = 0.03;
+    /// Hard cap on the accumulated A/D facing angle, ± each side (rad).
+    /// M_PI/2 = 90 deg: the robot can face at most 90 deg left/right of its
+    /// engage heading and won't spin past that on long-press.
+    const double adj_turn_max_rad = M_PI / 2;
 
     /**
      * @brief Construct the keyboard handler.
@@ -582,7 +589,7 @@ class SimpleKeyboard : public InputInterface {
               movement_key_pressed = true;
           }
           if (this->planner_move_adj_left && !is_static_motion_mode(planner_use_movement_mode)) {
-              planner_facing_angle += 0.1;
+              planner_facing_angle = std::fmin(planner_facing_angle + adj_turn_step_rad, adj_turn_max_rad);
               local_facing_direction[0] = cos(planner_facing_angle);
               local_facing_direction[1] = sin(planner_facing_angle);
               local_facing_direction[2] = 0.0f;
@@ -593,7 +600,7 @@ class SimpleKeyboard : public InputInterface {
               movement_key_pressed = true;
           }
           if (this->planner_move_adj_right && !is_static_motion_mode(planner_use_movement_mode)) {
-              planner_facing_angle -= 0.1;
+              planner_facing_angle = std::fmax(planner_facing_angle - adj_turn_step_rad, -adj_turn_max_rad);
               local_facing_direction[0] = cos(planner_facing_angle);
               local_facing_direction[1] = sin(planner_facing_angle);
               local_facing_direction[2] = 0.0f;
