@@ -364,7 +364,18 @@ class G1OnnxPolicyShim(torch.nn.Module):
 
         robot = self.env.scene["robot"]
         cmd = self.env.command_manager.get_term(self.command_name)
-        n = self.env.num_envs
+
+        # Use the motion-lib's GLOBAL per-env current motion ids (updated every
+        # env-loop by forward_motion_samples). cmd.motion_ids is env-local
+        # (0..num_envs-1) and constant across loops, so it can't key clips here.
+        cur = cmd.motion_lib._curr_motion_ids
+        ids = cur.detach().cpu().numpy()
+        lens = cmd.motion_lib.get_motion_num_steps(cur).detach().cpu().numpy()
+
+        # Size per-env state to the ACTUAL id array length. IsaacLab can round an
+        # odd num_envs up to a grid, so self.env.num_envs may exceed len(ids);
+        # keying off len(ids) (and the min-cap below) avoids an IndexError.
+        n = len(ids)
         if self._rec_state is None:
             os.makedirs(self._rec_dir, exist_ok=True)
             names = list(robot.data.joint_names)  # IsaacLab order
@@ -380,19 +391,13 @@ class G1OnnxPolicyShim(torch.nn.Module):
             }
         st = self._rec_state
 
-        # Use the motion-lib's GLOBAL per-env current motion ids (updated every
-        # env-loop by forward_motion_samples). cmd.motion_ids is env-local
-        # (0..num_envs-1) and constant across loops, so it can't key clips here.
-        cur = cmd.motion_lib._curr_motion_ids
-        ids = cur.detach().cpu().numpy()
-        lens = cmd.motion_lib.get_motion_num_steps(cur).detach().cpu().numpy()
         origins = self.env.scene.env_origins.detach().cpu().numpy()
         root = (robot.data.root_pos_w.detach().cpu().numpy() - origins) * 100.0  # cm
         quat_wxyz = robot.data.root_quat_w.detach().cpu().numpy()
         eul = R.from_quat(quat_wxyz[:, [1, 2, 3, 0]]).as_euler("xyz", degrees=True)
         jp = np.rad2deg(robot.data.joint_pos.detach().cpu().numpy())[:, self._soma_reindex]
 
-        for i in range(n):
+        for i in range(min(n, len(st["mid"]), len(root))):
             if ids[i] != st["mid"][i]:  # a new clip was assigned to this env
                 if st["buf"][i] is not None and not st["done"][i]:
                     self._flush_clip(i)  # safety: flush an unfinished prior clip
