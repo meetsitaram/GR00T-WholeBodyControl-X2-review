@@ -12,12 +12,14 @@ feasibility oracle**, then quantify how much compute we'd save.
 > train X2 SONIC** — deferred until Phase 1 is fully complete. So steps (e)–(g) below are
 > Phase 2; the *experiment* ends at the G1 metrics + the dumped feasible G1 corpus.
 >
-> **PILOT VALIDATED (2026-07-11):** ran `im_eval` on 34 X2 teleop clips, **34 parallel envs,
-> ~1.5 min, no new code** → `metrics_eval.json` gave per-motion `progress`/`terminated`/
-> `failed_keys` = **Metric 1 for free** (33/34 success). Confirms the vectorized-eval approach
-> scales. Two gaps to close for the real run: (i) enable **Metric 2 (MPJPE deviation)** output
-> in `im_eval` (not in the pilot JSON — needs a `log_keys`/config flag or a small extension);
-> (ii) **dump executed trajectories** (the callback already has `all_body_pos_pred`).
+> **MECHANISM DRY-RUN (2026-07-11) — X2 assets, NOT part of this experiment:** to prove the
+> vectorized `im_eval` sweep works, we ran it in **34 parallel envs, ~1.5 min, no new code**
+> (on convenient X2 stand-in assets) → `metrics_eval.json` emitted per-motion
+> `progress`/`terminated`/`failed_keys` = **Metric 1 for free**. This only validates the
+> *mechanism + metric keys*; **the experiment redoes it as G1 policy on G1 references (no X2).**
+> Two gaps to close for the real G1 run: (i) enable **Metric 2 (MPJPE deviation)** output in
+> `im_eval` (needs a `log_keys`/config flag or small extension); (ii) **dump executed
+> trajectories** (the callback already has `all_body_pos_pred`).
 > Also confirmed: the **stock G1 policy is framework-native** (encoder/decoder ONNX,
 > `policy/release/{model_encoder,model_decoder}.onnx`, obs config in this framework's
 > vocabulary — `token_state`, `his_body_joint_positions_*`, `motion_joint_positions_*`,
@@ -300,6 +302,46 @@ Do **one category** end-to-end before scaling:
    on the pilot so the classifier matches visual judgment.
 
 ---
+
+## 6b. ⚠️ CRITICAL: policy-failure vs motion-infeasibility (the false-negative problem)
+**The central methodological risk (user insight, 2026-07-11):** `terminated` (our SUCCESS
+signal) does NOT purely mean "infeasible." It conflates:
+- **(a) genuine infeasibility** — the G1 reference is physically impossible → the robot falls /
+  diverges hard → correctly filtered OUT.
+- **(b) policy false-negative** — the reference IS feasible (e.g. a motion a robot has actually
+  executed) but the *oracle policy* can't track it → terminates on a threshold → **wrongly
+  filtered out.**
+
+If we filter naïvely on `terminated`, we throw away **learnable, feasible G1 motions** the
+oracle merely struggles with — the opposite of what we want.
+
+**Implications for the G1 experiment:**
+1. The filter's **false-negative rate = the stock G1 policy's tracking-failure rate on
+   feasible motions.** A strong oracle (the point of using stock G1 SONIC) minimizes this, but
+   do NOT assume zero — verify it.
+2. **Distinguish the two failure modes — don't drop on `terminated` alone:**
+   - **Genuine infeasible** ⇒ hard fall: large pelvis tilt / height collapse / runaway tracking
+     error near the fail frame.
+   - **Policy false-negative** ⇒ clean reference (low ref tilt, normal kinematics), moderate
+     deviation, terminates on a soft threshold. **Keep these** — feasible, just hard (exactly
+     the learnable clips a downstream training wants).
+   - Classify using **Metric 2 (deviation) + fall-severity at the fail frame + the reference's
+     own kinematics**. Consider: only DROP on catastrophic fall; for soft-threshold terminations,
+     KEEP (or flag for review).
+3. **Sanity-check the filter on known-feasible G1 motions:** feed the G1 sweep motions we KNOW
+   are executable (e.g. G1-recorded / teleoped clips **on G1**) — they should nearly all pass.
+   A high false-negative rate there means the **oracle is too weak OR the G1 env termination
+   conditions are miscalibrated** (§6 open Q4) → fix before trusting the filter.
+4. **Eval start-state matters:** training uses RSI (random start); a deterministic frame-0 eval
+   can hit a mid-clip hard segment from a worse state than training ever did. Evaluate each
+   motion from a few start offsets and take the best/most-common outcome so one unlucky rollout
+   doesn't false-fail a feasible clip.
+
+> NOTE: this insight surfaced from an **X2-only mechanism dry-run** of `im_eval` (a clean,
+> robot-recorded reference got terminated by the policy despite being feasible). The dry-run is
+> **not part of this experiment** — it only validated that the vectorized `im_eval` sweep runs
+> and emits the feasibility metrics. The experiment itself is **G1 policy on G1 references,
+> X2 entirely excluded** until Phase 2.
 
 ## 7. Risks / caveats (be honest in the writeup)
 - **G1-feasible ≠ X2-feasible.** Different height (G1 1.70 vs X2 1.40), leg length, wrist
