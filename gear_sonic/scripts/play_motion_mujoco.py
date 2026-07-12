@@ -138,8 +138,9 @@ def _validate(motion: dict) -> None:
                 f"present: {sorted(motion.keys())}"
             )
     dof = np.asarray(motion["dof"])
-    if dof.ndim != 2 or dof.shape[1] != NUM_DOFS:
-        raise ValueError(f"dof must be (T, {NUM_DOFS}); got {dof.shape}")
+    if dof.ndim != 2:
+        raise ValueError(f"dof must be 2-D (T, n_dofs); got {dof.shape}")
+    # DOF count is validated against the loaded MJCF in play() (robot-agnostic).
 
 
 def _xyzw_to_wxyz(q_xyzw: np.ndarray) -> np.ndarray:
@@ -189,10 +190,12 @@ def play(
     print(f"[play_motion] loading MJCF {mjcf_path}", flush=True)
 
     model = mujoco.MjModel.from_xml_path(str(mjcf_path))
-    if model.nq < 7 + NUM_DOFS:
+    # Robot-agnostic: derive the actuated-DOF count from the MJCF (free root = 7).
+    n_dofs = model.nq - 7
+    if dof.shape[1] != n_dofs:
         print(
-            f"[play_motion] ERROR: MJCF nq={model.nq} but expected at least "
-            f"{7 + NUM_DOFS} (free root + {NUM_DOFS} DOF)",
+            f"[play_motion] ERROR: motion has {dof.shape[1]} DOF but MJCF "
+            f"{mjcf_path.name} expects {n_dofs} (nq={model.nq} - 7 free root).",
             file=sys.stderr,
         )
         return 1
@@ -211,7 +214,7 @@ def play(
 
             data_mj.qpos[:3] = root_pos[frame_idx]
             data_mj.qpos[3:7] = _xyzw_to_wxyz(root_quat_xyzw[frame_idx])
-            data_mj.qpos[7 : 7 + NUM_DOFS] = dof[frame_idx]
+            data_mj.qpos[7 : 7 + n_dofs] = dof[frame_idx]
             data_mj.qvel[:] = 0.0
             mujoco.mj_kinematics(model, data_mj)
             mujoco.mj_comPos(model, data_mj)
