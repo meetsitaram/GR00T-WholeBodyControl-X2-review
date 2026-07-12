@@ -25,6 +25,46 @@ feasibility oracle**, then quantify how much compute we'd save.
 > adapter needed** (STEP 0 path (a) is clean; disregard the batched-MuJoCo fallback unless
 > obs surprises appear).
 
+### Pilot findings — HOW SUCCESS IS MEASURED + how to visualize (2026-07-11)
+**Success metric (= Metric 1, feasibility) — confirmed by reading the eval loop + pilot output:**
+- **SUCCESS ⇔ the episode was NOT `terminated`** — i.e. the robot completed the whole clip
+  without hitting any env termination condition (fall / tracking-divergence / anchor-orientation
+  / foot-position / etc.). **`progress`** = fraction of the clip reached before termination
+  (`1.0` = full clip).
+- Pilot proof (34 X2 teleop clips, fine-tuned model): 33/34 SUCCESS (all `terminated=False`,
+  `progress=1.0`); the single FAIL `slow_walk_mid_keyboard_003` (idx 15) had
+  **`terminated=True, progress=0.65`** — it fell ~65% through. `success_rate=0.9706`,
+  `progress_rate=0.9897`.
+- **For the G1 sweep this is exactly the filter:** `terminated=False` ⇒ **feasible** (keep +
+  record the executed motion); `terminated=True` ⇒ **infeasible** (drop). `progress` gives a
+  graded "how far did it get" signal for the FAIL bucket.
+- **`metrics_eval.json` keys** (written to `eval_output_dir`): `eval/success/success_rate`,
+  `eval/success/progress_rate`, `eval/all_metrics_dict.{terminated, progress, motion_keys,
+  sampling_prob}`, `failed_keys`, `failed_idxes`.
+- ⚠️ **The `terminated` flag is only as good as the env's termination conditions.** Inspect /
+  calibrate them for the G1 env (height, `anchor_ori_full`, `foot_pos_xyz`, tracking-error
+  thresholds) so "infeasible" matches intent — a too-lenient termination keeps bad motions;
+  too-strict drops learnable ones. `terminated` is the oracle; know what trips it.
+- **Metric 2 (MPJPE deviation) is computed internally** (`im_eval_callback.py` tracks
+  `self.mpjpe` = `env.dif_global_body_pos.norm()*1000` mm) **but was NOT saved in the pilot
+  JSON** — enable it via `log_keys` / a small callback tweak so per-motion MPJPE lands in
+  `metrics_eval.json` (this is the "tracked-but-poor" signal for survivors).
+
+**Visualizing generated (executed) vs input (reference) in a kinematic MuJoCo viewer:**
+`im_eval` does **not** dump executed trajectories today (only metrics), so there is nothing to
+view yet — this is the **same trajectory-dump gap** as Metric 2 / the retarget data. To enable:
+1. Extend `im_eval_callback.py` to **save each env's executed root+dof trajectory** to a motion
+   PKL (the callback already has the predicted body state via `self.pred_pos` /
+   `env.dif_global_body_pos`; add the root+joint qpos capture + a `joblib.dump`).
+2. Then view side-by-side: **`gear_sonic/scripts/play_x2_motion_mujoco.py --motion <executed.pkl>`**
+   in one window and `--motion <input.pkl>` in another (pure `mj_forward` kinematic, no policy),
+   or the soma-retargeter **`scripts/view_g1_x2.py`** for a merged multi-robot view. For G1 use
+   the G1-MJCF kinematic viewer equivalent.
+3. One-at-a-time spot check (no dump needed, does NOT scale): play a clip through the deploy
+   SONIC stack + `record_motion_to_pkl.py`, then view the recorded PKL beside the input.
+> The executed-trajectory dump is the single highest-value next code change: it unlocks
+> Metric 2, the visualization, AND the Phase-2 retarget data all at once.
+
 ---
 
 ## 1. Hypothesis
