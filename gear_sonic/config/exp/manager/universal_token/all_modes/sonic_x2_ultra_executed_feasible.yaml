@@ -1,0 +1,79 @@
+# @package _global_
+# SONIC X2 Ultra — fine-tune on the G1-SONIC EXECUTED-FEASIBLE corpus.
+#
+# Corpus = gear_sonic/data/motions/x2_sonic_executed_feasible.pkl
+#   35,974 clips @ 50fps, dof=31:
+#     - 35,940 G1-SONIC *executed* (dynamically-consistent) bones-seed motions
+#       that survived the G1-SONIC feasibility filter, retargeted G1->X2 with
+#       the pin-root/+4.4cm-foot-offset config (single normal config; the
+#       floor-clamp variant was measured WORSE for ground poses).
+#     - 34 teleop walk clips (slow/medium/regular; VR + keyboard) merged from
+#       x2_teleop_g1recorded_v1.pkl.
+#   See docs/experiments/x2_sonic_executed_feasible_finetune.md for provenance.
+#
+# Every clip is a trajectory the G1 robot ACTUALLY EXECUTED in sim, so the
+# corpus is already implicitly feasibility-curated (the compute-saving
+# alternative to a curriculum filter on the raw retarget).
+#
+# ENV/OBS/REWARD RECIPE: this inherits the sphere-feet base and re-applies the
+# same two overrides + four reward-weight boosts that the iter-1376 warm-start
+# checkpoint was trained under (level0_4_pd KP/KD DR, local_dir_hist_v2 obs
+# noise, orientation-reward boost), so the RunningMeanStd obs-normalization and
+# reward balance carry over cleanly from the warm start. These are recipe
+# settings (DR / obs-noise / reward weights), independent of any retargeting
+# method. We override ONLY the corpus, names, and iteration budget.
+#
+# CAVEAT / WATCH-ITEM: the executed corpus KEEPS some ground/lying motions
+# (e.g. faint_stand_up) that an upright-pelvis curriculum would drop. The
+# orientation-reward boosts below prefer an upright pelvis and may fight those
+# clips. Watch Env/Episode_Termination/anchor_ori_full: if it climbs, drop the
+# four reward-weight overrides back to the sphere_feet base values (one edit).
+#
+# LEARNING RATE: the active mechanism is KL-ADAPTIVE (algo.config.schedule:
+# adaptive, desired_kl 0.01) -- NOT fixed, NOT cosine. Each PPO update the actor
+# LR is nudged to hold KL ~= 0.01, bounded [adaptive_lr_min 1e-5, adaptive_lr_max
+# 2e-4], starting from actor_learning_rate 2e-5. For this 30k warm-start we cap
+# adaptive_lr_max lower (1e-4) to protect the base policy over a long run. See
+# the run-plan doc's LR section for the cosine-decay option (a code change, not
+# a config flip -- KL-adaptive overwrites the param-group LR each update).
+#
+# Warm start (supplied by the launcher via +checkpoint=, NOT here):
+#   ~/x2_cloud_checkpoints/chain_matched_v3_iter_001376/model_step_001376.pt
+#   (the .pt trainable checkpoint -- NOT the exported ONNX; weight-only load,
+#    fresh optimizer/LR -- see train-on-cloud.md section 10).
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet
+  - override /manager_env/events: tracking/level0_4_pd
+  - override /manager_env/observations/policy: local_dir_hist_v2
+  - _self_
+
+exp_var: executed_feasible_v1
+project_name: TRL_X2Ultra_ExecutedFeasible
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_sonic_executed_feasible.pkl
+  rewards:
+    tracking_anchor_ori:
+      weight: 1.5
+    tracking_relative_body_ori:
+      weight: 2.0
+    tracking_body_angvel:
+      weight: 2.0
+    anti_shake_ang_vel:
+      weight: -0.02
+
+algo:
+  config:
+    # 30k iters on the warm start. ~9s/iter at NUM_ENVS=12288 on 8x H100 =>
+    # ~75h; watch the metrics and early-stop when converged.
+    num_learning_iterations: 30000
+    # Protect the warm-started base policy over a long run: cap how high the
+    # KL-adaptive controller can drive the actor LR (base default is 2e-4).
+    adaptive_lr_max: 1.0e-4
+
+# Numbered checkpoints (model_step_NNNNNN.pt) stay at the default 2000-iter
+# cadence -> ~15 over the 30k run, on top of the rolling last.pt.

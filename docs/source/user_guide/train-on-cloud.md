@@ -136,6 +136,58 @@ recipe is stable.
 > path (image family, subnet, SSH key, bootstrap), then scale up to 8x
 > with confidence.
 
+## 2b. Credentials the node needs — set up BEFORE cloning or launching
+
+The bootstrap (§3) **clones the repo**, and the training run **logs to W&B**, so
+the node needs two credentials in place *first*. Skipping either is the most
+common cold-start stall:
+
+- **Private repo → the HTTPS `git clone` hangs**, waiting for a
+  username/password it can't prompt for in a detached tmux (`Cloning into
+  ...` sits forever, `.git` created but empty — see B.16).
+- **Missing W&B creds → `USE_WANDB=True` aborts** the run at startup.
+
+Do this immediately after SSH works (§A.3 / §2) and *before* bootstrap.
+
+### GitHub (required if the repo is private)
+
+The bootstrap clones over **HTTPS**, so the node needs an HTTPS credential with
+`repo` scope. The cleanest source is your local `gh` auth:
+
+```bash
+# (local) extract your GitHub token — must have 'repo' scope for a private clone
+TOKEN=$(gh auth token)                 # or a PAT from github.com/settings/tokens
+
+# write it into the node's git credential store (token via stdin, not argv/logs)
+printf 'https://<your-gh-user>:%s@github.com\n' "$TOKEN" | \
+  ssh ubuntu@$PUBLIC_IP 'umask 077; cat > ~/.git-credentials; \
+    git config --global credential.helper store'
+
+# VERIFY the node can read the private repo BEFORE bootstrap:
+ssh ubuntu@$PUBLIC_IP \
+  'git ls-remote https://github.com/<fork>/GR00T-WholeBodyControl.git HEAD'
+# a 40-char SHA => auth works;  a hang or 401 => token missing/wrong scope
+```
+
+Copying `~/.config/gh/hosts.yml` alone is **not** enough — `gh`'s token often
+lives in the OS keyring, not that file, and git's HTTPS transport doesn't
+consult `gh` unless you run `gh auth setup-git`. The `~/.git-credentials` +
+`credential.helper store` route above is the reliable one. (A public repo needs
+none of this — the clone works anonymously.)
+
+### W&B (required when `USE_WANDB=True`)
+
+Copy your local W&B key so the run can log (else it aborts at startup):
+
+```bash
+scp ~/.netrc ubuntu@$PUBLIC_IP:~/.netrc          # holds the api.wandb.ai key
+ssh ubuntu@$PUBLIC_IP 'chmod 600 ~/.netrc'
+# ...or, interactively on the node: wandb login
+```
+
+Confirm both are in place, then proceed to §3. (Setting `USE_WANDB=False`
+skips the W&B requirement but not the git one.)
+
 ## 3. Install Isaac Lab and create the conda env
 
 > **Tip — one-shot bootstrap.** If you're starting from a fresh boot disk
@@ -1373,4 +1425,34 @@ cat /tmp/nccl_dbg/*/attempt_0/0/stderr.log    # rank-0 actual traceback
 grep -n "NCCL prime-barrier" gear_sonic/train_agent_trl.py
 # Expect: a block comment + `accelerator.wait_for_everyone()` right
 # after the Accelerator() construction (around line 188-207).
+```
+
+### B.16. Private-repo `git clone` hangs on a fresh node (no git credentials)
+
+On a **private** fork, the bootstrap's HTTPS `git clone` (Phase 11) can hang
+indefinitely — the log sits at `Cloning into '.../GR00T-WholeBodyControl'...`,
+the target dir exists with only an (empty) `.git`, and the bootstrap never
+advances. It's blocked waiting for a username/password it can't prompt for in a
+detached tmux. Telltales:
+
+```bash
+ssh ubuntu@$PUBLIC_IP 'pgrep -af git-remote-https; ls -a ~/GR00T-WholeBodyControl'
+# a live git-remote-https + a dir containing only .git  => hung on auth
+```
+
+**Prevent it** by setting up git credentials *before* bootstrap — see §2b. The
+reliable route is `~/.git-credentials` + `credential.helper store`; copying
+`gh`'s `hosts.yml` is not enough (its token is usually in the OS keyring, and
+git's HTTPS transport won't use `gh` without `gh auth setup-git`).
+
+**Recover** if you already hit the hang:
+
+```bash
+# 1. kill the hung clone (kill the bootstrap tmux; git auto-removes the partial dir)
+ssh ubuntu@$PUBLIC_IP 'tmux kill-session -t bootstrap'
+#    (do NOT `pkill -f "git clone --branch <b>"` from your workstation — that
+#     string is in your own ssh argv and the pattern kills your session.)
+# 2. set up git credentials (§2b) and verify with `git ls-remote`
+# 3. restart bootstrap — it's idempotent (skips conda/isaacsim/isaaclab) and
+#    re-clones with working auth
 ```
