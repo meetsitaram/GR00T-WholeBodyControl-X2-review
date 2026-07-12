@@ -164,7 +164,44 @@ clean rate of easy clips. Labels are semantically correct: INFEASIBLE = jumps /
 handstands / fast dance (fall mid-clip); POOR-POSE = crawls / deep crouches / stretches
 (complete but poor pose); BASE-MOBILE = footwork dances (pose tracked, base wanders).
 
-**Headline:** ~34% of the corpus (9% infeasible + 25% poor-pose) is where
-feasibility-filtering + executed-recording saves training gradient — the raw retarget
-would burn it chasing targets the robot can't hit; the executed motion encodes the
-achievable version (shallower crouch, realistic footwork, honest stride).
+**Full corpus — feasibility over all 37,968 planner clips (2026-07-12).** Metric-1
+sweep (2048 envs, length-sorted, no recording), ~55 min, one process:
+
+| category | n | infeasible | feasible | mean progress |
+| -------- | ----- | ---------- | -------- | ------------- |
+| locowalk | 18,036 | 1.4% | 98.6% | 0.990 |
+| locomanip | 9,712 | 5.2% | 94.8% | 0.963 |
+| locopost | 8,752 | **34.7%** | 65.3% | 0.742 |
+| locobal | 1,468 | 6.8% | 93.2% | 0.952 |
+| **total** | **37,968** | **10.2%** | **89.8%** | — |
+
+A 500-per-category sample predicted every rate to within ~2% (1 / 3 / 32 / 6%), so the
+sampling was sound. Infeasible motions are all sensible: handstands (fall at ~2%),
+heavy two-hand manipulations, ground descents (sits / deep crouches / cartwheels),
+jumps, single-foot balance — concentrated in **locopost** (35% infeasible; only 8%
+CLEAN in the sample).
+
+**Headline:** **~28% of the corpus (~10% infeasible + ~18% poor-pose) is wasted or
+degraded gradient if trained on the raw retarget** — the tracker burns it chasing
+targets the robot can't hit; the executed motion encodes the achievable version
+(shallower crouch, realistic footwork, honest ~9% understep). The gain is concentrated
+in posture/ground motions (locopost) and negligible for walking (locowalk 98.6% clean).
+
+## 6. Recorded executed corpus (Phase-2 data)
+
+Metric 1 needs no recording, but the *executed* trajectories (for Phase-2 G1→X2
+retarget/fine-tune and full-corpus Metric 2) require the recorder (`G1_SHIM_RECORD_DIR`).
+Two recorder correctness rules (both hard-won):
+
+- **Write once per clip, at its length** — not a periodic full-CSV rewrite (that was
+  O(clip-length²) I/O and made long dance-card clips crawl).
+- **Key by the motion-lib's global `_curr_motion_ids`, not `cmd.motion_ids`** — the
+  latter is env-local (0..num_envs-1) and constant across env-loops, so it mislabels
+  clips once the sweep spans more than one env-loop.
+
+To keep it bulletproof, run the recorded pass in **single-env-loop chunks**
+(`num_envs ≥ chunk_size`, e.g. 2048 clips/chunk): every feasible clip reaches its length
+within its chunk and flushes exactly once; there are no cross-loop reassignments to get
+wrong, and it avoids a physics CUDA-assert seen at multi-loop transitions. Filter the
+recorded CSVs to the feasible set (from `metrics_eval.json`) to get the clean,
+dynamically-consistent training corpus.

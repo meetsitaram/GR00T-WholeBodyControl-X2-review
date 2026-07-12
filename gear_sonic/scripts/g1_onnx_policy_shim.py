@@ -207,9 +207,7 @@ class G1OnnxPolicyShim(torch.nn.Module):
 
         # optional executed-trajectory recording (env var G1_SHIM_RECORD_DIR)
         self._rec_dir = os.environ.get("G1_SHIM_RECORD_DIR")
-        self._rec = None  # {env_idx: {"root": [], "quat": [], "dof": []}}
-        self._rec_keys = None  # env_idx -> clip key
-        self._rec_step = 0
+        self._rec_state = None  # lazily-built per-env recording state (see _record_step)
 
         # Sanity: the ONNX I/O dims must match our offset maps.
         enc_shape = self.encoder.get_inputs()[0].shape
@@ -354,51 +352,81 @@ class G1OnnxPolicyShim(torch.nn.Module):
     ]
 
     def _record_step(self):
-        """Capture the robot's current executed pose for each env (soma order)."""
-        robot = self.env.scene["robot"]
-        if self._rec is None:
-            names = list(robot.data.joint_names)  # IsaacLab order
-            self._soma_reindex = [names.index(j) for j in self._SOMA_JOINTS]
-            self._rec = {i: {"root": [], "eul": [], "dof": []} for i in range(self.env.num_envs)}
-            cmd = self.env.command_manager.get_term(self.command_name)
-            ids = cmd.motion_ids.detach().cpu().numpy()
-            keys = cmd.motion_lib._motion_data_keys
-            self._rec_keys = {i: str(keys[ids[i]]) for i in range(self.env.num_envs)}
+        """Record each env's executed pose, ONE CSV per clip.
+
+        Correct across multiple ``im_eval`` env-loops: between loops the envs are
+        reassigned to new clips, so we key each env by its CURRENT motion id and
+        start a fresh clip whenever it changes. Each clip's CSV is written exactly
+        once, when the clip reaches its length -- O(frames) I/O, not the O(frames^2)
+        of repeatedly rewriting a growing CSV. Buffers are freed on flush.
+        """
         from scipy.spatial.transform import Rotation as R
 
-        origins = self.env.scene.env_origins.detach().cpu().numpy()  # (N,3)
+        robot = self.env.scene["robot"]
+        cmd = self.env.command_manager.get_term(self.command_name)
+        n = self.env.num_envs
+        if self._rec_state is None:
+            os.makedirs(self._rec_dir, exist_ok=True)
+            names = list(robot.data.joint_names)  # IsaacLab order
+            self._soma_reindex = [names.index(j) for j in self._SOMA_JOINTS]
+            self._rec_state = {
+                "mid": np.full(n, -1, dtype=np.int64),  # current motion id per env
+                "key": [None] * n,
+                "buf": [None] * n,  # {"root","eul","dof"} lists for the current clip
+                "len": np.zeros(n, dtype=np.int64),  # clip length (eval steps)
+                "step": np.zeros(n, dtype=np.int64),  # frames recorded for current clip
+                "done": np.zeros(n, dtype=bool),  # clip already flushed
+                "keys": cmd.motion_lib._motion_data_keys,
+            }
+        st = self._rec_state
+
+        # Use the motion-lib's GLOBAL per-env current motion ids (updated every
+        # env-loop by forward_motion_samples). cmd.motion_ids is env-local
+        # (0..num_envs-1) and constant across loops, so it can't key clips here.
+        cur = cmd.motion_lib._curr_motion_ids
+        ids = cur.detach().cpu().numpy()
+        lens = cmd.motion_lib.get_motion_num_steps(cur).detach().cpu().numpy()
+        origins = self.env.scene.env_origins.detach().cpu().numpy()
         root = (robot.data.root_pos_w.detach().cpu().numpy() - origins) * 100.0  # cm
         quat_wxyz = robot.data.root_quat_w.detach().cpu().numpy()
-        quat_xyzw = quat_wxyz[:, [1, 2, 3, 0]]
-        eul = R.from_quat(quat_xyzw).as_euler("xyz", degrees=True)  # (N,3)
+        eul = R.from_quat(quat_wxyz[:, [1, 2, 3, 0]]).as_euler("xyz", degrees=True)
         jp = np.rad2deg(robot.data.joint_pos.detach().cpu().numpy())[:, self._soma_reindex]
-        for i in range(self.env.num_envs):
-            self._rec[i]["root"].append(root[i])
-            self._rec[i]["eul"].append(eul[i])
-            self._rec[i]["dof"].append(jp[i])
-        self._rec_step += 1
-        if self._rec_step % 50 == 0:
-            self._dump_records()
 
-    def _dump_records(self):
-        if not self._rec:
+        for i in range(n):
+            if ids[i] != st["mid"][i]:  # a new clip was assigned to this env
+                if st["buf"][i] is not None and not st["done"][i]:
+                    self._flush_clip(i)  # safety: flush an unfinished prior clip
+                st["mid"][i] = ids[i]
+                st["key"][i] = str(st["keys"][ids[i]])
+                st["len"][i] = int(lens[i])
+                st["step"][i] = 0
+                st["done"][i] = False
+                st["buf"][i] = {"root": [], "eul": [], "dof": []}
+            if st["done"][i]:
+                continue
+            b = st["buf"][i]
+            b["root"].append(root[i]); b["eul"].append(eul[i]); b["dof"].append(jp[i])
+            st["step"][i] += 1
+            if st["step"][i] >= st["len"][i]:  # clip complete -> write once
+                self._flush_clip(i)
+                st["done"][i] = True
+
+    def _flush_clip(self, i):
+        st = self._rec_state
+        buf = st["buf"][i]
+        if not buf or not buf["root"]:
             return
-        os.makedirs(self._rec_dir, exist_ok=True)
         header = ["Frame", "root_translateX", "root_translateY", "root_translateZ",
                   "root_rotateX", "root_rotateY", "root_rotateZ"] + [j + "_dof" for j in self._SOMA_JOINTS]
-        for i, rec in self._rec.items():
-            if not rec["root"]:
-                continue
-            root = np.asarray(rec["root"]); eul = np.asarray(rec["eul"]); dof = np.asarray(rec["dof"])
-            n = len(root)
-            rows = np.concatenate(
-                [np.arange(n)[:, None].astype(np.float64), root, eul, dof], axis=1
-            )
-            key = self._rec_keys.get(i, f"env{i}")
-            tmp = os.path.join(self._rec_dir, f".{key}.csv.tmp")
-            out = os.path.join(self._rec_dir, f"{key}.csv")
-            np.savetxt(tmp, rows, delimiter=",", header=",".join(header), comments="", fmt="%.6f")
-            os.replace(tmp, out)
+        rt = np.asarray(buf["root"]); eu = np.asarray(buf["eul"]); df = np.asarray(buf["dof"])
+        m = len(rt)
+        rows = np.concatenate([np.arange(m)[:, None].astype(np.float64), rt, eu, df], axis=1)
+        key = st["key"][i]
+        tmp = os.path.join(self._rec_dir, f".{key}.csv.tmp")
+        out = os.path.join(self._rec_dir, f"{key}.csv")
+        np.savetxt(tmp, rows, delimiter=",", header=",".join(header), comments="", fmt="%.6f")
+        os.replace(tmp, out)
+        st["buf"][i] = None  # free memory
 
     def _dump_debug(self, path, obs_dict, enc_in, prop, tokens, actions):
         info = {
