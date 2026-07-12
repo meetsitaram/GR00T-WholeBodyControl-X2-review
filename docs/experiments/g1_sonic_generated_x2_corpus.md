@@ -5,6 +5,26 @@
 dynamically-consistent* motions, using the stock **G1 tracking policy (SONIC) as a
 feasibility oracle**, then quantify how much compute we'd save.
 
+> **The stock G1 SONIC model IS in THIS repo.** `gear_sonic_deploy/policy/release/` —
+> `model_encoder.onnx` + `model_decoder.onnx` + `observation_config.yaml` (+ TensorRT `.trt`),
+> **git-LFS-stored** → fetch with `git lfs pull` (see `deploy.sh` note). It is exactly the
+> tracking policy the G1 deploy/planner stack uses (`deploy.sh` `CHECKPOINT_DEFAULT=
+> "policy/release/model"`, `OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"`) — the
+> same G1 SONIC we already ran via the planner stack (`run_sim_loop.py` + `deploy.sh sim`).
+> Check `deploy.sh` / the deploy_sim/deploy_real docs for exact download provenance.
+> **So the experiment runs HERE, on this model.** (`~/Documents/Sonic_Training_G1/
+> unitree_sonic_g1/` is a *previous* user experiment, NOT the model source — ignore it.)
+>
+> **STEP 0 nuance:** the stock model is **ONNX (encoder+decoder), not a framework `.pt`**, so
+> `eval_agent_trl`/`im_eval` can't load it directly (they load a `.pt` UniversalTokenActor).
+> Its `observation_config.yaml` IS in this framework's obs vocabulary (see below), so options:
+> **(a)** wrap the encoder/decoder ONNX (onnxruntime) as the sweep policy inside the framework's
+> vectorized eval (obs already matches → likely small); **(b)** batched MuJoCo/MJX rollout with
+> the ONNX natively (the deploy's own env). The `im_eval` mechanism + the two metrics + the
+> success definition + the false-negative guardrail (below) apply either way as the template.
+> (A 2026-07-11 `im_eval` mechanism dry-run was done here on X2 assets only — confirmed the
+> vectorized sweep runs; it was X2, not the experiment.)
+>
 > **SCOPE (user, 2026-07-11): this experiment is G1-ONLY.** Phase 1 (this doc) = run the
 > stock G1 policy over the bones-seed G1 corpus, produce the **feasibility filter (Metric 1)
 > + deviation (Metric 2) + estimated compute savings**, and dump the feasible executed G1
