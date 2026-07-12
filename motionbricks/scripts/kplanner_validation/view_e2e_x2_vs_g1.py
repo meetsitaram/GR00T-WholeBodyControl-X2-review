@@ -34,7 +34,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -221,6 +221,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Replay raw qpos in each clip's world frame (default: canonicalize "
              "so both robots start at (0,0) facing +X for clean side-by-side).",
     )
+    p.add_argument(
+        "--auto-cycle", action="store_true",
+        help="Automatically advance to the next trial after --loops-per-trial "
+             "loops -- cycle through every speed hands-free (n/p still work).",
+    )
+    p.add_argument(
+        "--loops-per-trial", type=int, default=2,
+        help="With --auto-cycle: times to loop each trial before advancing "
+             "(default 2).",
+    )
     args = p.parse_args(argv)
 
     x2 = _load_npz(args.x2_npz)
@@ -270,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     frame_idx = 0
     paused = False
     speed_mult = 1.0
+    loops_done = 0
     speeds = [0.25, 0.5, 1.0, 2.0, 4.0]
 
     # Segment schedule (only present for scripted-demo NPZs).
@@ -303,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         mujoco.mj_forward(model, data)
 
     def key_cb(keycode: int) -> None:
-        nonlocal frame_idx, paused, speed_mult, trial_idx
+        nonlocal frame_idx, paused, speed_mult, trial_idx, loops_done
+        loops_done = 0
         try:
             c = chr(keycode)
         except ValueError:
@@ -395,6 +407,12 @@ def main(argv: list[str] | None = None) -> int:
                 if new_idx >= horizon_frames:
                     new_idx = 0
                     last_segment_idx = -1  # re-announce on loop
+                    if args.auto_cycle:
+                        loops_done += 1
+                        if loops_done >= max(1, args.loops_per_trial):
+                            loops_done = 0
+                            trial_idx = (trial_idx + 1) % n_trials
+                            _print_trial_header()
                 frame_idx = new_idx
 
             time.sleep(max(0.0, 1.0 / (fps * speed_mult) - (time.time() - now)))

@@ -37,7 +37,7 @@ import joblib
 import numpy as np
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / "motionbricks") not in sys.path:
@@ -94,23 +94,66 @@ def _load_g1_fixture_qpos(
     return qpos_all[clip_idx, :n].astype(np.float32), 30.0
 
 
-def _load_planner(ckpt_set: str, device: str):
+_G1_CLIP_CKPT = REPO_ROOT / "motionbricks" / "out" / "G1-clip.ckpt"
+
+
+def _apply_ckpt_overrides(paths, vqvae_ckpt, pose_ckpt, root_ckpt):
+    """Point ``paths`` at explicit checkpoints instead of the pinned defaults.
+
+    Overriding a checkpoint also repoints its version dir (which holds the
+    hparams.yaml / skeleton / stats needed to instantiate the model) to the
+    checkpoint's run dir, assuming the standard Lightning layout
+    ``<version_dir>/checkpoints/<ckpt>`` (so version_dir = ckpt.parents[1]).
+    """
+    if vqvae_ckpt is not None:
+        paths.vqvae_ckpt = vqvae_ckpt
+        paths.vqvae_version_dir = Path(vqvae_ckpt).resolve().parents[1]
+    if pose_ckpt is not None:
+        paths.pose_ckpt = pose_ckpt
+        paths.pose_version_dir = Path(pose_ckpt).resolve().parents[1]
+    if root_ckpt is not None:
+        paths.root_ckpt = root_ckpt
+        paths.root_version_dir = Path(root_ckpt).resolve().parents[1]
+    return paths
+
+
+def _load_planner(
+    ckpt_set: str,
+    device: str,
+    clip_ckpt: "Path | None" = None,
+    vqvae_ckpt: "Path | None" = None,
+    pose_ckpt: "Path | None" = None,
+    root_ckpt: "Path | None" = None,
+):
+    """Load the planner with a pose-template clip library so mode-driven
+    schedules work. x2 -> ``clip_ckpt`` or auto (out/X2-clip.ckpt); g1 ->
+    ``clip_ckpt`` or out/G1-clip.ckpt. The ``*_ckpt`` overrides let you
+    validate an arbitrary trained checkpoint instead of the pinned default."""
     if ckpt_set == "x2":
         from motionbricks.motion_backbone.inference.load_x2_planner import (
             X2PlannerPaths,
             load_x2_planner,
         )
-        paths = X2PlannerPaths.default()
+        paths = _apply_ckpt_overrides(
+            X2PlannerPaths.default(), vqvae_ckpt, pose_ckpt, root_ckpt
+        )
         paths.validate()
-        return load_x2_planner(paths, device=device)
+        return load_x2_planner(
+            paths, device=device,
+            clip_library_ckpt=(clip_ckpt if clip_ckpt is not None else "auto"),
+        )
     if ckpt_set == "g1":
         from motionbricks.motion_backbone.inference.load_g1_planner import (
             G1PlannerPaths,
             load_g1_planner,
         )
-        paths = G1PlannerPaths.default()
+        paths = _apply_ckpt_overrides(
+            G1PlannerPaths.default(), vqvae_ckpt, pose_ckpt, root_ckpt
+        )
         paths.validate()
-        return load_g1_planner(paths, device=device)
+        g1_clip = clip_ckpt if clip_ckpt is not None else _G1_CLIP_CKPT
+        kw = {"clip_library_ckpt": g1_clip} if Path(g1_clip).is_file() else {}
+        return load_g1_planner(paths, device=device, **kw)
     raise ValueError(f"Unknown ckpt-set: {ckpt_set!r}")
 
 
@@ -137,6 +180,10 @@ class Step:
     yaw_rate_end: float | None = None
     vel_x_end: float | None = None
     vel_z_end: float | None = None
+    # Pose-template mode index (clip-library idx: 0=idle 1=slow_walk 2=walk
+    # 3=run_proxy). None -> velocity-only (replan_with_velocity). When set,
+    # the segment drives replan_with_pose_template(intent, mode_idx).
+    mode_idx: int | None = None
 
 
 def _default_schedule(hip_h: float) -> list[Step]:
@@ -164,6 +211,44 @@ def _default_schedule(hip_h: float) -> list[Step]:
         Step("sidestep_right",     1.5, 0.0,  -0.30, 0.0),
         Step("stop_5",             0.5, 0.0,  0.0,  0.0),
     ]
+
+
+def _validation_schedule(hip_h: float) -> list[Step]:
+    """Fixed MODE-driven validation routine (pose-template path): exercises
+    slow_walk / walk / run modes across speeds plus left/right walking turns.
+    Regenerate with each new checkpoint and compare side-by-side to judge
+    training progress on a consistent battery. Phases (mode @ speed):
+
+        1 idle              mode=idle
+        2 slow_walk 0.2     mode=slow_walk
+        3 slow_walk 0.3     mode=slow_walk
+        4 turn_left  @ 0.3  mode=slow_walk (+0.4 rad/s, 5 s)
+        5 turn_right @ 0.3  mode=slow_walk (-0.4 rad/s, 5 s)
+        6 slow_walk 0.5     mode=slow_walk
+        7 walk 1.0          mode=walk
+        8 run 1.5           mode=run_proxy
+
+    Turns are done in slow_walk mode at 0.3 m/s BEFORE ramping to higher
+    speeds. Mode indices are X2 clip-library semantics (0=idle 1=slow_walk
+    2=walk 3=run_proxy). G1 has no run clip, so the driver remaps run->walk
+    for the g1 reference (G1 realizes "run" as walk mode at higher velocity).
+    """
+    return [
+        Step("1_idle",            1.5, 0.0,  0.0, 0.00, mode_idx=0),
+        Step("2_slow_walk_0.2",   3.0, 0.0,  0.0, 0.20, mode_idx=1),
+        Step("3_slow_walk_0.3",   3.0, 0.0,  0.0, 0.30, mode_idx=1),
+        Step("4_turn_left_slow",  5.0, +0.4, 0.0, 0.30, mode_idx=1),
+        Step("5_turn_right_slow", 5.0, -0.4, 0.0, 0.30, mode_idx=1),
+        Step("6_slow_walk_0.5",   3.0, 0.0,  0.0, 0.50, mode_idx=1),
+        Step("7_walk_1.0",        3.5, 0.0,  0.0, 1.00, mode_idx=2),
+        Step("8_run_1.5",         3.5, 0.0,  0.0, 1.50, mode_idx=3),
+    ]
+
+
+_SCHEDULES = {
+    "default": _default_schedule,
+    "validation": _validation_schedule,
+}
 
 
 def _intent_at_fraction(step: Step, frac: float) -> tuple[float, float, float]:
@@ -201,16 +286,33 @@ def _run_schedule(
     hip_h: float,
     fps: float,
     device: str,
+    mode_map: dict | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
-    """Execute the schedule continuously, return [T_total, D] qpos + segment log."""
+    """Execute the schedule continuously, return [T_total, D] qpos + segment log.
+
+    ``mode_map`` remaps a step's ``mode_idx`` to this robot's actual clip
+    index (e.g. {3: 2} to realize X2's run as G1's walk). A step with
+    ``mode_idx=None`` uses the velocity-only path.
+    """
     n_avail = seed_qpos_np.shape[0] - seed_offset
     seed_window = seed_qpos_np[seed_offset : seed_offset + min(n_avail, 64)]
     seed_t = torch.from_numpy(seed_window).to(device)
     planner.reset(seed_t)
 
+    def _resolve_mode(m: int | None) -> int | None:
+        if m is None:
+            return None
+        return mode_map.get(m, m) if mode_map else m
+
+    def _replan(intent_t: torch.Tensor, mode_idx: int | None) -> None:
+        m = _resolve_mode(mode_idx)
+        if m is None:
+            planner.replan_with_velocity(intent_t)
+        else:
+            planner.replan_with_pose_template(intent_t, mode_idx=m)
+
     # Prime the buffer with the first step's intent.
-    initial_intent = _step_to_intent_tensor(schedule[0], hip_h, device)
-    planner.replan_with_velocity(initial_intent)
+    _replan(_step_to_intent_tensor(schedule[0], hip_h, device), schedule[0].mode_idx)
 
     qpos_dim = int(planner.frames["mujoco_qpos"].shape[-1])
     def _intent_tensor(yaw_rate: float, vel_x: float, vel_z: float) -> torch.Tensor:
@@ -232,7 +334,7 @@ def _run_schedule(
         # effect immediately (otherwise we'd burn through the previously
         # buffered frames first).
         yaw0, vx0, vz0 = _intent_at_fraction(step, 0.0)
-        planner.replan_with_velocity(_intent_tensor(yaw0, vx0, vz0))
+        _replan(_intent_tensor(yaw0, vx0, vz0), step.mode_idx)
 
         chunk = np.zeros((n_frames, qpos_dim), dtype=np.float32)
         for i in range(n_frames):
@@ -241,11 +343,12 @@ def _run_schedule(
             if is_ramped:
                 yaw_r, vx_r, vz_r = _intent_at_fraction(step, frac)
                 if planner.should_replan():
-                    planner.replan_with_velocity(_intent_tensor(yaw_r, vx_r, vz_r))
+                    _replan(_intent_tensor(yaw_r, vx_r, vz_r), step.mode_idx)
             else:
                 if planner.should_replan():
-                    planner.replan_with_velocity(
-                        _intent_tensor(step.yaw_rate, step.vel_x, step.vel_z)
+                    _replan(
+                        _intent_tensor(step.yaw_rate, step.vel_x, step.vel_z),
+                        step.mode_idx,
                     )
             chunk[i] = planner.get_next_frame().detach().cpu().numpy()
         chunks.append(chunk)
@@ -264,6 +367,7 @@ def _run_schedule(
                 "vel_z_end": vz1,
                 "ramped": is_ramped,
                 "hip_h": hip_h,
+                "mode_idx": step.mode_idx,
             }
         )
         frame_idx += n_frames
@@ -280,6 +384,22 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt-set", choices=("x2", "g1"), default="x2")
     p.add_argument(
+        "--schedule", choices=sorted(_SCHEDULES.keys()), default="default",
+        help="Which scripted schedule to run: 'default' (walk/turn/stop demo) "
+        "or 'validation' (fixed 8-phase speed+turn battery for judging "
+        "training runs). Default: default.",
+    )
+    p.add_argument(
+        "--seed-clip-idx", type=int, default=None,
+        help="Override g1_clip seed index (G1-clip.ckpt order: 0=idle 2=walk "
+        "11=walk_gun). Use 2 for a neutral seed. Ignored for x2.",
+    )
+    p.add_argument(
+        "--x2-seed-clip-key", type=str, default=None,
+        help="Override x2 seed clip key (e.g. neutral_idle_loop_001__A076 to "
+        "match G1's idle seed). Ignored for g1.",
+    )
+    p.add_argument(
         "--seed-frame", type=int, default=0,
         help="Frame index of the walking fixture to seed the planner from.",
     )
@@ -290,6 +410,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    p.add_argument(
+        "--vqvae-ckpt", type=Path, default=None,
+        help="Override the vqvae checkpoint (validate an arbitrary trained "
+        "model instead of the pinned default). Its version dir (hparams/"
+        "skeleton/stats) is auto-derived as <ckpt>/../.. .",
+    )
+    p.add_argument(
+        "--pose-ckpt", type=Path, default=None,
+        help="Override the pose-model checkpoint (see --vqvae-ckpt).",
+    )
+    p.add_argument(
+        "--root-ckpt", type=Path, default=None,
+        help="Override the root-model checkpoint (see --vqvae-ckpt).",
     )
     p.add_argument(
         "--save-npz", type=Path, default=None,
@@ -308,12 +442,12 @@ def main(argv: list[str] | None = None) -> int:
     fixture_spec = FIXTURES[args.ckpt_set]["walking"]
     if fixture_spec["kind"] == "x2_pkl":
         pkl = REPO_ROOT / fixture_spec["pkl"]
-        clip_key = fixture_spec["clip_key"]
+        clip_key = args.x2_seed_clip_key or fixture_spec["clip_key"]
         print(f"[fixture] {args.ckpt_set} walking: {pkl.name}::{clip_key}")
         seed_qpos_np, fps = _load_x2_fixture_qpos(pkl, clip_key)
     else:
         g1_path = REPO_ROOT / fixture_spec["g1_clip_path"]
-        idx = fixture_spec["clip_idx"]
+        idx = args.seed_clip_idx if args.seed_clip_idx is not None else fixture_spec["clip_idx"]
         print(f"[fixture] {args.ckpt_set} walking: {g1_path.name}[{idx}]")
         seed_qpos_np, fps = _load_g1_fixture_qpos(g1_path, idx)
 
@@ -322,7 +456,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.hip_h is not None
         else float(seed_qpos_np[args.seed_frame : args.seed_frame + 4, 2].mean())
     )
-    schedule = _default_schedule(hip_h)
+    schedule = _SCHEDULES[args.schedule](hip_h)
+    print(f"[plan] schedule={args.schedule}")
     total_s = sum(s.duration_s for s in schedule)
     print(
         f"[plan] hip_h={hip_h:.3f}  fps={fps:.0f}  total={total_s:.2f}s "
@@ -342,10 +477,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(f"[load] ckpt-set={args.ckpt_set} on device={args.device}")
-    planner = _load_planner(args.ckpt_set, args.device)
+    planner = _load_planner(
+        args.ckpt_set, args.device,
+        vqvae_ckpt=args.vqvae_ckpt, pose_ckpt=args.pose_ckpt, root_ckpt=args.root_ckpt,
+    )
+
+    # Per-robot mode remap: schedule mode indices are X2 semantics
+    # (0=idle 1=slow_walk 2=walk 3=run_proxy). G1's clip bank has no run
+    # (idx 3 = hand_crawling), so realize "run" as walk mode for the G1 ref.
+    mode_map = {3: 2} if args.ckpt_set == "g1" else None
 
     traj, segments = _run_schedule(
-        planner, seed_qpos_np, args.seed_frame, schedule, hip_h, fps, args.device
+        planner, seed_qpos_np, args.seed_frame, schedule, hip_h, fps,
+        args.device, mode_map=mode_map,
     )
     print(
         f"[run]  qpos shape = {traj.shape}  "

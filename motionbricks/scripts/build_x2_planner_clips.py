@@ -148,6 +148,33 @@ DEFAULT_MODES: tuple[ModeSpec, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# G1-STYLE mode table — a faithful port of the G1 demo's clip_holder_G1
+# (motionbricks/motion_backbone/demo/clips.py). On G1, idle/slow_walk/walk all
+# share the SAME neutral-idle keyframe (``neutral_idle_loop_001__A076`` frames
+# [0:30]) and differ ONLY by avg_root_vel (0.0 / 0.3 / 1.0 m/s, written *2 for
+# the spring model's 0.5x factor). The gait is produced by the velocity target
+# + backbone, not by a distinct walk clip. That exact clip is present in
+# ``x2_ultra_locowalk.pkl`` (the deployed backbone's own training set), so this
+# keyframe is IN-distribution. Select with ``--modes g1style``.
+# run_proxy keeps the same idle keyframe at a higher velocity (G1 has no
+# separate run clip; "run" == walk mode at higher target_vel).
+# ---------------------------------------------------------------------------
+_G1_IDLE_CLIP = "neutral_idle_loop_001__A076"
+
+G1STYLE_MODES: tuple[ModeSpec, ...] = (
+    ModeSpec(name="idle", clip_key=_G1_IDLE_CLIP, start_frame=0, end_frame=30, avg_root_vel=0.0),
+    ModeSpec(name="slow_walk", clip_key=_G1_IDLE_CLIP, start_frame=0, end_frame=30, avg_root_vel=0.6),
+    ModeSpec(name="walk", clip_key=_G1_IDLE_CLIP, start_frame=0, end_frame=30, avg_root_vel=2.0),
+    ModeSpec(name="run_proxy", clip_key=_G1_IDLE_CLIP, start_frame=0, end_frame=30, avg_root_vel=3.0),
+)
+
+_MODE_TABLES: dict[str, tuple[ModeSpec, ...]] = {
+    "default": DEFAULT_MODES,
+    "g1style": G1STYLE_MODES,
+}
+
+
 def _quat_xyzw_to_wxyz(quat_xyzw: np.ndarray) -> np.ndarray:
     """PKL stores root_rot as xyzw; mujoco_qpos uses wxyz."""
     return np.stack(
@@ -267,7 +294,18 @@ def main() -> int:
         help="Output path for the baked clip library ckpt.",
     )
     p.add_argument("--device", default="cuda")
+    p.add_argument(
+        "--modes",
+        choices=sorted(_MODE_TABLES.keys()),
+        default="default",
+        help="Which mode table to bake: 'default' (X2-curated walk clips) or "
+        "'g1style' (faithful G1 port: shared neutral-idle keyframe for "
+        "idle/slow_walk/walk, gait driven by velocity). Default: default.",
+    )
     args = p.parse_args()
+
+    modes = _MODE_TABLES[args.modes]
+    print(f"  mode table      = {args.modes} ({len(modes)} modes)")
 
     device = args.device
     if device != "cpu" and not torch.cuda.is_available():
@@ -306,7 +344,7 @@ def main() -> int:
 
     # Probe the number of joints by running one clip frame through the
     # FIRST mode's source clip (which may or may not be the default PKL).
-    probe_mode = DEFAULT_MODES[0]
+    probe_mode = modes[0]
     probe_pkl_path = probe_mode.source_pkl or default_pkl
     probe_raw = _load_pkl(probe_pkl_path)
     probe_key = probe_mode.clip_key
@@ -322,7 +360,7 @@ def main() -> int:
     # Process each mode in order, sourcing from per-mode PKL when set.
     per_mode_buffers = []
     per_mode_source_pkls: list[Path] = []
-    for mode in DEFAULT_MODES:
+    for mode in modes:
         pkl_path = (mode.source_pkl or default_pkl).resolve()
         raw = _load_pkl(pkl_path)
         if mode.clip_key not in raw:
@@ -369,9 +407,10 @@ def main() -> int:
                 "num_frames": int(out["num_frames_per_clip"][i].item()),
                 "source_pkl": str(per_mode_source_pkls[i]),
             }
-            for i, m in enumerate(DEFAULT_MODES)
+            for i, m in enumerate(modes)
         ],
         "num_joints": num_joints,
+        "mode_table": args.modes,
         "default_source_pkl": str(args.motion_lib_pkl.resolve()),
     }
     sidecar_path = args.out_ckpt.with_suffix(".modes.json")

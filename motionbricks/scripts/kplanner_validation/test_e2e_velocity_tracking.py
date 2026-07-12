@@ -69,7 +69,7 @@ import joblib
 import numpy as np
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / "motionbricks") not in sys.path:
@@ -182,7 +182,14 @@ def _load_g1_fixture_qpos(
 # ---------------------------------------------------------------------------
 
 
-def _load_planner(ckpt_set: str, device: str):
+def _load_planner(ckpt_set: str, device: str, clip_ckpt: "Path | None" = None):
+    """Load the planner. ``clip_ckpt`` overrides the pose-template clip library.
+
+    For x2, ``None`` -> ``"auto"`` (out/X2-clip.ckpt if present). For g1,
+    ``None`` -> no clip library (velocity-only). Pass an explicit path (e.g.
+    out/X2-clip-g1style.ckpt or out/G1-clip.ckpt) to exercise the
+    pose-template path.
+    """
     if ckpt_set == "x2":
         from motionbricks.motion_backbone.inference.load_x2_planner import (
             X2PlannerPaths,
@@ -190,7 +197,11 @@ def _load_planner(ckpt_set: str, device: str):
         )
         paths = X2PlannerPaths.default()
         paths.validate()
-        return load_x2_planner(paths, device=device)
+        return load_x2_planner(
+            paths,
+            device=device,
+            clip_library_ckpt=(clip_ckpt if clip_ckpt is not None else "auto"),
+        )
     if ckpt_set == "g1":
         from motionbricks.motion_backbone.inference.load_g1_planner import (
             G1PlannerPaths,
@@ -198,7 +209,10 @@ def _load_planner(ckpt_set: str, device: str):
         )
         paths = G1PlannerPaths.default()
         paths.validate()
-        return load_g1_planner(paths, device=device)
+        # load_g1_planner forwards **kwargs to NeuralPlannerCore. G1's loader
+        # has no "auto" clip resolution, so pass an explicit path or nothing.
+        kw = {} if clip_ckpt is None else {"clip_library_ckpt": clip_ckpt}
+        return load_g1_planner(paths, device=device, **kw)
     raise ValueError(f"Unknown ckpt-set: {ckpt_set!r}")
 
 
@@ -237,8 +251,15 @@ def _run_one_trial(
     intent: Intent,
     horizon_frames: int,
     device: str,
+    mode_idx: "int | None" = None,
 ) -> np.ndarray:
     """Drive the full planner for ``horizon_frames`` under a constant intent.
+
+    When ``mode_idx`` is None (default) the velocity-only path
+    (``replan_with_velocity``) is used. When set, the pose-template path
+    (``replan_with_pose_template``) is used with that clip-library mode
+    index -- the command velocity still drives the root target; the clip
+    supplies the pose keyframe.
 
     Returns:
         Integrated qpos trajectory of shape [horizon_frames, qpos_dim].
@@ -249,13 +270,20 @@ def _run_one_trial(
     planner.reset(seed_t)
 
     intent_t = intent.as_tensor(device)
-    planner.replan_with_velocity(intent_t)
+
+    def _replan() -> None:
+        if mode_idx is None:
+            planner.replan_with_velocity(intent_t)
+        else:
+            planner.replan_with_pose_template(intent_t, mode_idx=mode_idx)
+
+    _replan()
 
     qpos_dim = int(planner.frames["mujoco_qpos"].shape[-1])
     traj = np.zeros((horizon_frames, qpos_dim), dtype=np.float32)
     for i in range(horizon_frames):
         if planner.should_replan():
-            planner.replan_with_velocity(intent_t)
+            _replan()
         traj[i] = planner.get_next_frame().detach().cpu().numpy()
     return traj
 
@@ -451,6 +479,40 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    p.add_argument(
+        "--x2-seed-clip-key",
+        type=str,
+        default=None,
+        help="Override the x2_pkl fixture's seed clip key (e.g. "
+        "neutral_idle_loop_001__A076 to match G1's idle seed for a fair "
+        "same-start comparison). Ignored for g1_clip fixtures.",
+    )
+    p.add_argument(
+        "--seed-clip-idx",
+        type=int,
+        default=None,
+        help="Override the g1_clip fixture's seed clip index (G1-clip.ckpt "
+        "order: 0=idle 1=slow_walk 2=walk 11=walk_gun ...). Use 2 for a "
+        "neutral-arm walk seed instead of the fixture default. Ignored for "
+        "x2_pkl fixtures.",
+    )
+    p.add_argument(
+        "--planner-mode-idx",
+        type=int,
+        default=None,
+        help="If set, use POSE-TEMPLATE inference with this clip-library mode "
+        "index (0=idle, 1=slow_walk, 2=walk, 3=run_proxy) instead of the "
+        "velocity-only path. The command velocity still drives the root; "
+        "the clip supplies the target pose keyframe.",
+    )
+    p.add_argument(
+        "--clip-ckpt",
+        type=Path,
+        default=None,
+        help="Override the pose-template clip-library ckpt. x2 default: auto "
+        "(out/X2-clip.ckpt). Pass out/X2-clip-g1style.ckpt for the G1-style "
+        "A/B, or out/G1-clip.ckpt for g1 pose-template runs.",
+    )
     p.add_argument("--save-npz", type=Path, default=None)
     p.add_argument("--report-json", type=Path, default=None)
     return p.parse_args(argv)
@@ -530,12 +592,16 @@ def main(argv: list[str] | None = None) -> int:
     fixture_spec = FIXTURES[args.ckpt_set][args.fixture]
     if fixture_spec["kind"] == "x2_pkl":
         pkl = REPO_ROOT / fixture_spec["pkl"]
-        clip_key = fixture_spec["clip_key"]
+        clip_key = args.x2_seed_clip_key or fixture_spec["clip_key"]
         print(f"[fixture] {args.ckpt_set} {args.fixture}: {pkl.name}::{clip_key}")
         seed_qpos_np, fps = _load_x2_fixture_qpos(pkl, clip_key)
     else:
         g1_path = REPO_ROOT / fixture_spec["g1_clip_path"]
-        idx = fixture_spec["clip_idx"]
+        idx = (
+            args.seed_clip_idx
+            if args.seed_clip_idx is not None
+            else fixture_spec["clip_idx"]
+        )
         print(f"[fixture] {args.ckpt_set} {args.fixture}: {g1_path.name}[{idx}]")
         seed_qpos_np, fps = _load_g1_fixture_qpos(g1_path, idx)
     print(
@@ -561,13 +627,19 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"[load] ckpt-set={args.ckpt_set} on device={args.device}")
-    planner = _load_planner(args.ckpt_set, args.device)
+    if args.planner_mode_idx is not None:
+        print(
+            f"[plan] pose-template path: mode_idx={args.planner_mode_idx}  "
+            f"clip_ckpt={args.clip_ckpt if args.clip_ckpt else '(auto/default)'}"
+        )
+    planner = _load_planner(args.ckpt_set, args.device, clip_ckpt=args.clip_ckpt)
 
     rows: list[dict] = []
     trajs: list[np.ndarray] = []
     for axis, intent in trials:
         traj = _run_one_trial(
-            planner, seed_qpos_np, args.seed_frame, intent, horizon_frames, args.device
+            planner, seed_qpos_np, args.seed_frame, intent, horizon_frames,
+            args.device, mode_idx=args.planner_mode_idx,
         )
         metrics = _metrics_from_trial(traj, intent, fps)
         rows.append({"axis": axis, "intent": asdict(intent), "metrics": metrics})
@@ -669,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
             intents=intents_np,
             axes=axes_np,
             qpos_traj=traj_stack,
+            planner_mode_idx=(-1 if args.planner_mode_idx is None else args.planner_mode_idx),
+            clip_ckpt=("" if args.clip_ckpt is None else str(args.clip_ckpt)),
         )
         print(f"[npz]    wrote {args.save_npz}")
 
