@@ -1137,6 +1137,7 @@ class MotionLibBase:
                 self._pin_motion_idxes = torch.as_tensor(
                     _pin, dtype=sample_idxes.dtype, device=self._device
                 )
+            self._n_loaded_finetune = 0  # count of fine-tune clips at the FRONT of the loaded set
             if self._pin_motion_idxes.numel() > 0:
                 _n_pin = int(self._pin_motion_idxes.numel())
                 # fine_tune_dataset.load_fraction (0..1]: what FRACTION OF THE
@@ -1159,6 +1160,7 @@ class MotionLibBase:
                     _perm = torch.randperm(_n_pin, device=self._device)[:_n]
                     _sel = self._pin_motion_idxes[_perm]
                 _n = int(_sel.numel())
+                self._n_loaded_finetune = _n
                 sample_idxes = torch.cat(
                     [_sel, sample_idxes[_n:]]
                 )[:num_motion_to_load]
@@ -2307,11 +2309,42 @@ class MotionLibBase:
         motion_time_steps = (motion_time * self._sim_fps).floor().int()
         return motion_time_steps
 
+    def _apply_finetune_sample_rate(self, motion_ids, motion_time_steps=None):
+        """Route a guaranteed fraction of episodes to the pinned fine-tune dataset.
+
+        fine_tune_dataset.finetune_sample_rate (0..1): the fraction of per-episode
+        samples drawn UNIFORMLY from the pinned target clips (which sit at loaded
+        indices 0.._n_loaded_finetune), independent of the base adaptive sampler.
+        This decouples target training emphasis from both the dataset size and the
+        base sampling, and -- being a separate route -- it does NOT show up as
+        adaptive-sampler concentration (num_concentrated_bins stays clean). No-op
+        unless fine_tune_dataset.enable and finetune_sample_rate > 0.
+        """
+        _ft_cfg = self.m_cfg.get("fine_tune_dataset", None) or {}
+        if not _ft_cfg.get("enable", False):
+            return motion_ids, motion_time_steps
+        rate = float(_ft_cfg.get("finetune_sample_rate", 0.0))
+        n_ft = int(getattr(self, "_n_loaded_finetune", 0))
+        if rate <= 0.0 or n_ft <= 0:
+            return motion_ids, motion_time_steps
+        route = torch.rand(motion_ids.shape[0], device=self._device) < rate
+        n_route = int(route.sum())
+        if n_route == 0:
+            return motion_ids, motion_time_steps
+        new_ids = torch.randint(0, n_ft, (n_route,), device=self._device)
+        motion_ids = motion_ids.clone()
+        motion_ids[route] = new_ids.to(motion_ids.dtype)
+        if motion_time_steps is not None:  # give the routed clips a valid random frame
+            new_times = self.sample_time_steps(new_ids)
+            motion_time_steps = motion_time_steps.clone()
+            motion_time_steps[route] = new_times.to(motion_time_steps.dtype)
+        return motion_ids, motion_time_steps
+
     def sample_motions(self, n):
         motion_ids = torch.multinomial(
             self._sampling_batch_prob, num_samples=n, replacement=True
         ).to(self._device)
-
+        motion_ids, _ = self._apply_finetune_sample_rate(motion_ids)
         return motion_ids
 
     def get_motion_ids_in_dataset(self, motion_ids):
@@ -2932,4 +2965,7 @@ class MotionLibBase:
         if pre_failure_sample_window > 0:
             offset = torch.randint(pre_failure_sample_window, (n,), device=self._device)
             motion_time_steps = (motion_time_steps - offset).clamp_min(0)
+        motion_ids, motion_time_steps = self._apply_finetune_sample_rate(
+            motion_ids, motion_time_steps
+        )
         return motion_ids, motion_time_steps.int()
