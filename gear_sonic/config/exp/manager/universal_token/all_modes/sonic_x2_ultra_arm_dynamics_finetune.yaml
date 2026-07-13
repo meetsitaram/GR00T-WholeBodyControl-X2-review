@@ -1,0 +1,73 @@
+# @package _global_
+# SONIC X2 Ultra — ARM-DYNAMICS fine-tune (shadow boxing / dance / slow walk).
+#
+# Builds on the slow-walk dead-band fix + fine_tune_dataset pinning, and ADDS an
+# arm-scoped velocity reward so fast/dynamic arm motions (combat, dance) actually
+# track instead of collapsing to a damped mean pose. See
+# docs/experiments/x2_shadow_boxing_arm_dynamics_plan.md.
+#
+# WHY: the generic tracking_body_linvel/angvel average over all 14 tracked bodies,
+# so the 6 arm links are diluted -- a damped arm barely moves the mean. Scoping a
+# velocity term to just the arm links + a sharp kernel makes slow arms cost reward.
+# Reuses the existing body_linvel/angvel funcs via their body_names param (no new
+# reward code; the RewardsCfg fields tracking_arm_linvel/angvel were added).
+#
+# Also relaxes the smoothness penalties (action_rate_l2, anti_shake_ang_vel) that
+# actively DAMP fast arm actuation -- modest global reduction (they also touch legs).
+#
+# fine_tune_dataset.motion_file: point at the target set. Default is the COMBINED
+# slow+combat+dance corpus; swap to combat+dance-only to validate the hard targets
+# first. Dance clips are auto-injected (not in the base corpus) by the load-time
+# external-target merge. finetune_sample_rate 0.3 = 30% of episodes on the targets.
+#
+# Warm start (via launcher +checkpoint=): the fine-tune-500 or latest slow-walk ckpt.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_slow_manip_rebalance
+  - _self_
+
+exp_var: arm_dynamics_v1
+project_name: TRL_X2Ultra_ArmDynamics
+
+_arm_links: &arm_links
+  - left_shoulder_roll_link
+  - left_elbow_link
+  - left_wrist_yaw_link
+  - right_shoulder_roll_link
+  - right_elbow_link
+  - right_wrist_yaw_link
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        fine_tune_dataset:
+          enable: true
+          motion_file: gear_sonic/data/motions/x2_multiskill_finetune.pkl  # slow+combat+dance
+          load_fraction: 1.0
+          finetune_sample_rate: 0.3        # 30% of episodes on the fine-tune targets
+        adaptive_sampling:
+          uniform_sampling_rate: 1.0       # uniform base (pre-trained model, no grinding)
+  rewards:
+    # --- arm-scoped velocity tracking (the fast-arm fix) ---
+    tracking_arm_linvel:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
+      weight: 2.0
+      params:
+        command_name: motion
+        std: 0.25
+        body_names: *arm_links
+    tracking_arm_angvel:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
+      weight: 2.0
+      params:
+        command_name: motion
+        std: 0.35
+        body_names: *arm_links
+    # --- relax the smoothness penalties that damp fast arm actuation ---
+    action_rate_l2:
+      weight: -0.05        # was -0.1
+    anti_shake_ang_vel:
+      weight: -0.01        # was -0.02

@@ -35,6 +35,12 @@ class RewardsCfg:
     tracking_relative_body_ori_weighted = None
     tracking_body_linvel = None
     tracking_body_angvel = None
+    # Arm-scoped velocity tracking (reuse the body_linvel/angvel funcs with
+    # body_names=arm links). For fast-arm motions (shadow boxing / dance) where the
+    # generic all-body velocity terms dilute the arms; scope + a sharp kernel make
+    # slow/damped arms actually cost reward. Off (None) unless set in a config.
+    tracking_arm_linvel = None
+    tracking_arm_angvel = None
     action_rate_l2 = None
     joint_limit = None
     undesired_contacts = None
