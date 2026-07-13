@@ -413,6 +413,27 @@ class MotionLibBase:
 
             print(f"Loaded {len(self._motion_data_load)} motion files")  # noqa: T201
 
+        # FINE-TUNE DATASET external-target injection: merge in fine-tune clips that
+        # are NOT already in the base corpus, so freshly-retargeted targets (e.g.
+        # dance clips not yet in the corpus) can be pinned/trained without rebuilding
+        # the corpus. Clips already present are left as-is (base takes precedence).
+        _ft_cfg = self.m_cfg.get("fine_tune_dataset", None) or {}
+        if _ft_cfg.get("enable", False) and _ft_cfg.get("motion_file", None):
+            try:
+                _ft_data = joblib.load(_ft_cfg["motion_file"])
+                _added = 0
+                for _k, _v in _ft_data.items():
+                    if _k not in self._motion_data_load:
+                        self._motion_data_load[_k] = _v
+                        _added += 1
+                print(  # noqa: T201
+                    f"[MotionLib] fine_tune_dataset: injected {_added} external target "
+                    f"clips from {_ft_cfg['motion_file']} "
+                    f"({len(_ft_data) - _added} already in corpus)."
+                )
+            except Exception as _e:  # noqa: BLE001
+                print(f"[MotionLib] fine_tune_dataset injection failed: {_e}")  # noqa: T201
+
         data_list = self._motion_data_load
 
         filter_motion_keys = self.m_cfg.get("filter_motion_keys", None)
