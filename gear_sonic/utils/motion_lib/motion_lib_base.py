@@ -1077,6 +1077,92 @@ class MotionLibBase:
             ).to(self._device)
 
         # sample_idxes = torch.tensor([self._motion_data_keys.tolist().index("0-KIT_8_WalkInClockwiseCircle04_poses")]).to(self._device)  # noqa: E501
+
+        # --- FINE-TUNE DATASET pinning (opt-in, fine-tune runs ONLY) ---
+        # For targeted fine-tuning of a PRE-TRAINED model: a small "fine-tune
+        # dataset" of target clips is pinned so it is ALWAYS in the loaded subset
+        # (and thus reliably trained), while the remaining load slots rotate over
+        # the base corpus for anti-forgetting. Needed because a small target set
+        # (e.g. the 34 slow-walk/manipulation teleop clips) is a tiny fraction of a
+        # large corpus AND does not trip the failure gates, so neither random nor
+        # failure-weighted loading reliably includes it.
+        #
+        # DOUBLE-GATED so it can NEVER activate on a from-scratch run: requires
+        #   motion_lib_cfg.fine_tune_dataset: { enable: true, pin_motion_keys: [...] }
+        # If `enable` is absent/false (the default), this is a no-op.
+        if random_sample:
+            if getattr(self, "_pin_motion_idxes", None) is None:
+                _ft_cfg = self.m_cfg.get("fine_tune_dataset", None) or {}
+                _ft_on = bool(_ft_cfg.get("enable", False))
+                _pin = []
+                if _ft_on:
+                    _keys_all = [str(k) for k in self._motion_data_keys.tolist()]
+                    # (a) motion_file: pin EVERY clip whose key appears in this pkl
+                    #     (the fine-tune dataset IS the file -- no patterns needed).
+                    _ft_keys = set()
+                    _ft_file = _ft_cfg.get("motion_file", None)
+                    if _ft_file:
+                        try:
+                            import joblib as _joblib
+                            _ft_keys = {str(k) for k in _joblib.load(_ft_file).keys()}
+                        except Exception as _e:  # noqa: BLE001
+                            logger.warning(
+                                f"[MotionLib] fine_tune_dataset.motion_file "
+                                f"load failed ({_e}); ignoring it."
+                            )
+                    # (b) pin_motion_keys: OPTIONAL substring fallback/supplement.
+                    _pin_patterns = _ft_cfg.get("pin_motion_keys", None)
+                    for _i, _k in enumerate(_keys_all):
+                        if (_k in _ft_keys) or (
+                            _pin_patterns
+                            and any(str(p).lower() in _k.lower() for p in _pin_patterns)
+                        ):
+                            _pin.append(_i)
+                    if _pin:
+                        logger.warning(
+                            "[MotionLib] FINE-TUNE DATASET MODE ON "
+                            "(fine_tune_dataset.enable=true) -> pinning "
+                            f"{len(_pin)} target motions as always-loaded every reshuffle"
+                            + (f" (from {_ft_file})" if _ft_file else "")
+                            + (f" + patterns {_pin_patterns}" if _pin_patterns else "")
+                            + ". For fine-tuning a pre-trained model; do NOT enable "
+                            "for from-scratch training."
+                        )
+                    else:
+                        logger.warning(
+                            "[MotionLib] fine_tune_dataset.enable=true but no clips "
+                            "matched (set motion_file and/or pin_motion_keys) -> "
+                            "nothing pinned."
+                        )
+                self._pin_motion_idxes = torch.as_tensor(
+                    _pin, dtype=sample_idxes.dtype, device=self._device
+                )
+            if self._pin_motion_idxes.numel() > 0:
+                _n_pin = int(self._pin_motion_idxes.numel())
+                # fine_tune_dataset.load_fraction (0..1]: what FRACTION OF THE
+                # FINE-TUNE DATASET to load each reshuffle. 1.0 (default) = ALL
+                # target clips loaded every reshuffle (e.g. all 34). <1.0 loads a
+                # fresh random subset each reshuffle -- useful for a large
+                # fine-tune dataset you don't want fully resident at once. The
+                # loaded target clips take the first slots; the rest of the
+                # num_motions_to_load slots are the normal base-corpus sample.
+                _frac = float(
+                    (self.m_cfg.get("fine_tune_dataset", None) or {}).get(
+                        "load_fraction", 1.0
+                    )
+                )
+                _frac = max(0.0, min(1.0, _frac))
+                _n = int(min(round(_frac * _n_pin), num_motion_to_load))
+                if _n >= _n_pin:
+                    _sel = self._pin_motion_idxes
+                else:  # random subset of the fine-tune dataset this reshuffle
+                    _perm = torch.randperm(_n_pin, device=self._device)[:_n]
+                    _sel = self._pin_motion_idxes[_perm]
+                _n = int(_sel.numel())
+                sample_idxes = torch.cat(
+                    [_sel, sample_idxes[_n:]]
+                )[:num_motion_to_load]
+
         self._curr_motion_ids = sample_idxes
         self.curr_motion_keys = (
             [self._motion_data_keys[sample_idxes.cpu()]]
@@ -1577,6 +1663,11 @@ class MotionLibBase:
         logger.info(
             f"Loaded {num_motions:d} motions with a total length of {total_len:.3f}s and {self.body_pos_w.shape[0]} frames."  # noqa: E501
         )
+        # NOTE: verifying the fine-tune targets are loaded needs no extra logging.
+        # Pinned clips are PREPENDED to sample_idxes, so the existing
+        # "Current motion keys: {curr_motion_keys[:10]}" line above shows them at
+        # the front of every reshuffle, and the one-time "FINE-TUNE DATASET MODE
+        # ON -> pinning N motions" warning reports the pinned count.
 
         del (
             motions,

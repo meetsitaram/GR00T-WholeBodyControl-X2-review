@@ -33,16 +33,23 @@ manager_env:
   commands:
     motion:
       motion_lib_cfg:
+        # FINE-TUNE DATASET: the 34 slow-walk/manipulation teleop clips are pinned
+        # as always-loaded every reshuffle, so they are reliably TRAINED. Without
+        # this they are ~0.09% of the corpus and never foot-fail, so neither random
+        # nor failure-weighted loading includes them (empirically: 0 slow clips in
+        # the loaded subset on the prior run). Opt-in + double-gated -> from-scratch safe.
+        fine_tune_dataset:
+          enable: true
+          motion_file: gear_sonic/data/motions/x2_slow_manip_focus.pkl  # the 34 target clips
+          load_fraction: 1.0            # all 34 loaded every reshuffle
+          # log_loaded_motion_summary: true  # (optional) verbose per-reshuffle coverage log
         adaptive_sampling:
-          # Rebalance needs BROAD coverage, not hardest-subset mining. The
-          # executed run over-concentrated at iter ~960 (79 bins, 71% failure,
-          # reward 10->2.5). Guard against that WITHOUT the expensive decay path:
-          uniform_sampling_rate: 0.25    # was 0.1 -- 25% uniform floor keeps general clips trained
-          # use_failure_rate_decay stays FALSE: that branch (motion_lib_base.py:2535) is a
-          # serial reverse Python loop over every bin, recomputed each iter on CPU -> it 3x'd
-          # iteration time (9s -> 25s, GPUs starved at ~35%). Its own code comment says it is
-          # "very slow and not necessary" (pre_failure_sample_window already samples before
-          # failures). The uniform floor + 200x concentration cap are the cheap guards.
+          # Pre-trained model + explicit fine-tune pinning => we do NOT want failure-
+          # concentration (which grinds hard ground poses and ignores precision).
+          # Pure-uniform base load: the pinned targets get n/load_cap of episodes and
+          # the base corpus rotates uniformly for anti-forgetting.
+          uniform_sampling_rate: 1.0     # was 0.25 -- uniform base load, no hard-clip grind
+          # use_failure_rate_decay stays FALSE (serial CPU loop; 3x slowdown -- see git history).
   rewards:
     # --- dead-band fix (identical to the focused run) ---
     tracking_body_linvel:
