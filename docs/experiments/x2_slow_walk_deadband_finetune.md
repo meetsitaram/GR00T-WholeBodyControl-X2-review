@@ -86,6 +86,13 @@ the slow clips → they **terminate → register as failures → the adaptive sa
 auto-concentrates on them** (no manual oversampling — capped at 200× mean failure rate,
 so the ~34 slow clips draw a meaningful sample share while general clips stay covered).
 
+**Sampler guards (vs the executed run, which over-concentrated at iter ~960 — 79 bins,
+71% failure, reward 10→2.5):** `uniform_sampling_rate` 0.1→**0.25** (a uniform floor keeps
+general clips trained) and `use_failure_rate_decay` false→**true** (the sampler tracks
+*current* difficulty, so once the slow clips are learned it backs off and rebalances to the
+rest — self-correcting, prevents the frozen-hard-subset washout). Concentration cap stays
+200×. This keeps the slow-clip auto-focus while protecting general coverage.
+
 Judge on **both** instruments:
 - general feasibility ≥ ~92 (hold the line vs 2k), **and**
 - slow-walk understep in the low-20s / single digits (the new skill).
