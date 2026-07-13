@@ -36,13 +36,13 @@ manager_env:
         adaptive_sampling:
           # Rebalance needs BROAD coverage, not hardest-subset mining. The
           # executed run over-concentrated at iter ~960 (79 bins, 71% failure,
-          # reward 10->2.5). Two guards so we still auto-focus on the failing slow
-          # clips but don't re-crater general locomotion:
-          uniform_sampling_rate: 0.25   # was 0.1 -- 25% uniform floor keeps general clips trained
-          use_failure_rate_decay: true  # was false -- track CURRENT difficulty; once slow clips
-                                        # are learned the sampler backs off and rebalances to the
-                                        # rest (self-correcting; prevents frozen-hard-subset washout)
-          # decay_gamma stays 0.8 (base); concentration cap stays 200x mean.
+          # reward 10->2.5). Guard against that WITHOUT the expensive decay path:
+          uniform_sampling_rate: 0.25    # was 0.1 -- 25% uniform floor keeps general clips trained
+          # use_failure_rate_decay stays FALSE: that branch (motion_lib_base.py:2535) is a
+          # serial reverse Python loop over every bin, recomputed each iter on CPU -> it 3x'd
+          # iteration time (9s -> 25s, GPUs starved at ~35%). Its own code comment says it is
+          # "very slow and not necessary" (pre_failure_sample_window already samples before
+          # failures). The uniform floor + 200x concentration cap are the cheap guards.
   rewards:
     # --- dead-band fix (identical to the focused run) ---
     tracking_body_linvel:
