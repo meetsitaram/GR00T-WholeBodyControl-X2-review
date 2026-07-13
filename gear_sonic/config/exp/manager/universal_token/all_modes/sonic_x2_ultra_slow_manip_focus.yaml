@@ -1,0 +1,72 @@
+# @package _global_
+# SONIC X2 Ultra — FOCUSED slow/micro-adjustment fine-tune (dead-band fix).
+#
+# GOAL: teach the policy to actually translate at very low speed (~0.1-0.3 m/s)
+# so it can take slow, deliberate steps for micro-positioning during manipulation.
+# The base + executed-feasible-2k policies STALL below ~0.2 m/s: they hold a good
+# pose but don't step forward. This is a REWARD dead-band, not a data problem.
+#
+# ROOT CAUSE (measured on the config):
+#   * tracking_body_linvel std=1.0 m/s => at a 0.12 m/s target, STANDING STILL
+#     scores exp(-0.12^2/1.0^2)=0.986 vs 1.000 for tracking. ~Zero gradient to
+#     move slowly. -> sharpen std to 0.25 (standing drops to ~0.79).
+#   * tracking_anchor_pos weight=0.5, std=0.3 m => world-position lag is cheap
+#     (the only term that punishes "not keeping up"). -> weight 2.0, std 0.15 so
+#     accumulating lag produces a persistent catch-up signal.
+#
+# DATA: fine-tune on JUST the 34 recorded teleop clips (keyboard+VR slow/medium
+# walks incl. slow_walk_manipulation_vr) = gear_sonic/data/motions/x2_slow_manip_focus.pkl.
+# This is a deliberate small-subset test: the workflow must be "point at a small
+# task-relevant motion set + fine-tune -> get the capability", with NO per-task
+# corpus oversampling. If the dead-band fix works, it works on the subset alone.
+# NOTE: this WILL overfit / forget general locomotion -> it's a validation
+# checkpoint, not a deploy one. If it breaks the dead-band, follow up with a
+# rebalanced run that protects general walking.
+#
+# WARM START (via launcher +checkpoint=, NOT here): the executed-feasible 2k
+# checkpoint (model_step_002000.pt) -- its stepping is already cleaner than base.
+#
+# RUNS LOCALLY on one RTX 5090 (single GPU) -- no cloud needed for the check.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_executed_feasible
+  - _self_
+
+exp_var: slow_manip_focus_v1
+project_name: TRL_X2Ultra_SlowManipFocus
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_slow_manip_focus.pkl
+        adaptive_sampling:
+          # 34 clips: keep adaptive (once the sharpened anchor_pos makes a
+          # stalling robot exceed the 0.15m anchor gate, the slow clips TERMINATE
+          # -> register as failures -> sampler auto-focuses on the stall cases).
+          # But raise the uniform floor 0.1->0.25 so the medium walks aren't
+          # starved while it concentrates on the hard slow ones.
+          uniform_sampling_rate: 0.25
+  rewards:
+    # --- dead-band fix: make slow forward motion distinguishable from standing ---
+    tracking_body_linvel:
+      weight: 1.0
+      params:
+        command_name: motion
+        std: 0.25          # was 1.0 -- 1.0 m/s kernel could not tell slow-walk from standing
+    tracking_anchor_pos:
+      weight: 2.0          # was 0.5 -- lag from the reference must cost real reward
+      params:
+        command_name: motion
+        std: 0.15          # was 0.3 -- sharpen so small world-position lag is not free
+
+algo:
+  config:
+    # Short validation run -- we only want to see if the dead-band breaks.
+    num_learning_iterations: 3000
+    # Allow a touch more adaptation than the long protective cap, but still bounded.
+    adaptive_lr_max: 1.5e-4
+    # Small-subset tweaks (vs the 35,974-clip run):
+    save_interval: 250        # was 500 -- catch the behavior change early on a short run
+    num_steps_per_env: 32     # was 24 -- fewer envs (~4096 on 1 GPU) => longer rollouts firm up the batch
+    # num_envs is set at launch (NUM_ENVS=4096) to fit one RTX 5090.

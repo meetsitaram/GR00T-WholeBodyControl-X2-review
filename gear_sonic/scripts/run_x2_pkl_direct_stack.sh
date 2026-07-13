@@ -526,6 +526,7 @@ if [[ "${WITH_DEPLOY}" -eq 1 ]]; then
         --wrist-bypass ik
         --model "${SIM_MODEL}"
         --autostart-after 0
+        --sim-band-release-after-s "${SIM_BAND_RELEASE_S:-3}"
         --deploy-extra-arg --disable-pose-ref-watchdog
     )
     if (( DEPLOY_DURATION_S > 0 )); then

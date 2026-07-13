@@ -156,6 +156,35 @@ class ImEvalCallback(TrainerCallback):
                 metrics_json["log_keys"] = self.log_keys
             json.dump(metrics_json, f, indent=4)
 
+        # Guarded per-clip trajectory dump for OFFLINE rich metrics (understep,
+        # foot-slip, MPJPE). OFF by default; enable with IM_EVAL_DUMP_TRAJ=<dir>.
+        # Not set during training -> zero effect on the running job.
+        dump_dir = os.environ.get("IM_EVAL_DUMP_TRAJ")
+        if dump_dir and getattr(self, "pred_pos_all", None):
+            import pickle
+
+            os.makedirs(dump_dir, exist_ok=True)
+            body_names = (
+                self.env.motion_command.cmd_body_names
+                if hasattr(self.env, "motion_command")
+                else None
+            )
+            keys = metrics_eval.get("eval/all_metrics_dict", {}).get("motion_keys")
+            out = os.path.join(dump_dir, f"traj_rank{self.args.global_rank}.pkl")
+            with open(out, "wb") as tf:
+                pickle.dump(
+                    {
+                        "motion_keys": keys,
+                        "body_names": list(body_names) if body_names is not None else None,
+                        "fps": getattr(self.env._motion_lib, "target_fps", 50),
+                        "pred_pos": self.pred_pos_all,  # list of (T, n_bodies, 3) global, robot
+                        "gt_pos": self.gt_pos_all,  # list of (T, n_bodies, 3) global, reference
+                        "mpjpe": self.mpjpe_all,
+                    },
+                    tf,
+                )
+            print(f"[im_eval] dumped {len(self.pred_pos_all)} trajectories -> {out}")
+
     @torch.no_grad()
     def evaluate_policy(self):
 

@@ -32,6 +32,7 @@ import csv
 
 import imageio
 import mujoco
+import mujoco.viewer  # noqa: F401  -- needed for --onscreen live viewer
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as Rot
@@ -89,7 +90,12 @@ def main():
         help="Warehouse playlist YAML (resolved via _warehouse_playlist."
              "build_concat). Mutually exclusive with --motion.",
     )
-    parser.add_argument("--out", required=True, help="Output MP4 path.")
+    parser.add_argument("--out", required=False, default=None,
+                        help="Output MP4 path (required unless --onscreen/--no-render).")
+    parser.add_argument("--onscreen", action="store_true",
+                        help="Live interactive MuJoCo viewer (launch_passive) at "
+                             "real-time pacing, looping the clip. No MP4. Loads the "
+                             ".pt directly -- no ONNX/docker. SPACE pause, R restart.")
     parser.add_argument("--duration", type=float, default=10.0,
                         help="Seconds of rollout to record (default 10).")
     parser.add_argument("--init-frame", type=int, default=0)
@@ -149,10 +155,24 @@ def main():
     init_root_z = float(init_state["root_pos_w"][2])
     apply_init_state(mj_model, mj_data, init_state)
 
-    if args.no_render:
+    viewer = None
+    if args.onscreen:
+        renderer = None
+        cam = None
+        viewer = mujoco.viewer.launch_passive(
+            mj_model, mj_data, show_left_ui=False, show_right_ui=False)
+        viewer.cam.azimuth = args.cam_azimuth
+        viewer.cam.elevation = args.cam_elevation
+        viewer.cam.distance = args.cam_distance
+        viewer.cam.lookat[:] = [0.0, 0.0, init_root_z]
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = pelvis_id
+    elif args.no_render:
         renderer = None
         cam = None
     else:
+        if args.out is None:
+            raise SystemExit("--out is required unless --onscreen or --no-render")
         renderer = mujoco.Renderer(mj_model, height=args.height, width=args.width)
         cam = mujoco.MjvCamera()
         cam.azimuth = args.cam_azimuth
@@ -199,7 +219,11 @@ def main():
         ])
         print(f"Trajectory CSV -> {args.traj_csv}", flush=True)
 
-    if args.no_render:
+    if args.onscreen:
+        print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
+              f"LIVE viewer @ real-time (looping)", flush=True)
+        writer = None
+    elif args.no_render:
         print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
               f"NO render (fall-time only)", flush=True)
         writer = None
@@ -214,6 +238,8 @@ def main():
         )
 
     fall_frame = None
+    import time as _wallclock
+    _wall0 = _wallclock.time()
     try:
         for step in range(total_steps):
             motion_time = sim_time
@@ -293,10 +319,28 @@ def main():
                 frame = renderer.render()
                 writer.append_data(frame)
 
+            if args.onscreen:
+                if not viewer.is_running():
+                    break
+                viewer.sync()
+                _target = _wall0 + (step + 1) * CONTROL_DT
+                _dt = _target - _wallclock.time()
+                if _dt > 0:
+                    _wallclock.sleep(_dt)
+
             if step % 50 == 0:
                 print(f"  step {step}/{total_steps}  t={step*CONTROL_DT:.2f}s  "
                       f"pelvis_z={float(mj_data.qpos[2]):.3f}", flush=True)
+
+        if args.onscreen and viewer is not None:
+            print("clip done -- holding viewer open; close the window to exit",
+                  flush=True)
+            while viewer.is_running():
+                viewer.sync()
+                _wallclock.sleep(0.03)
     finally:
+        if viewer is not None:
+            viewer.close()
         if writer is not None:
             writer.close()
         if renderer is not None:

@@ -86,11 +86,24 @@ def main():
         help="Anchor pelvis XY at origin (do not advance world translation). "
         "Useful for clips where the motion drifts off-screen.",
     )
+    parser.add_argument("--world-cam", action="store_true",
+                        help="Fixed world camera (not pelvis-tracking) so forward "
+                        "translation is visible against the ground.")
+    parser.add_argument("--start-sec", type=float, default=None,
+                        help="Play window start in seconds (default: clip start).")
+    parser.add_argument("--end-sec", type=float, default=None,
+                        help="Play window end in seconds (default: clip end).")
     args = parser.parse_args()
 
     key, m = load_motion(args.motion, args.motion_key)
     fps = float(m["fps"])
     n_frames = m["dof"].shape[0]
+    start_f = 0 if args.start_sec is None else max(0, int(args.start_sec * fps))
+    end_f = n_frames if args.end_sec is None else min(n_frames, int(args.end_sec * fps))
+    if end_f <= start_f:
+        end_f = n_frames
+    print(f"  play window: frames [{start_f}, {end_f}) = "
+          f"{start_f / fps:.2f}s .. {end_f / fps:.2f}s", flush=True)
     print(f"Motion: {key}", flush=True)
     print(f"  {n_frames} frames @ {fps:g} fps = {n_frames / fps:.2f}s", flush=True)
     print(f"  dof shape={m['dof'].shape}  root_trans={m['root_trans_offset'].shape} "
@@ -130,28 +143,40 @@ def main():
         mj_data.xfrc_applied[:] = 0
         mujoco.mj_forward(mj_model, mj_data)
 
-    apply_frame(0)
-    init_root_z = float(root_pos[0, 2])
+    apply_frame(start_f)
+    init_root_z = float(root_pos[start_f, 2])
 
     paused = [False]
-    cur_frame = [0]
+    cur_frame = [start_f]
+    # Mutable wall-clock anchor so key_callback can re-sync playback timing.
+    clock = {"start": time.time(), "origin": start_f}
+
+    def resync():
+        clock["start"] = time.time()
+        clock["origin"] = cur_frame[0]
 
     def key_callback(keycode):
         import glfw
 
         if keycode == glfw.KEY_SPACE:
             paused[0] = not paused[0]
+            if not paused[0]:
+                resync()  # don't fast-forward through paused wall time
             print("Paused" if paused[0] else "Resumed", flush=True)
         elif keycode == glfw.KEY_R:
-            cur_frame[0] = 0
-            apply_frame(0)
-            print("[reset] frame 0", flush=True)
+            cur_frame[0] = start_f
+            apply_frame(start_f)
+            paused[0] = False
+            resync()
+            print(f"[replay] frame {start_f} ({start_f / fps:.2f}s)", flush=True)
         elif keycode == glfw.KEY_LEFT:
-            cur_frame[0] = max(0, cur_frame[0] - 10)
+            cur_frame[0] = max(start_f, cur_frame[0] - 10)
             apply_frame(cur_frame[0])
+            resync()
         elif keycode == glfw.KEY_RIGHT:
-            cur_frame[0] = min(n_frames - 1, cur_frame[0] + 10)
+            cur_frame[0] = min(end_f - 1, cur_frame[0] + 10)
             apply_frame(cur_frame[0])
+            resync()
 
     print(
         "\n=== X2 Kinematic Playback ===\n"
@@ -168,14 +193,22 @@ def main():
     ) as viewer:
         viewer.cam.azimuth = 120
         viewer.cam.elevation = -20
-        viewer.cam.distance = 3.0
-        viewer.cam.lookat[:] = [0.0, 0.0, init_root_z]
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        viewer.cam.trackbodyid = pelvis_id
+        if args.world_cam:
+            # Fixed world viewpoint centered on the clip's mid-path so forward
+            # translation is visible against the ground (not masked by tracking).
+            mid_xy = 0.5 * (root_pos[start_f, :2] + root_pos[end_f - 1, :2])
+            path_len = float(np.linalg.norm(root_pos[end_f - 1, :2] - root_pos[start_f, :2]))
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            viewer.cam.lookat[:] = [mid_xy[0], mid_xy[1], init_root_z]
+            viewer.cam.distance = max(4.0, path_len + 3.0)
+        else:
+            viewer.cam.distance = 3.0
+            viewer.cam.lookat[:] = [0.0, 0.0, init_root_z]
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            viewer.cam.trackbodyid = pelvis_id
 
         frame_dt = 1.0 / (fps * max(args.speed, 1e-6))
-        wall_start = time.time()
-        wall_frame_origin = cur_frame[0]
+        resync()
 
         while viewer.is_running():
             if paused[0]:
@@ -183,13 +216,14 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            elapsed = time.time() - wall_start
-            target_frame = wall_frame_origin + int(elapsed / frame_dt)
+            elapsed = time.time() - clock["start"]
+            span = end_f - start_f
+            target_frame = clock["origin"] + int(elapsed / frame_dt)
 
             if not args.no_loop:
-                target_frame = target_frame % n_frames
-            elif target_frame >= n_frames:
-                print("End of clip.", flush=True)
+                target_frame = start_f + ((target_frame - start_f) % span)
+            elif target_frame >= end_f:
+                print(f"End of window (frame {end_f}, {end_f / fps:.2f}s).", flush=True)
                 paused[0] = True
                 continue
 

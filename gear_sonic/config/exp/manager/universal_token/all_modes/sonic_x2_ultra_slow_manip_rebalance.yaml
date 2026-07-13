@@ -1,0 +1,49 @@
+# @package _global_
+# SONIC X2 Ultra — REBALANCE run: slow-walk dead-band fix on the FULL corpus.
+#
+# The focused run (sonic_x2_ultra_slow_manip_focus.yaml, 34 slow clips only) PROVED
+# the reward dead-band fix works -- iter-3000 walks the slow window in MuJoCo deploy
+# (understep 93%->27%) where base/2k hard-stall. But it OVERFIT: general feasibility
+# cratered 92.2->62.7. That checkpoint is a validation ckpt, not deploy.
+#
+# This run applies the SAME reward fix to the FULL executed-feasible corpus so we gain
+# the slow-walk capability WITHOUT forgetting general locomotion. Warm-start from the
+# executed-feasible 2k (best general checkpoint).
+#
+# NO MANUAL OVERSAMPLING: with the sharpened anchor_pos below, a stalling robot exceeds
+# the 0.15m anchor gate on the slow clips -> they terminate -> register as failures ->
+# the adaptive sampler auto-concentrates on them (capped at 200x mean failure rate, so
+# the ~34 slow clips draw a meaningful share while the 35,940 general clips stay covered).
+# This is the "point at task-relevant motions -> fine-tune -> capability" workflow with
+# the general corpus present as ballast.
+#
+# See docs/experiments/x2_slow_walk_deadband_finetune.md for the full diagnosis + results.
+#
+# Warm start (via launcher +checkpoint=, NOT here): executed-feasible 2k
+#   model_step_002000.pt.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_executed_feasible
+  - _self_
+
+exp_var: slow_manip_rebalance_v1
+project_name: TRL_X2Ultra_SlowManipRebalance
+
+manager_env:
+  rewards:
+    # --- dead-band fix (identical to the focused run) ---
+    tracking_body_linvel:
+      weight: 1.0
+      params:
+        command_name: motion
+        std: 0.25          # was 1.0 -- 1.0 m/s kernel could not tell slow-walk from standing
+    tracking_anchor_pos:
+      weight: 2.0          # was 0.5 -- lag from the reference must cost real reward
+      params:
+        command_name: motion
+        std: 0.15          # was 0.3 -- sharpen so small world-position lag is not free
+
+algo:
+  config:
+    num_learning_iterations: 30000
+    adaptive_lr_max: 1.0e-4
