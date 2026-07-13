@@ -50,10 +50,16 @@ manager_env:
           uniform_sampling_rate: 1.0       # uniform base (pre-trained model, no grinding)
   rewards:
     # --- arm-scoped velocity tracking (the fast-arm fix) ---
+    # Weights kept MODERATE on purpose: the arms are already covered by the generic
+    # body_linvel/angvel (2.0, all bodies) + relative_body_pos/ori, so these ADD arm
+    # emphasis on top. 1.0 each un-dilutes the arms without out-weighting the root/leg
+    # tracking. Stability is ultimately enforced by the termination gates (foot_pos_xyz
+    # 0.2m, anchor_pos 0.15m, anchor_ori), which no reward weight can override. If the
+    # arms still track poorly, raise these toward 2.0; if legs get sloppy, lower them.
     tracking_arm_linvel:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
-      weight: 2.0
+      weight: 1.0
       params:
         command_name: motion
         std: 0.25
@@ -61,13 +67,14 @@ manager_env:
     tracking_arm_angvel:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
-      weight: 2.0
+      weight: 1.0
       params:
         command_name: motion
         std: 0.35
         body_names: *arm_links
-    # --- relax the smoothness penalties that damp fast arm actuation ---
+    # --- modestly relax the smoothness penalties (they are GLOBAL -> legs too, so
+    #     only a small reduction to avoid leg jitter / instability) ---
     action_rate_l2:
-      weight: -0.05        # was -0.1
+      weight: -0.08        # was -0.1 (small relax; not gutted)
     anti_shake_ang_vel:
-      weight: -0.01        # was -0.02
+      weight: -0.015       # was -0.02
