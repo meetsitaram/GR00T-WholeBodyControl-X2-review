@@ -47,7 +47,13 @@ manager_env:
           load_fraction: 1.0
           finetune_sample_rate: 0.3        # 30% of episodes on the fine-tune targets
         adaptive_sampling:
-          uniform_sampling_rate: 1.0       # uniform base (pre-trained model, no grinding)
+          # 0.5 (not 1.0): re-enable base failure-weighting so the HARD targets
+          # (combat/dance -- they fail) concentrate more than the easy slow walks in
+          # each resample. Safe now because pinning keeps ALL targets loaded (no
+          # starvation). finetune_sample_rate still guarantees a 30% uniform baseline
+          # across all targets. Mild ground-pose grinding returns, but the warm-start
+          # is already good there. Watch num_concentrated_bins + termination rates.
+          uniform_sampling_rate: 0.5
   rewards:
     # --- arm-scoped velocity tracking (the fast-arm fix) ---
     # Weights kept MODERATE on purpose: the arms are already covered by the generic
