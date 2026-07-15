@@ -1,0 +1,67 @@
+name: x2_ultra_relaxed_walk_forward_v1
+output_key: relaxed_walk__v1__walk_forward
+fps: 30
+
+# Walk-forward-only subset of `relaxed_walk_loop_v1.yaml` (2026-06-26).
+# Drops the four pivot segments and the second walk, keeping only the
+# `relaxed_walk_out` slice wrapped in the same neutral_idle anchors and
+# 2.5 s rest seams the parent uses.
+#
+# Reel:
+#   1. neutral_idle anchor              (1.00 s)
+#   2. Relaxed_walk_forward_001__A057   (6.27 s, ~3.50 m forward, ends
+#                                        in an inter-step double-support
+#                                        frame at f187)
+#   3. neutral_idle anchor              (1.00 s)
+#
+# Plus two 2.5 s rest seams between segments -> 13.27 s total
+# (398 frames @ 30 fps). End pose ~(+3.50 m, 0), yaw ~0 deg.
+#
+# Trim window (start_frame=0, n_frames=188) lifted verbatim from the
+# parent playlist -- f187 is a double-support frame (gap_Y=-0.043 m)
+# picked by FK foot-slide sweep, and _001 walks straight (yaw drift
+# <1 deg over the slice). See the parent's header comment for the full
+# sweep table and `_004` vs `_001` rationale.
+#
+# Track: uniform_h14 (matches the parent). For a chain_matched variant,
+# copy this YAML and swap `x2_ultra_retarget_uniform_h14.pkl` ->
+# `x2_ultra_retarget_chain_matched.pkl` and the rest source to
+# `x2_ultra_stitched_idle_relaxed_arms_chain_matched.pkl`.
+
+zero_xy: true
+zero_yaw: true
+
+rest:
+  # Track-matched rest pose (2026-06-24) so segment_start <-> rest pose
+  # distance is small; kills the visible "snap to default pose" between
+  # segments.
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms_uniform_h14.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 75                # 2.5 s seam
+  blend_in_frames: 30
+  blend_out_frames: 30
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: relaxed_walk_out
+    # WINNER slice from the parent: frames [0..188). f187 lands in an
+    # inter-step double-support frame (both feet planted side-by-side,
+    # gap_Y=-0.043 m) instead of a mid-stride heel-strike, dropping
+    # post-walk rest-seam foot slide from 0.315 m (worst foot at f95)
+    # to 0.090 m. _001 walks straight (yaw drift <1 deg over the slice).
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: Relaxed_walk_forward_001__A057__speed_1.0
+    start_frame: 0
+    n_frames: 188                # 6.27 s, ~3.50 m forward, inter-step end
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_retarget_uniform_h14.pkl
+    motion_key: neutral_idle_loop_002__A074__speed_1.0
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

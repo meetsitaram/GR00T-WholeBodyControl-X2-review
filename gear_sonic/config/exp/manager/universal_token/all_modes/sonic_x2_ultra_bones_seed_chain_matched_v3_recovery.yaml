@@ -1,0 +1,85 @@
+# @package _global_
+# SONIC X2 Ultra — chain-matched v3 RECOVERY run.
+#
+# Continuation from the v2 run's iter-4000 checkpoint, with two simultaneous
+# interventions targeting the dominant failure mode identified in the v2 run
+# (61% of terminations were `anchor_ori_full` — pelvis tipping past the
+# upright threshold while limbs kept tracking the reference closely):
+#
+#   1. CORPUS (curriculum filter):
+#      x2_ultra_bones_seed_chain_matched_v2_easy.pkl
+#      = 35,688 / 49,790 clips kept (71.7%) after filtering on the SOURCE
+#        kinematics:
+#          peak_pelvis_tilt_deg <= 20
+#          peak_pelvis_angvel    <= 3.0 rad/s
+#      Drop breakdown by subdir:
+#        locowalk   10.1% dropped (essentially all walks kept)
+#        locomanip  35.6% dropped (kept standard pick/place, drop deep-crouch)
+#        locopost   78.7% dropped (kills nearly all sit/kneel — pelvis is
+#                                  tilted by definition; never recoverable
+#                                  for an upright-pelvis policy at this stage)
+#        locobal    50.4% dropped (kept standing balance, drop push-ups/floor)
+#      Removes the clips that were generating ~all of the `anchor_ori_full`
+#      terminations. Will revisit with a sit/kneel-capable specialist later.
+#
+#   2. REWARD WEIGHTS (orientation-focused boost):
+#      Currently 7 tracking_* positive terms sum to +7 max vs only one stiff
+#      –10 penalty (joint_limit). The optimizer was happily trading pelvis
+#      orientation for tighter limb tracking. Boost the four orientation /
+#      angular-motion terms:
+#        tracking_anchor_ori          0.5  -> 1.5  (3.0x, directly target tilt)
+#        tracking_relative_body_ori   1.0  -> 2.0  (2.0x)
+#        tracking_body_angvel         1.0  -> 2.0  (2.0x, fight chaos)
+#        anti_shake_ang_vel         -5e-3  -> -2e-2 (4.0x penalty, head/wrist)
+#
+# Total tracking reward budget moves from +7 to +10. The anchor-orientation
+# share goes from 7% (0.5/7) to 15% (1.5/10); body-orientation share from
+# 14% to 20%. Combined orientation+angvel share is now 55% vs 36% before.
+#
+# WARM START: iter-4000.pt from the v2 run. The v2 run reached this point on
+# the wider corpus with the unweighted reward; this run resumes from there on
+# the narrower corpus with the new weights, so the wider-DR observation
+# normalization (RunningMeanStd) is already broken in. Expect a brief reward
+# bump (smaller corpus) followed by 200-500 iter renormalization, then
+# (hypothesis) the `anchor_ori_full` termination count should start dropping
+# within 500-1000 iters if the interventions are working.
+#
+# WHAT TO WATCH (vs v2 baseline at matched iter delta from 4000):
+#   Env/Episode_Termination/anchor_ori_full     should DROP (was 124-133)
+#   Env/Metrics/motion/error_anchor_rot         should DROP (was 0.31 rad)
+#   Env/Metrics/motion/error_anchor_ang_vel     should DROP (was 4.6)
+#   Env/Episode_Termination/time_out (success)  should RISE (was 28-30)
+#   Env/adp_samp/failure_rate_mean              should DROP further
+#
+# Same DR / observation noise as v2 (level0_4_pd + local_dir_hist_v2 — these
+# stay on; we want the policy to be deploy-robust, just not failure-rate-blind
+# to corpus difficulty).
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_chain_matched_sphere_feet
+  - _self_
+
+exp_var: bones_seed_chain_matched_v3_recovery
+project_name: TRL_X2Ultra_BonesSeed_ChainMatched_V3_Recovery
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: gear_sonic/data/motions/x2_ultra_bones_seed_chain_matched_v2_easy.pkl
+  rewards:
+    tracking_anchor_ori:
+      weight: 1.5
+    tracking_relative_body_ori:
+      weight: 2.0
+    tracking_body_angvel:
+      weight: 2.0
+    anti_shake_ang_vel:
+      weight: -0.02
+
+algo:
+  config:
+    # 8000 iters on top of the warm-start iter-4000 = ~21 h on 8x H100 at
+    # NUM_ENVS=12288, iter_time ~9s. Continue past 8000 only if the
+    # `anchor_ori_full` trend has flipped and is still declining.
+    num_learning_iterations: 8000

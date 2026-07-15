@@ -1,0 +1,37 @@
+# @package _global_
+# SONIC X2 Ultra — DANCE fine-tune (79 dance clips).
+#
+# Inherits the arm-dynamics fine-tune (wrist_roll PALM tracking + arm-scoped
+# velocity reward) and re-targets it at the dance corpus with a much higher
+# fine-tune sample rate (0.7 vs 0.3) so the policy concentrates on the dances.
+#
+# PAIRED WITH the wrist velocity-limit fix in gear_sonic/envs/manager_env/robots/
+# x2_ultra.py (wrist pitch/roll velocity_limit_sim 4.188 -> 20.944 rad/s = 200 rpm
+# vendor peak, effort_limit_sim 4.8 -> 6.0 N-m) + the matching URDF <limit> edits.
+# That un-caps the wrist so palm/wrist_roll tracking is finally SATISFIABLE and the
+# policy can learn real expressive dance-wrist motion (was ~86% actuator-saturated
+# and untrackable before). See project_x2_wrist_investigation.
+#
+# Warm start (launcher +checkpoint=): the arm-dynamics v3 last.pt (iter ~1500) --
+# obs/action dims unchanged (still 14 tracked bodies, wrist_roll), so it loads
+# cleanly; the policy re-adapts the wrist to the now-uncapped actuator.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_arm_dynamics_finetune
+  - _self_
+
+exp_var: dance_finetune_v1
+project_name: TRL_X2Ultra_Dance
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        fine_tune_dataset:
+          # 79 dance clips: 33 showcase @30fps (basic turns/egyptian/hip-hop/country/
+          # vouge/latino/retro/jazz) + 46 corrected @120fps (dip/distraction/
+          # freedom_wheels/im_diamond/party_hips). Mixed native fps is fine -- motion-lib
+          # resamples each clip to the 50 Hz control rate at load.
+          motion_file: gear_sonic/data/motions/x2_all_dances_finetune.pkl
+          override_corpus: true
+          finetune_sample_rate: 0.3   # 30% on dance targets -- matches arm_dynamics (kept general feasibility ~93%); avoids the catastrophic-forgetting risk of higher concentration
