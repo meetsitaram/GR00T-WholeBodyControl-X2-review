@@ -12,7 +12,7 @@ ASSET_DIR = "gear_sonic/data/assets"
 # These MUST be tuned once real motor datasheets are obtained.
 ARMATURE_HIP_KNEE = 0.025101925  # 120 N-m class (hip pitch/roll/yaw, knee)
 ARMATURE_WAIST_YAW = 0.010177520  # 120 N-m waist yaw
-ARMATURE_WAIST_PR = 0.003609725  # 48 N-m waist pitch/roll
+ARMATURE_WAIST_PR = 0.003609725  # PFP-59-60 36 N-m waist pitch/roll (was mislabeled 48)
 ARMATURE_ANKLE = 0.003609725  # 36/24 N-m ankle
 ARMATURE_SHOULDER_ELBOW = 0.003609725  # 36/24 N-m shoulder/elbow
 ARMATURE_WRIST = 0.00425  # 4.8 N-m wrist pitch/roll
@@ -242,6 +242,15 @@ def make_x2_ultra_cfg(
             ),
             "feet": ActuatorCls(
                 joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
+                # Ankle effort = AgiBot URDF ENFORCED control limits
+                # (x2_31dof_hand.urdf on robot PC2: ankle_pitch 36, ankle_roll 24)
+                # -- these match our sim URDF exactly. The MOTORS are physically
+                # stronger (EtherCAT boot log: ankle pitch = motor_type 5 =
+                # PFP-74-56 peak 60; ankle roll = motor_type 6 = PFP-59-60 peak 36)
+                # but the robot's own model caps them at 36/24, so we match the
+                # enforced limit for sim2real fidelity, NOT the raw motor peak.
+                # Revisit ONLY if the deploy/MC torque-clamp is confirmed to pass
+                # the full motor peak through to the joint.
                 effort_limit_sim={
                     ".*_ankle_pitch_joint": 36.0,
                     ".*_ankle_roll_joint": 24.0,
@@ -266,7 +275,15 @@ def make_x2_ultra_cfg(
             ),
             "waist": ActuatorCls(
                 joint_names_expr=["waist_pitch_joint", "waist_roll_joint"],
-                effort_limit_sim=48.0,
+                # Waist pitch/roll motor = motor_type 6 = PFP-59-60, physical peak
+                # 36 N-m (EtherCAT boot log + datasheet). The AgiBot URDF caps
+                # these at 48 -- ABOVE the motor's physical peak, i.e. phantom
+                # torque the real motor cannot deliver. Sim inherited that 48 and
+                # let the policy arrest forward lean with torque the hardware
+                # can't produce -> "stable in sim, falls forward on real" (deploy
+                # walking_recovery.yaml: waist_pitch resistance ran +45% vs MC).
+                # Clamp to the true physical ceiling, 36.
+                effort_limit_sim=36.0,
                 velocity_limit_sim=13.088,
                 stiffness=STIFFNESS_WAIST_PR,
                 damping=DAMPING_WAIST_PR,
@@ -304,8 +321,12 @@ def make_x2_ultra_cfg(
                     ".*_shoulder_yaw_joint": 24.0,
                     ".*_elbow_joint": 24.0,
                     ".*_wrist_yaw_joint": 24.0,
-                    ".*_wrist_pitch_joint": 4.8,
-                    ".*_wrist_roll_joint": 4.8,
+                    # Wrist pitch/roll = vendor joint PFP-41-50: peak torque 6 N-m,
+                    # peak speed 200 rpm (=20.944 rad/s). Prior velocity_limit 4.188
+                    # (~40 rpm) was a ~5x error and the binding constraint that made
+                    # the wrist untrackable (see project_x2_wrist_investigation).
+                    ".*_wrist_pitch_joint": 6.0,
+                    ".*_wrist_roll_joint": 6.0,
                 },
                 velocity_limit_sim={
                     ".*_shoulder_pitch_joint": 13.088,
@@ -313,8 +334,8 @@ def make_x2_ultra_cfg(
                     ".*_shoulder_yaw_joint": 15.077,
                     ".*_elbow_joint": 15.077,
                     ".*_wrist_yaw_joint": 15.077,
-                    ".*_wrist_pitch_joint": 4.188,
-                    ".*_wrist_roll_joint": 4.188,
+                    ".*_wrist_pitch_joint": 20.944,  # 200 rpm peak (PFP-41-50); was 4.188 (~40 rpm, wrong)
+                    ".*_wrist_roll_joint": 20.944,
                 },
                 stiffness={
                     ".*_shoulder_pitch_joint": STIFFNESS_SHOULDER_ELBOW,

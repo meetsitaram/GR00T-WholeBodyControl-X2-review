@@ -245,6 +245,15 @@ class G1OnnxPolicyShim(torch.nn.Module):
         # method so both ``policy.act_inference(...)`` and the attribute work.
         return self._act_inference
 
+    def rollout(self, obs_dict=None, **kwargs):
+        # The run_once / render playback path (eval_agent_trl) calls
+        # ``policy.rollout(obs_dict=...)``, reads ``policy.action_mean`` for the
+        # action, and indexes the return dict's ``"obs_dict"`` for env.step.
+        # This single-frame ONNX policy is deterministic, so action == action_mean.
+        actions = self._act_inference(obs_dict, **kwargs)
+        self.action_mean = actions
+        return {"actions": actions, "obs_dict": obs_dict}
+
     # --- core forward ------------------------------------------------------
     def _to_np(self, t):
         return t.detach().to("cpu", torch.float32).numpy()

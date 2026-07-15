@@ -585,11 +585,16 @@ class ImEvalCallback(TrainerCallback):
                     "right_knee_link",
                     "right_ankle_roll_link",
                 ]
-                # NOTE use torso_link instead of head for vr_3points_subset_names
+                # NOTE use torso_link instead of head for vr_3points_subset_names.
+                # The tracked wrist link differs by config (wrist_yaw for base,
+                # wrist_roll for the palm-tracking arm-dynamics v3), so pick
+                # whichever is actually in body_names instead of hardcoding yaw.
+                _lw = "left_wrist_yaw_link" if "left_wrist_yaw_link" in body_names else "left_wrist_roll_link"
+                _rw = "right_wrist_yaw_link" if "right_wrist_yaw_link" in body_names else "right_wrist_roll_link"
                 vr_3points_subset_names = [
                     "torso_link",
-                    "left_wrist_yaw_link",
-                    "right_wrist_yaw_link",
+                    _lw,
+                    _rw,
                 ]
                 other_upper_bodies_subset_names = [
                     "pelvis",

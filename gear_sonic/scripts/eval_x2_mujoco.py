@@ -60,6 +60,7 @@ Controls:
 import argparse
 import collections
 import math
+import os
 import time
 from pathlib import Path
 
@@ -263,6 +264,44 @@ def _compute_gains_and_scales():
 
 KP, KD, ACTION_SCALE, DEFAULT_DOF = _compute_gains_and_scales()
 
+# Action clip to match the IsaacLab wrapper (config action_clip_value=20.0).
+# Applied to the policy output each step so target + last_action history obs
+# stay bounded exactly as in training. Override via env for A/B testing.
+ACTION_CLIP = float(os.environ.get("ACTION_CLIP", "20.0"))
+
+# --- Wrist diagnostic dump (gated by WRIST_DUMP=<csv path>). Records, per
+# control step: wrist target_pos, actual qpos, applied-vs-clamped torque, and
+# joint-limit / ctrl-range saturation. Separates a bad-target (mapping/sign)
+# bug from a bad-tracking (torque/limit) bug. ---
+_WRIST_MJ_IDX = [i for i, n in enumerate(MUJOCO_JOINT_NAMES) if "wrist" in n]
+_WRIST_NAMES = [MUJOCO_JOINT_NAMES[i].replace("_joint", "") for i in _WRIST_MJ_IDX]
+# IL-order indices of the wrist joints (action vector is in IL order).
+_WRIST_IL_IDX = [il for il in range(NUM_DOFS) if IL_TO_MJ_DOF[il] in _WRIST_MJ_IDX]
+_wrist_dump_fh = None
+
+
+def _wrist_dump(step, target_pos, mj_data, action_mj=None):
+    global _wrist_dump_fh
+    path = os.environ.get("WRIST_DUMP")
+    if not path:
+        return
+    q = mj_data.qpos[7:7 + NUM_DOFS]
+    qd = mj_data.qvel[6:6 + NUM_DOFS]
+    tau = KP * (target_pos - q) - KD * qd
+    if _wrist_dump_fh is None:
+        _wrist_dump_fh = open(path, "w")
+        hdr = ["step", "act_max", "act_mean"]
+        for n in _WRIST_NAMES:
+            hdr += [f"{n}_tgt", f"{n}_q", f"{n}_tau"]
+        _wrist_dump_fh.write(",".join(hdr) + "\n")
+    amax = float(np.abs(action_mj).max()) if action_mj is not None else 0.0
+    amean = float(np.abs(action_mj).mean()) if action_mj is not None else 0.0
+    row = [str(step), f"{amax:.3f}", f"{amean:.3f}"]
+    for i in _WRIST_MJ_IDX:
+        row += [f"{target_pos[i]:.4f}", f"{q[i]:.4f}", f"{tau[i]:.3f}"]
+    _wrist_dump_fh.write(",".join(row) + "\n")
+    _wrist_dump_fh.flush()
+
 
 # ---------- Actor ----------
 class SimpleMLP(nn.Module):
@@ -343,7 +382,32 @@ class UniversalTokenActor(nn.Module):
 
 
 def load_actor_from_checkpoint(ckpt_path: str, device: str = "cpu"):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    # Full training checkpoints pickle class refs from the *public* ``trl``
+    # package (HuggingFace TRL) present in the trainer's node env but not
+    # necessarily here. We only need ``policy_state_dict`` (plain tensors), so
+    # unpickle with a tolerant Unpickler that stubs out any class it can't
+    # import -- the optimizer/args/env objects become inert stubs we never
+    # touch, and no ``trl`` install is required to run the policy.
+    import pickle as _pickle, types as _types
+
+    class _Stub:
+        def __init__(self, *a, **k): pass
+        def __setstate__(self, state): pass
+
+    class _StubUnpickler(_pickle.Unpickler):
+        def find_class(self, module, name):
+            try:
+                return super().find_class(module, name)
+            except Exception:
+                return _Stub
+
+    _tolerant = _types.ModuleType("_tolerant_pickle")
+    for _a in dir(_pickle):
+        setattr(_tolerant, _a, getattr(_pickle, _a))
+    _tolerant.Unpickler = _StubUnpickler
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False,
+                      pickle_module=_tolerant)
     sd = ckpt.get("policy_state_dict") or ckpt.get("actor_model_state_dict")
     if sd is None:
         raise KeyError("Cannot find policy state dict in checkpoint")
@@ -642,8 +706,54 @@ def main():
              "build_concat into a virtual single-clip motion). Mutually "
              "exclusive with --motion.",
     )
+    motion_grp.add_argument(
+        "--motions",
+        help="Multi-clip motion-lib PKL: iterate EVERY clip one-by-one in one "
+             "viewer session, RSI-resetting the robot before each clip. Advances "
+             "to the next clip when the current one completes a full pass OR the "
+             "robot falls. Mutually exclusive with --motion / --playlist.",
+    )
+    parser.add_argument(
+        "--loop-clips", action="store_true",
+        help="With --motions, loop back to the first clip after the last "
+             "(default: stop after one pass through all clips).")
+    parser.add_argument(
+        "--seconds-per-clip", type=float, default=0.0,
+        help="With --motions, show each clip for at most this many seconds before "
+             "auto-advancing (default 0 = play the full clip once). E.g. 5 = a 5 s "
+             "snippet of each. Keyboard N/B still override to step manually.")
+    parser.add_argument(
+        "--clip", default=None,
+        help="With --motions, only play clips whose name CONTAINS this substring "
+             "(case-insensitive). E.g. --clip dance_disco_fever_001__A465 plays just "
+             "that one dance; --clip freedom_wheels plays all freedom_wheels variants.")
+    parser.add_argument(
+        "--record", default=None,
+        help="Capture the per-step sim trajectory (MuJoCo-order measured joint "
+             "pos/vel + commanded target) to this .npz and EXIT after one clip pass. "
+             "For sim-vs-real comparison against the LeRobot capture.")
+    parser.add_argument(
+        "--record-seconds", type=float, default=0.0,
+        help="With --record, capture this many seconds (default 0 = one full clip pass).")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--speed", type=float, default=1.0)
+    # Wrist handling in deploy. The policy's wrist actions diverge in the
+    # MuJoCo deploy loop (the wrist is the weakest joint; explicit-PD tracking
+    # error corrupts the proprioception obs -> action runaway -> wrist slams to
+    # its limit), even though the SAME policy keeps wrists natural in IsaacLab.
+    # Taking the wrists out of the policy loop removes the divergence seed.
+    # DEFAULT = freeze wrists (interim mitigation, 2026-07-13): the policy's
+    # wrist actions diverge in deploy, so by default we hold the wrists out of
+    # the loop. --wrist-ref articulates them from the reference instead;
+    # --no-wrist-fix restores the old raw-policy-wrist behavior.
+    wgrp = parser.add_mutually_exclusive_group()
+    wgrp.add_argument("--freeze-wrist", action="store_true",
+                      help="Hold wrists at the neutral (default) pose (this is the default).")
+    wgrp.add_argument("--wrist-ref", action="store_true",
+                      help="Drive wrists to the reference motion's wrist angles each "
+                           "frame (keeps articulation, no divergence).")
+    wgrp.add_argument("--no-wrist-fix", action="store_true",
+                      help="Restore raw policy control of the wrists (they will diverge/twist).")
     parser.add_argument(
         "--init-frame",
         type=int,
@@ -669,6 +779,21 @@ def main():
         default=0.0,
         help="If > 0, force a reset after this many simulated seconds (default 0 = no limit).",
     )
+    parser.add_argument(
+        "--push-force", type=float, default=200.0,
+        help="Magnitude (N) of the manual forward push applied on key 'P' "
+             "(adjust live with '[' / ']'). Default 200.")
+    parser.add_argument(
+        "--push-duration", type=float, default=0.2,
+        help="How long (s) the manual push force is held. Default 0.2.")
+    parser.add_argument(
+        "--push-body", default="head_pitch_link",
+        help="Body the manual push is applied to. Default head_pitch_link "
+             "(head/neck) -- it sits ~0.40 m above the waist pitch joint, giving "
+             "the largest moment arm about the waist, so it actually stresses "
+             "waist-pitch control. A chest/pelvis push is at/below the waist and "
+             "mostly loads ankles/hips instead. Use --push-body head_yaw_link "
+             "(neck) or pelvis to compare.")
 
     # ---- Per-joint-group PD scaling. Multiplicative on top of the
     # DEPLOYMENT_KP_SCALE / DEPLOYMENT_KD_SCALE tables baked into this script
@@ -737,16 +862,29 @@ def main():
     actor = load_actor_from_checkpoint(args.checkpoint, args.device)
     print("  Actor loaded.", flush=True)
 
-    if args.playlist is not None:
+    # ---- Build the clip list: single (--motion/--playlist) or multi (--motions) ----
+    if args.motions is not None:
+        print(f"Loading multi-clip motions from {args.motions} ...", flush=True)
+        _all = load_motion_data(args.motions)
+        clip_names = list(_all.keys())
+        if args.clip:
+            clip_names = [k for k in clip_names if args.clip.lower() in k.lower()]
+            if not clip_names:
+                raise SystemExit(
+                    f"[eval] --clip '{args.clip}' matched no clip names in {args.motions}")
+        clips = [{k: _all[k]} for k in clip_names]
+        _sel = f" matching '{args.clip}'" if args.clip else ""
+        print(f"  {len(clips)} clip(s){_sel} -- iterating one-by-one, RSI-reset before each.",
+              flush=True)
+    elif args.playlist is not None:
         print(f"Loading playlist from {args.playlist} ...", flush=True)
-        motion_data = load_playlist_motion_data(args.playlist)
+        _md = load_playlist_motion_data(args.playlist)
+        clip_names, clips = [list(_md.keys())[0]], [_md]
     else:
         print(f"Loading motion from {args.motion} ...", flush=True)
-        motion_data = load_motion_data(args.motion)
-    total_frames = get_total_frames(motion_data)
-    motion_fps = get_motion_fps(motion_data)
-    print(f"  {total_frames} frames @ {motion_fps} fps = {total_frames / motion_fps:.1f}s",
-          flush=True)
+        _md = load_motion_data(args.motion)
+        clip_names, clips = [list(_md.keys())[0]], [_md]
+    n_clips = len(clips)
 
     print("Loading MuJoCo model ...", flush=True)
     mj_model = mujoco.MjModel.from_xml_path(MJCF_PATH)
@@ -754,25 +892,44 @@ def main():
     mj_model.opt.timestep = SIM_DT
 
     pelvis_id = mj_model.body("pelvis").id
+    push_body_id = mj_model.body(args.push_body).id
+    push_steps_left = 0
+    push_force = float(args.push_force)
+    pending_clip_jump = 0      # +1 next / -1 previous, set from key_callback
+    pending_rating = None      # 'E'/'M'/'D' = rate current dance easy/medium/difficult
 
-    # ---- RSI: pull full robot state from motion frame `init_frame` ----
+    # ---- Per-clip state, reassigned by _load_clip() when iterating clips.
+    # RSI: pull the full robot reset state from motion frame `init_frame`.
     init_frame = int(args.init_frame)
-    init_motion_state = compute_motion_state(motion_data, init_frame, motion_fps)
-    init_root_z = float(init_motion_state["root_pos_w"][2])
-    print(f"  [RSI] Initializing from motion frame {init_frame} "
-          f"(t={init_frame / motion_fps:.3f}s):", flush=True)
-    print(f"    root_pos_w     = {init_motion_state['root_pos_w']}", flush=True)
-    print(f"    root_quat_wxyz = {init_motion_state['root_quat_w_wxyz']}", flush=True)
-    print(f"    root_lin_vel_w = {init_motion_state['root_lin_vel_w']}", flush=True)
-    print(f"    root_ang_vel_w = {init_motion_state['root_ang_vel_w']}", flush=True)
-    print(f"    joint_pos_mj[:6] = {init_motion_state['joint_pos_mj'][:6]}", flush=True)
-    print(f"    joint_vel_mj[:6] = {init_motion_state['joint_vel_mj'][:6]}", flush=True)
+    clip_idx = 0
+    motion_data = None
+    total_frames = 0
+    motion_fps = 30.0
+    init_motion_state = None
+    init_root_z = 0.0
+
+    def _load_clip(idx):
+        nonlocal motion_data, total_frames, motion_fps, init_motion_state, init_root_z
+        motion_data = clips[idx]
+        total_frames = get_total_frames(motion_data)
+        motion_fps = get_motion_fps(motion_data)
+        init_motion_state = compute_motion_state(motion_data, init_frame, motion_fps)
+        init_root_z = float(init_motion_state["root_pos_w"][2])
+        if n_clips > 1:
+            print(f"\n=== DANCE {idx + 1}/{n_clips}: {clip_names[idx]} "
+                  f"({total_frames / motion_fps:.1f}s) ===", flush=True)
+        else:
+            print(f"\n[RSI] {clip_names[idx]}: {total_frames} frames @ {motion_fps:g} fps "
+                  f"= {total_frames / motion_fps:.1f}s (RSI frame {init_frame})", flush=True)
+
+    _load_clip(0)
 
     print(f"  Default DOF (MJ order): {DEFAULT_DOF}", flush=True)
     print(f"  Action scale (MJ order): {ACTION_SCALE}", flush=True)
 
     prop_buf = ProprioceptionBuffer()
     last_action_mj = np.zeros(NUM_DOFS, dtype=np.float32)
+    _rec = {"t": [], "frame": [], "qpos": [], "qvel": [], "target": []} if args.record else None
     sim_time = float(init_frame) / motion_fps
     step_count = 0
     episode_count = 0
@@ -818,13 +975,33 @@ def main():
         print(f"\n[reset]{tag} starting episode {episode_count}", flush=True)
 
     def key_callback(keycode):
-        nonlocal paused
+        nonlocal paused, push_steps_left, push_force, pending_clip_jump, pending_rating
         import glfw
         if keycode == glfw.KEY_SPACE:
             paused = not paused
             print("Paused" if paused else "Resumed", flush=True)
         elif keycode == glfw.KEY_R:
             reset_state("manual")
+        elif keycode == glfw.KEY_N:          # next dance
+            pending_clip_jump = 1
+        elif keycode == glfw.KEY_B:          # back / previous dance
+            pending_clip_jump = -1
+        elif keycode == glfw.KEY_E:          # rate current dance: easy
+            pending_rating = "easy"
+        elif keycode == glfw.KEY_M:          # rate current dance: medium
+            pending_rating = "medium"
+        elif keycode == glfw.KEY_D:          # rate current dance: difficult
+            pending_rating = "difficult"
+        elif keycode == glfw.KEY_P:
+            push_steps_left = max(1, int(round(args.push_duration / CONTROL_DT)))
+            print(f"[PUSH] forward {push_force:.0f} N for {args.push_duration:.2f}s "
+                  f"on {args.push_body}", flush=True)
+        elif keycode == glfw.KEY_RIGHT_BRACKET:      # ']' -> stronger
+            push_force += 50.0
+            print(f"[PUSH] magnitude -> {push_force:.0f} N", flush=True)
+        elif keycode == glfw.KEY_LEFT_BRACKET:       # '[' -> weaker
+            push_force = max(0.0, push_force - 50.0)
+            print(f"[PUSH] magnitude -> {push_force:.0f} N", flush=True)
         elif keycode == glfw.KEY_V:
             if viewer.cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING:
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -839,7 +1016,8 @@ def main():
           f"{int(np.rad2deg(np.arccos(-args.fall_tilt_cos)))}°).", flush=True)
     if args.max_episode > 0:
         print(f"Max episode length: {args.max_episode:.1f} s.", flush=True)
-    print("Press SPACE pause, R reset, V toggle camera.\n", flush=True)
+    print("Keys: SPACE pause | R reset | N next | B back | E/M/D rate easy/med/hard | "
+          "V camera | P push | [ / ] push force.\n", flush=True)
 
     with mujoco.viewer.launch_passive(
         mj_model, mj_data,
@@ -863,6 +1041,19 @@ def main():
                 viewer.sync()
                 time.sleep(0.02)
                 continue
+
+            # -- Pending manual dance nav / mark (set from key_callback; handled
+            #    here on the main loop for thread-safety) --
+            if pending_rating is not None:
+                print(f"  ★ RATING {pending_rating} | DANCE {clip_idx + 1}/{n_clips}: "
+                      f"{clip_names[clip_idx]}", flush=True)
+                pending_rating = None
+            if pending_clip_jump != 0 and n_clips > 1:
+                clip_idx = (clip_idx + pending_clip_jump) % n_clips
+                pending_clip_jump = 0
+                _load_clip(clip_idx)
+                reset_state("manual nav")
+                wall_start = time.time() - sim_time
 
             # -- Motion phase --
             motion_time = sim_time * args.speed
@@ -902,11 +1093,62 @@ def main():
                 tok_t = torch.from_numpy(tokenizer_obs).unsqueeze(0).to(args.device)
                 action_il_t = actor(prop_t, tok_t).squeeze(0).cpu().numpy()
 
+            # Match the IsaacLab wrapper, which clips env_actions to
+            # ±action_clip_value BEFORE applying them AND before the action
+            # manager stores them (so the `last_action` history obs is also
+            # clipped). Without this the deploy applies + re-observes the raw
+            # action, which can run away (wrist actions -> 60+ -> target far
+            # past the joint limit -> wrist slams to its stop). ACTION_CLIP=0
+            # disables (old behavior) for A/B testing.
+            if ACTION_CLIP > 0:
+                action_il_t = np.clip(action_il_t, -ACTION_CLIP, ACTION_CLIP)
+
+            # Take the wrists out of the (deploy-divergent) policy loop: zero the
+            # wrist action channels so the last_action obs for the wrist is 0 and
+            # the wrist target comes from below, not the runaway-prone policy
+            # output. Verified 2026-07-13 to stop the wrist-twist. (Env
+            # FREEZE_WRIST kept as an override for A/B diagnostics.)
+            _do_wrist_fix = (not args.no_wrist_fix) and not os.environ.get("NO_WRIST_FIX")
+            if _do_wrist_fix:
+                action_il_t[_WRIST_IL_IDX] = 0.0
+
             # Convert IL→MJ using MJ_TO_IL_DOF as gather index:
             #   result[mj_pos] = source[MJ_TO_IL_DOF[mj_pos]]
             action_mj = action_il_t[MJ_TO_IL_DOF]
             last_action_mj = action_mj.copy()
             target_pos = DEFAULT_DOF + action_mj * ACTION_SCALE
+
+            # --wrist-ref: articulate the wrists from the reference motion
+            # instead of holding them at neutral (--freeze-wrist).
+            if args.wrist_ref:
+                ref_dof_mj = np.asarray(_m(motion_data)["dof"][motion_frame], dtype=np.float64)
+                target_pos[_WRIST_MJ_IDX] = ref_dof_mj[_WRIST_MJ_IDX]
+
+            # -- Trajectory capture (--record): measured joint state (pre-step) +
+            #    commanded target, MuJoCo order, one sample per 50 Hz control tick. --
+            if _rec is not None:
+                _rec["t"].append(sim_time)
+                _rec["frame"].append(motion_frame)
+                _rec["qpos"].append(qpos_j.copy())
+                _rec["qvel"].append(qvel_j.copy())
+                _rec["target"].append(target_pos.copy())
+
+            # -- Manual forward push (key 'P'): external force at the head/neck
+            # (--push-body, default head_pitch_link -- high up for a large moment
+            # arm about the waist), applied along the robot's own forward (+X
+            # body) projected to horizontal, so "forward" is relative to facing. --
+            if push_steps_left > 0:
+                w, x, y, z = base_quat
+                u = np.array([x, y, z])
+                fwd = np.array([1.0, 0.0, 0.0])
+                fwd_w = fwd + 2.0 * w * np.cross(u, fwd) + 2.0 * np.cross(u, np.cross(u, fwd))
+                fwd_w[2] = 0.0
+                nrm = np.linalg.norm(fwd_w)
+                if nrm > 1e-6:
+                    fwd_w /= nrm
+                mj_data.xfrc_applied[push_body_id, :3] = push_force * fwd_w
+            else:
+                mj_data.xfrc_applied[push_body_id, :3] = 0.0
 
             # -- PD control + step --
             for _ in range(DECIMATION):
@@ -916,9 +1158,35 @@ def main():
                     mj_data.ctrl[JOINT_TO_ACTUATOR[j]] = torque[j]
                 mujoco.mj_step(mj_model, mj_data)
 
+            _wrist_dump(step_count, target_pos, mj_data, action_mj)
+
+            if push_steps_left > 0:
+                push_steps_left -= 1
+                if push_steps_left == 0:
+                    mj_data.xfrc_applied[push_body_id, :3] = 0.0
+
             sim_time += CONTROL_DT
             step_count += 1
             viewer.sync()
+
+            # -- --record: stop + dump after one clip pass (or --record-seconds). --
+            if _rec is not None:
+                _dur = (args.record_seconds if args.record_seconds > 0
+                        else total_frames / motion_fps / max(args.speed, 1e-9))
+                if len(_rec["t"]) * CONTROL_DT >= _dur:
+                    jn = [mj_model.joint(i + 1).name for i in range(NUM_DOFS)]
+                    np.savez(args.record,
+                             joint_names=np.array(jn),
+                             t=np.array(_rec["t"]),
+                             motion_frame=np.array(_rec["frame"]),
+                             qpos=np.array(_rec["qpos"]),
+                             qvel=np.array(_rec["qvel"]),
+                             target=np.array(_rec["target"]),
+                             clip=(clip_names[clip_idx] if clip_names else ""),
+                             fps=float(motion_fps))
+                    print(f"[record] wrote {len(_rec['t'])} steps ({_dur:.1f}s) to "
+                          f"{args.record}", flush=True)
+                    break
 
             wall_elapsed = time.time() - wall_start
             if sim_time > wall_elapsed:
@@ -936,9 +1204,24 @@ def main():
                                 f"(tilt {int(np.rad2deg(np.arccos(np.clip(-grav_z,-1,1))))}°)")
             elif args.max_episode > 0 and episode_seconds >= args.max_episode:
                 reset_reason = f"reached --max-episode={args.max_episode:.1f}s"
+            elif n_clips > 1:
+                clip_window = total_frames / motion_fps / max(args.speed, 1e-9)
+                if args.seconds_per_clip > 0:
+                    clip_window = min(clip_window, args.seconds_per_clip)
+                if episode_seconds >= clip_window:
+                    reset_reason = "window done"
             if reset_reason is not None:
-                print(f"  [fall] ep={episode_count} ran {episode_seconds:.2f}s, "
-                      f"reason: {reset_reason}", flush=True)
+                print(f"  [end] DANCE {clip_idx + 1}/{n_clips} {clip_names[clip_idx]} "
+                      f"ran {episode_seconds:.2f}s ({reset_reason})", flush=True)
+                if n_clips > 1:
+                    # Advance to the next dance clip (RSI-reset happens in reset_state).
+                    clip_idx += 1
+                    if clip_idx >= n_clips:
+                        if not args.loop_clips:
+                            print(f"\n[done] iterated all {n_clips} clips.", flush=True)
+                            break
+                        clip_idx = 0
+                    _load_clip(clip_idx)
                 reset_state(reset_reason)
                 wall_start = time.time() - sim_time
                 continue
@@ -959,6 +1242,10 @@ def main():
                 print(f"  action |min|={np.abs(action_il_t).min():.4f} "
                       f"|max|={np.abs(action_il_t).max():.4f} "
                       f"|mean|={np.abs(action_il_t).mean():.4f}", flush=True)
+                _top = np.argsort(np.abs(action_mj))[::-1][:4]
+                print("  top|action| joints: " + ", ".join(
+                    f"{MUJOCO_JOINT_NAMES[i].replace('_joint','')}={action_mj[i]:.1f}"
+                    for i in _top), flush=True)
                 print(f"  prop shape={proprioception.shape} "
                       f"|min|={proprioception.min():.4f} |max|={proprioception.max():.4f}",
                       flush=True)

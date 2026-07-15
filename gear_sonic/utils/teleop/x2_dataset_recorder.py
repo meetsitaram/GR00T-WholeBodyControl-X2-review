@@ -179,6 +179,26 @@ _RIGHT_ARM_MJ_SLICE = slice(22, 29)  # right arm (7 joints)
 # ``_DEPLOY_SILENT_REWARN_S`` seconds so a long crash doesn't spam.
 _DEPLOY_SILENT_REWARN_S: float = 30.0
 
+# Shutdown safety: on stop() the recorder ramps the wire reference
+# from the last commanded pose back to the neutral stand, then holds
+# stand for a beat, so the deploy converges to a stable upright target
+# before the pose wire goes silent (the direct/replay stacks disable
+# the pose-ref watchdog, so without this a mid-clip Ctrl-C leaves the
+# robot latched at a dynamic pose and it can tip). Kept well inside the
+# launcher's ~5 s post-SIGINT teardown budget. See
+# :meth:`X2DatasetRecorder._settle_to_stand_on_shutdown`.
+_SHUTDOWN_SETTLE_RAMP_S: float = 0.8
+_SHUTDOWN_SETTLE_HOLD_S: float = 0.4
+
+# Return-to-stand transition when a clip is stopped / released / ends
+# (hold_after=False) with no upstream body_pose to hand off to. The
+# reference is smootherstep-ramped from the last commanded pose to the
+# neutral stand over this window, played out through the main publish
+# loop (non-blocking), so the locomotion policy is guided back to a
+# balanced stand instead of being left holding an unstable mid-motion
+# frame. See :meth:`X2DatasetRecorder._begin_return_to_stand`.
+_RETURN_TO_STAND_RAMP_S: float = 1.0
+
 
 @dataclass
 class RecorderConfig:
@@ -1647,6 +1667,40 @@ class X2DatasetRecorder:
         self._active_clip_hold_after: bool = False
         self._clip_held_frame: Optional[dict[str, np.ndarray]] = None
 
+        # Return-to-stand transition. When a clip is stopped / released
+        # mid-motion (or finishes with hold_after=False) in a stack
+        # with no upstream body_pose (the direct-PKL / replay stacks),
+        # we can't just clear the clip and let the next tick publish the
+        # static stand pose: the reference would jump from a dynamic
+        # mid-stride frame straight to stand and the locomotion policy
+        # stumbles and falls (observed: walk stopped at frame 208/1249
+        # -> tilt watchdog -> SAFE_HOLD). Instead we start a short ramp
+        # here and play it out over subsequent main-loop ticks,
+        # smootherstep-interpolating the reference from the last
+        # published pose to stand so the policy has time to plant its
+        # feet. ``None`` means no transition in progress. See
+        # :meth:`_begin_return_to_stand` /
+        # :meth:`_publish_return_to_stand_frame`.
+        self._settle_ramp: Optional[dict[str, Any]] = None
+
+        # Last reference frame actually put on the wire (any publish
+        # path -- clip, held-clip, merge, or idle). Cached so the
+        # shutdown handler can ramp the robot from wherever it was
+        # commanded back to the stable stand pose instead of leaving
+        # the deploy latched at a mid-clip pose (which, with the
+        # pose-ref watchdog disabled for the direct/replay stacks,
+        # freezes the robot mid-motion and can tip it). See
+        # :meth:`_settle_to_stand_on_shutdown`.
+        self._last_published_body_q: Optional[np.ndarray] = None
+        self._last_published_root_quat: Optional[np.ndarray] = None
+        # Set only while the shutdown settle ramp is driving the wire.
+        # Gates :meth:`_publish_pose` so that once ``stop()`` fires, the
+        # settle frames are the ONLY thing that can reach :5556 -- the
+        # run loop (paused mid-tick under the signal handler) can't
+        # resume and slap a stale clip frame back on the wire after the
+        # ramp has settled the robot to stand.
+        self._in_shutdown_settle: bool = False
+
         # Idle-yaw rebase logging gates. We re-derive the idle frame's
         # ``root_quat_xyzw`` from the live ``x2_debug`` ``base_quat``
         # every tick that we publish an idle stand pose (see
@@ -2084,6 +2138,23 @@ class X2DatasetRecorder:
             return
         self._stop_called = True
         self._stop_event.set()
+
+        # Safety: ramp the wire back to a stable stand before we stop
+        # publishing, so a mid-clip Ctrl-C doesn't leave the deploy
+        # latched at a dynamic pose (it can tip -- the direct/replay
+        # stacks disable the pose-ref watchdog). Only where the
+        # recorder owns the pose wire: NOT in VLA subscribe-mode (the
+        # bridge owns :5556; publishing here would race it) and only
+        # when idle-publish is enabled (the same gate that makes the
+        # recorder responsible for the idle stand fallback). The run
+        # loop is paused here -- stop() runs on the main thread from
+        # the signal handler, between the loop's bytecodes -- so the
+        # pub socket is idle and safe to drive directly.
+        if (
+            not getattr(self, "_vla_subscribe_mode", False)
+            and self._cfg.idle_publish_enabled
+        ):
+            self._settle_to_stand_on_shutdown()
         # Persist any buffered episode?
         #
         # Internal / planner-zmq modes: NO -- the recorder requires an
@@ -2242,7 +2313,7 @@ class X2DatasetRecorder:
                             flush=True,
                         )
                         wait_msg = True
-                    self._publish_idle()
+                    self._publish_idle(tick=tick)
                     self._sleep_until(next_tick + period)
                     next_tick += period
                     continue
@@ -2578,9 +2649,18 @@ class X2DatasetRecorder:
                                     f"[recorder] motion-clip "
                                     f"(kind={self._active_clip.kind}) "
                                     f"{self._active_clip.entry.name!r} "
-                                    f"completed; resuming kplanner forwarding",
+                                    f"completed; ramping back to idle stand "
+                                    f"(or resuming kplanner if present)",
                                     flush=True,
                                 )
+                            # Ease the reference from the clip's final
+                            # frame to the idle stand rather than
+                            # snapping, so a clip that ends mid-motion
+                            # doesn't leave the policy holding an
+                            # unbalanced pose. No-op in the kplanner
+                            # stack (body_pose present -> ramp abandoned
+                            # next tick).
+                            self._begin_return_to_stand(reason="clip-completed")
                         self._active_clip = None
                         self._active_clip_hold_after = False
                     tick += 1
@@ -2600,6 +2680,27 @@ class X2DatasetRecorder:
                     next_tick += period
                     self._sleep_until(next_tick)
                     continue
+
+                # Return-to-stand ramp (a clip just stopped / ended and
+                # we have no upstream body_pose to hand off to). Guides
+                # the reference from the last mid-motion frame back to a
+                # balanced stand so the policy can recover, instead of
+                # snapping to idle. If an upstream body_pose has since
+                # arrived (kplanner stack), abandon the ramp and let the
+                # normal merge path resume -- the planner owns continuity
+                # there.
+                if (
+                    not self._vla_subscribe_mode
+                    and self._settle_ramp is not None
+                ):
+                    if snap["body_pose_q_mj"] is not None:
+                        self._settle_ramp = None
+                    else:
+                        self._publish_return_to_stand_frame(tick=tick)
+                        tick += 1
+                        next_tick += period
+                        self._sleep_until(next_tick)
+                        continue
 
                 body_pose = snap["body_pose_q_mj"]
                 if body_pose is None:
@@ -2638,7 +2739,12 @@ class X2DatasetRecorder:
                         not self._vla_subscribe_mode
                         and self._cfg.idle_publish_enabled
                     ):
-                        self._publish_idle()
+                        self._publish_idle(tick=tick)
+                        # Advance the frame counter so the future-window
+                        # frame indices stay monotonic across idle ticks
+                        # (matches clip playback; a frozen frame_index
+                        # can read as a stale/duplicate frame downstream).
+                        tick += 1
                     next_tick += period
                     self._sleep_until(next_tick)
                     continue
@@ -3246,6 +3352,13 @@ class X2DatasetRecorder:
         policy's 10-slot future window pinned at the current pose
         and prevents anticipatory locomotion thrust.
         """
+        # Once shutdown has begun, the settle ramp owns the wire. Drop
+        # any other publish (a clip frame from the run loop resuming
+        # under the signal handler after stop() interrupted it) so it
+        # can't overwrite the stand pose we've settled the robot to.
+        if self._stop_event.is_set() and not self._in_shutdown_settle:
+            return
+
         payload: dict[str, np.ndarray] = {
             "joint_pos_mj": body_q_mj.astype(np.float32),
             "root_quat_xyzw": (
@@ -3312,6 +3425,17 @@ class X2DatasetRecorder:
                         payload["frame_index_future"] = fidx
                 payload["future_dt_s"] = np.array([dt], dtype=np.float32)
 
+        # Cache the frame we're about to send so the shutdown handler
+        # can ramp back to stand from the last commanded pose (see
+        # :meth:`_settle_to_stand_on_shutdown`). Copy: callers reuse
+        # their buffers across ticks.
+        self._last_published_body_q = payload["joint_pos_mj"].astype(
+            np.float64, copy=True
+        )
+        self._last_published_root_quat = payload["root_quat_xyzw"].astype(
+            np.float32, copy=True
+        )
+
         msg = pack_pose_message(
             payload, topic=self._cfg.pub_topic, version=self._cfg.protocol_version
         )
@@ -3320,7 +3444,74 @@ class X2DatasetRecorder:
         except zmq.Again:
             pass
 
-    def _publish_idle(self) -> None:
+    def _publish_stationary_pose(
+        self,
+        *,
+        body_q_mj: np.ndarray,
+        root_quat_xyzw: Optional[np.ndarray],
+        tick: int,
+    ) -> None:
+        """Publish a held/stationary reference WITH a populated future window.
+
+        Broadcasts ``body_q_mj`` + ``root_quat_xyzw`` across the v5
+        future window (the same shape :meth:`_publish_held_clip_frame`
+        emits), instead of the single-frame v4 path that
+        :meth:`_publish_idle` historically took.
+
+        **Why this matters (balance).** The deployed SONIC policy reads
+        a 10-slot future window every tick. When the recorder sends a
+        single frame with no ``joint_pos_mj_future`` /
+        ``root_quat_xyzw_future``, the deploy's
+        ``ZmqPoseInputSource::Sample()`` falls back to pinning that
+        window at the current pose -- and empirically the policy holds
+        balance poorly in that mode, drifting off balance and
+        collapsing even while nominally "holding" a stand. Live clip
+        playback and the held-clip path both populate the window and
+        stay stable; a plain single-frame idle did not. Broadcasting a
+        stationary future window makes idle / return-to-stand behave
+        like a held clip -- the mode that demonstrably keeps the robot
+        up (a fresh ``play`` of any clip resets to a clean stand).
+        """
+        zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
+        body32 = np.asarray(body_q_mj, dtype=np.float32)
+        if root_quat_xyzw is None:
+            rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            rot = np.asarray(root_quat_xyzw, dtype=np.float32).reshape(4)
+        n_future = int(self._cfg.clip_future_window_frames)
+        if n_future > 0:
+            jpos_future = np.broadcast_to(
+                body32, (n_future, body32.shape[0])
+            ).copy()
+            rot_future = np.broadcast_to(rot, (n_future, 4)).copy()
+            step_ticks = max(
+                1,
+                int(round(
+                    self._cfg.clip_future_dt_s * self._cfg.publish_rate_hz
+                )),
+            )
+            frame_idx_future = np.array(
+                [tick + (k + 1) * step_ticks for k in range(n_future)],
+                dtype=np.int64,
+            )
+        else:
+            jpos_future = None
+            rot_future = None
+            frame_idx_future = None
+        self._publish_pose(
+            body_q_mj=np.asarray(body_q_mj, dtype=np.float64),
+            motion_token=self._zero_motion_token,
+            left_hand_q=zero_hand,
+            right_hand_q=zero_hand,
+            tick=tick,
+            root_quat_xyzw=rot,
+            joint_pos_mj_future=jpos_future,
+            root_quat_xyzw_future=rot_future,
+            frame_index_future=frame_idx_future,
+            future_dt_s=float(self._cfg.clip_future_dt_s),
+        )
+
+    def _publish_idle(self, *, tick: int = 0) -> None:
         """Emit the trained stand pose while we wait for VR to wake up.
 
         ``joint_pos_mj`` is the SONIC tracking policy's reference
@@ -3353,16 +3544,148 @@ class X2DatasetRecorder:
         wire shape.
         """
         body = np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64)
-        zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
         root_quat_xyzw = self._compute_idle_root_quat_xyzw()
+        # Populated future window (not the legacy single-frame path) so
+        # the policy holds balance -- see _publish_stationary_pose.
+        self._publish_stationary_pose(
+            body_q_mj=body,
+            root_quat_xyzw=root_quat_xyzw,
+            tick=tick,
+        )
+
+    def _begin_return_to_stand(self, *, reason: str) -> None:
+        """Start a smooth ramp from the last commanded pose back to stand.
+
+        Called when a motion clip is stopped / released / ends
+        (hold_after=False) in a stack with no upstream body_pose. Rather
+        than let the very next tick snap the reference from a dynamic
+        mid-motion frame straight to the static idle stand -- which
+        leaves the locomotion policy holding an unbalanced mid-stride
+        pose it can't recover from -- we latch the last frame here and
+        :meth:`_publish_return_to_stand_frame` interpolates it toward
+        the idle stand over :data:`_RETURN_TO_STAND_RAMP_S` seconds. The
+        endpoint is exactly :data:`DEFAULT_STAND_POSE_MUJOCO_RAD` (==
+        :meth:`_publish_idle`'s target) so when the ramp finishes the
+        main loop's idle publish takes over seamlessly.
+
+        No-op (falls straight through to idle) when nothing was ever
+        published -- there's no pose to ramp from.
+        """
+        last_body = self._last_published_body_q
+        if last_body is None:
+            self._settle_ramp = None
+            return
+        stand = np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64)
+        if last_body.shape != stand.shape:
+            # Protocol/shape drift: skip the ramp, let idle take over.
+            self._settle_ramp = None
+            return
+        # Hold the heading we were last commanding so the ramp injects
+        # no waist-yaw twist; fall back to the yaw-rebased idle quat.
+        root_quat = self._last_published_root_quat
+        if root_quat is None:
+            root_quat = self._compute_idle_root_quat_xyzw()
+        total = max(
+            1, int(round(self._cfg.publish_rate_hz * _RETURN_TO_STAND_RAMP_S))
+        )
+        self._settle_ramp = {
+            "from_body": last_body.astype(np.float64, copy=True),
+            "root_quat": (
+                None if root_quat is None
+                else np.asarray(root_quat, dtype=np.float32).copy()
+            ),
+            "total": total,
+            "elapsed": 0,
+        }
+        if self._cfg.verbose:
+            print(
+                f"[recorder] return-to-stand: ramping to idle stand over "
+                f"{total} ticks (~{total / max(self._cfg.publish_rate_hz, 1e-6):.2f}s) "
+                f"[{reason}]",
+                flush=True,
+            )
+
+    def _publish_return_to_stand_frame(self, *, tick: int) -> None:
+        """Publish one frame of the return-to-stand ramp; clear when done.
+
+        Smootherstep-interpolates from the latched start pose to
+        :data:`DEFAULT_STAND_POSE_MUJOCO_RAD` (zero velocity at both
+        ends). On the final tick clears :attr:`_settle_ramp` so the main
+        loop falls through to the steady idle publish, which continues
+        holding the same stand pose -- no discontinuity at the seam.
+
+        The v5 future window is filled with the UPCOMING ramp frames
+        (the interpolation evaluated further along the ramp), so the
+        deploy's future slots preview the settle-to-stand trajectory
+        rather than being pinned at a single frame. A populated future
+        window is what keeps the policy balanced -- see
+        :meth:`_publish_stationary_pose`; a single-frame ramp starves it
+        the same way plain idle used to and the robot collapses.
+        """
+        ramp = self._settle_ramp
+        assert ramp is not None  # noqa: S101 -- gated by caller
+        stand = np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64)
+        from_body = ramp["from_body"]
+        total = int(ramp["total"])
+        root_quat = ramp["root_quat"]
+        ramp["elapsed"] = int(ramp["elapsed"]) + 1
+        elapsed = ramp["elapsed"]
+
+        def _ramp_pose(step_elapsed: float) -> np.ndarray:
+            t = min(1.0, step_elapsed / total)
+            a = t * t * t * (t * (t * 6.0 - 15.0) + 10.0)  # smootherstep
+            return (1.0 - a) * from_body + a * stand
+
+        body = _ramp_pose(elapsed)
+        zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
+        n_future = int(self._cfg.clip_future_window_frames)
+        if root_quat is None:
+            rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            rot = np.asarray(root_quat, dtype=np.float32).reshape(4)
+        if n_future > 0:
+            step_ticks = max(
+                1,
+                int(round(
+                    self._cfg.clip_future_dt_s * self._cfg.publish_rate_hz
+                )),
+            )
+            jpos_future = np.stack(
+                [
+                    _ramp_pose(elapsed + (k + 1) * step_ticks).astype(np.float32)
+                    for k in range(n_future)
+                ],
+                axis=0,
+            )
+            rot_future = np.broadcast_to(rot, (n_future, 4)).copy()
+            frame_idx_future = np.array(
+                [tick + (k + 1) * step_ticks for k in range(n_future)],
+                dtype=np.int64,
+            )
+        else:
+            jpos_future = None
+            rot_future = None
+            frame_idx_future = None
         self._publish_pose(
             body_q_mj=body,
             motion_token=self._zero_motion_token,
             left_hand_q=zero_hand,
             right_hand_q=zero_hand,
-            tick=-1,
-            root_quat_xyzw=root_quat_xyzw,
+            tick=tick,
+            root_quat_xyzw=rot,
+            joint_pos_mj_future=jpos_future,
+            root_quat_xyzw_future=rot_future,
+            frame_index_future=frame_idx_future,
+            future_dt_s=float(self._cfg.clip_future_dt_s),
         )
+        if ramp["elapsed"] >= total:
+            if self._cfg.verbose:
+                print(
+                    "[recorder] return-to-stand: reached idle stand; "
+                    "holding (idle publish resumes)",
+                    flush=True,
+                )
+            self._settle_ramp = None
 
     def _compute_idle_root_quat_xyzw(self) -> Optional[np.ndarray]:
         """Build the yaw-rebased idle root_quat (or None for identity).
@@ -3495,6 +3818,111 @@ class X2DatasetRecorder:
             self._idle_yaw_rebase_logged_fallback = False
 
         return quat_xyzw
+
+    def _settle_to_stand_on_shutdown(self) -> None:
+        """Ramp the wire reference from the last commanded pose to stand.
+
+        Called from :meth:`stop` before the pub socket is torn down.
+        The direct-PKL and replay stacks launch the deploy with
+        ``--disable-pose-ref-watchdog`` (there is no kplanner merging
+        idle frames during cold-start, so the watchdog would trip in
+        the boot gap). The side effect is that when the operator
+        Ctrl-C's the stack mid-clip, the deploy latches whatever
+        reference last landed on :5556 -- typically a dynamic mid-clip
+        pose (a lunge, a kneel, an arm swing) -- and holds it forever.
+        The SONIC policy tracks that frozen mid-motion target and the
+        robot can drift out of balance and tip.
+
+        This method walks the reference from the last-published body_q
+        to :data:`DEFAULT_STAND_POSE_MUJOCO_RAD` over a short window at
+        the configured publish rate, then holds the stand pose for a
+        few extra ticks so the policy has a stable, upright target to
+        converge to before the wire goes silent. Root-quat is held at
+        the last-published heading (no yaw twist injected during the
+        settle); the joints ramp to the neutral stand.
+
+        Best-effort and defensive: any failure only logs -- a botched
+        settle must never block the launcher's SIGTERM budget or mask
+        the shutdown.
+        """
+        last_body = self._last_published_body_q
+        if last_body is None:
+            # Nothing was ever published (e.g. Ctrl-C during bring-up
+            # before the first clip / idle tick). Nothing to settle.
+            return
+        try:
+            stand = np.array(DEFAULT_STAND_POSE_MUJOCO_RAD, dtype=np.float64)
+            if last_body.shape != stand.shape:
+                # Shape drift (protocol mismatch): don't risk a bad
+                # interpolation; just publish clean stand frames.
+                last_body = stand
+            # Hold the heading we were last commanding so the settle
+            # doesn't introduce a waist-yaw twist. Fall back to the
+            # yaw-rebased idle quat, then identity.
+            root_quat = self._last_published_root_quat
+            if root_quat is None:
+                root_quat = self._compute_idle_root_quat_xyzw()
+
+            zero_hand = np.zeros(NUM_HAND_DOF_PER_SIDE, dtype=np.float64)
+            rate = max(float(self._cfg.publish_rate_hz), 1.0)
+            period = 1.0 / rate
+            ramp_ticks = max(1, int(round(rate * _SHUTDOWN_SETTLE_RAMP_S)))
+            hold_ticks = max(1, int(round(rate * _SHUTDOWN_SETTLE_HOLD_S)))
+
+            print(
+                f"[recorder] shutdown: settling to stand pose over "
+                f"{ramp_ticks + hold_ticks} ticks "
+                f"(~{(ramp_ticks + hold_ticks) * period:.2f}s) so the "
+                f"deploy converges to a stable stand before the wire "
+                f"goes silent",
+                flush=True,
+            )
+
+            # Claim the wire for the duration of the ramp so
+            # :meth:`_publish_pose`'s stop-guard lets our frames
+            # through while blocking any interrupted clip publish.
+            self._in_shutdown_settle = True
+            next_tick = time.monotonic()
+            settle_tick = 0
+            for k in range(ramp_ticks):
+                # Smootherstep on [0,1] -> zero velocity at both ends so
+                # the ramp doesn't yank the policy at t=0 or overshoot
+                # at the stand.
+                t = (k + 1) / ramp_ticks
+                a = t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+                body = (1.0 - a) * last_body + a * stand
+                # Populated future window (not single-frame) so the
+                # policy stays balanced through the settle -- same
+                # rationale as _publish_stationary_pose.
+                self._publish_stationary_pose(
+                    body_q_mj=body,
+                    root_quat_xyzw=root_quat,
+                    tick=settle_tick,
+                )
+                settle_tick += 1
+                next_tick += period
+                self._sleep_until(next_tick)
+
+            for _ in range(hold_ticks):
+                self._publish_stationary_pose(
+                    body_q_mj=stand,
+                    root_quat_xyzw=root_quat,
+                    tick=settle_tick,
+                )
+                settle_tick += 1
+                next_tick += period
+                self._sleep_until(next_tick)
+        except Exception as exc:  # noqa: BLE001 - defensive at shutdown
+            print(
+                f"[recorder] shutdown: settle-to-stand FAILED ({exc!r}); "
+                f"proceeding with teardown",
+                flush=True,
+            )
+        finally:
+            # Release the wire. Any subsequent publish attempt from the
+            # resuming run loop now hits the stop-guard and is dropped,
+            # leaving the settled stand pose as the last frame on :5556.
+            self._in_shutdown_settle = False
 
     # -- motion-clip playback (subscribe-mode override path) ----------------
 
@@ -3680,12 +4108,23 @@ class X2DatasetRecorder:
                 elif self._clip_held_frame is not None:
                     print(
                         "[recorder] motion-clip STOP (releasing held "
-                        "pose; resuming kplanner forwarding)",
+                        "pose; ramping back to idle stand)",
                         flush=True,
                     )
+                had_reference = (
+                    self._active_clip is not None
+                    or self._clip_held_frame is not None
+                )
                 self._active_clip = None
                 self._active_clip_hold_after = False
                 self._clip_held_frame = None
+                # Ease from the mid-motion / held pose back to the idle
+                # stand instead of snapping (a mid-stride STOP would
+                # otherwise leave the policy holding an unbalanced pose).
+                # No-op in the kplanner stack (body_pose present -> the
+                # ramp is abandoned on the next tick).
+                if had_reference:
+                    self._begin_return_to_stand(reason="clip-stop")
                 continue
             entry = self._resolve_clip_entry(req)
             if entry is None:
@@ -3762,8 +4201,10 @@ class X2DatasetRecorder:
                 effective_hold_after = bool(entry.hold_after)
             self._active_clip_hold_after = effective_hold_after
             # Starting a new play always clears the previous held
-            # frame: the new session owns the publish path.
+            # frame and any in-progress return-to-stand ramp: the new
+            # session owns the publish path.
             self._clip_held_frame = None
+            self._settle_ramp = None
             hold_tag = " (will HOLD on completion)" if effective_hold_after else ""
             # Both kinds now rebase frame-0 yaw to the operator-
             # supplied seed; the source tag tells the operator which

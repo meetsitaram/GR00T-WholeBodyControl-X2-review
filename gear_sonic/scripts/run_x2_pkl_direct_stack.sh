@@ -365,9 +365,13 @@ DEPLOY_LOG=""
 RECORDER_PID=""
 RECORDER_PGID=""
 RECORDER_LOG=""
+RESET_WATCHER_PID=""
 
 cleanup_children() {
     log "shutting down children (reverse spawn order)..."
+    if [[ -n "${RESET_WATCHER_PID}" ]] && kill -0 "${RESET_WATCHER_PID}" 2>/dev/null; then
+        kill -TERM "${RESET_WATCHER_PID}" 2>/dev/null || true
+    fi
     if [[ -n "${RECORDER_PID}" ]] && kill -0 "${RECORDER_PID}" 2>/dev/null; then
         log "  SIGINT recorder (pid=${RECORDER_PID}, pgid=${RECORDER_PGID:-?})"
         if [[ -n "${RECORDER_PGID}" ]]; then
@@ -636,6 +640,26 @@ if ! wait_for_log_marker "${RECORDER_LOG}" "${RECORDER_PID}" \
 fi
 log "  recorder READY (pid=${RECORDER_PID}); stack is live."
 log "  follow recorder output with: tail -F ${RECORDER_LOG}"
+
+# Surface the recorder's return-to-stand / shutdown-settle events in
+# THIS terminal (the recorder's own logs go to recorder.log, which the
+# operator may not be tailing). Background watcher: tail only NEW lines
+# (-n0) and reformat the recorder's markers into a prominent
+# launcher-level banner so the operator sees exactly when the robot is
+# being reset to the stable stand pose. Killed in cleanup_children.
+(
+    tail -n0 -F "${RECORDER_LOG}" 2>/dev/null | while IFS= read -r _line; do
+        case "${_line}" in
+            *"return-to-stand: ramping"*)
+                log "*** robot RESETTING to stable stand pose (clip stopped/ended) ***" ;;
+            *"return-to-stand: reached idle stand"*)
+                log "*** robot RESET to stable stand pose -- holding idle stand ***" ;;
+            *"shutdown: settling to stand"*)
+                log "*** shutdown: settling robot to stable stand pose before exit ***" ;;
+        esac
+    done
+) &
+RESET_WATCHER_PID=$!
 log ""
 log "  Operator hint -- in another terminal:"
 log "    play_gesture --list                         # see catalog"

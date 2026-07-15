@@ -183,6 +183,41 @@ _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS: float = 0.30
 # ``_apply_continuous_runtime_scales`` pick up the override on every
 # dispatch call.
 _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
+
+# --------------------------------------------------------------------------
+# Fixed-speed movement test (continuous VR path).
+#
+# Temporary single-magnitude speeds so the operator can evaluate slow-
+# movement feel with fully predictable velocities: any stick deflection
+# past the deadzone produces the fixed magnitude below (direction from
+# the stick sign), instead of analog scaling / discrete forward levels.
+# To restore analog + discrete-forward behaviour, revert
+# ``_resolve_locomotion_continuous`` and remove these constants.
+# --------------------------------------------------------------------------
+_TEST_FIXED_FORWARD_MPS: float = 0.30
+_TEST_FIXED_BACK_MPS: float = 0.30
+_TEST_FIXED_SIDE_MPS: float = 0.30
+_TEST_FIXED_TURN_RAD_S: float = 0.30
+# Forward-dominance lateral deadband on the LEFT stick: while the
+# operator is pushing forward, the shaped side-stick magnitude must
+# exceed this (wider than the normal stick deadzone) before ANY lateral
+# velocity is produced, so a slightly-canted left stick doesn't
+# accidentally bleed into a strafe during forward walking. Pure lateral
+# (forward stick centred) is unaffected -- it uses the normal deadzone.
+_FWD_LATERAL_DEADBAND: float = 0.35
+
+# Discrete VR forward-speed levels. The analog forward stick snaps to one of
+# these two speeds instead of scaling continuously, with a hysteresis deadband
+# around the edge so a stick hovering near the boundary doesn't flicker between
+# levels (mirrors the G1 VR ``_discretize_slow_walk_speed`` behaviour). Only the
+# continuous forward channel is affected; backward / lateral / yaw stay analog.
+# NOTE: superseded by the fixed-speed test above -- kept for easy revert.
+_VR_FORWARD_LEVELS: tuple[float, float] = (0.3, 0.5)
+_VR_FORWARD_EDGE: float = 0.6      # shaped-forward-stick magnitude splitting the two levels
+_VR_FORWARD_HYST: float = 0.04     # deadband around the edge (anti-flicker)
+# Module state: the level currently latched. Reset to the low level whenever the
+# operator is not pushing forward, so each new forward push starts slow.
+_vr_forward_level: float = _VR_FORWARD_LEVELS[0]
 # Per-step yaw rate baseline; magnitude scalars in ``_TURN_SCALE`` rescale.
 _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
@@ -269,6 +304,19 @@ _HIP_HEIGHT_M: float = 0.687
 # unrecognised intents). The publisher's idle-gate compares against this
 # tuple to decide whether to freeze on the static anchor.
 _IDLE_INTENT: tuple[float, float, float, float] = (0.0, 0.0, 0.0, _HIP_HEIGHT_M)
+
+# ==========================================================================
+# DEPRECATED: bucketed motion stack.
+#
+# The bucketed (intent, magnitude) command path -- ``_BASE_VELOCITY``,
+# ``_TURN_SCALE`` / ``_TRANSLATIONAL_SCALE``, ``_TURN_{15,30,45,90}_RAD_S``,
+# ``_WALK_VELOCITY_BY_MAGNITUDE`` and ``_resolve_velocity`` -- drives the
+# legacy single-button-press step / pivot commands. The live operator path
+# is the continuous VR stick resolver (``_resolve_locomotion_continuous``).
+# The bucketed stack is retained only for scripted demos / legacy manager
+# vocabulary and should NOT be extended; prefer the continuous path for all
+# new work. Do not wire new operator controls into this table.
+# ==========================================================================
 
 # Direction-explicit 1× velocity vector per intent. Magnitude is applied
 # separately via ``_TRANSLATIONAL_SCALE`` / ``_TURN_SCALE`` below.
@@ -361,6 +409,28 @@ def _shape_stick(value: float) -> float:
     return sign * mag ** _RUNTIME_STICK_SHAPING_EXPONENT
 
 
+def _discretize_vr_forward_speed(mag: float) -> float:
+    """Snap the shaped forward-stick magnitude to one of ``_VR_FORWARD_LEVELS``
+    with a hysteresis deadband so a stick hovering near ``_VR_FORWARD_EDGE``
+    doesn't flicker between the two speeds. Latches the chosen level in the
+    ``_vr_forward_level`` module global across ticks (mirrors the G1 VR
+    ``_discretize_slow_walk_speed`` anti-flicker behaviour)."""
+    global _vr_forward_level
+    lo, hi = _VR_FORWARD_LEVELS
+    if _vr_forward_level <= lo and mag >= _VR_FORWARD_EDGE + _VR_FORWARD_HYST:
+        _vr_forward_level = hi
+    elif _vr_forward_level >= hi and mag < _VR_FORWARD_EDGE - _VR_FORWARD_HYST:
+        _vr_forward_level = lo
+    return _vr_forward_level
+
+
+def _reset_vr_forward_level() -> None:
+    """Latch back to the low level; call when the operator is not pushing
+    forward so each new forward push starts at the slow speed."""
+    global _vr_forward_level
+    _vr_forward_level = _VR_FORWARD_LEVELS[0]
+
+
 def _resolve_locomotion_continuous(
     stick_fwd: float,
     stick_side: float,
@@ -382,27 +452,42 @@ def _resolve_locomotion_continuous(
     shaped_fwd  = _shape_stick(stick_fwd)
     shaped_side = _shape_stick(stick_side)
     shaped_yaw  = _shape_stick(stick_yaw)
-    vel_z = (
-        shaped_fwd * _WALK_SPEED_MPS
-        if shaped_fwd >= 0
-        else shaped_fwd * _BACK_SPEED_MPS
-    )
+
+    # Forward-dominance band on the LEFT stick: while pushing forward,
+    # ignore small simultaneous lateral deflection so a slightly-canted
+    # stick doesn't accidentally bleed into a strafe. Pure lateral
+    # (forward centred) keeps the normal deadzone and is unaffected.
+    if shaped_fwd > 0.0 and abs(shaped_side) < _FWD_LATERAL_DEADBAND:
+        shaped_side = 0.0
+
+    # Fixed-speed movement test: forward / backward / lateral snap to a
+    # single fixed magnitude when engaged (direction from the stick
+    # sign); turn snaps to a fixed yaw rate. This replaces the analog
+    # scaling + discrete-forward levels while we dial in slow-movement
+    # feel. Deadzone still applies (``_shape_stick`` returns 0 inside
+    # it), so a centred stick idles.
+    if shaped_fwd > 0.0:
+        vel_z = _TEST_FIXED_FORWARD_MPS
+    elif shaped_fwd < 0.0:
+        vel_z = -_TEST_FIXED_BACK_MPS
+    else:
+        vel_z = 0.0
     # ``stick_side > 0`` (L-stick right, lx > 0) -> side_right ->
     # negative vel_x, matching ``_BASE_VELOCITY['side_right']``.
-    vel_x = -shaped_side * _SIDE_SPEED_MPS
+    if shaped_side > 0.0:
+        vel_x = -_TEST_FIXED_SIDE_MPS
+    elif shaped_side < 0.0:
+        vel_x = _TEST_FIXED_SIDE_MPS
+    else:
+        vel_x = 0.0
     # ``stick_yaw > 0`` (R-stick right) -> turn-right -> negative
     # yaw_rate, matching ``_BASE_VELOCITY['turn_right']``.
-    #
-    # Continuous mode uses its own yaw ceiling
-    # (``_CONTINUOUS_TURN_MAX_RAD_S``) rather than the bucketed
-    # ``_TURN_45_RAD_S`` constant -- the bucketed callers want a
-    # sharp pivot from a single button press, but the analog R-stick
-    # wants gentler resolution. See the constant's comment block for
-    # the full rationale (model is trained on a no-yaw clip; high
-    # yaw_rate is OOD). The mutable global is set from ``run()`` per
-    # CLI flag / env var; this read picks up any override applied
-    # before the dispatcher fires.
-    yaw_rate = -shaped_yaw * _CONTINUOUS_TURN_MAX_RAD_S
+    if shaped_yaw > 0.0:
+        yaw_rate = -_TEST_FIXED_TURN_RAD_S
+    elif shaped_yaw < 0.0:
+        yaw_rate = _TEST_FIXED_TURN_RAD_S
+    else:
+        yaw_rate = 0.0
     return (yaw_rate, vel_x, vel_z, _HIP_HEIGHT_M)
 
 
@@ -433,6 +518,12 @@ _RUNTIME_LATERAL_SCALE: float = 1.0
 
 def _resolve_velocity(intent: str, magnitude: str) -> tuple[float, float, float, float]:
     """Pure ``(intent, magnitude)`` -> 4-D velocity resolver; idle on miss.
+
+    .. deprecated::
+        Bucketed motion stack (see the DEPRECATED banner above
+        ``_BASE_VELOCITY``). The live operator path is the continuous VR
+        resolver ``_resolve_locomotion_continuous``. Kept for scripted
+        demos / legacy manager vocabulary only -- do not extend.
 
     Direction lives in the intent name for everything except ``walk``
     (legacy: ``walk/forward`` vs ``walk/backward``). Magnitude is a

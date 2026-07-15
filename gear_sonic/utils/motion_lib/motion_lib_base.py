@@ -413,23 +413,33 @@ class MotionLibBase:
 
             print(f"Loaded {len(self._motion_data_load)} motion files")  # noqa: T201
 
-        # FINE-TUNE DATASET external-target injection: merge in fine-tune clips that
-        # are NOT already in the base corpus, so freshly-retargeted targets (e.g.
-        # dance clips not yet in the corpus) can be pinned/trained without rebuilding
-        # the corpus. Clips already present are left as-is (base takes precedence).
+        # FINE-TUNE DATASET external-target injection: merge in the fine-tune clips so
+        # freshly-retargeted targets can be pinned/trained without rebuilding the corpus.
+        # The fine-tune clips are AUTHORITATIVE: a clip whose key already exists in the
+        # base corpus is OVERRIDDEN by the fine-tune version (override_corpus, default
+        # True) -- this is essential when the corpus holds an inferior version of the
+        # same key, e.g. a stock-policy-executed DAMPED combat clip that must be
+        # replaced by its corrected/un-damped retarget. Set override_corpus=false for
+        # the old add-only behaviour (base takes precedence).
         _ft_cfg = self.m_cfg.get("fine_tune_dataset", None) or {}
         if _ft_cfg.get("enable", False) and _ft_cfg.get("motion_file", None):
             try:
                 _ft_data = joblib.load(_ft_cfg["motion_file"])
-                _added = 0
+                _override = bool(_ft_cfg.get("override_corpus", True))
+                _added = _overridden = _kept = 0
                 for _k, _v in _ft_data.items():
                     if _k not in self._motion_data_load:
                         self._motion_data_load[_k] = _v
                         _added += 1
+                    elif _override:
+                        self._motion_data_load[_k] = _v
+                        _overridden += 1
+                    else:
+                        _kept += 1
                 print(  # noqa: T201
-                    f"[MotionLib] fine_tune_dataset: injected {_added} external target "
-                    f"clips from {_ft_cfg['motion_file']} "
-                    f"({len(_ft_data) - _added} already in corpus)."
+                    f"[MotionLib] fine_tune_dataset: injected {_added} new + overrode "
+                    f"{_overridden} existing target clips from {_ft_cfg['motion_file']} "
+                    f"({_kept} left as base-corpus, override_corpus={_override})."
                 )
             except Exception as _e:  # noqa: BLE001
                 print(f"[MotionLib] fine_tune_dataset injection failed: {_e}")  # noqa: T201

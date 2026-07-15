@@ -26,16 +26,18 @@ defaults:
   - /exp/manager/universal_token/all_modes/sonic_x2_ultra_slow_manip_rebalance
   - _self_
 
-exp_var: arm_dynamics_v1
+exp_var: arm_dynamics_v3   # v3: WRIST FIX (VR/reward_point + arm-reward EE moved wrist_yaw_link -> wrist_roll_link, the distal palm) so wrist_pitch/roll are constrained; warm-started from v2 step-~719. (v2 = corrected combat@120 + dance@120 + wrist/EE arm reward)
 project_name: TRL_X2Ultra_ArmDynamics
 
-_arm_links: &arm_links
-  - left_shoulder_roll_link
-  - left_elbow_link
-  - left_wrist_yaw_link
-  - right_shoulder_roll_link
-  - right_elbow_link
-  - right_wrist_yaw_link
+# Wrist / end-effector only, and specifically the DISTAL wrist link (wrist_roll = the
+# palm). X2's wrist chain is elbow -> yaw -> pitch -> ROLL -> palm, so wrist_roll_link is
+# the true end effector; tracking it (not the proximal wrist_yaw_link) captures the full
+# hand motion. The wrist world-linvel already integrates the whole arm chain, so scoping
+# the reward to the palms measures HAND speed directly instead of averaging in the
+# near-stationary shoulder. Matches the eval metric: measure what you reward.
+_ee_links: &ee_links
+  - left_wrist_roll_link
+  - right_wrist_roll_link
 
 manager_env:
   commands:
@@ -43,7 +45,8 @@ manager_env:
       motion_lib_cfg:
         fine_tune_dataset:
           enable: true
-          motion_file: gear_sonic/data/motions/x2_multiskill_finetune.pkl  # slow+combat+dance
+          motion_file: gear_sonic/data/motions/x2_multiskill_finetune_real.pkl  # slow@50 + REAL combat@120 (un-damped) + dance@120 (fps-fixed)
+          override_corpus: true   # the 23 combat keys ALSO live in the base corpus as the DAMPED executed version -> override so training uses the corrected un-damped clips
           load_fraction: 1.0
           finetune_sample_rate: 0.3        # 30% of episodes on the fine-tune targets
         adaptive_sampling:
@@ -54,6 +57,28 @@ manager_env:
           # across all targets. Mild ground-pose grinding returns, but the warm-start
           # is already good there. Watch num_concentrated_bins + termination rates.
           uniform_sampling_rate: 0.5
+      # --- WRIST FIX (X2-only, this-run overrides) ---
+      # X2's wrist chain is elbow->YAW->pitch->ROLL->palm, so the base config's tracked
+      # wrist_yaw_link is the PROXIMAL wrist link -> wrist_pitch+roll hang off the distal
+      # end unconstrained and flop to their limits (the long-standing wrist bug). Fix: move
+      # every tracking reference to the DISTAL wrist_roll_link (the palm), whose pos+orn
+      # then constrains the WHOLE wrist chain. This mirrors G1, whose chain is roll->pitch->
+      # YAW so ITS wrist_yaw IS the distal link -- X2 had copied G1's body name onto a
+      # reversed chain. We SWAP (not add) wrist_yaw->wrist_roll so the tracked-body count
+      # (14) is unchanged and the v2 checkpoint warm-starts cleanly (same obs dimension).
+      # All 3 overrides are X2-only (base lists live in shared commands/terms/motion.yaml;
+      # overriding here leaves G1 untouched). reward_point_body must be a subset of
+      # body_names, hence body_names must carry wrist_roll_link too.
+      body_names: [
+        "pelvis",
+        "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
+        "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link",
+        "torso_link",
+        "left_shoulder_roll_link", "left_elbow_link", "left_wrist_roll_link",
+        "right_shoulder_roll_link", "right_elbow_link", "right_wrist_roll_link",
+      ]
+      vr_3point_body: ["left_wrist_roll_link", "right_wrist_roll_link", "torso_link"]
+      reward_point_body: ["torso_link", "left_wrist_roll_link", "right_wrist_roll_link"]
   rewards:
     # --- arm-scoped velocity tracking (the fast-arm fix) ---
     # Weights kept MODERATE on purpose: the arms are already covered by the generic
@@ -69,7 +94,7 @@ manager_env:
       params:
         command_name: motion
         std: 0.25
-        body_names: *arm_links
+        body_names: *ee_links      # wrist/EE only (was shoulder+elbow+wrist -> diluted)
     tracking_arm_angvel:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
@@ -77,10 +102,15 @@ manager_env:
       params:
         command_name: motion
         std: 0.35
-        body_names: *arm_links
+        body_names: *ee_links      # wrist/EE only
     # --- modestly relax the smoothness penalties (they are GLOBAL -> legs too, so
     #     only a small reduction to avoid leg jitter / instability) ---
     action_rate_l2:
       weight: -0.08        # was -0.1 (small relax; not gutted)
     anti_shake_ang_vel:
       weight: -0.015       # was -0.02
+      params:
+        # base refs wrist_YAW_link, which we swapped OUT of body_names -> it would match
+        # zero bodies -> mean() over empty -> NaN. Repoint to the palm (wrist_roll). head
+        # kept for parity (it's not in the tracked set so it's harmlessly skipped, as before).
+        body_names: ["left_wrist_roll_link", "right_wrist_roll_link", "head_pitch_link"]
