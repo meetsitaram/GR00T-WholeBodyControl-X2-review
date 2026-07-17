@@ -260,6 +260,46 @@ class X2MotionDataset(Dataset):
 X2LocoMotionDataset = X2MotionDataset
 
 
+def build_finetune_sampler(dataset, finetune_pkls, sample_rate, seed: int = 42):
+  """DDP-safe weighted sampler that PRIORITIZES the new motion files.
+
+  Draws ``sample_rate`` fraction of each epoch's samples from the PRIORITY clips
+  (those whose keys appear in any ``finetune_pkls``), the remaining
+  ``1 - sample_rate`` uniformly from the base corpus. Mirrors SONIC's
+  ``finetune_sample_rate`` (motion_lib) for the kplanner side, replacing the
+  uniform ``DataLoader(shuffle=True)`` where every clip is equally likely.
+
+  Returns ``None`` on a degenerate split (no priority clips, or ALL clips are
+  priority) so the caller falls back to uniform shuffle.
+
+  Usage: ``DataLoader(sampler=<this>, shuffle=False)`` +
+  ``pl.Trainer(use_distributed_sampler=False)``. Under DDP each rank builds the
+  SAME weights but a rank-seeded generator, so ranks draw DIFFERENT sequences
+  (real data parallelism) while each rank keeps the priority rate.
+  """
+  import os
+
+  ft_keys = set()
+  for p in finetune_pkls:
+    ft_keys |= set(joblib.load(Path(p)).keys())
+  ds_keys = dataset._keys
+  n = len(ds_keys)
+  ft_idx = [i for i, k in enumerate(ds_keys) if k in ft_keys]
+  if not ft_idx or len(ft_idx) == n:
+    print(f"[finetune-sampler] degenerate split (priority {len(ft_idx)}/{n}) -> uniform shuffle")
+    return None
+  n_base = n - len(ft_idx)
+  w = torch.full((n,), (1.0 - sample_rate) / n_base, dtype=torch.double)
+  w_ft = sample_rate / len(ft_idx)
+  for i in ft_idx:
+    w[i] = w_ft
+  rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+  gen = torch.Generator().manual_seed(int(seed) + rank)
+  print(f"[finetune-sampler] priority={len(ft_idx)} clips @ {sample_rate:.0%} "
+        f"| base={n_base} @ {1.0 - sample_rate:.0%} | rank={rank}")
+  return torch.utils.data.WeightedRandomSampler(w, num_samples=n, replacement=True, generator=gen)
+
+
 def default_cache_dir_for(version_dir: PathLike, pkl_paths: Union[PathLike, Sequence[PathLike]]) -> Path:
   """Return the per-PKL feature-cache directory.
 

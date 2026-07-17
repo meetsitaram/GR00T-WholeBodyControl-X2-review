@@ -182,20 +182,54 @@ def _load_g1_fixture_qpos(
 # ---------------------------------------------------------------------------
 
 
-def _load_planner(ckpt_set: str, device: str, clip_ckpt: "Path | None" = None):
+def _apply_ckpt_overrides(paths, vqvae_ckpt, pose_ckpt, root_ckpt):
+    """Point ``paths`` at explicit checkpoints instead of the pinned defaults.
+
+    Overriding a checkpoint also repoints its version dir (which holds the
+    hparams.yaml / skeleton / stats needed to instantiate the model) to the
+    checkpoint's run dir, assuming the standard Lightning layout
+    ``<version_dir>/checkpoints/<ckpt>`` (so version_dir = ckpt.parents[1]).
+    Mirrors run_scripted_demo.py._apply_ckpt_overrides.
+    """
+    if vqvae_ckpt is not None:
+        paths.vqvae_ckpt = vqvae_ckpt
+        paths.vqvae_version_dir = Path(vqvae_ckpt).resolve().parents[1]
+    if pose_ckpt is not None:
+        paths.pose_ckpt = pose_ckpt
+        paths.pose_version_dir = Path(pose_ckpt).resolve().parents[1]
+    if root_ckpt is not None:
+        paths.root_ckpt = root_ckpt
+        paths.root_version_dir = Path(root_ckpt).resolve().parents[1]
+    return paths
+
+
+def _load_planner(
+    ckpt_set: str,
+    device: str,
+    clip_ckpt: "Path | None" = None,
+    vqvae_ckpt: "Path | None" = None,
+    pose_ckpt: "Path | None" = None,
+    root_ckpt: "Path | None" = None,
+):
     """Load the planner. ``clip_ckpt`` overrides the pose-template clip library.
 
     For x2, ``None`` -> ``"auto"`` (out/X2-clip.ckpt if present). For g1,
     ``None`` -> no clip library (velocity-only). Pass an explicit path (e.g.
     out/X2-clip-g1style.ckpt or out/G1-clip.ckpt) to exercise the
     pose-template path.
+
+    The ``*_ckpt`` overrides let you validate an arbitrary trained checkpoint
+    instead of the pinned default (each auto-derives its version dir for
+    hparams/skeleton/stats as ``<ckpt>/../..``).
     """
     if ckpt_set == "x2":
         from motionbricks.motion_backbone.inference.load_x2_planner import (
             X2PlannerPaths,
             load_x2_planner,
         )
-        paths = X2PlannerPaths.default()
+        paths = _apply_ckpt_overrides(
+            X2PlannerPaths.default(), vqvae_ckpt, pose_ckpt, root_ckpt
+        )
         paths.validate()
         return load_x2_planner(
             paths,
@@ -207,7 +241,9 @@ def _load_planner(ckpt_set: str, device: str, clip_ckpt: "Path | None" = None):
             G1PlannerPaths,
             load_g1_planner,
         )
-        paths = G1PlannerPaths.default()
+        paths = _apply_ckpt_overrides(
+            G1PlannerPaths.default(), vqvae_ckpt, pose_ckpt, root_ckpt
+        )
         paths.validate()
         # load_g1_planner forwards **kwargs to NeuralPlannerCore. G1's loader
         # has no "auto" clip resolution, so pass an explicit path or nothing.
@@ -513,6 +549,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "(out/X2-clip.ckpt). Pass out/X2-clip-g1style.ckpt for the G1-style "
         "A/B, or out/G1-clip.ckpt for g1 pose-template runs.",
     )
+    p.add_argument(
+        "--vqvae-ckpt", type=Path, default=None,
+        help="Override the vqvae checkpoint (validate an arbitrary trained "
+        "model instead of the pinned default). Its version dir (hparams/"
+        "skeleton/stats) is auto-derived as <ckpt>/../.. .",
+    )
+    p.add_argument(
+        "--pose-ckpt", type=Path, default=None,
+        help="Override the pose-model checkpoint (see --vqvae-ckpt).",
+    )
+    p.add_argument(
+        "--root-ckpt", type=Path, default=None,
+        help="Override the root-model checkpoint (see --vqvae-ckpt).",
+    )
     p.add_argument("--save-npz", type=Path, default=None)
     p.add_argument("--report-json", type=Path, default=None)
     return p.parse_args(argv)
@@ -632,7 +682,10 @@ def main(argv: list[str] | None = None) -> int:
             f"[plan] pose-template path: mode_idx={args.planner_mode_idx}  "
             f"clip_ckpt={args.clip_ckpt if args.clip_ckpt else '(auto/default)'}"
         )
-    planner = _load_planner(args.ckpt_set, args.device, clip_ckpt=args.clip_ckpt)
+    planner = _load_planner(
+        args.ckpt_set, args.device, clip_ckpt=args.clip_ckpt,
+        vqvae_ckpt=args.vqvae_ckpt, pose_ckpt=args.pose_ckpt, root_ckpt=args.root_ckpt,
+    )
 
     rows: list[dict] = []
     trajs: list[np.ndarray] = []

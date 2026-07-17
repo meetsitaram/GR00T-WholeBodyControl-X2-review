@@ -25,6 +25,73 @@ multi-month gaps in training cadence.
 | 2     | 2026-06-24 → 06-26 | Nebius 8× H100 SXM (cloud, ~1.5 TB RAM) | `x2_ultra_bones_seed_chain_matched.pkl` (VQVAE) + `_v2` w/ 0.5× locowalk merge (Pose+Root) | 37,968 base / 49,790 v2 | ~25.5 hr (VQVAE 6h50m, Pose ~13.5 hr incl. GPU 1 fault recovery, Root 4h40m) | All 3 stages converged on paper (VQVAE 0.028, Pose 0.586, Root 1.50 / top-5 token 85 %). **Closed-loop sim still bad**: forward walk yaw drift +46.5°/30 s, slow / sideways / back gaits worse than Round 1 in places. See [Round 2 postmortem](#round-2-postmortem-why-25-hours-of-h100s-still-did-not-give-a-smooth-vr-walk). |
 | 2.1   | 2026-06-26     | Same Nebius node, 8× H100 | Same v2 PKL, `loco` filter (locowalk + locopost + locobal subset only) | ~14,400 (filter on 49,790) | ~50 min (15K steps from 300K) | **FT1**: cosine-tail continuation from R2 step 300K. Yaw bias 46.5° → 34° (−27 %) but fwd throughput regressed 9.29 m → 7.62 m (−18 %) and lateral drift grew 0.28 m → 0.65 m. Trade, not a win. Cosine schedule was bottomed-out at LR ~2e-6 by step 300K — couldn't be pushed further on the same recipe. |
 | 2.2   | 2026-06-26     | Same Nebius node, 8× H100 | Same v2 PKL, `loco` filter | ~14,400 | ~28 min (30K steps, weights-only resume from FT1 315K) | **FT2**: weights-only init + fresh optimizer + fresh cosine (peak LR 1e-5, warmup 1K, final 5e-7). Open-loop multi-clip eval was too noisy to pick a single "best" step. Final 30K checkpoint pulled locally; A/B vs 300K/315K not yet run on hardware. **Net effect on closed-loop sim still likely small** given the inference-mode mismatch documented in the postmortem. |
+| 3     | 2026-07-15     | Cloud (fine-tune) → eval local 1× RTX 5090 | `x2_from_g1` → 30 fps, feasibility-filtered (**33,206 clips**) | 33,206 | VQVAE 250K / Pose 250K / **Root 100K** | **g1-x2 30fps corpus fine-tune.** VQVAE + Pose are healthy (forward/lateral tracking ≈1.0 when paired with a converged root; yaw improved 2.53→2.04, toward G1's 1.21). **Root is undertrained at 100K** → forward/lateral velocity over-tracks **~5.5×** (base ≈1.0). Confirmed by swapping in the base 315K root: forward 5.54→1.01, lateral 5.51→1.08. Verdict: **not shippable as-is — train root to ≥300K before judging the corpus.** See [Round 3 eval](#round-3--2026-07-15-g1-x2-30fps-corpus-fine-tune-eval). |
+
+---
+
+## Round 3 — 2026-07-15: g1-x2 30fps corpus fine-tune (eval)
+
+> **Status:** models fine-tuned on the cloud, downloaded + md5-verified, and
+> evaluated **locally** on the RTX 5090 with the k-planner validation harness
+> (`motionbricks/scripts/kplanner_validation/test_e2e_velocity_tracking.py`).
+> This entry is the **eval writeup**; the cloud training log lives with the
+> run's launcher artifacts.
+
+### Why this round
+
+Round 2's corpus was the BONES-SEED chain-matched retarget. Round 3 fine-tunes
+the same VQVAE/Pose/Root architecture on the **`x2_from_g1` corpus** — X2 clips
+generated from the deployed G1 SONIC reference, resampled to **30 fps** and
+**feasibility-filtered to 33,206 clips**. The hypothesis: a corpus derived from
+the known-good G1 gaits should tighten velocity tracking toward the G1 reference.
+The fine-tune **reuses the base hparams / skeleton / normalization stats** (same
+architecture, same motion-rep stats) so the only variable is the weights.
+
+### Models evaluated (fine-tuned, md5-verified)
+
+| Stage | Checkpoint                              | Steps |
+|-------|-----------------------------------------|-------|
+| VQVAE | `kplanner_g1ret/vqvae/vqvae_g1ret_250k.ckpt` | 250,000 |
+| Pose  | `kplanner_g1ret/pose/pose_g1ret_250k.ckpt`   | 250,000 |
+| Root  | `kplanner_g1ret/root/root_g1ret_100k.ckpt`   | **100,000** |
+
+Baselines: **BASE** = Round-2 deployed triple (VQVAE 500K / Pose 500K / Root
+315K); **G1** = the deployed G1 SONIC k-planner reference (`--ckpt-set g1`).
+
+### Eval method
+
+Constant-velocity sweep (`test_e2e_velocity_tracking.py --sweep all
+--horizon-s 4.0`), forward + lateral + yaw axes, X2 seeded from
+`neutral_idle_loop_001__A076`, G1 seeded from `G1-clip.ckpt[2]`. The headline
+number is the **dimensionless tracking slope** (achieved ÷ commanded over the
+horizon; **ideal ≈ 1.0**). Fine-tuned checkpoints were staged into throwaway
+`version_1` dirs (real dereferenced hparams/skeleton/stats copied from the base
+dirs) and passed via new `--vqvae-ckpt/--pose-ckpt/--root-ckpt` overrides added
+to `test_e2e_velocity_tracking.py` (mirroring `run_scripted_demo.py`).
+
+### Results — dimensionless tracking slope (ideal ≈ 1.0)
+
+| Axis    | Fine-tuned (250K/250K/100K) | Base (500K/500K/315K) | G1 reference | FT pose+vqvae **+ base root** |
+|---------|:---------------------------:|:---------------------:|:------------:|:-----------------------------:|
+| forward | **5.54**                    | 1.03                  | 1.07         | **1.01**                      |
+| lateral | **5.51**                    | 1.10                  | 0.95         | **1.08**                      |
+| yaw     | 2.04                        | 2.53                  | 1.21         | 2.67                          |
+
+(Lower drift + slope nearer 1.0 = better. Hip-Z std stayed small in every
+config — no falls. Full per-speed tables + JSON reports under
+`out/kplanner_g1ret_eval/`.)
+
+### Verdict
+
+Fine-tuning on the g1-x2 30 fps corpus did **not** improve tracking as shipped —
+forward/lateral velocity tracking **regressed ~5×** (slope ~5.5 vs base ~1.0
+and G1 ~1.0). The regression is **entirely the undertrained root** (100K vs the
+base's 315K): the isolation run (FT VQVAE + FT Pose + **base** root) restores
+forward 5.54→**1.01** and lateral 5.51→**1.08**, proving the fine-tuned VQVAE +
+Pose stages are healthy. The FT root does already move yaw the right direction
+(2.04 vs base 2.53, toward G1's 1.21), so the corpus signal looks promising —
+**it just needs the root trained to ≥300K before a fair verdict.** Do not deploy
+the 100K root; re-evaluate after further root training.
 
 ---
 

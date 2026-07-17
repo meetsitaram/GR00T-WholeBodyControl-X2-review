@@ -1,0 +1,76 @@
+# @package _global_
+# SOFT-LANDING fine-tune (2026-07-16): dance_finetune + feet landing shaping.
+#
+# NOTE the @package _global_ header above is LOAD-BEARING: without it the body
+# merges under exp.manager_env.rewards (dead branch the env never reads) and
+# the new terms silently do not register (smoke showed 14 terms, not 16).
+#
+# Motivation: feet slam the floor on recovery steps and dance moves. Two new
+# reward terms (gear_sonic/envs/manager_env/mdp/rewards.py):
+#   feet_impact_vel    -1.0   downward foot speed^2 at the touchdown tick only
+#   feet_grf_overshoot -0.4   per-foot vertical GRF above 1.2x robot weight
+# Deliberately NOT dense "slow feet near ground" shaping (hover risk -> would
+# feed the known low-speed dead-band). Weights start at a few % of the ~+7
+# tracking budget so tracking quality is not sacrificed.
+#
+# NOTE: terms are declared INLINE in the body (not via an
+# `override /manager_env/rewards:` group swap) because hydra cannot re-override
+# the rewards group from a nested exp default
+# ("Could not override 'manager_env/rewards@exp.manager_env.rewards'").
+# The RewardsCfg dataclass has matching feet_impact_vel/feet_grf_overshoot
+# fields (default None), so the body merge instantiates them.
+#
+# PRIOR ART note: IsaacLab ships a built-in ``mdp.contact_forces`` penalty
+# (norm > absolute threshold, linear excess) that overlaps feet_grf_overshoot.
+# Ours deliberately differs: vertical-only (landing-specific), threshold as a
+# RATIO of robot weight (robot-agnostic), quadratic excess (progressive).
+# feet_impact_vel (touchdown velocity) has no built-in equivalent. The already-
+# active feet_acc (-2.5e-6 ankle joint-acc) is an indirect impact damper and
+# was insufficient alone. No double-counting: the built-in is not enabled.
+#
+# Corpus/warm-start: same v4 fine-tune targets as dance_finetune; warm-start
+# from the walk-FT run's latest checkpoint (launcher +checkpoint=).
+#
+# A/B gates vs the warm-start checkpoint: dance/recovery feasibility must
+# HOLD; landing-velocity + peak-GRF distributions shift down; visual check.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_dance_finetune
+  - _self_
+
+exp_var: dance_softland_v1
+
+manager_env:
+  rewards:
+    feet_impact_vel:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:feet_impact_vel_penalty
+      # x20 bump 2026-07-16 PM: initial -0.05 read ~0.005% of episode budget
+      # (sparse term, dt-scaled) -- below PPO noise floor. Velocity term is the
+      # PRIMARY (kinematic -> contact-model-independent, transfers).
+      weight: -1.0
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: "contact_forces"
+          body_names: ["left_ankle_roll_link", "right_ankle_roll_link"]
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: "robot"
+          body_names: ["left_ankle_roll_link", "right_ankle_roll_link"]
+    feet_grf_overshoot:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:feet_grf_overshoot_penalty
+      # x20 bump + threshold 1.5->1.2: sim contact models under-report force
+      # spikes (why policies slam in the first place) -- trust magnitudes less,
+      # trip earlier.
+      weight: -0.4
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: "contact_forces"
+          body_names: ["left_ankle_roll_link", "right_ankle_roll_link"]
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: "robot"
+        soft_ratio: 1.2

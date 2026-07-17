@@ -35,6 +35,7 @@ sys.path.insert(0, str(MB_ROOT))
 from motionbricks.data.synthetic_dataset import collate_batch  # noqa: E402
 from motionbricks.data.x2_bones_seed_dataset import (  # noqa: E402
   X2MotionDataset,
+  build_finetune_sampler,
   default_cache_dir_for,
 )
 from motionbricks.data.x2_loco_filters import (  # noqa: E402
@@ -117,6 +118,11 @@ def main() -> None:
   parser.add_argument("--min_frames", type=int, default=80)
   parser.add_argument("--max_frames", type=int, default=200)
   parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument("--finetune-pkl", default=None,
+    help="PKL of PRIORITY (new) motion files to oversample; its keys must also be "
+         "present via --pkl. None -> uniform sampling.")
+  parser.add_argument("--finetune-sample-rate", type=float, default=0.3,
+    help="fraction of samples drawn from --finetune-pkl clips (default 0.3)")
   parser.add_argument("--save-every-n-steps", type=int, default=200)
   parser.add_argument("--save-top-k", type=int, default=-1)
   parser.add_argument(
@@ -226,10 +232,19 @@ def main() -> None:
     raise RuntimeError("Empty dataset after FK extraction")
 
   effective_batch = min(args.batch_size, len(dataset))
+  # Priority sampling: oversample the new motion files (--finetune-pkl) to
+  # --finetune-sample-rate. None -> uniform shuffle (legacy behaviour).
+  ft_sampler = None
+  if args.finetune_pkl:
+    ft_sampler = build_finetune_sampler(
+      dataset, parse_pkl_args([args.finetune_pkl]),
+      args.finetune_sample_rate, seed=args.seed,
+    )
   dataloader = DataLoader(
     dataset,
     batch_size=effective_batch,
-    shuffle=True,
+    shuffle=ft_sampler is None,
+    sampler=ft_sampler,
     num_workers=args.num_workers,
     collate_fn=collate_batch,
     persistent_workers=args.num_workers > 0,
@@ -292,6 +307,7 @@ def main() -> None:
     enable_checkpointing=True,
     callbacks=[ckpt_callback],
     logger=logger,
+    use_distributed_sampler=ft_sampler is None,
   )
 
   resume_path = str(args.resume) if args.resume else None

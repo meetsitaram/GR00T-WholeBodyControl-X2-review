@@ -491,7 +491,18 @@ KPLANNER_COLD_START_RAMP_TAU_S="${KPLANNER_COLD_START_RAMP_TAU_S:-}"
 # path validated in 2026-06-24_pose_template_gate (3x forward locomotion,
 # ~6x better yaw stability when paired with smoothed intent). Requires
 # the X2-clip.ckpt library (motionbricks/scripts/build_x2_planner_clips.py).
-KPLANNER_PLANNER_MODE="${KPLANNER_PLANNER_MODE:-}"
+# Default = slow_walk pose-template mode (2026-07-16: user-validated best walk
+# -- slow_walk template from our own recordings + 0.3 m/s setpoint). Pass
+# --kplanner-planner-mode to override; set to "" / "none" for the legacy
+# velocity-only path.
+KPLANNER_PLANNER_MODE="${KPLANNER_PLANNER_MODE:-slow_walk}"
+
+# --pad-only (2026-07-16): spawn pad_locomotion_bridge.py (gamepad sticks ->
+# planner_cmd, PUB-bind :5563) IN PLACE OF quest3_manager_x2 — no headset
+# needed. The bridge occupies the MANAGER_PID watchdog slot, so the stack's
+# manager-death teardown protects it identically. (Killing the manager to
+# swap in the bridge post-hoc tears the whole stack down — don't.)
+PAD_ONLY=0
 # Opt-in safety watchdog (seconds) for stale upstream intents. **OFF by
 # default for Quest 3 live control** because the IntentDecoder emits new
 # planner_cmd messages only when the stick value changes; a held stick
@@ -948,6 +959,7 @@ while [[ $# -gt 0 ]]; do
         --vla-target-lpf-hz) VLA_TARGET_LPF_HZ="$2"; VLA_DEPLOY_FILTERS=1; shift 2 ;;
         --vla-deploy-filters) VLA_DEPLOY_FILTERS=1; shift ;;
         --vla-no-policy) VLA_NO_POLICY=1; shift ;;
+        --pad-only) PAD_ONLY=1; shift ;;
         --pc2-host) PC2_HOST="$2"; shift 2 ;;
         --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
         --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
@@ -2404,6 +2416,10 @@ else
     if [[ -n "${KPLANNER_COLD_START_RAMP_TAU_S}" ]]; then
         PLANNER_ARGS+=(--cold-start-ramp-tau-s "${KPLANNER_COLD_START_RAMP_TAU_S}")
     fi
+    # "none" = explicit opt-out of the slow_walk default -> legacy velocity-only.
+    if [[ "${KPLANNER_PLANNER_MODE}" == "none" ]]; then
+        KPLANNER_PLANNER_MODE=""
+    fi
     if [[ -n "${KPLANNER_PLANNER_MODE}" ]]; then
         PLANNER_ARGS+=(--planner-mode "${KPLANNER_PLANNER_MODE}")
     fi
@@ -2505,6 +2521,41 @@ else
     # support) typically don't. Inject PYTHONPATH explicitly so import
     # resolves regardless of which interpreter is selected; this is
     # idempotent on .venv runs because the editable install masks it.
+    # KPLANNER_ONNX=<graph.onnx>: swap the torch x2_kplanner for the
+    # torch-free ONNX runtime (pc2_kplanner_onnx.py). Same wire format,
+    # same "first replan complete" ready marker -- the sim then exercises
+    # the EXACT artifact deployed on the robot's PC2. Dance chords play
+    # from KPLANNER_DANCES_DIR (baked .x2m2, not the pkl).
+    if [[ -n "${KPLANNER_ONNX:-}" ]]; then
+        PLANNER_ARGS=(
+            "${REPO_ROOT}/gear_sonic/scripts/pc2_kplanner_onnx.py"
+            --onnx "${KPLANNER_ONNX}"
+            --pub-host "${PLANNER_PUB_HOST}"
+            --pub-port "${BODY_POSE_PORT}"
+            --pub-topic "${BODY_POSE_TOPIC}"
+            --cmd-host localhost
+            --cmd-port "${PLANNER_CMD_PORT}"
+            --cmd-topic "${PLANNER_CMD_TOPIC}"
+            --warmup-quiet-stand-s "${WARMUP_QUIET_STAND_S}"
+            --pid-file "${PLANNER_PID_FILE}"
+            --duration-s "${DURATION_S}"
+            --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
+            --dances-dir "${KPLANNER_DANCES_DIR:-${HOME}/x2_cloud_checkpoints/dances_x2m2}"
+        )
+        if [[ -n "${KPLANNER_WARMUP_QPOS}" ]]; then
+            PLANNER_ARGS+=(--warmup-qpos "${KPLANNER_WARMUP_QPOS}")
+        fi
+        if [[ -n "${KPLANNER_PLANNER_MODE}" && "${KPLANNER_PLANNER_MODE}" != "none" ]]; then
+            PLANNER_ARGS+=(--planner-mode "${KPLANNER_PLANNER_MODE}")
+        fi
+        # Sim has no C++ deploy -> no x2_debug PUB. Disable the measured-yaw
+        # rebase (and its silent capture-wait) unless the caller opts in via
+        # KPLANNER_YAW_REBASE=1 (e.g. a sim harness with a mock x2_debug).
+        if [[ "${KPLANNER_YAW_REBASE:-0}" != "1" ]]; then
+            PLANNER_ARGS+=(--no-yaw-rebase)
+        fi
+        log "  KPLANNER_ONNX: torch-free ONNX runtime (${KPLANNER_ONNX})"
+    fi
     KPLANNER_PYTHONPATH="${REPO_ROOT}/motionbricks:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
     log "  PYTHONPATH=${KPLANNER_PYTHONPATH}"
     PYTHONPATH="${KPLANNER_PYTHONPATH}" \
@@ -2739,6 +2790,44 @@ if [[ -n "${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG}" ]]; then
     log "  RIGHT wrist op-quat offset: rpy_deg=(${_RIGHT_RPY[0]}, ${_RIGHT_RPY[1]}, ${_RIGHT_RPY[2]})"
 fi
 
+if [[ "${PAD_ONLY}" -eq 1 ]]; then
+    log "Step 3/4 — PAD-ONLY: spawning pad_locomotion_bridge (no headset) -> ${MANAGER_LOG}"
+    # PAD_SOURCE=zmq PAD_HOST=<PC2> env vars switch the bridge to consume the
+    # robot-resident pad (pc2_pad_daemon broadcast) instead of a local pad.
+    PAD_BRIDGE_EXTRA=()
+    if [[ "${PAD_SOURCE:-local}" == "zmq" ]]; then
+        PAD_BRIDGE_EXTRA+=(--source zmq --pad-host "${PAD_HOST:-192.168.86.32}")
+    fi
+    if [[ "${PAD_LOCK_SPEED:-0}" == "1" ]]; then
+        PAD_BRIDGE_EXTRA+=(--lock-speed)
+    fi
+    if [[ "${PAD_LOG_BUTTONS:-0}" == "1" ]]; then
+        PAD_BRIDGE_EXTRA+=(--log-buttons)
+    fi
+    if [[ -n "${PAD_DEADMAN:-}" ]]; then
+        PAD_BRIDGE_EXTRA+=(--deadman "${PAD_DEADMAN}")
+    fi
+    # PAD_CLIP_PKL[/PAD_CLIP_KEY]: arm the dance chord (L1+Y plays the clip
+    # over motion_clip_cmd, L1+B stops). Recorder SUB binds locally, so the
+    # default --clip-host 127.0.0.1 is correct for laptop-resident stacks.
+    if [[ -n "${PAD_CLIP_PKL:-}" ]]; then
+        PAD_BRIDGE_EXTRA+=(--clip-pkl "${PAD_CLIP_PKL}")
+        [[ -n "${PAD_CLIP_KEY:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-key "${PAD_CLIP_KEY}")
+        # PAD_CLIP_KEYS: comma list -> L1+Y/L1+A cycle through all clips.
+        [[ -n "${PAD_CLIP_KEYS:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys "${PAD_CLIP_KEYS}")
+    fi
+    "${PYTHON}" "${REPO_ROOT}/gear_sonic/scripts/pad_locomotion_bridge.py" \
+        --bind --port "${PLANNER_CMD_PORT}" --topic "${PLANNER_CMD_TOPIC}" \
+        "${PAD_BRIDGE_EXTRA[@]}" \
+        >"${MANAGER_LOG}" 2>&1 &
+    MANAGER_PID=$!
+    if ! wait_for_log_marker "${MANAGER_LOG}" "${MANAGER_PID}" \
+            "PUB bind" 15 "pad-bridge"; then
+        exit 1
+    fi
+    log "  pad bridge READY (pid=${MANAGER_PID}); hold L2+R2 to drive; settle 0.5s ..."
+    sleep 0.5
+else
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
 MANAGER_PID=$!
@@ -2757,6 +2846,7 @@ if ! wait_for_log_marker "${MANAGER_LOG}" "${MANAGER_PID}" \
 fi
 log "  manager READY (pid=${MANAGER_PID}); settle 0.5s before recorder ..."
 sleep 0.5
+fi
 
 cat <<EOF
 
@@ -2831,6 +2921,22 @@ else
     RECORDER_DEBUG_SUB_HOST="localhost"
 fi
 
+# ── SAFETY: pose-wire bind scope ─────────────────────────────────────
+# The pose PUB on :${POSE_PORT} is the wire real-robot deploys (PC2
+# watchdog) subscribe to. If PC2 daemons from an earlier session are
+# still running, they will consume ANY pose stream published on this
+# wire — a "sim-only" launch (no --pc2-host / --remote-deploy) would
+# silently command the real robot (observed 2026-07-16). Sim-only
+# sessions therefore bind LOOPBACK so LAN hosts physically cannot
+# subscribe; any robot-targeting arg restores the LAN bind.
+if [[ -z "${PC2_HOST}" && -z "${REMOTE_DEPLOY_HOST}" ]]; then
+    POSE_PUB_HOST="127.0.0.1"
+    echo "[quest3_stack] SIM-ONLY: pose PUB bound to 127.0.0.1:${POSE_PORT} (real robot cannot subscribe)." >&2
+    echo "[quest3_stack]           pass --pc2-host / --remote-deploy to drive a robot." >&2
+else
+    POSE_PUB_HOST="*"
+fi
+
 RECORDER_ARGS=(
     -m gear_sonic.scripts.record_x2_dataset
     --body-pose-source zmq
@@ -2840,7 +2946,7 @@ RECORDER_ARGS=(
     --body-pose-sub-topic "${BODY_POSE_TOPIC}"
     --arm-and-hands-sub-host localhost
     --arm-and-hands-sub-port "${ARM_HANDS_PORT}"
-    --pub-host '*'
+    --pub-host "${POSE_PUB_HOST}"
     --pub-port "${POSE_PORT}"
     --pub-topic "${POSE_TOPIC}"
     --sub-host "${RECORDER_DEBUG_SUB_HOST}"

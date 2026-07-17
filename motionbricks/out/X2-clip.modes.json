@@ -13,34 +13,35 @@
     {
       "index": 1,
       "name": "slow_walk",
-      "clip_key": "Loop_Forward_Walk_001__A018",
-      "start_frame": 0,
-      "end_frame": 174,
-      "avg_root_vel": 0.4,
-      "num_frames": 174,
-      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+      "clip_key": "slow_walk_0.3_001",
+      "start_frame": 61,
+      "end_frame": 230,
+      "avg_root_vel": 0.22,
+      "num_frames": 169,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_g1teleop_30fps.pkl"
     },
     {
       "index": 2,
       "name": "walk",
-      "clip_key": "relaxed_walk__v1__walk_forward",
-      "start_frame": 0,
-      "end_frame": 398,
-      "avg_root_vel": 0.27,
-      "num_frames": 398,
-      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_relaxed_walk_forward_v1.pkl"
+      "clip_key": "walk_002",
+      "start_frame": 47,
+      "end_frame": 247,
+      "avg_root_vel": 0.51,
+      "num_frames": 200,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_g1teleop_30fps.pkl"
     },
     {
       "index": 3,
       "name": "run_proxy",
-      "clip_key": "walk_forward_confident_impro_001__A002_M",
-      "start_frame": 0,
-      "end_frame": 200,
-      "avg_root_vel": 0.97,
-      "num_frames": 200,
-      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
+      "clip_key": "run_001",
+      "start_frame": 45,
+      "end_frame": 238,
+      "avg_root_vel": 1.04,
+      "num_frames": 193,
+      "source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_g1teleop_30fps.pkl"
     }
   ],
   "num_joints": 34,
+  "mode_table": "g1teleop",
   "default_source_pkl": "/home/stickbot/Projects/GR00T-WholeBodyControl/gear_sonic/data/motions/x2_ultra_locowalk.pkl"
 }

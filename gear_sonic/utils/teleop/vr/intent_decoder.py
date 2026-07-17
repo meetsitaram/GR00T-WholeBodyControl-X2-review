@@ -138,6 +138,11 @@ class LocomotionCmd:
     stick_fwd: float = 0.0
     stick_side: float = 0.0
     stick_yaw: float = 0.0
+    # One-shot speed-setpoint adjustment (m/s), from X/Y face buttons in
+    # LOCOMOTION mode: X = -0.1, Y = +0.1. Consumed by the kplanner's
+    # runtime forward-speed setpoint (0.2..1.0, default 0.3). 0.0 = no
+    # adjustment this command.
+    speed_delta: float = 0.0
     # Continuous hip-height target in metres. Populated by the
     # ARM_MANIPULATION L-stick Y path (squat / stand) and read by the
     # kplanner's ``intent_to_velocity`` to override channel-3 of the
@@ -393,6 +398,9 @@ class IntentDecoder:
 
         self._mode = StreamMode.OFF
         self._last_emitted: Optional[LocomotionCmd] = None
+        # Accumulated X/Y speed nudges awaiting attachment to the next
+        # emitted locomotion command (see _apply_button_transitions).
+        self._pending_speed_delta: float = 0.0
         self._last_emit_t: float = -1.0
         # Wall-clock deadline (monotonic) before which decode_locomotion
         # treats Y-as-crouch and all stick deflections as neutral. Armed
@@ -426,6 +434,20 @@ class IntentDecoder:
         """
         prev = self._mode
         new = self._mode
+
+        # X/Y single presses in LOCOMOTION = forward-speed setpoint nudges
+        # (X -0.1, Y +0.1). Latched here (rising edges) and attached to the
+        # next emitted locomotion command; the kplanner owns the actual
+        # setpoint state/clamping. Chords (abxy/xy/...) below still win --
+        # their handlers run after and a chord press also sets x/y flags,
+        # so skip the nudge on any chord tick.
+        if self._mode == StreamMode.LOCOMOTION and not (
+            ev.abxy_pressed or ev.xy_pressed or ev.ax_pressed or ev.by_pressed
+        ):
+            if ev.x_pressed:
+                self._pending_speed_delta -= 0.1
+            if ev.y_pressed:
+                self._pending_speed_delta += 0.1
 
         if ev.abxy_pressed:
             new = (
@@ -568,13 +590,20 @@ class IntentDecoder:
                 abs(stick_fwd) > 0.0
                 or abs(stick_side) > 0.0
                 or abs(stick_yaw) > 0.0
+                or self._pending_speed_delta != 0.0
             ):
+                # Attach (and clear) any accumulated X/Y speed nudge. The
+                # dedup filter force-emits commands carrying a nonzero
+                # speed_delta so a nudge is never lost to stick-noise
+                # hysteresis.
+                delta, self._pending_speed_delta = self._pending_speed_delta, 0.0
                 return LocomotionCmd(
                     intent="locomotion",
                     magnitude="continuous",
                     stick_fwd=float(stick_fwd),
                     stick_side=float(stick_side),
                     stick_yaw=float(stick_yaw),
+                    speed_delta=float(delta),
                 )
             # All three locomotion sticks released. Fall through to the
             # ry-driven hold_torso path below so the right thumb can
@@ -973,6 +1002,10 @@ class IntentDecoder:
             # this every tick of inevitable thumbstick noise would
             # republish at 50-90 Hz.
             thresh = self._continuous_stick_threshold
+            # A speed-setpoint nudge must ALWAYS go out, even when the
+            # sticks themselves haven't moved past the hysteresis.
+            if new.speed_delta != 0.0:
+                return True
             return (
                 abs(new.stick_fwd  - old.stick_fwd)  >= thresh
                 or abs(new.stick_side - old.stick_side) >= thresh

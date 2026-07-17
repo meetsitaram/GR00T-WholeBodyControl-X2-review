@@ -169,9 +169,61 @@ G1STYLE_MODES: tuple[ModeSpec, ...] = (
     ModeSpec(name="run_proxy", clip_key=_G1_IDLE_CLIP, start_frame=0, end_frame=30, avg_root_vel=3.0),
 )
 
+# ---------------------------------------------------------------------------
+# G1-TELEOP mode table — templates sourced from OUR OWN recorded corpus
+# (2026-07-16: G1 stock planner+sonic teleop drives, retargeted to X2 at
+# 30 fps). These are physics-executed, natural-stance gaits — the same
+# distribution the SONIC tracker was fine-tuned on, so template and tracker
+# finally agree on gait style. Windows were measured for steady gait
+# (movement onset +15 frames, ≤240 f) and near-zero net yaw drift
+# (slow_walk −1.6°, walk −2.7°) to avoid the heading-wobble propagation
+# documented for the old Loop_Forward_Walk template. Select with
+# ``--modes g1teleop``.
+# ---------------------------------------------------------------------------
+_G1TELEOP_PKL = (
+    REPO_ROOT / "gear_sonic" / "data" / "motions" / "x2_g1teleop_30fps.pkl"
+)
+
+G1TELEOP_MODES: tuple[ModeSpec, ...] = (
+    # idle keeps the proven locowalk idle clip (our clips' idle lead-ins are
+    # short and the existing idle template has been fine in deploy).
+    ModeSpec(
+        name="idle",
+        clip_key="Idle_Right_001__A019",
+        start_frame=0,
+        end_frame=200,
+        avg_root_vel=0.0,
+    ),
+    ModeSpec(
+        name="slow_walk",
+        clip_key="slow_walk_0.3_001",
+        start_frame=61,
+        end_frame=230,
+        avg_root_vel=0.22,
+        source_pkl=_G1TELEOP_PKL,
+    ),
+    ModeSpec(
+        name="walk",
+        clip_key="walk_002",
+        start_frame=47,
+        end_frame=247,
+        avg_root_vel=0.51,
+        source_pkl=_G1TELEOP_PKL,
+    ),
+    ModeSpec(
+        name="run_proxy",
+        clip_key="run_001",
+        start_frame=45,
+        end_frame=238,
+        avg_root_vel=1.04,
+        source_pkl=_G1TELEOP_PKL,
+    ),
+)
+
 _MODE_TABLES: dict[str, tuple[ModeSpec, ...]] = {
     "default": DEFAULT_MODES,
     "g1style": G1STYLE_MODES,
+    "g1teleop": G1TELEOP_MODES,
 }
 
 

@@ -36,6 +36,7 @@ sys.path.insert(0, str(MB_ROOT))
 from motionbricks.data.synthetic_dataset import collate_batch  # noqa: E402
 from motionbricks.data.x2_bones_seed_dataset import (  # noqa: E402
   X2MotionDataset,
+  build_finetune_sampler,
   default_cache_dir_for,
 )
 from motionbricks.data.x2_loco_filters import (  # noqa: E402
@@ -104,6 +105,11 @@ def main() -> None:
   parser.add_argument("--min_frames", type=int, default=80)
   parser.add_argument("--max_frames", type=int, default=200)
   parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument("--finetune-pkl", default=None,
+    help="PKL of PRIORITY (new) motion files to oversample; its keys must also be "
+         "present via --pkl. None -> uniform sampling.")
+  parser.add_argument("--finetune-sample-rate", type=float, default=0.3,
+    help="fraction of samples drawn from --finetune-pkl clips (default 0.3)")
   parser.add_argument(
     "--save-every-n-steps",
     type=int,
@@ -142,6 +148,15 @@ def main() -> None:
     help="Path to a Lightning checkpoint to resume training from.",
   )
   parser.add_argument(
+    "--init-from",
+    type=Path,
+    default=None,
+    help="Weights-only init from a Lightning checkpoint: loads model.state_dict "
+    "but starts a FRESH optimizer, FRESH LR scheduler, and step counter at 0. "
+    "Use for fine-tuning when the previous run's cosine schedule has bottomed "
+    "out. Mutually exclusive with --resume.",
+  )
+  parser.add_argument(
     "--use-wandb",
     action="store_true",
     help="Log to Weights & Biases (default project: TRL_X2Ultra_Planner).",
@@ -157,6 +172,9 @@ def main() -> None:
     help="W&B run name override (only used if --use-wandb).",
   )
   args = parser.parse_args()
+
+  if args.resume is not None and args.init_from is not None:
+    raise SystemExit("--resume and --init-from are mutually exclusive")
 
   pl.seed_everything(args.seed, workers=True)
   strategy = args.strategy or ("ddp" if args.devices > 1 else "auto")
@@ -195,10 +213,19 @@ def main() -> None:
     raise RuntimeError("Empty dataset after FK extraction")
 
   effective_batch = min(args.batch_size, len(dataset))
+  # Priority sampling: oversample the new motion files (--finetune-pkl) to
+  # --finetune-sample-rate. None -> uniform shuffle (legacy behaviour).
+  ft_sampler = None
+  if args.finetune_pkl:
+    ft_sampler = build_finetune_sampler(
+      dataset, parse_pkl_args([args.finetune_pkl]),
+      args.finetune_sample_rate, seed=args.seed,
+    )
   dataloader = DataLoader(
     dataset,
     batch_size=effective_batch,
-    shuffle=True,
+    shuffle=ft_sampler is None,
+    sampler=ft_sampler,
     num_workers=args.num_workers,
     collate_fn=collate_batch,
     persistent_workers=args.num_workers > 0,
@@ -259,9 +286,24 @@ def main() -> None:
     enable_checkpointing=True,
     callbacks=[ckpt_callback],
     logger=logger,
+    use_distributed_sampler=ft_sampler is None,
   )
 
   resume_path = str(args.resume) if args.resume else None
+
+  if args.init_from is not None:
+    init_path = Path(args.init_from).resolve()
+    if not init_path.is_file():
+      raise FileNotFoundError(f"--init-from path not found: {init_path}")
+    print(f"Loading weights-only from {init_path} (fresh optimizer + scheduler)")
+    init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+    state_dict = init_ckpt.get("state_dict", init_ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+      print(f"  WARN missing keys ({len(missing)}); first 5: {missing[:5]}")
+    if unexpected:
+      print(f"  WARN unexpected keys ({len(unexpected)}); first 5: {unexpected[:5]}")
+    print("  loaded; resetting optimizer/scheduler/step_counter to step 0")
   print(
     f"Starting X2 VQVAE training: max_steps={args.max_steps} "
     f"devices={args.devices} num_nodes={args.num_nodes} strategy={strategy} "

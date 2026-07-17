@@ -187,7 +187,12 @@ def main(argv=None):
                          "feed to soma-retargeter app/g1_csv_to_x2_csv.py")
     ap.add_argument("--motion-key", default=None, help="motion key (default: out stem)")
     ap.add_argument("--duration", type=float, default=20.0, help="capture seconds")
-    ap.add_argument("--fps", type=int, default=50, help="output fps grid (default 50)")
+    ap.add_argument("--fps", default="50",
+                    help="output fps grid(s); single (e.g. 50) or comma-list (e.g. 30,50) to "
+                         "write BOTH grids from ONE capture -- 30fps = kplanner corpus, "
+                         "50fps = SONIC. Both are resampled from the SAME raw samples (linear + "
+                         "Slerp), so neither is a lossy downsample of the other. Multi-fps writes "
+                         "siblings <out_stem>_<fps>fps<ext>.")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--debug-port", type=int, default=5557)
     ap.add_argument("--topic", default=None, help="debug topic (default <robot>_debug)")
@@ -200,15 +205,47 @@ def main(argv=None):
     key = args.motion_key or args.out.stem
 
     t_pose, pose7, t_dof, body_q = _capture(args, num_dof)
-    entry = build_entry(t_pose, pose7, t_dof, body_q, fps=args.fps,
-                        num_dof=num_dof, num_bodies=num_bodies, dof_axis=dof_axis)
-    entry["x2_record_source"] = f"live:{args.robot}:{args.topic}+robot_pose"
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({key: entry}, args.out, compress=3)
-    T = entry["dof"].shape[0]
-    trav = np.linalg.norm(entry["root_trans_offset"][-1, :2] - entry["root_trans_offset"][0, :2])
-    print(f"[record] wrote {args.out}  key={key!r}  {T} frames @ {args.fps}fps "
-          f"({T/args.fps:.1f}s), traveled {trav:.2f} m in world XY")
+    fps_list = [int(x) for x in str(args.fps).split(",") if x.strip()]
+
+    def _merge_save(out_path, entry):
+        """Merge {key: entry} into out_path -- atomic write, .prev one-level undo,
+        .corrupt guard. NEVER clobbers other clips."""
+        existing: dict = {}
+        if out_path.exists():
+            try:
+                loaded = joblib.load(out_path)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception as exc:  # noqa: BLE001
+                print(f"[record] WARNING: could not read existing {out_path} ({exc}); "
+                      f"backing it up to {out_path}.corrupt before writing")
+                out_path.replace(out_path.with_suffix(out_path.suffix + ".corrupt"))
+        if key in existing:
+            print(f"[record] NOTE: key {key!r} already in {out_path.name} -- replacing that clip")
+        existing[key] = entry
+        if out_path.exists():
+            import shutil
+            shutil.copy2(out_path, out_path.with_suffix(out_path.suffix + ".prev"))
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        joblib.dump(existing, tmp, compress=3)
+        tmp.replace(out_path)
+        return len(existing)
+
+    # One raw capture -> one grid per requested fps. Multi-fps writes siblings so a
+    # single drive yields both the 30fps (kplanner corpus) and 50fps (SONIC) pkls.
+    entry = None
+    for fps in fps_list:
+        entry = build_entry(t_pose, pose7, t_dof, body_q, fps=fps,
+                            num_dof=num_dof, num_bodies=num_bodies, dof_axis=dof_axis)
+        entry["x2_record_source"] = f"live:{args.robot}:{args.topic}+robot_pose"
+        out_path = (args.out if len(fps_list) == 1
+                    else args.out.with_name(f"{args.out.stem}_{fps}fps{args.out.suffix}"))
+        n = _merge_save(out_path, entry)
+        T = entry["dof"].shape[0]
+        trav = np.linalg.norm(entry["root_trans_offset"][-1, :2] - entry["root_trans_offset"][0, :2])
+        print(f"[record] wrote {out_path}  key={key!r}  {T} frames @ {fps}fps "
+              f"({T/fps:.1f}s), traveled {trav:.2f} m  [{n} clip(s) in file]")
     if args.g1_csv:
         if args.robot != "g1":
             raise SystemExit("--g1-csv is only valid with --robot g1")

@@ -27,7 +27,7 @@ python -m gear_sonic.scripts.play_locomotion --pkl <X2_clip.pkl>
 
 # G1
 cd ~/Projects/GR00T-WholeBodyControl
-
+what are you doing? we already 
 ### One-time per clip — convert a G1 motion PKL -> deploy reference CSVs:
 .venv_sim/bin/python gear_sonic/scripts/training_pkl_to_deploy_csv.py --pkl <G1_clip.pkl> --fps 50
 #   (writes gear_sonic_deploy/reference/<clip>/)
@@ -38,7 +38,14 @@ python gear_sonic/scripts/run_sim_loop.py
 
 ### Terminal 2 — G1 deploy (stock SONIC) playing the motion:
 cd gear_sonic_deploy && source scripts/setup_env.sh
+
+bash deploy.sh sim --input-type keyboard
 bash deploy.sh sim --motion-data reference/<clip>/
+
+### T3  (capture REAL world root xyz + joints -> motion-lib pkl)
+.venv/bin/python gear_sonic/scripts/record_motion_to_pkl.py \
+  --robot g1 --out gear_sonic/data/motions/g1_recorded_x2/sample_kplanner_motions.pkl \
+  --motion-key walk_001 --duration N
 
 ### slow walk tests
 cd ~/Projects/GR00T-WholeBodyControl
@@ -183,3 +190,23 @@ Full corpus (35,974 clips), warm-start from 2k
 Reward fix: linvel std 0.25, anchor_pos 2.0/0.15
 Sampler guards (your call): uniform_sampling_rate 0.25 + use_failure_rate_decay true — auto-focus the slow clips without re-cratering general feasibility
 8 procs × 12,288 envs, 30k iters, W&B on
+
+
+### encoder logs
+
+Setting encode_mode for 13 loaded reference motions...
+  Motion 'tired_forward_lunge_R_001__A359_M' encode_mode set to: 0
+  Motion 'dance_in_da_party_001__A464_M' encode_mode set to: 0
+  Motion 'dance_in_da_party_001__A464' encode_mode set to: 0
+  Motion 'neutral_kick_R_001__A543' encode_mode set to: 0
+  Motion 'tired_one_leg_jumping_R_001__A359' encode_mode set to: 0
+  Motion 'macarena_001__A545' encode_mode set to: 0
+  Motion 'macarena_001__A545_M' encode_mode set to: 0
+  Motion 'neutral_kick_R_001__A543_M' encode_mode set to: 0
+  Motion 'forward_lunge_R_001__A359_M' encode_mode set to: 0
+  Motion 'squat_001__A359' encode_mode set to: 0
+  Motion 'walking_quip_360_R_002__A428' encode_mode set to: 0
+  Motion 'tired_one_leg_jumping_R_001__A359_M' encode_mode set to: 0
+  Motion 'walking_quip_360_R_002__A428_M' encode_mode set to: 0
+Planner motion encode_mode set to: 0
+

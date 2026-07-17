@@ -82,7 +82,10 @@ def test_default_constants_match_policy() -> None:
     """Pins the 2026-05-31 defaults so a drift here is loud, not silent."""
     assert _DEFAULT_REF_SMOOTHER_MS == 300.0
     assert _DEFAULT_REF_SMOOTHER_TRIGGER_RAD == 0.05
-    assert _DEFAULT_REF_SMOOTHER_SHAPE == "halfcos"
+    # Default flipped to "off" when the 30->50 Hz output resampling +
+    # 8-frame cross-fade blend landed: the seam blend now handles replan
+    # discontinuities at the source, so the reactive smoother is opt-in.
+    assert _DEFAULT_REF_SMOOTHER_SHAPE == "off"
     assert _DEFAULT_REF_SMOOTHER_JOINTS == "lower_body"
     assert _REF_SMOOTHER_SHAPES == ("halfcos", "linear", "off")
     # Layout invariants: lower_body = 15 DoFs (legs 0-11 + waist 12-14),

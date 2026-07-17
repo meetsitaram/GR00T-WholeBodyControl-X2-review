@@ -566,6 +566,10 @@ def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
         payload["stick_fwd"]  = float(cmd.stick_fwd)
         payload["stick_side"] = float(cmd.stick_side)
         payload["stick_yaw"]  = float(cmd.stick_yaw)
+        # X/Y face-button speed-setpoint nudge (one-shot, +/-0.1 m/s);
+        # consumed by the kplanner's runtime forward-speed setpoint.
+        if getattr(cmd, "speed_delta", 0.0):
+            payload["speed_delta"] = float(cmd.speed_delta)
     return json.dumps(payload).encode("utf-8")
 
 

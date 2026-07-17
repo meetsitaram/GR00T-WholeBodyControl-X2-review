@@ -44,6 +44,7 @@ the velocity-only path is available.
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Union
@@ -257,6 +258,35 @@ class NeuralPlannerCore(nn.Module):
         self._current_frame_idx = 0
         self._qpos_dim: Optional[int] = None
 
+        # ------------------------------------------------------------------
+        # Output resampling (30 Hz model -> control-loop output_fps) + an
+        # 8-frame cross-fade blend between successive planner outputs.
+        #
+        # This mirrors the G1 stock deployment stack (see
+        # ``docs/source/references/planner_onnx.md`` "Output Resampling" and
+        # "Animation Blending"). The plain integer ``get_next_frame`` path
+        # advances +1 whole 30 Hz frame per call; when a 50 Hz publish loop
+        # drives it that plays the 30 Hz content 1.67x too fast, so the
+        # reference outruns the tracking policy. ``get_next_frame_resampled``
+        # instead advances a FLOAT read cursor by ``model_fps / output_fps``
+        # native frames per output tick and interpolates (lerp on
+        # translation + dof, slerp on the root quaternion).
+        #
+        # State is inert until ``get_next_frame_resampled`` is first called
+        # (``_resample_active`` stays False), so the legacy integer path and
+        # the offline replay tooling are byte-for-byte unaffected.
+        # ------------------------------------------------------------------
+        self.BLEND_FRAMES: int = 8
+        self._resample_active: bool = False
+        self._resample_output_fps: float = 50.0
+        # Fractional read cursor, in native (30 fps) frame units, into
+        # ``self.frames["mujoco_qpos"]``.
+        self._read_pos: float = 0.0
+        # Cross-fade blend state (old buffer we are fading OUT of).
+        self._blend_prev_buf: Optional[t.Tensor] = None  # [1, T, D]
+        self._blend_prev_pos: float = 0.0                # native-frame cursor into old buf
+        self._blend_remaining: int = 0                   # output ticks of blend left
+
         # Diagnostic hook. Optional callable invoked inside _predict after
         # the default has_* masks are constructed but before predict() is
         # called. Signature:
@@ -285,10 +315,18 @@ class NeuralPlannerCore(nn.Module):
 
     @property
     def frames_remaining(self) -> int:
-        """How many frames are left in the buffer after the current pop index."""
+        """How many frames are left in the buffer after the current pop index.
+
+        In resampled mode the read cursor is fractional (``_read_pos``); we
+        report the remaining native (30 fps) frames so the replan threshold
+        keeps the same "frames of lookahead" meaning across both paths.
+        """
         if self.frames["mujoco_qpos"] is None:
             return 0
-        return int(self.frames["mujoco_qpos"].shape[1]) - self._current_frame_idx
+        T = int(self.frames["mujoco_qpos"].shape[1])
+        if self._resample_active:
+            return int(math.floor(T - self._read_pos))
+        return T - self._current_frame_idx
 
     def reset(self, init_mujoco_qpos: t.Tensor) -> None:
         """Seed the ring buffer with NUM_MIN_FRAMES_IN_BUFFER copies of a stand pose.
@@ -315,9 +353,27 @@ class NeuralPlannerCore(nn.Module):
         self.frames["mujoco_qpos"] = init_mujoco_qpos
         self.frames["model_features"] = None  # not used until first replan
         self._current_frame_idx = 0
+        # Reset the resampled read cursor + drop any in-flight cross-fade.
+        # ``_resample_active`` is intentionally left as-is: once the caller
+        # opts into resampling it stays on across PLAYING re-entries.
+        self._read_pos = 0.0
+        self._blend_prev_buf = None
+        self._blend_prev_pos = 0.0
+        self._blend_remaining = 0
 
     def should_replan(self) -> bool:
-        """True when the ring buffer's tail is closer than REPLAN_THRESHOLD_FRAMES."""
+        """True when the ring buffer's tail is closer than REPLAN_THRESHOLD_FRAMES.
+
+        In resampled mode the decision is made against the FLOAT read
+        position so it fires with enough lookahead given the fractional
+        (``model_fps / output_fps``) consumption rate: replan when
+        ``read_pos + REPLAN_THRESHOLD_FRAMES >= T``.
+        """
+        buf = self.frames["mujoco_qpos"]
+        if buf is None:
+            return False
+        if self._resample_active:
+            return (self._read_pos + self.REPLAN_THRESHOLD_FRAMES) >= float(buf.shape[1])
         return self.frames_remaining <= self.REPLAN_THRESHOLD_FRAMES
 
     def get_next_frame(self) -> t.Tensor:
@@ -348,6 +404,162 @@ class NeuralPlannerCore(nn.Module):
             for i in range(self.NUM_FRAMES_PER_TOKEN)
         ]
         return buf[:, indices, :].to(self._device)
+
+    # ------------------------------------------------------------------
+    # Output resampling (30 Hz model -> control-loop output_fps) + blend
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slerp_wxyz(q0: t.Tensor, q1: t.Tensor, w: float) -> t.Tensor:
+        """Spherical linear interpolation between two wxyz quaternions.
+
+        Args:
+            q0, q1: [4] tensors in ``[w, x, y, z]`` order.
+            w: interpolation fraction in [0, 1] (0 -> q0, 1 -> q1).
+
+        Returns a normalized [4] wxyz quaternion. Takes the shortest arc
+        (flips ``q1`` when the dot product is negative) and falls back to a
+        normalized lerp for nearly-parallel inputs to stay numerically safe.
+        """
+        q0 = q0 / (q0.norm() + 1e-8)
+        q1 = q1 / (q1.norm() + 1e-8)
+        dot = (q0 * q1).sum()
+        if float(dot) < 0.0:
+            q1 = -q1
+            dot = -dot
+        if float(dot) > 0.9995:
+            out = q0 + w * (q1 - q0)
+            return out / (out.norm() + 1e-8)
+        theta0 = t.acos(dot.clamp(-1.0, 1.0))
+        theta = theta0 * w
+        sin0 = t.sin(theta0)
+        s0 = t.sin(theta0 - theta) / sin0
+        s1 = t.sin(theta) / sin0
+        out = s0 * q0 + s1 * q1
+        return out / (out.norm() + 1e-8)
+
+    def _frame_at(self, buf: t.Tensor, pos: float) -> t.Tensor:
+        """Interpolate a single [D] qpos frame at fractional index ``pos``.
+
+        Layout is X2 ``mujoco_qpos`` ``[trans(3), root_quat_wxyz(4),
+        dof(31)]`` (D=38): lerp indices 0:3 and 7:D, slerp the root quat
+        at 3:7. Positions clamp to the valid ``[0, T-1]`` range.
+        """
+        T = int(buf.shape[1])
+        if T <= 1:
+            return buf[0, 0].detach().clone()
+        pos = min(max(float(pos), 0.0), float(T - 1))
+        i0 = int(math.floor(pos))
+        i1 = min(i0 + 1, T - 1)
+        frac = pos - i0
+        f0 = buf[0, i0]
+        if i1 == i0 or frac <= 0.0:
+            return f0.detach().clone()
+        f1 = buf[0, i1]
+        out = f0.clone()
+        out[:3] = f0[:3] * (1.0 - frac) + f1[:3] * frac
+        out[7:] = f0[7:] * (1.0 - frac) + f1[7:] * frac
+        out[3:7] = self._slerp_wxyz(f0[3:7], f1[3:7], frac)
+        return out.detach()
+
+    def _blend_frames(self, old: t.Tensor, new: t.Tensor, w_new: float) -> t.Tensor:
+        """Cross-fade two [D] qpos frames: lerp trans/dof, slerp root quat."""
+        w_old = 1.0 - w_new
+        out = new.clone()
+        out[:3] = old[:3] * w_old + new[:3] * w_new
+        out[7:] = old[7:] * w_old + new[7:] * w_new
+        out[3:7] = self._slerp_wxyz(old[3:7], new[3:7], w_new)
+        return out.detach()
+
+    def _resampled_output_frame(self, output_offset_ticks: float = 0.0) -> t.Tensor:
+        """Return the resampled (+ optionally blended) [D] frame at a given
+        offset (in OUTPUT ticks) ahead of the current read cursor.
+
+        ``output_offset_ticks == 0`` is the frame about to be published;
+        positive offsets are the future-window lookahead slots. Each output
+        tick maps to ``model_fps / output_fps`` native (30 fps) frames.
+        """
+        buf = self.frames["mujoco_qpos"]
+        step = self._fps / self._resample_output_fps
+        new_pos = self._read_pos + step * output_offset_ticks
+        frame = self._frame_at(buf, new_pos)
+        if self._blend_prev_buf is not None:
+            blend_left = self._blend_remaining - output_offset_ticks
+            if blend_left > 0.0:
+                old_pos = self._blend_prev_pos + step * output_offset_ticks
+                old_frame = self._frame_at(self._blend_prev_buf, old_pos)
+                # Linearly increasing weight on the NEW animation across the
+                # 8-tick window: reaches 1.0 on the final blend tick.
+                w_new = 1.0 - (blend_left - 1.0) / float(self.BLEND_FRAMES)
+                w_new = min(max(w_new, 0.0), 1.0)
+                frame = self._blend_frames(old_frame, frame, w_new)
+        return frame
+
+    def get_next_frame_resampled(
+        self, output_fps: Optional[float] = None
+    ) -> t.Tensor:
+        """Pop one output frame at ``output_fps`` and advance the float cursor.
+
+        This is the resampling counterpart to ``get_next_frame``. It advances
+        a fractional read cursor by ``model_fps / output_fps`` native frames
+        per call and interpolates between the two nearest 30 Hz frames
+        (lerp on translation + dof, slerp on the root quaternion). When a
+        replan installed a new buffer, the first ``BLEND_FRAMES`` outputs are
+        cross-faded from the previous buffer for a seamless handoff.
+        """
+        if self.frames["mujoco_qpos"] is None:
+            raise RuntimeError(
+                "NeuralPlannerCore.get_next_frame_resampled() called before reset()"
+            )
+        if output_fps is not None:
+            self._resample_output_fps = float(output_fps)
+        self._resample_active = True
+
+        frame = self._resampled_output_frame(0.0)
+
+        step = self._fps / self._resample_output_fps
+        self._read_pos += step
+        # Keep the integer cursor in sync so get_context_mujoco_qpos() (read
+        # at replan time) samples the seam around the current read position.
+        self._current_frame_idx = int(math.floor(self._read_pos))
+        if self._blend_prev_buf is not None:
+            self._blend_prev_pos += step
+            self._blend_remaining -= 1
+            if self._blend_remaining <= 0:
+                self._blend_prev_buf = None
+                self._blend_remaining = 0
+        return frame
+
+    def peek_output_frame(self, output_offset_ticks: float) -> t.Tensor:
+        """Peek a resampled (+ blended) future frame WITHOUT advancing.
+
+        ``output_offset_ticks`` is measured in OUTPUT ticks ahead of the
+        frame that ``get_next_frame_resampled`` will next return. With the
+        publish loop's ``step_ticks = 5`` at 50 Hz this yields +0.1 s real
+        spacing (0.6 native frames/tick * 5 = 3 native frames = 0.1 s).
+        """
+        if self.frames["mujoco_qpos"] is None:
+            raise RuntimeError(
+                "NeuralPlannerCore.peek_output_frame() called before reset()"
+            )
+        self._resample_active = True
+        return self._resampled_output_frame(float(output_offset_ticks))
+
+    def _arm_output_blend(self) -> None:
+        """Snapshot the current buffer + read cursor to start an 8-tick blend.
+
+        Called from the replan paths right before the buffer is swapped, but
+        only while resampling is active. The old buffer keeps playing forward
+        (from ``_blend_prev_pos``) and is faded out over ``BLEND_FRAMES``
+        output ticks while the new buffer fades in from its frame 0.
+        """
+        if not self._resample_active:
+            return
+        if self.frames["mujoco_qpos"] is None:
+            return
+        self._blend_prev_buf = self.frames["mujoco_qpos"]
+        self._blend_prev_pos = float(self._read_pos)
+        self._blend_remaining = self.BLEND_FRAMES
 
     # ------------------------------------------------------------------
     # Velocity-intent replan
@@ -421,9 +633,17 @@ class NeuralPlannerCore(nn.Module):
             input_state, num_tokens=num_tokens
         )
 
+        # Arm the cross-fade BEFORE swapping the buffer (snapshots the
+        # still-playing old buffer + read cursor). No-op unless resampling
+        # is active, so the legacy integer / offline paths are unaffected.
+        self._arm_output_blend()
         self.frames["model_features"] = model_features[:, : int(num_pred_frames), :]
         self.frames["mujoco_qpos"] = mujoco_qpos[:, : int(num_pred_frames), :]
         self._current_frame_idx = self.NUM_FRAMES_PER_TOKEN - self.PRED_OFFSETS
+        # New buffer read starts at frame 0 (the FILTER_QPOS-blended context
+        # seam), mirroring the integer cursor reset above.
+        if self._resample_active:
+            self._read_pos = float(self.NUM_FRAMES_PER_TOKEN - self.PRED_OFFSETS)
 
         return model_features, mujoco_qpos, int(num_pred_frames)
 
@@ -505,9 +725,17 @@ class NeuralPlannerCore(nn.Module):
             random_seed=random_seed,
         )
 
+        # Arm the cross-fade BEFORE swapping the buffer (snapshots the
+        # still-playing old buffer + read cursor). No-op unless resampling
+        # is active, so the legacy integer / offline paths are unaffected.
+        self._arm_output_blend()
         self.frames["model_features"] = model_features[:, : int(num_pred_frames), :]
         self.frames["mujoco_qpos"] = mujoco_qpos[:, : int(num_pred_frames), :]
         self._current_frame_idx = self.NUM_FRAMES_PER_TOKEN - self.PRED_OFFSETS
+        # New buffer read starts at frame 0 (the FILTER_QPOS-blended context
+        # seam), mirroring the integer cursor reset above.
+        if self._resample_active:
+            self._read_pos = float(self.NUM_FRAMES_PER_TOKEN - self.PRED_OFFSETS)
 
         return model_features, mujoco_qpos, int(num_pred_frames)
 

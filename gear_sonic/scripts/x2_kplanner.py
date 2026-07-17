@@ -194,7 +194,36 @@ _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
 # To restore analog + discrete-forward behaviour, revert
 # ``_resolve_locomotion_continuous`` and remove these constants.
 # --------------------------------------------------------------------------
-_TEST_FIXED_FORWARD_MPS: float = 0.30
+# Forward is ANALOG: the shaped forward stick scales from the in-distribution
+# floor (0.30 m/s -- below this the corpus is empty and the robot just wiggles
+# its hips without stepping) up to the walk peak (_WALK_SPEED_MPS = 0.60). The
+# old fixed 0.30 "barely moved"; this lets the operator push into the 0.3-0.6
+# walking band. Back / side / turn stay fixed-magnitude for now.
+_FWD_MIN_MPS: float = 0.30
+_FWD_MAX_MPS: float = _WALK_SPEED_MPS  # 0.60
+
+# Runtime forward-speed SETPOINT (m/s): any forward stick deflection past the
+# deadzone commands exactly this speed (deterministic; replaces the analog
+# band). Adjustable live from the VR X/Y face buttons in LOCOMOTION mode
+# (payload "speed_delta": X = -0.1, Y = +0.1), clamped to
+# [_SETPOINT_MIN, _SETPOINT_MAX]. Default 0.3; KPLANNER_FIXED_FWD_MPS env var
+# overrides the INITIAL value (kept for script compatibility).
+_SETPOINT_MIN: float = 0.2
+_SETPOINT_MAX: float = 1.0
+_SPEED_SETPOINT: float = float(os.environ.get("KPLANNER_FIXED_FWD_MPS") or 0.30)
+
+
+def _adjust_speed_setpoint(delta: float) -> float:
+    """Nudge the runtime forward-speed setpoint; returns the new value."""
+    global _SPEED_SETPOINT
+    _SPEED_SETPOINT = max(_SETPOINT_MIN, min(_SETPOINT_MAX, _SPEED_SETPOINT + delta))
+    log.info("speed setpoint %+0.1f -> %.1f m/s", delta, _SPEED_SETPOINT)
+    return _SPEED_SETPOINT
+
+
+# Back-compat alias: non-None means "fixed/setpoint mode" (always on now).
+_FIXED_FWD_MPS: Optional[float] = _SPEED_SETPOINT
+_TEST_FIXED_FORWARD_MPS: float = 0.30  # (superseded by the analog band above)
 _TEST_FIXED_BACK_MPS: float = 0.30
 _TEST_FIXED_SIDE_MPS: float = 0.30
 _TEST_FIXED_TURN_RAD_S: float = 0.30
@@ -460,14 +489,17 @@ def _resolve_locomotion_continuous(
     if shaped_fwd > 0.0 and abs(shaped_side) < _FWD_LATERAL_DEADBAND:
         shaped_side = 0.0
 
-    # Fixed-speed movement test: forward / backward / lateral snap to a
-    # single fixed magnitude when engaged (direction from the stick
-    # sign); turn snaps to a fixed yaw rate. This replaces the analog
-    # scaling + discrete-forward levels while we dial in slow-movement
-    # feel. Deadzone still applies (``_shape_stick`` returns 0 inside
+    # Forward is ANALOG (floor 0.30 -> peak 0.60 m/s across the shaped
+    # stick throw); backward / lateral snap to a single fixed magnitude
+    # when engaged (direction from the stick sign); turn snaps to a fixed
+    # yaw rate. Deadzone still applies (``_shape_stick`` returns 0 inside
     # it), so a centred stick idles.
     if shaped_fwd > 0.0:
-        vel_z = _TEST_FIXED_FORWARD_MPS
+        # Deterministic setpoint mode: ANY forward deflection past the
+        # deadzone commands exactly the runtime setpoint (default 0.3 m/s,
+        # X/Y buttons nudge it +/-0.1 in [0.2, 1.0]). Replaces the analog
+        # 0.3-0.6 band; also reaches run-band speeds the band couldn't.
+        vel_z = _SPEED_SETPOINT
     elif shaped_fwd < 0.0:
         vel_z = -_TEST_FIXED_BACK_MPS
     else:
@@ -925,6 +957,12 @@ def _zmq_command_thread(
                 stick_fwd  = float(payload.get("stick_fwd",  0.0))
                 stick_side = float(payload.get("stick_side", 0.0))
                 stick_yaw  = float(payload.get("stick_yaw",  0.0))
+                # One-shot X/Y speed-setpoint nudge from the VR manager.
+                # Applied immediately to the module-level setpoint (the
+                # continuous resolver reads it on every dispatch).
+                sd = payload.get("speed_delta")
+                if sd:
+                    _adjust_speed_setpoint(float(sd))
                 # ``hold_torso`` (continuous waist target) is consumed
                 # by the kplanner's waist-overlay path (v7.4): the
                 # tracker walks ``current_*_deg`` toward these targets
@@ -1550,7 +1588,12 @@ def _load_warmup_qpos(path: Optional[Path]) -> np.ndarray:
 # pre-2026-05-30 behavior). Operators tune this via the kplanner CLI
 # (``--cold-start-ramp-tau-s``) or the Quest 3 / PKL wrappers'
 # ``KPLANNER_COLD_START_RAMP_TAU_S`` env var.
-_DEFAULT_COLD_START_RAMP_TAU_S: float = 0.20
+# 2026-07-16: default OFF (0.0). The ramp was a band-aid for models trained
+# only on steady-state loops; the g1teleop fine-tuned roots train on real
+# stand->walk transitions (idle lead-ins kept in the corpus), so deploy-side
+# intent smoothing now just masks the model. Opt back in for legacy models
+# via KPLANNER_COLD_START_RAMP_TAU_S / --cold-start-ramp-tau-s.
+_DEFAULT_COLD_START_RAMP_TAU_S: float = 0.0
 
 
 class _ColdStartVelocityRamp:
@@ -1681,7 +1724,13 @@ _DEFAULT_REF_SMOOTHER_TRIGGER_RAD: float = 0.05
 # passthrough -- byte-equivalent to the pre-2026-05-31 publisher output,
 # usable as a single-flag revert in case the smoother regresses anything.
 _REF_SMOOTHER_SHAPES: tuple[str, ...] = ("halfcos", "linear", "off")
-_DEFAULT_REF_SMOOTHER_SHAPE: str = "halfcos"
+# Default OFF as of the 30->50 Hz output-resampling + 8-frame cross-fade
+# blend landing (see NeuralPlannerCore.get_next_frame_resampled). The
+# ref-smoother was a reactive substitute for proper handoff blending
+# (300 ms halfcos on >0.05 rad reference jumps); with the seam blend now
+# handling replan discontinuities at the source it is opt-in only. Pass
+# ``--ref-smoother-shape halfcos`` (or ``linear``) to re-enable.
+_DEFAULT_REF_SMOOTHER_SHAPE: str = "off"
 
 # Joint-mask presets. ``lower_body`` (default) ramps legs + waist only
 # (MJ indices [0..14], confirmed against
@@ -2162,7 +2211,16 @@ def _planner_worker(
                     reseed_stats["skipped_other"],
                 )
 
-        log.debug("worker: replan intent v=%d target=%s", ver, target)
+        # G1-demo-style replan line (post-ramp = the actual model input).
+        # target = (yaw_rate, vel_x_lateral, vel_z_forward, hip_h).
+        log.info(
+            "Replanning with mode: %s, target_vel(fwd): %+.3f, lateral: %+.3f, "
+            "yaw_rate: %+.3f, hip_h: %.3f  [v=%d]",
+            ("velocity-only" if planner_mode_idx is None
+             else f"template_idx={planner_mode_idx}"),
+            float(target[2]), float(target[1]), float(target[0]),
+            float(target[3]), ver,
+        )
         t0 = time.monotonic()
         try:
             with replan_lock:
@@ -3095,17 +3153,24 @@ def run(
                     # exactly as before, with the lookahead window the
                     # tokenizer expects.
                     with replan_lock:
-                        qpos_tensor = planner_core.get_next_frame()
+                        # Resampled read: advance a float cursor by
+                        # model_fps/OUTPUT_FPS (=0.6) native frames per tick
+                        # and interpolate, instead of the legacy +1 whole
+                        # 30 fps frame per 50 Hz tick (which played the
+                        # reference 1.67x too fast). An 8-tick cross-fade
+                        # blends successive planner outputs at each replan
+                        # seam (both handled inside NeuralPlannerCore).
+                        qpos_tensor = planner_core.get_next_frame_resampled(OUTPUT_FPS)
                         if planner_core.should_replan():
                             replan_event.set()
                         future_qposes: list[np.ndarray] = []
                         for k in range(num_future):
-                            peek_idx = planner_core.current_frame_idx + step_ticks * (k + 1) - 1
-                            buf = planner_core.frames["mujoco_qpos"]
-                            peek_idx_clamped = max(0, min(peek_idx, buf.shape[1] - 1))
-                            future_qposes.append(
-                                buf[0, peek_idx_clamped].detach().cpu().numpy()
-                            )
+                            # Future slot k is +0.1*(k+1) s in REAL time:
+                            # step_ticks(=5) output ticks * 0.6 native/tick =
+                            # 3 native frames = 0.1 s. Time-correct spacing
+                            # on the resampled timeline (was +5 native = 0.167s).
+                            fq = planner_core.peek_output_frame(step_ticks * (k + 1))
+                            future_qposes.append(fq.detach().cpu().numpy())
                     qpos_np = qpos_tensor.detach().cpu().numpy()
 
                     # Yaw-lock mitigation. When the operator's commanded
@@ -3638,14 +3703,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(_REF_SMOOTHER_SHAPES),
         default=_DEFAULT_REF_SMOOTHER_SHAPE,
         help=(
-            "Ramp shape for the reference-step smoother. 'halfcos' (default) "
-            "is C^1 smooth at both endpoints -- no velocity step is injected "
-            "into the PD law at the start OR end of the ramp; this is what "
-            "the piano shoulder-click work used. 'linear' has a dq/dt step "
-            "at the endpoints (worse for the click) and is exposed for A/B "
-            "comparison. 'off' short-circuits the smoother to pure pass"
-            "through (single-flag revert; byte-equivalent to pre-2026-05-31 "
-            "publisher output)."
+            "Ramp shape for the reference-step smoother. Default 'off' now "
+            "that the 30->50 Hz output resampling + 8-frame cross-fade blend "
+            "handles replan-seam discontinuities at the source. 'halfcos' "
+            "(opt-in) is C^1 smooth at both endpoints -- no velocity step is "
+            "injected into the PD law at the start OR end of the ramp; this "
+            "is what the piano shoulder-click work used. 'linear' has a "
+            "dq/dt step at the endpoints (worse for the click) and is "
+            "exposed for A/B comparison. 'off' short-circuits the smoother "
+            "to pure passthrough."
         ),
     )
     p.add_argument(

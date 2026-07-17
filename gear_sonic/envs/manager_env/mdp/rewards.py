@@ -60,6 +60,11 @@ class RewardsCfg:
     feet_acc = None
     is_terminated = None
     upright_penalty = None
+    # Soft-landing terms (2026-07-16): touchdown impact velocity + GRF
+    # overshoot. Off (None) unless composed in a config -- see
+    # config/manager_env/rewards/terms/feet_{impact_vel,grf_overshoot}.yaml.
+    feet_impact_vel = None
+    feet_grf_overshoot = None
 
 
 def tracking_anchor_pos_error(
@@ -564,6 +569,80 @@ def tracking_body_angvel_error(
     vel_diff = command.body_ang_vel_w[:, tracked] - command.robot_body_ang_vel_w[:, tracked]
     per_body_err = (vel_diff * vel_diff).sum(dim=-1)
     return torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+
+
+def feet_impact_vel_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize downward foot speed at the instant of touchdown (foot slam).
+
+    Fires ONLY on the tick a foot transitions air -> contact
+    (``compute_first_contact``), penalizing its downward vertical velocity
+    squared. Swing dynamics and steady stance are untouched, so this shapes
+    the LANDING (decelerate before impact) without teaching hovering or
+    hesitant steps -- deliberately NOT a dense "slow feet near ground"
+    shaping, which would feed the known low-speed dead-band.
+
+    Motivation (2026-07-16): recovery steps and dance moves land hard; on
+    real hardware the impact spikes excite unmodeled dynamics.
+
+    Args:
+        env: The environment.
+        sensor_cfg: Contact sensor scoped to the feet, e.g.
+            ``SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")``.
+        asset_cfg: Robot asset scoped to the SAME bodies (for velocities).
+
+    Returns:
+        Penalty tensor of shape (num_envs,). Positive values (use negative
+        weight; start small, ~2-5% of tracking-reward magnitude).
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    # [E, F] bool: feet that just made contact this step
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[
+        :, sensor_cfg.body_ids
+    ]
+    asset = env.scene[asset_cfg.name]
+    # downward speed at touchdown (positive = moving down): [E, F]
+    down_speed = torch.relu(-asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2])
+    impact = down_speed * first_contact.float()
+    return (impact * impact).sum(dim=-1)
+
+
+def feet_grf_overshoot_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    soft_ratio: float = 1.5,
+) -> torch.Tensor:
+    """Penalize vertical ground-reaction force above ``soft_ratio`` x weight.
+
+    Complements ``feet_impact_vel_penalty``: that term shapes the approach
+    (velocity at touchdown), this one shapes the LOADING right after contact
+    -- a hard "catch" after a nominally slow touchdown still spikes force.
+    Normalized by robot weight so the weight is robot-agnostic; forces below
+    the soft threshold (single-stance + normal dynamics headroom) incur zero
+    penalty.
+
+    Args:
+        env: The environment.
+        sensor_cfg: Contact sensor scoped to the feet.
+        asset_cfg: Robot asset (for total mass; default whole robot).
+        soft_ratio: Per-foot force threshold as a multiple of total robot
+            weight (1.5 = full bodyweight + 50% dynamic headroom).
+
+    Returns:
+        Penalty tensor of shape (num_envs,). Positive values (negative weight).
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    # [E, F] vertical GRF on the feet
+    fz = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
+    asset = env.scene[asset_cfg.name]
+    # [E] robot weight (N)
+    weight_n = asset.data.default_mass.sum(dim=-1).to(fz.device) * 9.81
+    excess = torch.relu(fz - soft_ratio * weight_n.unsqueeze(-1)) / weight_n.unsqueeze(-1)
+    return (excess * excess).sum(dim=-1)
 
 
 def anti_shake_ang_vel_l2(

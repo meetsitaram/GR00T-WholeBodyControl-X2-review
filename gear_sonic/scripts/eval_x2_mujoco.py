@@ -794,6 +794,16 @@ def main():
              "waist-pitch control. A chest/pelvis push is at/below the waist and "
              "mostly loads ankles/hips instead. Use --push-body head_yaw_link "
              "(neck) or pelvis to compare.")
+    parser.add_argument(
+        "--assist-force", type=float, default=0.0,
+        help="Sustained external ASSIST force (N) applied every step at --push-body "
+             "(set --push-body torso_link for a chest assist), directed UP + toward "
+             "the robot's BACK -- mimics a human helping the robot stand from lying. "
+             "Default 0 (off).")
+    parser.add_argument("--assist-up", type=float, default=1.0,
+                        help="Vertical (up) weight of the assist direction. Default 1.0.")
+    parser.add_argument("--assist-back", type=float, default=1.0,
+                        help="Backward (toward robot's back) weight of the assist direction. Default 1.0.")
 
     # ---- Per-joint-group PD scaling. Multiplicative on top of the
     # DEPLOYMENT_KP_SCALE / DEPLOYMENT_KD_SCALE tables baked into this script
@@ -1149,6 +1159,24 @@ def main():
                 mj_data.xfrc_applied[push_body_id, :3] = push_force * fwd_w
             else:
                 mj_data.xfrc_applied[push_body_id, :3] = 0.0
+
+            # -- Sustained ASSIST force (--assist-force): lift UP + toward the
+            # robot's BACK, at --push-body (torso_link = chest). Mimics a human
+            # helping the robot up from lying. Added on top of any P-push. --
+            if args.assist_force > 0.0:
+                w2, x2, y2, z2 = base_quat
+                u2 = np.array([x2, y2, z2])
+                fwd2 = np.array([1.0, 0.0, 0.0])
+                fwd2_w = fwd2 + 2.0 * w2 * np.cross(u2, fwd2) + 2.0 * np.cross(u2, np.cross(u2, fwd2))
+                fwd2_w[2] = 0.0
+                n2 = np.linalg.norm(fwd2_w)
+                if n2 > 1e-6:
+                    fwd2_w /= n2
+                assist_dir = args.assist_up * np.array([0.0, 0.0, 1.0]) + args.assist_back * (-fwd2_w)
+                na = np.linalg.norm(assist_dir)
+                if na > 1e-6:
+                    assist_dir /= na
+                mj_data.xfrc_applied[push_body_id, :3] += args.assist_force * assist_dir
 
             # -- PD control + step --
             for _ in range(DECIMATION):
