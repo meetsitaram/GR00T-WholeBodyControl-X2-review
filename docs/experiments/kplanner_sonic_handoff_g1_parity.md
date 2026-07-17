@@ -39,7 +39,9 @@ x2_kplanner publish loop: period_s = 1/OUTPUT_FPS (50 Hz), calls get_next_frame(
 | **50 Hz (the bug)** | 5.9 s | **0.646 m/s** (too fast; overshoots the 0.5 command) |
 | correct for 0.5 m/s | — | ~39 fps |
 
-Because the reference feet cycled 1.67× faster than the robot could physically translate, **sonic couldn't keep up and the feet slid** — the slippage. The offline eval avoided all this because `eval_x2_mujoco.py` samples the motion by **sim-time → frame at the real `motion_fps` (30)** (line ~491), i.e. it *accidentally did the resampling the live path skipped.*
+**The key mental model (important):** the bug did NOT make the robot move 1.67× faster. It made the *reference* step 1.67× too fast — past sonic's trackable bandwidth. Sonic is a finite-bandwidth tracking policy (PD-driven, trained on a specific reference cadence); when the reference joint targets sweep faster than anything it saw in training, it **lags and the intended motion is smeared / attenuated / lost**, not sped up. Feet: the reference foot placement moves faster than sonic can plant→lift → the foot slides (**slippage**). Run mode: the reference legs cycle fast but sonic can't drive the body that fast → **"runner pose, barely moves"** — the motion was *lost*, not accelerated. Fixing the rate put the reference back inside sonic's envelope, so it can actually reproduce it — which is why the walk immediately looked clean.
+
+The offline eval avoided all this because `eval_x2_mujoco.py` samples the motion by **sim-time → frame at the real `motion_fps` (30)** (line ~491), i.e. it *accidentally did the resampling the live path skipped.*
 
 ## What the G1 stock stack does (the spec we were missing)
 
