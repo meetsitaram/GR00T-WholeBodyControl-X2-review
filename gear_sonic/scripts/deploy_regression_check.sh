@@ -55,6 +55,8 @@ SONIC="${SONIC:-$DEFAULT_SONIC}"
 
 PY=/home/stickbot/miniconda3/envs/env_isaaclab/bin/python
 SUITE=gear_sonic/data/motions/deploy_regression_suite.pkl
+# data/motions is gitignored -> regenerate the curated suite on a fresh clone.
+[[ -f "$SUITE" ]] || "$PY" gear_sonic/scripts/build_deploy_regression_suite.py
 LOCAL_PLANNER_DIR="$HOME/x2_cloud_checkpoints/planner_onnx_ft"
 
 # ---------------------------------------------------------------------------
