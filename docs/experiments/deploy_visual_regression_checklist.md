@@ -57,12 +57,21 @@ Verdict is printed as **GATE MATCHED** (results certify the robot's build) or
 
 ## Part B — sonic tracking (deploy model)
 
+> **Test the ONNX, not the `.pt`.** The robot only ever runs ONNX, so that is the artifact
+> under test — a `.pt` run validates something that never ships and can mask an export-stage
+> defect. The runner defaults to ONNX; `.pt` is accepted for debugging only and must never be
+> used to certify a deploy. (ONNX mode shows one clip per window — close each to advance.)
+
 ```bash
-./gear_sonic/scripts/deploy_regression_check.sh --pc2 192.168.86.32            # robot's current model
-./gear_sonic/scripts/deploy_regression_check.sh --pc2 10.0.1.41 <model.pt>     # specific model
-./gear_sonic/scripts/deploy_regression_check.sh --no-pc2 <candidate.pt>        # pre-deploy candidate
-# viewer: N=next clip, SPACE=pause, ,/. = speed
+./gear_sonic/scripts/deploy_regression_check.sh --pc2 192.168.86.32               # robot's current ONNX
+./gear_sonic/scripts/deploy_regression_check.sh --pc2 10.0.1.41 <model_g1.onnx>   # specific ONNX
+./gear_sonic/scripts/deploy_regression_check.sh --no-pc2 <candidate_g1.onnx>      # pre-deploy candidate
+# viewer: SPACE=pause, ,/. = speed; close the window to advance to the next clip
 ```
+
+Every run prints **and logs** a stats block to `logs/deploy_regression/<ts>_<model>.log`:
+model under test + md5, ONNX form, clip count, PC2 gate verdict, the robot's sonic md5,
+planner/handoff status, and a GO/NO-GO line to fill in. Paste it into the deploy log below.
 
 Curated set (`gear_sonic/data/motions/deploy_regression_suite.pkl`, 7 clips):
 

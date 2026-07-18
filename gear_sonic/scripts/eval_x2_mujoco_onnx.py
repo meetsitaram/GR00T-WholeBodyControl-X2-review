@@ -429,8 +429,17 @@ def main():
 
     _apply_init_state()
 
+    # Tracks the reference index so we can catch the loop wrap. Sonic is a tracking
+    # policy: it can neither hold a frozen frame nor chase a teleport. Letting the
+    # reference index wrap on its own snaps it back to frame 0 -- metres behind the
+    # robot on locomotion clips -- and the robot collapses. Wrapping must be a full
+    # reset so sim state and reference move together.
+    prev_motion_frame = -1
+
     def reset_state(reason: str = "") -> None:
         nonlocal sim_time, last_action_mj, episode_count, episode_start_step
+        nonlocal prev_motion_frame
+        prev_motion_frame = -1
         sim_time = float(init_frame) / motion_fps
         last_action_mj[:] = 0
         prop_buf.reset()
@@ -443,10 +452,14 @@ def main():
     # Per-step body that's identical in headless and viewer paths.
     def step_once() -> str | None:
         """Run one control tick. Returns reset reason if the episode ended."""
-        nonlocal sim_time, step_count, last_action_mj
+        nonlocal sim_time, step_count, last_action_mj, prev_motion_frame
 
         motion_time = sim_time * args.speed
         motion_frame = int(motion_time * motion_fps) % total_frames
+        # Clip looped: end the episode instead of teleporting the reference (see above).
+        if 0 <= prev_motion_frame and motion_frame < prev_motion_frame:
+            return "motion_end"
+        prev_motion_frame = motion_frame
         motion_time = motion_frame / motion_fps
 
         qpos_j = mj_data.qpos[7 : 7 + NUM_DOFS].copy()

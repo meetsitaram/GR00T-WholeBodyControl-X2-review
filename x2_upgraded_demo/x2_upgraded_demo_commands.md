@@ -37,6 +37,29 @@ python gear_sonic/scripts/play_x2_motion_mujoco.py   --motion gear_sonic/data/mo
 
 ===================================================================
 
+### validation
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh --cleanup-only 
+
+###### validate the latesrt models are on the robot
+SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx \
+  PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_ft \
+  ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
+
+ALLOW_MISMATCH=1 \
+  SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx \
+  PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_ft \
+  ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
+
+
+
+
+MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx \
+  ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
+
+
+
+
+
 ### various dance moves with sonic in mujoco
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl

@@ -86,7 +86,7 @@ Laptop A/B (live stack owns 5556/5563/5568 -- offset everything)::
     .venv/bin/python gear_sonic/scripts/pc2_kplanner_onnx.py \
         --backend torch --port-offset 100 --device cpu \
         --vqvae-ckpt ... --pose-ckpt ... --root-ckpt ... \
-        --warmup-qpos gear_sonic/data/motions/kplanner_idle_anchor_g1teleop_v2.pkl
+        --warmup-qpos gear_sonic/data/motions/kplanner_idle_anchor_g1teleop_v3.pkl
 """
 
 from __future__ import annotations
@@ -144,7 +144,7 @@ DEFAULT_PUB_PORT: int = 5556           # PUB bind, topic "pose"
 DEFAULT_CMD_PORT: int = 5563           # SUB connect, topic "planner_cmd"
 DEFAULT_CLIP_CMD_PORT: int = 5568      # SUB bind, topic "motion_clip_cmd"
 DEFAULT_WARMUP_PKL = Path(
-    "/home/run/getsolo/planner_stack/models/kplanner_idle_anchor_g1teleop_v2.pkl"
+    "/home/run/getsolo/planner_stack/models/kplanner_idle_anchor_g1teleop_v3.pkl"
 )
 DEFAULT_DANCES_DIR = Path(
     "/home/run/getsolo/planner_stack/models/dances_x2m2"
@@ -849,11 +849,28 @@ class OnnxPlannerBackend:
 
     # --- replan ------------------------------------------------------------
 
-    def replan(self, target: tuple[float, float, float, float]) -> int:
+    # -----------------------------------------------------------------
+    # Replan is SPLIT into prepare / infer / commit so the ONNX inference
+    # can run WITHOUT holding the publisher's lock.
+    #
+    # Why this matters: the publish loop takes replan_lock to read every
+    # 50 Hz frame. When replan() ran wholly inside that lock, a 300-500 ms
+    # inference blocked the pose stream for 15-25 frames. SONIC cannot hold
+    # a frame -- a gap that long is a collapse. Observed on hardware as
+    # repeated "loop fell behind by 300-550ms; resyncing" with the robot
+    # nearly going down.
+    #
+    # Only prepare() and commit() touch shared state (_buf / _read_pos);
+    # infer() is pure compute over a snapshot, so it is safe to run unlocked.
+    #   with lock: prep = replan_prepare(t)
+    #   (no lock): pred, npf = replan_infer(prep)
+    #   with lock: replan_commit(pred, npf)
+    # -----------------------------------------------------------------
+    def replan_prepare(self, target: tuple[float, float, float, float]) -> dict:
+        """Snapshot context + build ONNX feeds. CALLER MUST HOLD THE LOCK."""
         if self._buf is None:
             raise RuntimeError("replan() called before reset()")
         roles = self._contract["inputs"]
-        outs = self._contract["outputs"]
         context = self._get_context()
         feeds: dict = {
             roles["context"]: context,
@@ -872,9 +889,20 @@ class OnnxPlannerBackend:
             if "shape" in spec:
                 arr = arr.reshape(spec["shape"])
             feeds[name] = arr
+        return {"feeds": feeds, "context": context}
+
+    def replan_infer(self, prep: dict) -> tuple[np.ndarray, int]:
+        """Run the planner graph. MUST be called WITHOUT the lock.
+
+        This is the 300-500 ms step. It reads only the snapshot in ``prep``
+        and mutates no shared state, so the publisher keeps streaming while
+        it runs.
+        """
+        outs = self._contract["outputs"]
+        context = prep["context"]
 
         qpos_out, npf_out = self._sess.run(
-            [outs["qpos"], outs["num_pred_frames"]], feeds
+            [outs["qpos"], outs["num_pred_frames"]], prep["feeds"]
         )
         npf = int(np.asarray(npf_out).reshape(-1)[0])
         npf = max(1, min(npf, int(qpos_out.shape[1])))
@@ -891,7 +919,14 @@ class OnnxPlannerBackend:
             blend = np.linspace(0.3, 0.7, num_ctx, dtype=np.float32)[:n, None]
             pred[:n, :3] = ctx[:n, :3] * (1 - blend) + pred[:n, :3] * blend
             pred[:n, 7:] = ctx[:n, 7:] * (1 - blend) + pred[:n, 7:] * blend
+        return pred, npf
 
+    def replan_commit(self, pred: np.ndarray, npf: int) -> int:
+        """Arm the seam blend and swap in the new buffer.
+
+        CALLER MUST HOLD THE LOCK. Pure bookkeeping -- microseconds, not the
+        hundreds of milliseconds that inference costs.
+        """
         # Arm the 8-tick cross-fade before swapping the buffer (snapshot the
         # still-playing old buffer + read cursor). No-op unless resampling
         # is active.
@@ -904,6 +939,17 @@ class OnnxPlannerBackend:
         if self._resample_active:
             self._read_pos = float(NUM_FRAMES_PER_TOKEN - PRED_OFFSETS)
         return npf
+
+    def replan(self, target: tuple[float, float, float, float]) -> int:
+        """Single-threaded convenience wrapper (offline clip generation, A/B).
+
+        The live publisher must NOT use this -- it would hold the lock across
+        inference again. Use prepare/infer/commit with the lock released around
+        infer(). Safe here because these callers have no concurrent reader.
+        """
+        prep = self.replan_prepare(target)
+        pred, npf = self.replan_infer(prep)
+        return self.replan_commit(pred, npf)
 
     def describe(self) -> str:
         return f"onnx/{self.graph_kind}" + (
@@ -1005,6 +1051,13 @@ class TorchPlannerBackend:
                 list(target), mode_idx=self.mode_idx
             )
         return int(npf)
+
+    # NOTE: deliberately does NOT implement the prepare/infer/commit split.
+    # The torch core fuses inference and buffer swap, so there is no safe way
+    # to run part of it unlocked. The worker feature-detects the split API and
+    # falls back to the locked replan() here. That costs a stall, which is
+    # acceptable because this backend is the offline A/B path and never runs
+    # on the robot -- and a stall is far better than a half-applied replan.
 
     def describe(self) -> str:
         return f"torch/{self.graph_kind}" + (
@@ -1636,8 +1689,23 @@ def _planner_worker(
         )
         t0 = time.monotonic()
         try:
-            with replan_lock:
-                backend.replan(target)
+            # Lock held only for the two cheap phases. Inference -- the
+            # 300-500 ms step -- runs UNLOCKED so the 50 Hz publisher keeps
+            # streaming. Holding the lock across inference starved SONIC for
+            # 15-25 frames and nearly dropped the robot.
+            #
+            # Feature-detected: the ONNX backend splits, the torch A/B backend
+            # cannot (it fuses inference with the buffer swap) and falls back
+            # to the fully-locked path.
+            if hasattr(backend, "replan_prepare"):
+                with replan_lock:
+                    prep = backend.replan_prepare(target)
+                pred, npf = backend.replan_infer(prep)      # <-- no lock
+                with replan_lock:
+                    backend.replan_commit(pred, npf)
+            else:
+                with replan_lock:
+                    backend.replan(target)
         except Exception:
             log.exception("worker: replan failed; will retry next cycle")
             time.sleep(0.05)
@@ -1848,6 +1916,29 @@ def run(args: argparse.Namespace) -> int:
             return qs
         return [_reb1(q) for q in qs]
 
+    def _track_idle_yaw() -> None:
+        """While IDLE, let the reference heading FOLLOW the robot's measured yaw.
+
+        A one-shot offset makes idle hold a *world-absolute* heading: nudge the
+        robot and the reference stays put, so SONIC sees yaw error and drives it
+        back. That restoring torque is the "it fights me back to one orientation"
+        symptom -- world coordinates leaking into idle.
+
+        The one-shot rule exists so the offset never double-counts the planner's
+        own yaw integration -- but the planner only integrates yaw while PLAYING.
+        IDLE republishes a frozen anchor and integrates nothing, so tracking the
+        measurement here is safe and removes the yaw stiffness.
+
+        Called only from the idle path. During PLAYING the offset stays frozen at
+        whatever heading idle last observed, which is exactly what we want: drive
+        and turns come out relative to the heading the robot was actually facing.
+        """
+        if yaw_offset[0] is None:
+            return                      # rebase not armed (sim / no x2_debug)
+        cur = measured_yaw.get(max_age_s=1.0)
+        if cur is not None:             # stale/absent -> keep the last good offset
+            yaw_offset[0] = cur
+
     global_tick = 0
     last_intent_log: tuple[float, float, float, float] = _IDLE_INTENT
     is_playing = False           # False == IDLE_LOOP (frozen anchor)
@@ -1873,6 +1964,15 @@ def run(args: argparse.Namespace) -> int:
         smoother shapes only the CURRENT frame; the future window stays
         raw -- same as x2_kplanner (futures are built pre-smoother)."""
         nonlocal global_tick
+        # DISABLED 2026-07-18 after a runaway-spin incident on hardware.
+        # _track_idle_yaw() removed yaw stiffness so idle would stop fighting
+        # hand-nudges. The unchecked assumption was that anchor ticks never
+        # publish while the robot is rotating. If they do, it is positive
+        # feedback: robot turns -> offset tracks the new heading -> reference
+        # rotates further -> robot turns more. Re-enable ONLY with a guard that
+        # refuses to track while is_playing, plus a slew limit (rad/s cap) so a
+        # feedback loop cannot run away even if the guard is wrong.
+        # _track_idle_yaw()
         xyzw = _reb1(_idle_root_xyzw())
         jpos = ref_smoother.update(anchor_jpos, time.monotonic())
         payload = build_pose_payload_np(

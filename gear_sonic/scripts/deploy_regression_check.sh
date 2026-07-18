@@ -22,9 +22,10 @@
 #   ./gear_sonic/scripts/deploy_regression_check.sh --pc2 10.0.1.41 <model.pt|_g1.onnx>
 #   ./gear_sonic/scripts/deploy_regression_check.sh --no-pc2 <candidate.pt>   # pre-deploy
 #
-#   .pt  -> eval_x2_mujoco.py --motions : ALL 7 clips in one window, press N to step.
-#   .onnx-> eval_x2_mujoco_onnx.py takes ONE motion PKL, so we loop the 7 clips;
-#           CLOSE each viewer window to advance.
+#   .onnx (DEFAULT, and what the robot actually runs) -> eval_x2_mujoco_onnx.py takes
+#           ONE motion PKL, so we loop the 7 clips; CLOSE each window to advance.
+#   .pt   -> debugging convenience only (one window, N to step). NOT the shipped
+#           artifact -- never certify a deploy from a .pt run.
 #
 # Viewer: SPACE=pause, N=next clip (.pt mode), R=reset, ,/. = speed.
 # A deploy PASSES only if every clip is visually clean AND the PC2 gate matched.
@@ -32,11 +33,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-PC2_IP=""; SKIP_PC2=0; SONIC=""
+PC2_IP=""; SKIP_PC2=0; SONIC=""; PLANNER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pc2)    PC2_IP="$2"; shift 2 ;;
     --no-pc2) SKIP_PC2=1; shift ;;
+    --planner) PLANNER="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *)        SONIC="$1"; shift ;;
   esac
@@ -49,7 +51,9 @@ if [[ -z "$PC2_IP" && "$SKIP_PC2" -eq 0 ]]; then
   exit 1
 fi
 
-DEFAULT_SONIC="$HOME/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/ft_2082.pt"  # = robot's deployed ft_2082_g1.onnx
+# THE ROBOT RUNS ONNX -- so the regression tests ONNX by default. Testing a .pt
+# would validate an artifact that never ships and could mask an export defect.
+DEFAULT_SONIC="$HOME/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/ft_2082_g1.onnx"
 SONIC="${SONIC:-$DEFAULT_SONIC}"
 [[ -f "$SONIC" ]] || { echo "model not found: $SONIC"; exit 1; }
 
@@ -57,7 +61,9 @@ PY=/home/stickbot/miniconda3/envs/env_isaaclab/bin/python
 SUITE=gear_sonic/data/motions/deploy_regression_suite.pkl
 # data/motions is gitignored -> regenerate the curated suite on a fresh clone.
 [[ -f "$SUITE" ]] || "$PY" gear_sonic/scripts/build_deploy_regression_suite.py
-LOCAL_PLANNER_DIR="$HOME/x2_cloud_checkpoints/planner_onnx_ft"
+# Planner ONNX under test -- a deploy changes BOTH models, so one run validates both.
+PLANNER="${PLANNER:-$HOME/x2_cloud_checkpoints/planner_onnx_ft/x2_planner_template.onnx}"
+LOCAL_PLANNER_DIR="$(dirname "$PLANNER")"
 
 # ---------------------------------------------------------------------------
 # PC2 identity gate
@@ -124,6 +130,26 @@ echo "  clips: 2 walk/turn | 2 easy dance | 2 medium dance | 1 combat/boxing"
 echo "  judge each against docs/experiments/deploy_visual_regression_checklist.md"
 echo
 
+NCLIPS=$("$PY" - "$SUITE" <<'PYEOF'
+import joblib, sys; print(len(joblib.load(sys.argv[1])))
+PYEOF
+)
+# --- PART A (automated): drive the PLANNER ONNX under test, then play its own
+# --- output through the sonic ONNX under test => validates the deployed pipeline.
+GEND=$(mktemp -d); trap 'rm -rf "$GEND"' EXIT
+if [[ -f "$PLANNER" ]]; then
+  echo "  generating kplanner clips from $(basename "$PLANNER") ..."
+  "$PY" gear_sonic/scripts/gen_kplanner_clip.py --planner-onnx "$PLANNER" \
+      --out "$GEND/kp_walk.pkl" --seconds 8 --vel-z 0.5 --name kplanner__walk_0.5 2>/dev/null | tail -1
+  "$PY" gear_sonic/scripts/gen_kplanner_clip.py --planner-onnx "$PLANNER" \
+      --out "$GEND/kp_turn.pkl" --seconds 8 --vel-z 0.4 --yaw-rate 0.4 --name kplanner__walk_turn 2>/dev/null | tail -1
+  "$PY" gear_sonic/scripts/merge_regression_clips.py "$SUITE" "$GEND/kp_walk.pkl" "$GEND/kp_turn.pkl" "$GEND/combined.pkl" \
+      && SUITE="$GEND/combined.pkl"
+else
+  echo "  WARNING: planner ONNX not found ($PLANNER) -- kplanner stage SKIPPED"
+fi
+
+START_TS=$(date +%Y-%m-%dT%H:%M:%S)
 case "$SONIC" in
   *.onnx)
     echo "  ONNX mode: one clip per window -- CLOSE each window to advance."; echo
@@ -135,7 +161,16 @@ PYEOF
 )
     i=0
     for k in "${KEYS[@]}"; do
-      i=$((i+1)); echo "--- [$i/${#KEYS[@]}] $k ---"
+      i=$((i+1))
+      # Big, unmissable banner + an explicit gate: the viewer window carries no clip
+      # name, so without this you cannot tell which clip you are judging.
+      echo
+      echo "==============================================================="
+      printf '  CLIP [%d/%d]  %s\n' "$i" "${#KEYS[@]}" "$k"
+      echo "==============================================================="
+      if [ -t 0 ] || [ -e /dev/tty ]; then
+        read -r -p "  press ENTER to play this clip (or Ctrl-C to stop) ..." _ < /dev/tty || true
+      fi
       "$PY" - "$SUITE" "$k" "$TMPD/clip.pkl" <<'PYEOF'
 import joblib, sys
 d = joblib.load(sys.argv[1]); joblib.dump({sys.argv[2]: d[sys.argv[2]]}, sys.argv[3])
@@ -143,10 +178,43 @@ PYEOF
       .venv/bin/python gear_sonic/scripts/eval_x2_mujoco_onnx.py \
         --onnx "$SONIC" --motion "$TMPD/clip.pkl" || true
     done
-    echo "=== suite complete ($i clips), pc2 gate: $GATE ==="
     ;;
   *)
-    exec .venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py \
-      --checkpoint "$SONIC" --wrist-ref --motions "$SUITE"
+    # NOTE: not exec'd -- we must survive the viewer to print/log the run stats.
+    .venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py \
+      --checkpoint "$SONIC" --wrist-ref --motions "$SUITE" || true
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Run stats: printed AND appended to a log, so every deploy decision has a record.
+# ---------------------------------------------------------------------------
+END_TS=$(date +%Y-%m-%dT%H:%M:%S)
+LOGDIR=logs/deploy_regression; mkdir -p "$LOGDIR"
+LOGF="$LOGDIR/$(date +%Y%m%d_%H%M%S)_$(basename "$SONIC").log"
+SONIC_MD5_SHORT="${LOCAL_SONIC_MD5:-n/a}"; SONIC_MD5_SHORT="${SONIC_MD5_SHORT:0:12}"
+{
+  echo "===================== DEPLOY REGRESSION RUN STATS ====================="
+  echo "  started / ended : $START_TS  ->  $END_TS"
+  echo "  model under test: $SONIC"
+  echo "  model onnx form : ${LOCAL_SONIC_ONNX:-n/a}"
+  echo "  model md5       : $SONIC_MD5_SHORT"
+  echo "  clips shown     : $NCLIPS  (2 walk/turn | 2 easy | 2 medium | 1 combat)"
+  echo "  planner onnx    : $PLANNER"
+  echo "  planner md5     : $([[ -f "$PLANNER" ]] && md5sum "$PLANNER" | cut -c1-12 || echo n/a)"
+  echo "  suite           : $SUITE"
+  echo "  ---- PC2 identity gate ----"
+  echo "  pc2             : ${PC2_IP:-<skipped>}"
+  echo "  gate verdict    : $GATE"
+  echo "  robot sonic md5 : ${REMOTE_SONIC_MD5:0:12}"
+  echo "  planner graphs  : $([[ "${PLAN_OK:-0}" -eq 1 ]] && echo MATCH || echo MISMATCH/unchecked)"
+  echo "  handoff fix     : $([[ "${HF_OK:-0}" -eq 1 ]] && echo PRESENT || echo ABSENT/unchecked)"
+  echo "  ---- verdict (fill in) ----"
+  echo "  visual result   : GO / NO-GO   <- record per docs/experiments/deploy_visual_regression_checklist.md"
+  echo "  notes           :"
+  echo "======================================================================"
+} | tee "$LOGF"
+echo "logged -> $LOGF"
+if [[ "$GATE" != "MATCHED" ]]; then
+  echo "REMINDER: gate was $GATE -- this run does NOT certify the robot's current build."
+fi
