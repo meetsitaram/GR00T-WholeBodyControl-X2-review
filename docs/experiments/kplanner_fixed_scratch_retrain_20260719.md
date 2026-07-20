@@ -74,10 +74,10 @@ visible in every training sample**, so the 100%-masked regime that generation
 actually runs in is never trained; ambiguous-conditioning motions (idle vs
 turn) collapse to the idle mode.
 
-## 5. The fix (novel over stock): `full_mask_prob`
+## 5. The fix (novel over stock): `fully_masked_sample_prob`
 
 `motionbricks/motion_backbone/models/pose_model.py::_get_token_masks` now
-supports `full_mask_prob` (hparams key next to `masked_token_ratio`;
+supports `fully_masked_sample_prob` (hparams key next to `masked_token_ratio`;
 default 0.0 = bit-identical legacy behavior): with that probability per
 sample, every token is masked, directly training the from-scratch prior.
 
@@ -87,7 +87,7 @@ elevation (0.644 vs 0.591) confirms the regime engages;
 **`pose_fullmask_hot` (0.5/priority 0.5 → ~25% fully-masked turn windows)
 launched and stopped with the instances before its first checkpoint — verdict
 pending on resume.** If hot stays flat by +25–50k, warm-starts cannot unlearn
-the anchored prior → decide on a from-scratch pose run with `full_mask_prob`
+the anchored prior → decide on a from-scratch pose run with `fully_masked_sample_prob`
 enabled from step 0.
 
 ## 6. Deploy recipe available now (no training required)
@@ -111,3 +111,13 @@ enabled from step 0.
   caches must symlink with **absolute** targets.
 - Retarget gotcha: pre-warm the newton asset cache once per node before
   launching parallel shards (thundering-herd git clone crash).
+- **Rename gotcha (resume-critical)**: the flag was renamed
+  `full_mask_prob` → `fully_masked_sample_prob` after the nodes were stopped.
+  Node B's `out_fixed_scratch/motionbricks_pose_x2/version_1/hparams.yaml`
+  still carries the OLD key, which the renamed code silently ignores
+  (defaults to 0.0). On resume: ship the current `pose_model.py` AND rename
+  the key in B's hparams before relaunching the fullmask runs.
+- Flag verified end-to-end post-rename: real `_get_token_masks` with
+  DictConfig args produces 0% / 26% / 53% fully-masked samples at
+  prob 0 / 0.25 / 0.5, legacy max mask fraction 0.75 unchanged, and the
+  hparams key resolves into `model.args`.

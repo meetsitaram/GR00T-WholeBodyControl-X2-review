@@ -287,12 +287,12 @@ class MotionModel(LightningModule):
         # visible as ground-truth anchors, so generation-from-scratch (100%
         # masked) is never trained and rare sequences (e.g. standing-start
         # turns) collapse to the idle mode at inference. With probability
-        # full_mask_prob per sample, mask EVERY token so the from-scratch
+        # fully_masked_sample_prob per sample, mask EVERY token so the from-scratch
         # joint prior is trained directly. Default 0.0 preserves the original
         # behavior exactly.
-        full_mask_prob = float(self._args.get('full_mask_prob', 0.0))
-        if full_mask_prob > 0.0:
-            full_mask = t.rand([batch_size, 1], device=device) < full_mask_prob
+        fully_masked_sample_prob = float(self._args.get('fully_masked_sample_prob', 0.0))
+        if fully_masked_sample_prob > 0.0:
+            full_mask = t.rand([batch_size, 1], device=device) < fully_masked_sample_prob
             num_focus_tokens = t.where(full_mask,
                                        t.full_like(num_focus_tokens, num_all_tokens_per_sample),
                                        num_focus_tokens)
