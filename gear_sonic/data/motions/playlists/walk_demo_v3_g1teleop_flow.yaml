@@ -1,0 +1,66 @@
+# walk_demo_v3 rebuilt on the G1->X2 retarget (x2_g1teleop_30fps.pkl).
+#
+# Same shape as walk_demo_v3.yaml: idle -> walk out -> turn -> turn -> walk back
+# -> idle. Only the SOURCE changes: v3 pulls from x2_ultra_bones_seed.pkl, which
+# is the old low-quality retarget (its clips crab-walk -- measured 32.6 deg median
+# body-vs-travel misalignment, and the operator flagged them as low quality).
+#
+# SUBSTITUTION worth knowing: v3's pivots are IN-PLACE turns
+# (idle_turn_270 / step_rotate_idle_090). The g1teleop corpus contains NO in-place
+# turns -- 61 clips, all walking variants -- so those slots use walking turns
+# instead. The motion therefore turns while stepping rather than pivoting on the
+# spot. The chain-matched in-place equivalents were tried and FAIL under sonic
+# (pelvis_z 0.368 / 0.365), so this is the better trade.
+#
+# All segment clips individually validated PASS under softland_4800 in MuJoCo.
+name: x2_ultra_walk_demo_v3_g1teleop_flow
+output_key: walk_demo__v3__g1teleop__flow
+fps: 30
+zero_xy: true
+zero_yaw: true
+
+rest:
+  source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+  motion_key: null
+  frame: 0
+  rest_frames: 24                # == blend_in + blend_out, so the rest window is ALL crossfade
+                                 # and the robot never stands still between segments.
+  blend_in_frames: 12            # 0.4 s crossfade only
+  blend_out_frames: 12
+
+segments:
+  - name: anchor_open
+    source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+    motion_key: stitched__lower=idle_hands_on_back_loop_001__A__upper=Relaxed_walk_forward_002__A057
+    start_frame: 0
+    n_frames: 30                 # 1.00 s
+
+  - name: walk_straight_out
+    source: gear_sonic/data/motions/x2_g1teleop_30fps.pkl
+    motion_key: walk_001
+    start_frame: 0
+    n_frames: 60                 # 2.00 s
+
+  - name: turn_1
+    source: gear_sonic/data/motions/x2_g1teleop_30fps.pkl
+    motion_key: slow_walk_turns_0.7_001
+    start_frame: 0
+    n_frames: 90                 # 3.00 s
+
+  - name: turn_2
+    source: gear_sonic/data/motions/x2_g1teleop_30fps.pkl
+    motion_key: slow_walk_turns_0.7_001
+    start_frame: 120
+    n_frames: 90                 # 3.00 s
+
+  - name: walk_straight_back
+    source: gear_sonic/data/motions/x2_g1teleop_30fps.pkl
+    motion_key: walk_001
+    start_frame: 60
+    n_frames: 60                 # 2.00 s
+
+  - name: anchor_close
+    source: gear_sonic/data/motions/x2_ultra_stitched_idle_relaxed_arms.pkl
+    motion_key: stitched__lower=idle_hands_on_back_loop_001__A__upper=Relaxed_walk_forward_002__A057
+    start_frame: 0
+    n_frames: 30                 # 1.00 s

@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>X2 Ultra Sim-to-Real — Technical Report</title>
+<style>
+
+@page {
+    size: letter;
+    margin: 0.65in 0.55in 0.7in 0.55in;
+    @bottom-center {
+        content: counter(page);
+        font-family: "Latin Modern Roman", "STIX Two Text", "Times New Roman", serif;
+        font-size: 8.5pt;
+        color: #333;
+    }
+}
+
+/* Reset and base */
+* { box-sizing: border-box; }
+
+body {
+    font-family: "Latin Modern Roman", "STIX Two Text", "Times New Roman", Times, serif;
+    font-size: 8.5pt;
+    line-height: 1.18;
+    color: #000;
+    margin: 0;
+    padding: 0;
+    text-rendering: optimizeLegibility;
+    counter-reset: section figure-num table-num;
+}
+
+/* ------------------------------------------------------------------ */
+/* Title block — single-column, full width                            */
+/* ------------------------------------------------------------------ */
+body > h1:first-child {
+    column-span: all;
+    text-align: center;
+    font-size: 17pt;
+    font-weight: 700;
+    line-height: 1.18;
+    margin: 0 0 0.5em 0;
+    padding: 0 0.4in;
+    letter-spacing: -0.01em;
+    border: none;
+}
+
+/* The "Technical Report" subtitle line + author + author note paragraphs */
+body > h1:first-child ~ p:nth-of-type(-n+3) {
+    column-span: all;
+    text-align: center;
+    margin: 0.2em 0;
+    font-size: 10pt;
+    color: #222;
+}
+
+/* The "---" separator after author block */
+body > h1:first-child ~ hr:first-of-type {
+    column-span: all;
+    margin: 0.6em 0 0.6em 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Two-column body                                                    */
+/* ------------------------------------------------------------------ */
+body {
+    column-count: 2;
+    column-gap: 0.28in;
+    column-fill: balance;
+}
+
+/* ------------------------------------------------------------------ */
+/* Headings — auto-numbered sections, no underlines                   */
+/* ------------------------------------------------------------------ */
+h1, h2, h3, h4, h5 {
+    font-family: "Latin Modern Roman", "Times New Roman", serif;
+    font-weight: 700;
+    page-break-after: avoid;
+    color: #000;
+    border: none;
+}
+
+h2 {
+    font-size: 11pt;
+    margin: 1.1em 0 0.3em 0;
+    line-height: 1.25;
+    counter-reset: subsection figure-num table-num;
+    counter-increment: section;
+}
+h2::before {
+    content: counter(section) ".  ";
+}
+
+h3 {
+    font-size: 10pt;
+    margin: 0.9em 0 0.2em 0;
+    line-height: 1.25;
+    counter-increment: subsection;
+}
+h3::before {
+    content: counter(section) "." counter(subsection) ".  ";
+    font-weight: 700;
+}
+
+h4 {
+    font-size: 9.5pt;
+    font-style: italic;
+    margin: 0.7em 0 0.2em 0;
+    line-height: 1.25;
+}
+
+/* The Abstract section (matched by content via :first-of-type after title block)
+   — emphasized via tighter font and italic-style framing */
+h2 + p {
+    /* normal paragraph; abstract gets manual styling via class if needed */
+}
+
+/* ------------------------------------------------------------------ */
+/* Body paragraphs                                                    */
+/* ------------------------------------------------------------------ */
+p {
+    margin: 0 0 0.45em 0;
+    text-align: justify;
+    text-justify: inter-word;
+    hyphens: auto;
+    orphans: 2;
+    widows: 2;
+}
+
+p + p {
+    text-indent: 0.18in;
+    margin-top: 0;
+}
+
+/* No indent on the first paragraph after a heading or figure or pre */
+h1 + p, h2 + p, h3 + p, h4 + p,
+figure + p, pre + p, table + p, ul + p, ol + p, blockquote + p,
+hr + p {
+    text-indent: 0;
+}
+
+/* Lists */
+ul, ol {
+    margin: 0.3em 0 0.5em 0;
+    padding-left: 1.3em;
+}
+li {
+    margin: 0.1em 0;
+    text-align: justify;
+}
+
+/* ------------------------------------------------------------------ */
+/* Inline + block code                                                */
+/* ------------------------------------------------------------------ */
+code {
+    font-family: "Latin Modern Mono", "DejaVu Sans Mono", "Courier New", monospace;
+    font-size: 0.86em;
+    background: #f0f0f0;
+    padding: 0.04em 0.25em;
+    border-radius: 2px;
+}
+
+pre {
+    font-family: "Latin Modern Mono", "DejaVu Sans Mono", "Courier New", monospace;
+    font-size: 7.6pt;
+    background: #f4f4f4;
+    border: 0.5pt solid #bbb;
+    border-radius: 2px;
+    padding: 0.4em 0.6em;
+    margin: 0.5em 0;
+    line-height: 1.3;
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    page-break-inside: avoid;
+    column-span: all;  /* code blocks span both columns to fit comfortably */
+}
+pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+}
+
+/* ------------------------------------------------------------------ */
+/* Blockquote — used for the "Calibrated bottom-line claim"           */
+/* ------------------------------------------------------------------ */
+blockquote {
+    border-left: 2pt solid #555;
+    padding: 0.2em 0 0.2em 0.7em;
+    margin: 0.5em 0 0.5em 0;
+    color: #222;
+    font-style: italic;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tables                                                             */
+/* ------------------------------------------------------------------ */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.5em 0;
+    font-size: 7.8pt;
+    line-height: 1.2;
+    page-break-inside: avoid;
+}
+
+/* Wide tables span both columns */
+table {
+    column-span: all;
+}
+
+th, td {
+    border: 0.5pt solid #555;
+    padding: 3px 5px;
+    text-align: left;
+    vertical-align: top;
+}
+
+th {
+    background: #e4e4e4;
+    font-weight: 700;
+    font-size: 8.5pt;
+}
+
+tbody tr:nth-child(even) {
+    background: #f7f7f7;
+}
+
+/* ------------------------------------------------------------------ */
+/* Figures — span both columns, auto-number captions                 */
+/* ------------------------------------------------------------------ */
+figure {
+    column-span: all;
+    margin: 0.7em 0 0.5em 0;
+    text-align: center;
+    page-break-inside: avoid;
+    counter-increment: figure-num;
+}
+
+img {
+    max-width: 100%;
+    max-height: 6.5in;
+    height: auto;
+    display: block;
+    margin: 0 auto;
+}
+
+/* Pandoc's implicit_figures wraps img in <figure><figcaption> */
+figcaption {
+    font-size: 8.5pt;
+    color: #222;
+    text-align: justify;
+    margin: 0.35em auto 0 auto;
+    padding: 0 0.5in;
+    line-height: 1.3;
+    max-width: 6.5in;
+    font-style: normal;  /* keep caption text upright; Fig label gets bold via prefix */
+}
+
+figcaption::before {
+    content: "Figure " counter(figure-num) ". ";
+    font-weight: 700;
+}
+
+/* ------------------------------------------------------------------ */
+/* Misc                                                               */
+/* ------------------------------------------------------------------ */
+hr {
+    border: none;
+    border-top: 0.5pt solid #888;
+    margin: 0.8em 0;
+    column-span: all;
+}
+
+a {
+    color: #1a3a78;
+    text-decoration: none;
+}
+
+em, i { font-style: italic; }
+strong, b { font-weight: 700; }
+
+sup, sub {
+    font-size: 0.75em;
+    line-height: 0;
+}
+
+/* Avoid orphans/widows in headings */
+h2, h3, h4, figure, table, pre {
+    break-inside: avoid;
+}
+
+</style>
+</head>
+<body>
+<h1 id="closing-two-sequential-gaps-in-humanoid-sim-to-real-bug-discovery-deploy-handoff-and-a-validation-substrate-on-the-agibot-x2-ultra">Closing Two Sequential Gaps in Humanoid Sim-to-Real: Bug Discovery, Deploy Handoff, and a Validation Substrate on the AgiBot X2 Ultra</h1>
+<p><strong>Technical Report — Draft v0.2, 2026-05-04</strong></p>
+<p>Sitarama Chekuri <em>(corresponding author, sole author pending co-author confirmation)</em></p>
+<hr />
+<h2 id="abstract">Abstract</h2>
+<p>We deploy a learned whole-body controller on the AgiBot X2 Ultra (31 DoF, 14-DoF dexterous hands), the first publicly documented Sonic-family policy on a non-G1 humanoid. Adapting upstream Sonic surfaced gaps at every layer. Motion retargeting introduced arm-flip and wrist-clamp failures from G1-specific IK assumptions. Sim-to-sim training was blocked by three independent observation/encoding bugs masquerading as physics-tuning problems: a foot-collision URDF mismatch in the training distribution; a 6D-rotation channel-order error that survived months of tolerance-based parity checks because permutations preserve RMS; and an ONNX tokenizer layout bug. Sim-to-real handoff suffered ~1.6 s of <em>dual-publisher motor whir</em> because the upstream motion controller exposed only <code>stop_app</code>/<code>start_app</code> — no graceful overlap command. We document each bug’s controlled fine-tune validation, a smooth-handoff state machine built atop the stop/start primitives, and a two-layer validation substrate (sim-side parity gates + hardware preflight envelopes) that made debugging survivable. A committed sim-to-real <em>anchor archive</em> of three matched real+sim recordings from a single iter-22000 ONNX validates the URDF/MJCF kinematic chain and torso inertia within ~5° per-DoF RMS and IMU angular-velocity within ~5%, and surfaces a 166° yaw-drift signature on the locomotion anchor — direct evidence of unmodeled contact/friction/free-base dynamics. We list five policy-free bench tests that would convert this indirect evidence into direct component-level validation. All code, the iter-22000 ONNX checkpoint, the BONES-SEED retargeted dataset, the anchor archive, and the reproducibility stack are released.</p>
+<p><strong>Keywords:</strong> humanoid locomotion, sim-to-real transfer, reference-tracking RL, whole-body control, deployment systems, digital-twin validation.</p>
+<hr />
+<h2 id="introduction">1. Introduction</h2>
+<p>Humanoid whole-body controllers trained in simulation routinely promise sim-to-real transfer and routinely fail to transfer cleanly when the simulator, the policy, the deploy stack, and the real robot are integrated by different teams. Joint orderings, observation layouts, quaternion conventions, contact geometries, motion-controller APIs, mode-transition primitives — any one mismatched contract can produce failure modes that look identical to bad training. Distinguishing a training problem from a deployment-side bug under these conditions is the first hard problem; doing it without bricking expensive hardware is the second.</p>
+<p>This paper documents the integration of NVIDIA’s reference-tracking <em>Sonic</em> policy onto the <strong>AgiBot X2 Ultra</strong>, a 31-DoF humanoid with 14-DoF dexterous hands and a sphere-foot lower-body variant. Sonic was originally developed and demonstrated on the Unitree G1; ours is the first publicly documented deployment on a non-G1 platform. The work fell into two sequential gaps connected by a validation substrate that prevented either gap from destroying hardware.</p>
+<p><strong>Bridge 1 (IsaacLab → MuJoCo).</strong> Round-1 training (mesh-foot URDF) reached ~16k iterations and yet collapsed within 2–5 s in MuJoCo. After four physics-tuning experiments failed to close the gap, a 6×3 mirror ablation isolated the foot collider as the dominant axis. Two further bugs lived in the deploy-side observation builder: a row-vs-column-major flatten of the 6D rotation that produced a fictitious large yaw error invisible to RMS comparators; and an ONNX tokenizer layout bug that scrambled per-frame inputs. We validate each fix by <em>controlled fine-tune comparison</em> — most starkly, the rotation fix alone unlocks an already-trained checkpoint (3.8 s collapse → full clip walk) without retraining.</p>
+<p><strong>Bridge 2 (MuJoCo → real robot).</strong> The upstream motion controller (MC) exposes only <code>stop_app</code> / <code>start_app</code> — no graceful “switch with overlap” command. Naive parallel publishing produces ~1.6 s of <em>dual-publisher whir</em> (motors physically buzzing as the two control signals fight). We construct smooth handoff out of these primitives: a four-state machine, a takeover-detector subscriber, sentinel-file orchestration, and a runtime dual-publisher monitor.</p>
+<p><strong>Substrate.</strong> Both bridges sit on a two-layer validation substrate. Sim-side: four cross-axis observation comparators (deploy↔︎IsaacLab, deploy↔︎Python, IsaacLab↔︎MuJoCo, ONNX standstill), frozen-reference dumps as the tolerance baseline. Hardware-side: a master preflight script with pose / velocity / effort / IMU / gravity / tilt envelopes plus topology checks; a ground-truth-verified mode-transition escalator; a tilt watchdog. One concrete substrate insight: tolerance comparators silently pass <em>channel permutations</em> — the same numbers in different positions — and this is exactly how the 6D rotation bug survived months of “passing” parity checks. Element-wise positional assertions against frozen reference dumps are the missing rung.</p>
+<p><strong>Closed-loop validation.</strong> We commit a sim-to-real <em>anchor archive</em> of three matched real+sim recordings produced by a single canonical checkpoint (iter-22000 of the H200 sphere-feet training run). The archive validates kinematic chain and torso inertia within ~5° per-DoF RMS and ~5% IMU angular-velocity, while surfacing a 166° sim yaw-drift on the locomotion anchor that points at unmodeled contact / friction / free-base dynamics. The closed-loop anchors do <em>not</em> validate contact geometry, floor friction, actuator saturation, joint friction at low velocity, sensor latency/noise, or free-base dynamics, and we name the limitation explicitly (§9).</p>
+<p><strong>Contributions.</strong> (1) First public Sonic-family policy on a non-G1 humanoid, with X2-specific motion-retargeting fixes. (2) Three independent sim-to-sim bugs identified, fixed, and validated by controlled fine-tune comparisons, plus a generalizable methodology for deploy-side vs training-side isolation. (3) A smooth-handoff state machine built atop stop/start primitives only, with measured whir-window numbers. (4) A two-layer validation substrate with the documented insight that tolerance comparators miss channel permutations. (5) A committed sim-to-real anchor archive with calibrated fidelity claims and an explicit catalog of unvalidated model components.</p>
+<hr />
+<h2 id="related-work">2. Related Work</h2>
+<p><em>Citation pass deferred to submission preparation; placeholders marked <code>[CITE]</code>.</em></p>
+<p>The Sonic family of reference-tracking RL policies trains a single network to track sequenced reference motions retargeted from human motion-capture, using PPO with reward shaping over tracking error and balance terms [CITE: Sonic, OmniH2O, ExBody, HumanPlus]. Our policy architecture and reward shaping inherit upstream unchanged; we contribute embodiment delivery and deployment systems, not new RL methodology. Domain randomization over physical parameters [CITE: Tobin, Peng] is the dominant sim-to-real technique; we use upstream’s DR but do not perform a sensitivity sweep (§9). Concurrent work emphasizes carefully tuned actuator and contact models; our Bridge-1 finding is that <em>before</em> DR or actuator tuning can help, observation-side encoding bugs must be ruled out, and tolerance-based parity checks alone are insufficient (§6). The community standard for “sim-to-real worked” is a video plus per-DoF tracking trace; our anchor archive (§5.6) extends this with calibrated fidelity claims and an explicit “what we did NOT validate” catalog.</p>
+<hr />
+<h2 id="the-x2-ultra-integration-precursor">3. The X2 Ultra Integration (Precursor)</h2>
+<p>The X2 Ultra is a 31-DoF humanoid: 14-DoF arms (incl. 3-DoF wrist), 2-DoF head, 12-DoF legs, 3-DoF waist. Hands are 14-DoF dexterous but held static at neutral pose for all reported runs.</p>
+<p><strong>URDF/MJCF mismatch.</strong> AgiBot’s <code>X2_URDF-v1.3.0</code> upstream drop ships three robot descriptors side-by-side: <code>x2_ultra.urdf</code> (mesh feet), <code>x2_ultra_simple_collision.urdf</code> (24 spheres), and <code>x2_ultra.xml</code> MJCF (24 spheres). Our integration grabbed <code>x2_ultra.urdf</code> for IsaacLab training because of the obvious filename, and <code>x2_ultra.xml</code> for MuJoCo deploy. Nobody opened the third file. The mesh-vs-sphere mismatch is the root cause of <em>Bug G18</em> (§4.2). Recommendation for future integrators: ship a <code>MUJOCO_REFERENCE.md</code> documenting URDF↔︎MJCF coherence on every contact-relevant link before any training run.</p>
+<p><strong>SOMA retargeter — two X2-specific fixes.</strong> We retarget the BONES-SEED motion library (~2,500 SMPL motions) to the X2 skeleton using a fork of NVIDIA’s SOMA retargeter. The G1-tuned SOMA configuration produced two failure modes on X2:</p>
+<ul>
+<li><strong>Arm-flip-over-head.</strong> G1 has an X-axis elbow; X2 has a Y-axis elbow. The G1 IK rotation weights (<code>r_weight: 1.0/1.2</code> forearm/hand) were calibrated for G1’s kinematic structure; applied to X2 they let the IK solver drive shoulder pitch to its limit (−3.08 rad) and rotate the entire arm over the head. <strong>Fix:</strong> reduce forearm/hand rotation weights from 1.0/1.2 to 0.1, letting position objectives dominate.</li>
+<li><strong>Wrist hard-clamping.</strong> X2 wrist limits are tighter than G1 (pitch ±32° vs ±92.5°; roll ±28° vs ±45°). G1’s <code>joint_offsets</code> placed the X2 neutral wrist <em>outside</em> its physical limits, producing 100% saturation. <strong>Fix:</strong> empirical Euler corrections Y=−55°, X=+80° per hand, derived via systematic single-axis sweep.</li>
+</ul>
+<p>Both fixes are configuration choices, not new IK methodology. Round 2 of training (sphere-foot URDF) reached 25,000 PPO iterations on a single H200 GPU over ~3 days at $1,600 cloud compute. The deployed and validated checkpoint is <strong>iter-22000</strong>; all real-robot demos and anchors in this paper come from this single checkpoint.</p>
+<hr />
+<h2 id="bridge-1-sim-to-sim-isaaclab-mujoco">4. Bridge 1: Sim-to-Sim (IsaacLab → MuJoCo)</h2>
+<h3 id="the-convention-thicket">4.1 The convention thicket</h3>
+<p>Adapting an existing policy across simulators imposes a long contract list: joint orderings (IsaacLab BFS-alphabetical vs MuJoCo DFS-XML — <em>not</em> the same permutation; we construct gather indices empirically); quaternions (IsaacLab + MuJoCo wxyz, SciPy xyzw); 6D rotation flatten (row-major vs column-major produces <em>the same six numbers</em> in permuted slots — <em>Bug G20</em> lives here); observation layout (the order of subterms in the 990-D proprioception and 680-D tokenizer is <em>PolicyCfg dataclass attribute order</em>, not YAML order — wrong order yields “nicely-numerically-ranged garbage”); implicit (IsaacLab) vs explicit (MuJoCo) PD. None is novel; collectively they are the attack surface for the bugs that follow.</p>
+<h3 id="bug-g18-foot-urdf-mismatch">4.2 Bug G18 — Foot-URDF mismatch</h3>
+<p>The round-1 mesh-foot policy collapsed in 2–5 s in MuJoCo across the standard benchmark. Four deploy-side physics-tuning experiments — softening the MJCF foot collider (G11), tuning sphere compliance (G13), exhaustive solver/contact + LPF sweep (G15), per-joint-group PD scaling (G16) — were net-zero or net-negative.</p>
+<p>The G18 ablation took the opposite direction: <em>harden IsaacLab to look like MuJoCo</em> on each axis in turn, reusing the trained checkpoint, asking which single axis reproduces the failure inside the trainer’s own simulator. Six rows × three checkpoints (2k/6k/16k); <code>progress</code> = mean fraction of motion completed, <code>term</code> = fraction hitting the fall terminator:</p>
+<table>
+<colgroup>
+<col style="width: 24%" />
+<col style="width: 14%" />
+<col style="width: 10%" />
+<col style="width: 14%" />
+<col style="width: 10%" />
+<col style="width: 15%" />
+<col style="width: 11%" />
+</colgroup>
+<thead>
+<tr>
+<th>Row</th>
+<th style="text-align: right;">2k progress</th>
+<th style="text-align: right;">2k term</th>
+<th style="text-align: right;">6k progress</th>
+<th style="text-align: right;">6k term</th>
+<th style="text-align: right;">16k progress</th>
+<th style="text-align: right;">16k term</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>A0_isaac_stock</code></td>
+<td style="text-align: right;">0.94</td>
+<td style="text-align: right;">0.07</td>
+<td style="text-align: right;">0.99</td>
+<td style="text-align: right;">0.07</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+</tr>
+<tr>
+<td><code>A1_no_dr_no_noise</code></td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">0.07</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+</tr>
+<tr>
+<td><code>A2_frictionloss</code></td>
+<td style="text-align: right;">0.96</td>
+<td style="text-align: right;">0.07</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+</tr>
+<tr>
+<td><strong><code>A3_sphere_feet</code></strong></td>
+<td style="text-align: right;"><strong>0.41</strong></td>
+<td style="text-align: right;"><strong>0.93</strong></td>
+<td style="text-align: right;"><strong>0.66</strong></td>
+<td style="text-align: right;"><strong>0.53</strong></td>
+<td style="text-align: right;"><strong>0.49</strong></td>
+<td style="text-align: right;"><strong>0.67</strong></td>
+</tr>
+<tr>
+<td><code>A4_explicit_pd</code></td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">0.00</td>
+</tr>
+<tr>
+<td><code>A5_full_mirror</code></td>
+<td style="text-align: right;">0.66</td>
+<td style="text-align: right;">0.60</td>
+<td style="text-align: right;">0.71</td>
+<td style="text-align: right;">0.60</td>
+<td style="text-align: right;">0.63</td>
+<td style="text-align: right;">0.67</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Foot-collider geometry is the dominant axis.</strong> A3 alone collapses Isaac to 0.41/0.66/0.49 progress with 0.93/0.53/0.67 termination, matching MuJoCo’s collapse signature. The fix: train against the sphere-foot URDF. A 2k-iter fine-tune of the 16k mesh-trained policy on <code>x2_ultra_sphere_feet.urdf</code> (24 spheres at MJCF positions) produced: IsaacLab <code>A3_sphere_feet</code> progress <strong>0.49 → 0.981</strong> (+49pp); MuJoCo time-to-fall on <code>Relaxed_walk_forward</code> <strong>2.22 s → 5.12 s</strong> (+131%); on <code>eat_icecream</code> <strong>2.14 s → 3.20 s</strong> (+50%). The fine-tune holds <em>all other variables fixed</em> — same weights, same trainer, same evaluation — so the improvement is the bug’s controlled signature. (Postmortem: AgiBot’s upstream <code>x2_ultra_simple_collision.urdf</code> already shipped these 24 spheres at byte-identical positions; we re-derived an existing artifact.)</p>
+<h3 id="bug-g20-6d-rotation-channel-order">4.3 Bug G20 — 6D-rotation channel-order</h3>
+<p>After Round 2, the dominant remaining MuJoCo failure was distinctive: the robot would spawn matching the motion’s first-frame heading, commence a yaw correction within 0.5 s, rotate 140°–180° in world frame within 1–2 s, and walk in the wrong direction until it fell. Standing motions did not show the failure (the policy never tried to translate).</p>
+<p>IsaacLab training built the future-frame heading representation row-major; the MuJoCo evaluation script built it column-major:</p>
+<pre class="python"><code># IsaacLab (correct): row-major flatten of mat[..., :2]
+out = mat[..., :2].reshape(num_envs, -1)
+# → [m00, m01, m10, m11, m20, m21]
+
+# MuJoCo eval (BUGGY): column-major
+ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])
+# → [m00, m10, m20, m01, m11, m21]</code></pre>
+<p>Same six numbers; permuted positions. The policy saw a fictitious large yaw error.</p>
+<p><strong>Diagnostic data</strong> (iter-761, 3 motions, 20 s rollouts):</p>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 26%" />
+<col style="width: 24%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Motion</th>
+<th style="text-align: right;">Max|robot − ref yaw|</th>
+<th style="text-align: right;">Robot travel (0–5 s)</th>
+<th>Ref travel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>relaxed_walk_postfix</code></td>
+<td style="text-align: right;"><strong>179.9°</strong></td>
+<td style="text-align: right;">+57.5° NE (1.0 m)</td>
+<td>−87.6° S (3.1 m)</td>
+</tr>
+<tr>
+<td><code>walk_forward</code></td>
+<td style="text-align: right;">134.7°</td>
+<td style="text-align: right;">−92.6° (1.0 m)</td>
+<td>−97.1° (0.78 m)</td>
+</tr>
+<tr>
+<td><code>take_a_sip</code></td>
+<td style="text-align: right;">11.0°</td>
+<td style="text-align: right;">(stationary)</td>
+<td>(stationary)</td>
+</tr>
+</tbody>
+</table>
+<p>A 145° direction error between robot travel and reference cannot be produced by any contact-side physics gap — it is a smoking gun for an observation-side encoding bug. <strong>The fix is one line:</strong> <code>ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)</code>.</p>
+<p><strong>Validation.</strong> The same already-trained <code>4k_sphere_ft</code> checkpoint that collapses in 3.8 s pre-fix walks the full motion clip post-fix. <strong>Zero retraining.</strong> On the older <code>16k_mesh</code> checkpoint, the fix lifts MuJoCo survival from 2.22 s to 12.24 s — still falls before clip end, because the residual G18 mesh-foot gap remains.</p>
+<figure>
+<img src="/home/stickbot/Projects/GR00T-WholeBodyControl/docs/source/_static/sim2sim_demo/sim2sim_6d_fix__4k_sphere_ft_last.png" alt="G20 fix on the post-fix sphere-feet fine-tune. Left: pre-fix (column-major 6D) — phantom yaw correction collapses the policy in 3.8 s. Right: post-fix (row-major) — same policy weights walk the full clip without retraining. End-of-clip frame (X2 Ultra · 4k_sphere_ft · motion=relaxed_walk · init=0)." />
+<figcaption aria-hidden="true">G20 fix on the post-fix sphere-feet fine-tune. Left: pre-fix (column-major 6D) — phantom yaw correction collapses the policy in 3.8 s. Right: post-fix (row-major) — <em>same</em> policy weights walk the full clip without retraining. End-of-clip frame (<code>X2 Ultra · 4k_sphere_ft · motion=relaxed_walk · init=0</code>).</figcaption>
+</figure>
+<figure>
+<img src="/home/stickbot/Projects/GR00T-WholeBodyControl/docs/source/_static/sim2sim_demo/sim2sim_6d_fix__16k_mesh_last.png" alt="G20 fix on the older 16k mesh-foot baseline. Left: pre-fix collapses in 2.22 s (matches the original ablation measurement to the centisecond, confirming bit-exact reproduction). Right: post-fix walks for 12.24 s but still falls before clip end — the residual G18 foot-URDF gap remains." />
+<figcaption aria-hidden="true">G20 fix on the older 16k mesh-foot baseline. Left: pre-fix collapses in 2.22 s (matches the original ablation measurement to the centisecond, confirming bit-exact reproduction). Right: post-fix walks for 12.24 s but still falls before clip end — the residual G18 foot-URDF gap remains.</figcaption>
+</figure>
+<p>Post-fix bench: <code>relaxed_walk_postfix</code> survives 20 s (was: fell 13.9 s), traveling 2.6 m of 3.1 m expected; yaw drift 8.8° (was 179.9°). The bug had survived months of “passing” parity checks because it is invariant under aggregate-tolerance comparison (§6.2).</p>
+<h3 id="bug-g21-onnx-tokenizer-layout">4.4 Bug G21 — ONNX tokenizer layout</h3>
+<p>After G20 the C++ deploy was correct (we audited the same column-vs-row-major assumption). Auditing the ONNX path surfaced a separate bug: the fused ONNX expects the 680-D tokenizer in <em>interleaved-per-frame</em> layout (<code>[cmd_f1, ori_f1, cmd_f2, ori_f2, ...]</code>), but a wrapper was re-shuffling correct input into <em>grouped</em> layout (<code>[cmd_f1, ..., cmd_f10, ori_f1, ..., ori_f10]</code>). The wrapper’s docstring claimed validation against a PT-only path.</p>
+<p><strong>The smoking gun is a 3-way layout test.</strong> Feed each candidate layout to the ONNX session and read off the action delta:</p>
+<pre><code>grouped [cmd(620), ori(60)]    max|live - onnx| = 1.455 rad
+grouped [ori(60), cmd(620)]                       1.271 rad
+interleaved                                       4.768e-7 rad ✓</code></pre>
+<p>The interleaved layout matches PT to better than 5×10⁻⁷ rad. Fix: remove the wrapper rearrangement; feed interleaved directly. Post-fix: <code>walk_forward</code> rollouts at init {0,20,40,60} all saturate the 30 s cap (init=20 had been falling at 1.64 s).</p>
+<h3 id="methodology-takeaway-deploy-side-vs-training-side-isolation">4.5 Methodology takeaway: deploy-side vs training-side isolation</h3>
+<p>Why did G11/G13/G15 — months of carefully designed physics-tuning experiments — fail? Because the gap was not a physics-tuning problem. Three independent encoding bugs (G18 training-side, G20+G21 deploy-side) masquerade perfectly as physics gaps in MuJoCo evaluation. Without isolating deploy-side from training-side first, every physics-tuning experiment fights with one hand tied behind its back.</p>
+<p><strong>Recommendation:</strong> before any physics-tuning experiment, run a <em>direct equivalence check</em> — element-wise positional equality (not RMS, not aggregate tolerance) against a frozen IsaacLab reference dump. If the equivalence fails, the bug is deploy-side and physics tuning will not help. When equivalence passes and a residual gap remains, fine-tune comparisons are the cleanest controlled validation: hold the policy weights fixed, change one thing, measure the delta on the same benchmark.</p>
+<hr />
+<h2 id="bridge-2-sim-to-real-mujoco-real-robot">5. Bridge 2: Sim-to-Real (MuJoCo → Real Robot)</h2>
+<h3 id="the-mc-api-constraint-and-dual-publisher-whir">5.1 The MC API constraint and dual-publisher whir</h3>
+<p>The X2 Ultra ships with a default motion controller running an upstream stand-and-balance policy. It exposes <code>stop_app</code> (releases joint authority) and <code>start_app</code> (acquires joint authority) and <em>not</em>: a <code>switch_to_external_controller</code> overlap mode, a heartbeat from MC, or a graceful handoff command. We construct smooth handoff out of these primitives only.</p>
+<p>Our first deploy iteration ignored the constraint and ran the policy publisher in parallel with MC. Within seconds the motors began <strong>physically buzzing</strong> — both the MC and policy were publishing on the arm command topic; joint controllers were being driven by alternating signals at slightly different rates. We measured the dwell time of this <em>dual-publisher whir</em> at approximately <strong>1.6 s</strong> before the takeover detector fired and the policy was stopped. The 8× drop in dwell time relative to a manual stop is the empirical evidence that the smooth-handoff state machine eliminated the whir window.</p>
+<h3 id="smooth-handoff-state-machine">5.2 Smooth-handoff state machine</h3>
+<p>Four states with bash-side coordination via sentinel files:</p>
+<ul>
+<li><strong><code>STANDBY</code></strong>: policy loaded, observations being constructed, action publisher muted. The bash launcher issues <code>stop_app</code>.</li>
+<li><strong><code>CONTROL</code></strong>: deploy publisher hot; policy commands joints normally.</li>
+<li><strong><code>RAMP_OUT</code></strong>: on <code>--max-duration</code> trip, joint targets are open-loop linearly interpolated to <code>default_angles</code> over 2 s. <em>Gains are lerped together with targets</em> — interpolating only targets while keeping policy gains active produces a stiffness spike at the seam.</li>
+<li><strong><code>HOLD_FOR_MC</code></strong>: deploy publisher continues publishing default-angles target at <em>MC-stand stiffness</em> (not deploy gains). Bash launcher issues <code>start_app</code>. A takeover-detector subscriber on the MC arm command topic fires when MC’s first re-publish lands; deploy publisher then mutes and exits.</li>
+</ul>
+<p>Three wire-level gotchas: (a) <code>SetMcAction</code> returns <code>code=0</code> even when MC is mid-boot and the request was effectively dropped — do not trust the return code; (b) <code>RAMP_OUT</code> must lerp targets <em>and</em> gains together; (c) <code>HOLD_FOR_MC</code> needs MC-stand stiffness, not deploy gains. A runtime <em>action monitor</em> (<code>x2_action_monitor.py</code>) cuts our control if a conflicting publisher appears mid-run — the only check that catches a stale publisher from a previous deploy run.</p>
+<h3 id="per-joint-deploy-tuning">5.3 Per-joint deploy tuning</h3>
+<p>Even with smooth handoff and parity-checked observations, the first powered runs exhibited audible arm jitter. Output-side LPF sweeping 8 → 5 Hz dropped IMU peak ω from 3.36 to 2.78 rad/s; per-joint arm jitter reductions ranged from −13% to −25% across 10 arm joints. Target clamps: a 0.30-rad clamp was capping every arm joint on every tick (17.2° too tight); loosened to 1.50 rad, the clamp now serves as a hard ceiling rather than an active constraint.</p>
+<h3 id="the-closed-loop-sim-vs-real-anchor-archive">5.4 The closed-loop sim-vs-real anchor archive</h3>
+<p>To quantify the residual sim-to-real gap on the validated motions, we commit a sim-to-real anchor archive under <code>data/sim_to_real_anchors/</code>. Each anchor is a pair of <code>run.npz</code> files produced by <code>deploy_x2.sh --record</code>: <code>real.npz</code> (X2 Ultra hardware, <code>mode=local</code>) and <code>sim.npz</code> (<code>mode=sim --sim-profile parity</code>). Both runs use the <strong>same</strong> ONNX checkpoint (iter-22000), motion playlist, <code>--target-lpf-hz 5.0</code>, <code>--max-target-dev 1.50</code>. Only the physics environment differs.</p>
+<table>
+<colgroup>
+<col style="width: 3%" />
+<col style="width: 17%" />
+<col style="width: 8%" />
+<col style="width: 15%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr>
+<th>Anchor</th>
+<th>Motion</th>
+<th>Real / Sim duration</th>
+<th>State-diff RMS</th>
+<th>Headline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>B</strong></td>
+<td><code>casual_walk_v1</code> (14.8 s)</td>
+<td>16.03 s / 14.02 s</td>
+<td><strong>7.27°</strong> (4.74° after t&gt;1 s)</td>
+<td>First powered walk on hardware. <strong>166° sim yaw drift vs −6.5° real</strong> = direct contact/friction/free-base mis-modeling signature.</td>
+</tr>
+<tr>
+<td><strong>C</strong></td>
+<td><code>showcase_v1</code> (96.5 s, stand-in-place)</td>
+<td>102.00 s / 102.02 s</td>
+<td><strong>3.88°</strong></td>
+<td>Tightest sim-to-real of the three; upper-body kinematics transfer near-perfectly.</td>
+</tr>
+<tr>
+<td><strong>D</strong></td>
+<td><code>walk_demo_v6</code> (44.2 s, turn-walk-turn)</td>
+<td>48.99 s / 52.02 s</td>
+<td><strong>5.03°</strong></td>
+<td>Strongest locomotion result; both worlds traverse home-loop choreography, returning within 3° of starting heading.</td>
+</tr>
+</tbody>
+</table>
+<p><code>compare_sim_vs_real_npz.py</code> produces five PNGs per anchor (<code>dof_pos_grid</code>, <code>dof_tracking_error</code>, <code>dof_l2_bar</code>, <code>imu_overlay</code>, <code>cmd_diff_heatmap</code>) plus anchor-specific overlays, and <code>summary.json/.txt</code>. <code>play_npz_dual_kinematic.py</code> is the side-by-side MuJoCo viewer for qualitative inspection. <code>compare_run_vs_motion.py</code> is a third tool that catches motion-file over-reach against the source motion-reference (head_pitch 171°, waist_pitch 166°, several shoulder DoFs &gt; 175° saturated identically by sim and real).</p>
+<figure>
+<img src="/home/stickbot/Projects/GR00T-WholeBodyControl/data/sim_to_real_anchors/anchor_c_iter22k_showcase_v1/plots/dof_l2_bar.png" alt="Per-DoF tracking-error RMS (state − cmd, paired real vs sim) on Anchor C. Closest-to-zero anchor; upper-body kinematics transfer near-perfectly." />
+<figcaption aria-hidden="true">Per-DoF tracking-error RMS (state − cmd, paired real vs sim) on Anchor C. Closest-to-zero anchor; upper-body kinematics transfer near-perfectly.</figcaption>
+</figure>
+<figure>
+<img src="/home/stickbot/Projects/GR00T-WholeBodyControl/data/sim_to_real_anchors/anchor_d_iter22k_walk_demo_v6/plots/dof_l2_bar.png" alt="Per-DoF tracking-error RMS on Anchor D. Strongest locomotion result; both worlds close the home loop within 3°." />
+<figcaption aria-hidden="true">Per-DoF tracking-error RMS on Anchor D. Strongest locomotion result; both worlds close the home loop within 3°.</figcaption>
+</figure>
+<figure>
+<img src="/home/stickbot/Projects/GR00T-WholeBodyControl/data/sim_to_real_anchors/anchor_b_iter22k_casual_walk_v1/plots/real_vs_sim_diff_with_yaw.png" alt="Anchor B real-vs-sim state divergence (blue) with IMU yaw overlay (green = real, orange = sim). Smoking gun for §9: leg kinematics agree per-cycle (low blue trace) but the integrated base trajectory diverges over many gait cycles, producing a 166° sim yaw drift vs −6.5° real. Direct evidence of unmodeled contact/friction/free-base, partially masked on the real side by the gantry strap." />
+<figcaption aria-hidden="true">Anchor B real-vs-sim state divergence (blue) with IMU yaw overlay (green = real, orange = sim). Smoking gun for §9: leg kinematics agree per-cycle (low blue trace) but the integrated base trajectory diverges over many gait cycles, producing a 166° sim yaw drift vs −6.5° real. Direct evidence of unmodeled contact/friction/free-base, partially masked on the real side by the gantry strap.</figcaption>
+</figure>
+<p><strong>Calibrated digital-twin fidelity claim</strong> (lifted from anchor <code>README.md</code>):</p>
+<blockquote>
+<p><em>On the gantry-tethered X2 Ultra, the URDF/MJCF reproduces real-robot joint kinematics within ~5° per-DoF RMS and base IMU angular-velocity within ~5% during closed-loop reference-tracking of in-distribution motions, validating the kinematic chain and torso inertia of the model.</em></p>
+</blockquote>
+<p>The claim explicitly <em>excludes</em> contact geometry, floor friction, actuator torque saturation, joint friction at low velocity, cable/CoM offsets, IMU latency/noise model, encoder noise, backlash, and free-base dynamics — the gantry-tethered configuration cannot exercise those. Anchor B’s yaw-drift finding (§9) is direct evidence at least one is off.</p>
+<h3 id="ramp_out-handoff-as-physics-divergence">5.5 RAMP_OUT-handoff-as-physics-divergence</h3>
+<p>When viewing the side-by-side qualitative video on Anchors B and C, the runs end with the <em>sim</em> robot face-planting in MuJoCo (pitch −85°) while the <em>real</em> robot stays upright (pitch −2°). On first viewing this looks like a clear sim-to-real policy gap. It is not. The face-plant happens during the deploy harness’s intentional <code>RAMP_OUT → HOLD_FOR_MC</code> open-loop window: joint targets ramp to defaults over 2 s while the policy is out of the loop. <strong>On hardware, the gantry strap catches residual tilt during this window. In MuJoCo, there is no gantry.</strong> This is direct evidence that the gantry is doing real balance work post-CONTROL, and propagates two consequences: (a) when comparing real-vs-sim, trim the post-CONTROL handoff (<code>--end-trim 1.5</code>/<code>3.5</code> for B/C) before quoting any divergence; (b) the closed-loop anchors do not validate free-base balance (§9).</p>
+<hr />
+<h2 id="validation-safety-substrate">6. Validation &amp; Safety Substrate</h2>
+<h3 id="pre-deploy-parity-gates-sim-side">6.1 Pre-deploy parity gates (sim-side)</h3>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 18%" />
+<col style="width: 20%" />
+<col style="width: 15%" />
+<col style="width: 27%" />
+</colgroup>
+<thead>
+<tr>
+<th>Script</th>
+<th>Comparison axis</th>
+<th>Fixture</th>
+<th>Threshold</th>
+<th>Catches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>compare_deploy_vs_isaaclab_obs.py</code></td>
+<td>C++ deploy ↔︎ IsaacLab GT</td>
+<td>StandStill (10-frame constant pose)</td>
+<td>1e-3 rad on state-invariant slots</td>
+<td>Obs-construction sign / order / quantization in C++</td>
+</tr>
+<tr>
+<td><code>compare_deploy_vs_python_obs.py</code></td>
+<td>C++ deploy ↔︎ Python MuJoCo runtime</td>
+<td>RSI frame 0</td>
+<td>1e-4 rad on action delta</td>
+<td>Runtime / float32 divergence; state injection mismatch</td>
+</tr>
+<tr>
+<td><code>compare_isaaclab_vs_mujoco_obs.py</code></td>
+<td>IsaacLab ↔︎ MuJoCo</td>
+<td>Step 0 + motion .pkl</td>
+<td>Per-term envelope (1e-2 to 0.5)</td>
+<td>Gravity sign / joint-order / scale / dtype</td>
+</tr>
+<tr>
+<td><code>parity_check_onnx_standstill.py</code></td>
+<td>ONNX model behavior</td>
+<td>Synthetic perfect standstill</td>
+<td>Action inf-norm vs ±0.05 rad</td>
+<td>Broken / overfit ONNX (saturated actions on ideal input)</td>
+</tr>
+</tbody>
+</table>
+<p>Frozen-reference dumps (<code>dump_isaaclab_step0.py</code>, etc.) provide the tolerance baseline. Cross-runtime eval drivers (<code>eval_x2_mujoco.py</code>, <code>eval_x2_mujoco_onnx.py</code>, <code>eval_x2_isaacsim_onnx.py</code>) close the runtime loop. Documented PT vs ONNX action delta: <strong>≤1.7×10⁻⁶ rad over 150 ticks across 15 policy variants</strong>.</p>
+<h3 id="what-tolerance-comparators-miss">6.2 What tolerance comparators miss</h3>
+<p>A 6D rotation flatten produces <em>the same six numbers</em> under row-major and column-major flatten — only the slot positions are permuted. Any comparator that asserts an aggregate property (RMS, mean absolute error, maximum element) is <em>invariant</em> to permutation. Per-slot tolerance comparators against a different fixture also pass if the fixture’s value happens to be similar across permuted slots (which is what happens for nearly-identity rotations in standstill fixtures). The fix is structural, not numerical: assert <em>element-wise positional equality</em> against a frozen IsaacLab dump with tolerance 0 (or numerical noise floor). General principle: any fixed-layout channel (flattened rotation matrix, joint vector, observation slot) needs an element-wise positional assertion in addition to aggregate tolerance — RMS alone is insufficient.</p>
+<h3 id="hardware-side-safety-gates">6.3 Hardware-side safety gates</h3>
+<p><code>x2_preflight.py</code> runs before any live deploy:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 56%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Category</th>
+<th>Threshold</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Joint pose</td>
+<td>±0.6 / 1.0 / 1.5 rad (waist / legs / arms)</td>
+<td>WARN/FAIL</td>
+</tr>
+<tr>
+<td>Joint velocity</td>
+<td>max 0.5 rad/s</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>Joint effort</td>
+<td>max 15 Nm</td>
+<td>WARN/FAIL</td>
+</tr>
+<tr>
+<td>IMU angular vel</td>
+<td>max 0.2 rad/s</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>IMU tilt</td>
+<td>max 30° from gravity-vertical</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>Gravity magnitude</td>
+<td>9.81 ± 2.0 m/s²</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>Joint-group topics</td>
+<td>All four groups publishing</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>MC heartbeat</td>
+<td>Arm command topic has ≥1 publisher</td>
+<td>FAIL</td>
+</tr>
+<tr>
+<td>Conflicting pubs</td>
+<td>No second publisher on arm topic</td>
+<td>FAIL</td>
+</tr>
+</tbody>
+</table>
+<p>Plus continuous runtime gates: <code>x2_mc_escalator.py</code> for ground-truth-verified mode transitions (no policy commands until MC has acknowledged the requested state, removing the false-positive <code>code=0</code> failure mode); a C++ tilt watchdog at 0.3 cosine threshold (~72.5° from vertical) inside the deploy. Procedural: a mandatory gantry-bound standstill smoke test before every live unconstrained run on a new motion.</p>
+<h3 id="reproducibility">6.4 Reproducibility</h3>
+<p>To reproduce any result: iter-22000 ONNX checkpoint (released); <code>deploy_x2.sh sim</code> mode (released); <code>data/sim_to_real_anchors/{B,C,D}/</code> (Git LFS, ~79 MB; real half preserved-only, sim half regenerable in minutes); motion playlist PKLs (released); BONES-SEED dataset pointer (license-bound); W&amp;B run mirror (released); plot replot scripts and CSV sources (released).</p>
+<hr />
+<h2 id="experiments-and-results">7. Experiments and Results</h2>
+<p><strong>Training.</strong> Both rounds used PPO on a single H200 GPU with upstream Sonic architecture, reward shaping, and DR distribution unchanged. Round 1 (mesh-foot) reached ~16k iterations and was halted after G18. Round 2 (sphere-foot) reached 25,000 iterations over ~3 days at $1,600 cloud compute. Deployed checkpoint: <strong>iter-22000</strong>.</p>
+<p><strong>Multi-init MuJoCo bench</strong> (3 motions × 5 init frames, 30 s cap):</p>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 29%" />
+<col style="width: 19%" />
+<col style="width: 19%" />
+</colgroup>
+<thead>
+<tr>
+<th>Policy</th>
+<th><code>relaxed_walk_postfix</code></th>
+<th><code>eat_icecream</code></th>
+<th><code>walk_forward</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16k mesh-foot (round 1)</td>
+<td>5.48 s mean fall</td>
+<td>3.20 s</td>
+<td>1.0 s</td>
+</tr>
+<tr>
+<td>iter-22000 sphere-foot</td>
+<td>30 s (capped)</td>
+<td>30 s (capped)</td>
+<td>30 s (capped)</td>
+</tr>
+</tbody>
+</table>
+<p>100% completion across all three motions is the headline result on the bench. (The 30 s cap is the bench’s design limit; longer-horizon evaluation is queued as future work.)</p>
+<p><strong>Parity ladder.</strong> PT vs ONNX action delta over 150 ticks across 15 policy variants: ≤1.7×10⁻⁶ rad max, mean below 5×10⁻⁷ rad. C++ vs Python MuJoCo runtime: action delta consistently below 1×10⁻⁴ rad on RSI frame 0 fixture across all checkpoints we shipped.</p>
+<p><strong>Per-DoF tracking error</strong> within sim and within real agree to within ~1° between the two worlds at the same <code>kp/kd</code>: 13.05° / 14.09° (C), 13.12° / 12.95° (D), 14.99° / 15.34° (B). Joint PD response transfers tightly. <strong>Anchor archive RMS</strong> (already in §5.4 table): C 3.88°, D 5.03°, B 7.27° (4.74° post t&gt;1s). <strong>IMU angular-velocity match</strong> (sim/real): C 0.186/0.197, D 0.447/0.436, B 1.027/1.024 rad/s.</p>
+<p><strong>Real-robot demos.</strong> Three motions validated end-to-end: showcase reel (<code>showcase_v1.yaml</code>), single-foot balance (<code>one_foot_v1.yaml</code>), turn-walk-turn-walk-return (<code>walk_demo_v6.yaml</code>).</p>
+<hr />
+<h2 id="discussion-limitations">8. Discussion + Limitations</h2>
+<h3 id="what-is-confirmed">8.1 What is confirmed</h3>
+<table>
+<colgroup>
+<col style="width: 36%" />
+<col style="width: 53%" />
+<col style="width: 9%" />
+</colgroup>
+<thead>
+<tr>
+<th>Component</th>
+<th>Evidence</th>
+<th>Confidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kinematic chain (links, joint axes)</td>
+<td>Per-DoF state agrees within 3.88–5.03° RMS across all anchors</td>
+<td>High</td>
+</tr>
+<tr>
+<td>Torso mass distribution / inertia</td>
+<td>IMU angular-velocity RMS matches within ~5%</td>
+<td>Medium-high</td>
+</tr>
+<tr>
+<td>Joint PD response under reference tracking</td>
+<td>Tracking error RMS within ~1° between sim and real at same kp/kd</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Joint-limit / saturation behavior</td>
+<td>Physically impossible targets refused identically by sim and real</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Closed-loop choreography phasing</td>
+<td>Anchor D closes home loop within 3° in both worlds</td>
+<td>High</td>
+</tr>
+<tr>
+<td>Deploy-harness bit-exactness</td>
+<td>Same ONNX, same observation builder produce identical command stream</td>
+<td>High</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-is-not-yet-validated">8.2 What is NOT yet validated</h3>
+<table>
+<colgroup>
+<col style="width: 38%" />
+<col style="width: 61%" />
+</colgroup>
+<thead>
+<tr>
+<th>Component</th>
+<th>Why these anchors miss it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Foot contact geometry (sphere vs flat sole)</td>
+<td>Anchor C is stand-in-place; B/D have gantry pinning the base</td>
+</tr>
+<tr>
+<td>Floor friction coefficient</td>
+<td>Same gantry confound</td>
+</tr>
+<tr>
+<td>Actuator torque saturation curves</td>
+<td>Linear regime only — no anchor hits hard torque limits</td>
+</tr>
+<tr>
+<td>Joint friction / damping at low velocity</td>
+<td>Reactive PD policy continuously excites every joint, masking static friction</td>
+</tr>
+<tr>
+<td>Cable / battery / harness mass and CoM offsets</td>
+<td>Bundled into torso inertia term; can be off O(10%) and still match within noise</td>
+</tr>
+<tr>
+<td>IMU latency + noise model</td>
+<td>We match RMS, not phase response. 5–10 ms latency invisible here</td>
+</tr>
+<tr>
+<td>Backlash / soft-body / cable compliance</td>
+<td>Hard for any rigid-body URDF; closed-loop tracking hides residuals</td>
+</tr>
+<tr>
+<td>Free-base dynamics</td>
+<td>All real recordings have the gantry strap engaged</td>
+</tr>
+</tbody>
+</table>
+<h3 id="specific-signs-of-modeling-divergence">8.3 Specific signs of modeling divergence</h3>
+<p>Two findings point at unmodeled physics:</p>
+<ol type="1">
+<li><strong>Anchor B 166° sim yaw drift vs −6.5° real.</strong> Per-cycle leg kinematics agree (4.74° RMS) but the integrated base trajectory diverges. Classic signature of contact / friction / floor-model error integrated over many gait cycles, partially masked on the real side by the gantry strap.</li>
+<li><strong>Anchor C right-knee cmd-range diverges by ~30° between sim and real</strong> despite the motion being stand-in-place. The policy reacts to <em>different</em> IMU/state observations between worlds — inertia or contact response models are not perfectly matched.</li>
+</ol>
+<p>Both point at the same suspect: contact / friction / free-base integration in MuJoCo.</p>
+<h3 id="other-limitations">8.4 Other limitations</h3>
+<ul>
+<li>Single robot, single retargeter, no DR sensitivity sweep on iter-22000.</li>
+<li>Only three motions validated end-to-end on real robot; the closed-loop comparator runs on any new recording with no paper-side rework.</li>
+<li>Long-horizon MuJoCo evaluation: bench saturates the 30 s cap on the post-fix policy.</li>
+<li>Recorder <code>meta_json</code> does not yet bake <code>--model</code>/<code>--motion</code>; provenance currently traced via per-anchor <code>SUMMARY.md</code>. TODO at host.</li>
+<li>Deployment-side timing not characterized: inference latency, MC-topic latency, power consumption all unmeasured. Measurement infrastructure exists but has not been logged for this report.</li>
+</ul>
+<hr />
+<h2 id="conclusion-future-work">9. Conclusion + Future Work</h2>
+<p>We deployed a learned whole-body controller on a 31-DoF humanoid by closing two sequential gaps that turned out harder than the literature implies. Bug discovery (§4) consumed more wall-clock time than physics tuning would have suggested; the methodology that finally landed (deploy-side vs training-side isolation, controlled fine-tune validation) is generalizable. The smooth-handoff state machine (§5) is built atop the only primitives the upstream MC exposes; the validation substrate (§6) made the work survivable on hardware. The closed-loop anchor archive (§5.4) is calibrated: we validate kinematic chain and torso inertia within <sub>5°/</sub>5%; we explicitly do not validate contact, friction, free-base dynamics, or sensor models.</p>
+<p><strong>Five policy-free bench tests</strong> would convert indirect closed-loop evidence into direct component-level validation; each is a 1–2 hour bench session: (1) passive sway/drop test (motors off, gantry slack — tests inertia + joint friction); (2) open-loop joint sweep with low PD, no policy (per-actuator dynamics); (3) hanging-arm gravity test (per-link mass distribution); (4) foot contact characterization via 5 cm drop (contact geometry + floor model); (5) per-joint step response (PD gains, motor inertia, friction). Each maps to a row of the §8.2 not-yet-validated table.</p>
+<p><strong>Other future work:</strong> DR sensitivity sweep on iter-22000; broader motion-set evaluation on the real robot; deployment-side timing characterization (latency + power); on-device whole-body RL beyond reference-tracking; untethered locomotion (converts gantry-confound limitations into testable claims).</p>
+<p><strong>Release.</strong> All code, the iter-22000 ONNX checkpoint, BONES-SEED retargeted dataset pointer, SOMA retargeter fork, W&amp;B run mirror, the <code>sim_to_real_anchors/</code> archive (~79 MB), figure-replot CSV sources, and the reproducibility stack (§6.4) are released alongside this paper.</p>
+<hr />
+<h2 id="appendix-portability-map">10. Appendix: Portability Map</h2>
+<p>What’s portable to other Sonic-family humanoids vs X2-specific:</p>
+<table>
+<colgroup>
+<col style="width: 75%" />
+<col style="width: 24%" />
+</colgroup>
+<thead>
+<tr>
+<th>Component</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sonic policy architecture (PolicyCfg, FSQ, tokenizer)</td>
+<td>Portable</td>
+</tr>
+<tr>
+<td>BONES-SEED dataset (SMPL source motions)</td>
+<td>Portable</td>
+</tr>
+<tr>
+<td>SOMA retargeter (per-robot config required)</td>
+<td>Portable</td>
+</tr>
+<tr>
+<td>Smooth-handoff state machine</td>
+<td>Portable (depends only on <code>stop_app</code>/<code>start_app</code> API)</td>
+</tr>
+<tr>
+<td>Sentinel-file orchestration</td>
+<td>Portable</td>
+</tr>
+<tr>
+<td>Action monitor (dual-publisher detector)</td>
+<td>Portable</td>
+</tr>
+<tr>
+<td>Parity gates (4 obs comparators) + frozen-ref dumps</td>
+<td>Portable (re-threshold per robot)</td>
+</tr>
+<tr>
+<td>URDF / MJCF asset files</td>
+<td>X2-specific</td>
+</tr>
+<tr>
+<td>SOMA configuration (arm-flip, wrist-clamp Euler)</td>
+<td>X2-specific (G1 has different elbow axis + wrist limits)</td>
+</tr>
+<tr>
+<td><code>x2_preflight.py</code> envelopes</td>
+<td>X2-specific (calibrated per robot)</td>
+</tr>
+<tr>
+<td>Tilt watchdog cosine threshold (0.3)</td>
+<td>X2-specific</td>
+</tr>
+<tr>
+<td>LPF + target-clamp values</td>
+<td>X2-specific</td>
+</tr>
+<tr>
+<td>DR distribution (inherited from upstream)</td>
+<td>Portable, untuned</td>
+</tr>
+</tbody>
+</table>
+<p>A reader porting to another Sonic-family humanoid should expect: drop-in of the smooth-handoff machine and parity comparators (with re-thresholding); 1–2 days re-deriving SOMA configuration; authoring of robot-specific URDF/MJCF coherence (start with the upstream <code>simple_collision</code> file or equivalent — <em>do not pick by filename alone</em>); a full bug-discovery pass per §4.5 methodology before chasing physics tuning.</p>
+<hr />
+<h2 id="acknowledgements">Acknowledgements</h2>
+<p><em>To be filled in: Nebius compute disclosure, AgiBot upstream, NVIDIA Sonic upstream, BONES-SEED dataset acknowledgement.</em></p>
+<h2 id="references">References</h2>
+<p><em>Citation list deferred to submission preparation. Citations inline marked <code>[CITE]</code>.</em></p>
+
+</body>
+</html>

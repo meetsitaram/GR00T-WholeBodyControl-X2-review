@@ -311,6 +311,34 @@ MONITOR_SESSION="${MONITOR_SESSION:-x2_motor_monitor}"
 # operators may remember by name. POSE_PROXY_SESSION env override is
 # kept for compatibility with old ~/.x2 env files that pinned the name.
 POSE_PROXY_SESSION="${POSE_PROXY_SESSION:-x2_pose_watchdog}"
+# Started by ritual_start_demo.sh, not by this script -- but "stop" must still
+# kill them, or the ritual reuses the survivors and a redeployed planner never
+# loads. Names must match ritual_start_demo.sh's start_tmux session names.
+KPLANNER_SESSION="${KPLANNER_SESSION:-pc2_kplanner}"
+PAD_BRIDGE_SESSION="${PAD_BRIDGE_SESSION:-pad_bridge}"
+# Max seconds to wait for a GRACEFUL exit before escalating, per session.
+# Generous by design: the loop polls for actual process death and returns the
+# instant it is gone, so a long budget costs nothing in the normal case -- it
+# only matters when a daemon genuinely needs the time. pc2_kplanner is the slow
+# one (onnxruntime session teardown + worker thread join), and force-killing it
+# early risks leaving a half-written log or a stale pid file.
+STOP_GRACE_S="${STOP_GRACE_S:-15}"
+declare -A SESSION_GRACE_S=(
+    [pc2_kplanner]=45
+    [x2_deploy]=30
+    [x2_pose_watchdog]=15
+    [x2_hand_bridge]=15
+    [x2_motor_monitor]=15
+    [pad_bridge]=15
+)
+# Additional wait AFTER kill-session before considering SIGKILL. kill-session
+# tears down the pane; the python process may still be flushing.
+STOP_POST_KILL_S="${STOP_POST_KILL_S:-20}"
+# Deploy-only budget. Deliberately SHORT: this is the window where a human is
+# holding the robot waiting for MC. The deploy handles SIGINT and exits
+# promptly; if it does not, waiting longer does not help the person taking the
+# weight. Everything else uses SESSION_GRACE_S.
+DEPLOY_GRACE_S="${DEPLOY_GRACE_S:-5}"
 
 POSTMORTEM_OUT="${POSTMORTEM_OUT:-./postmortem_out}"
 
@@ -608,19 +636,97 @@ tmux_start_session() {
     ssh_pc2 "tmux new-session -d -s ${name} ${script_path}"
 }
 
+# Map each tmux session to the process cmdline that MUST be gone before we
+# consider it stopped. Polling for actual death beats a fixed sleep: the old
+# "SIGINT then 5s grace" printed its line BEFORE the grace, so kill-session
+# landed ~5s after the log said so. Firing the ritual in that window let the
+# stop reach forward and kill a freshly started daemon (2026-07-19: killed a
+# new pc2_kplanner one second after the ritual created it, with no traceback
+# because a kill leaves none).
+declare -A SESSION_PROC_PATTERN=(
+    [x2_deploy]="x2_deploy_onnx_ref"
+    [x2_pose_watchdog]="x2_pose_watchdog.py"
+    [x2_hand_bridge]="x2_hand_zmq_to_aimdk_bridge.py"
+    [x2_motor_monitor]="x2_motor_monitor.py"
+    [pc2_kplanner]="pc2_kplanner_onnx.py"
+    [pad_bridge]="pad_locomotion_bridge.py"
+)
+
+# 0 = at least one matching process alive on PC2, 1 = none.
+# Scans /proc rather than using pgrep -f: pgrep -f matches the *checking*
+# command itself (its own cmdline contains the pattern), which has produced
+# false positives here before. We also skip $$ / $PPID for the same reason.
+remote_proc_alive() {
+    local pat="$1"
+    [[ -z "${pat}" ]] && return 1
+    ssh_pc2 "for p in \$(ls /proc 2>/dev/null | grep -E '^[0-9]+\$'); do
+                 [ \"\$p\" = \"\$\$\" ] && continue
+                 [ \"\$p\" = \"\$PPID\" ] && continue
+                 c=\$(tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null) || continue
+                 case \"\$c\" in *${pat}*) exit 0 ;; esac
+             done; exit 1" 2>/dev/null
+}
+
+# Stop a session and VERIFY it is gone. SIGINT -> poll -> kill-session ->
+# poll -> SIGKILL survivors -> final verify. Returns non-zero if anything
+# is still alive at the end, so the caller never reports a false "stopped".
 tmux_kill_session() {
     local name="$1"
-    if ! tmux_session_exists "${name}"; then
+    local pat="${SESSION_PROC_PATTERN[$name]:-}"
+    local grace="${SESSION_GRACE_S[$name]:-$STOP_GRACE_S}"
+    local waited=0
+
+    if ! tmux_session_exists "${name}" && ! remote_proc_alive "${pat}"; then
         log "  tmux session ${name}: not running"
         return 0
     fi
-    log "  tmux session ${name}: SIGINT then 5s grace, then kill-session"
-    # Send Ctrl-C into the pane so the python / ros2 shutdown hooks can
-    # flush. The tmux send-keys C-c lands as SIGINT to the foreground
-    # process inside the pane.
+
+    log "  ${name}: SIGINT, waiting for actual exit (up to ${grace}s)..."
     ssh_pc2 "tmux send-keys -t ${name} C-c 2>/dev/null || true"
-    sleep 5
+    while (( waited < grace )); do
+        if ! tmux_session_exists "${name}" && ! remote_proc_alive "${pat}"; then
+            log "  ${name}: exited cleanly after ${waited}s"
+            return 0
+        fi
+        sleep 1; waited=$(( waited + 1 ))
+    done
+
+    # Audit line on the ROBOT: a tmux pane dies with its session, taking any
+    # traceback with it, so without this a kill is indistinguishable from a
+    # crash when reading the robot's own logs later.
+    ssh_pc2 "echo \"\$(date +%F_%T) ${name}: KILLED by x2_pc2_daemons.sh stop\" \
+             >> /home/run/getsolo/log/ritual_fired.log 2>/dev/null || true"
+    log "  ${name}: did not exit in ${grace}s -> kill-session"
     ssh_pc2 "tmux kill-session -t ${name} 2>/dev/null || true"
+
+    waited=0
+    while (( waited < STOP_POST_KILL_S )); do
+        if ! tmux_session_exists "${name}" && ! remote_proc_alive "${pat}"; then
+            log "  ${name}: stopped after ${waited}s"
+            return 0
+        fi
+        (( waited % 5 == 0 && waited > 0 )) && \
+            log "    ${name}: still shutting down (${waited}s)... not forcing yet"
+        sleep 1; waited=$(( waited + 1 ))
+    done
+
+    if [[ -n "${pat}" ]] && remote_proc_alive "${pat}"; then
+        warn "  ${name}: STILL alive ${STOP_POST_KILL_S}s after kill-session -> SIGKILL (last resort)"
+        ssh_pc2 "for p in \$(ls /proc 2>/dev/null | grep -E '^[0-9]+\$'); do
+                     [ \"\$p\" = \"\$\$\" ] && continue
+                     [ \"\$p\" = \"\$PPID\" ] && continue
+                     c=\$(tr '\\0' ' ' < /proc/\$p/cmdline 2>/dev/null) || continue
+                     case \"\$c\" in *${pat}*) kill -9 \$p 2>/dev/null ;; esac
+                 done" 2>/dev/null
+        sleep 1
+    fi
+
+    if tmux_session_exists "${name}" || remote_proc_alive "${pat}"; then
+        warn "  ${name}: STILL ALIVE after SIGKILL -- do NOT start the ritual yet"
+        return 1
+    fi
+    log "  ${name}: stopped (forced)"
+    return 0
 }
 
 tail_session_log() {
@@ -992,8 +1098,18 @@ cmd_stop() {
     # also serves as a "did you mean to do this?" sanity check -- if
     # nothing is running, we can short-circuit the prompt entirely
     # rather than annoying the operator with a confirm-to-kill-nothing.
+    # NOTE (2026-07-18): kplanner + pad_bridge were MISSING from this list.
+    # This script predates the kplanner stack, so "stop" only ever killed the
+    # four VLA-era sessions and silently left the planner and pad bridge
+    # running. The ritual's start_tmux skips any session name that already
+    # exists, so those survivors were reused on every subsequent launch --
+    # meaning a freshly deployed pc2_kplanner_onnx.py never actually loaded.
+    # Cost several hours of "the fix didn't work" when the fix was on disk but
+    # the old process was still in memory. Any session the ritual STARTS must
+    # appear here, or stop/start is not a real restart.
     local sessions_running=()
-    for s in "${DEPLOY_SESSION}" "${POSE_PROXY_SESSION}" "${HAND_SESSION}" "${MONITOR_SESSION}"; do
+    for s in "${DEPLOY_SESSION}" "${POSE_PROXY_SESSION}" "${HAND_SESSION}" \
+             "${MONITOR_SESSION}" "${KPLANNER_SESSION}" "${PAD_BRIDGE_SESSION}"; do
         if tmux_session_exists "${s}"; then
             sessions_running+=("${s}")
         fi
@@ -1069,26 +1185,63 @@ cmd_stop() {
     fi
 
     log "stopping X2 daemons on ${PC2_USER}@${PC2_HOST}"
-    # Order: deploy first (its restart_mc_on_exit trap brings MC back up
-    # via the wire-still-flowing watchdog), then watchdog, then hand
-    # bridge + motor monitor. Killing the watchdog before the deploy
-    # would yank the pose wire out from under deploy's RAMP_OUT and tip
-    # MC over a silent input source mid-handoff.
-    tmux_kill_session "${DEPLOY_SESSION}"
-    tmux_kill_session "${POSE_PROXY_SESSION}"
-    tmux_kill_session "${HAND_SESSION}"
-    tmux_kill_session "${MONITOR_SESSION}"
+    # -------- PHASE 1: release SONIC, then stop stalling. -----------------
+    # CORRECTION (2026-07-19): the EM "start_app?app=mc" call below does NOT
+    # damp or catch the robot -- it drops straight to ZERO TORQUE. So nothing
+    # in this script supports the robot. The operator (or the gantry) bears
+    # the load from the moment SONIC releases until the robot is secured.
+    #
+    # Therefore phase 1 exists only to make that window SHORT and predictable:
+    # kill the deploy on a short leash and get the unavoidable zero-torque
+    # transition over with, rather than making the operator hold an
+    # uncontrolled robot through 65s of unrelated daemon shutdown (which is
+    # what this script did before -- MC was called LAST).
+    #
+    # Any message telling the operator they can let go would be dangerous and
+    # must not be reintroduced.
+    stop_failures=0
+    log "  [1/2] releasing SONIC -- KEEP HOLDING THE ROBOT"
+    # NOTE: an array element cannot be set as an inline env-var prefix
+    # ("SESSION_GRACE_S[x]=v cmd" is a bash syntax error), so set it on its own
+    # line. The first version of this got 30s from the map instead of the
+    # intended 5s -- i.e. the operator held the robot 6x longer than designed.
+    SESSION_GRACE_S[${DEPLOY_SESSION}]="${DEPLOY_GRACE_S}"
+    tmux_kill_session "${DEPLOY_SESSION}" || stop_failures=$(( stop_failures + 1 ))
 
     if [[ "${NO_MC_RESTART}" -eq 0 ]]; then
-        log "  damping MC (passive) via ssh -> PC2 -> EM HTTP"
+        warn "  MC app start via EM HTTP -- this puts the robot in ZERO TORQUE."
+        warn "  It does NOT support the robot. KEEP HOLDING / keep it on the gantry."
         ssh_pc2 "curl -s -m 5 --request POST \
             'http://${PC1_HOST}:${PC1_EM_PORT}/x2/em/start_app?app=mc' \
             -H 'Content-Type: application/json' -d '{}' \
             > /dev/null 2>&1 || true"
+        log "  MC app start requested (fire-and-forget; not confirmed)."
     else
-        log "  --no-mc-restart: skipping MC damp/restart"
+        log "  --no-mc-restart: MC app NOT started"
     fi
-    log "stopped"
+
+    # -------- PHASE 2: the rest, unhurried. ------------------------------
+    # These get generous budgets -- by now the robot is secured by the
+    # operator / gantry, so a slow clean exit costs nothing.
+    # kplanner + pad_bridge go last: they feed the pose wire, and killing
+    # them before the deploy would starve SONIC mid-shutdown. They were
+    # missing from this script entirely until 2026-07-19 -- "stop" left them
+    # running, the ritual's start_tmux then REUSED the stale sessions, and a
+    # freshly deployed pc2_kplanner_onnx.py never actually loaded.
+    log "  [2/2] shutting down remaining daemons (robot must already be secured)..."
+    tmux_kill_session "${POSE_PROXY_SESSION}" || stop_failures=$(( stop_failures + 1 ))
+    tmux_kill_session "${HAND_SESSION}"       || stop_failures=$(( stop_failures + 1 ))
+    tmux_kill_session "${MONITOR_SESSION}"    || stop_failures=$(( stop_failures + 1 ))
+    tmux_kill_session "${KPLANNER_SESSION}"   || stop_failures=$(( stop_failures + 1 ))
+    tmux_kill_session "${PAD_BRIDGE_SESSION}" || stop_failures=$(( stop_failures + 1 ))
+
+    if (( stop_failures > 0 )); then
+        warn "STOP INCOMPLETE: ${stop_failures} session(s) still alive."
+        warn "Do NOT fire the ritual yet -- it would reuse the survivors and a"
+        warn "freshly deployed file would not load. Re-run stop or kill by hand."
+        return 1
+    fi
+    log "stopped -- all sessions verified down; safe to fire the ritual"
 }
 
 # -------------------------------------------------------------------------

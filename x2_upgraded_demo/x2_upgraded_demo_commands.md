@@ -64,9 +64,21 @@ MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/s
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
 .venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py \
-  --checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/model_step_002000.pt \
+  --checkpoint  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt \
   --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl \
   --clip dance_party_hips_003__A467
+
+--checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/model_step_002000.pt
+--checkpoint  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt
+--onnx -onnx /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx
+
+
+cd /home/stickbot/Projects/GR00T-WholeBodyControl
+.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py \
+  --checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt \
+  --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl
+
+
 
 -- medium dance_latino_chase_mambo_kicks_R_fast_001__A314 (needs space - feet hitting each other on the robot, but ok)
 -- medium dance_retro_jazz_cross_step_180_R_001__A314 (needs space in front)

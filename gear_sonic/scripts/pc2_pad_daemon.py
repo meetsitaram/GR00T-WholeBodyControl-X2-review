@@ -71,6 +71,8 @@ def wait_for_pad() -> "pygame.joystick.Joystick":
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pub-port", type=int, default=5569)
+    ap.add_argument("--rumble-port", type=int, default=5570,
+                    help="PULL port for rumble requests from the bridge")
     ap.add_argument("--start-cmd", required=True,
                     help="shell command to run on ritual confirm")
     ap.add_argument("--rate", type=float, default=50.0)
@@ -85,6 +87,14 @@ def main() -> int:
     pub.setsockopt(zmq.SNDHWM, 10)
     pub.bind(f"tcp://*:{args.pub_port}")
     print(f"[pc2-pad] pad_state PUB bind tcp://*:{args.pub_port}", flush=True)
+    # Rumble command channel. The bridge reads the pad over ZMQ but never HOLDS
+    # it -- only this daemon owns the pygame joystick, so only this daemon can
+    # rumble. Without this channel every buzz() in the bridge is a silent no-op.
+    rum = ctx.socket(zmq.PULL)
+    rum.setsockopt(zmq.RCVTIMEO, 0)      # non-blocking drain
+    rum.setsockopt(zmq.RCVHWM, 20)
+    rum.bind(f"tcp://*:{args.rumble_port}")
+    print(f"[pc2-pad] rumble PULL bind tcp://*:{args.rumble_port}", flush=True)
     print(f"[pc2-pad] START ritual: hold L1+R1+L2+R2 {HOLD_S:.0f}s -> ARMED, "
           f"then Y within {WINDOW_S:.0f}s", flush=True)
 
@@ -98,6 +108,7 @@ def main() -> int:
         except Exception as e:
             print(f"[pc2-pad] rumble failed: {e}", flush=True)
 
+    pulse_q: list[tuple[float, float, int]] = []   # (fire_at, strength, ms)
     hold_start = None
     hold_pulses = 0     # arming-progress pulses sent this hold (1/sec, 3 total)
     armed_until = 0.0
@@ -107,6 +118,30 @@ def main() -> int:
 
     while True:
         pygame.event.pump()
+        # --- rumble requests from the bridge -------------------------------
+        # Multi-pulse patterns are SCHEDULED, never slept through: a sleep here
+        # would stall pad_state publishing and the bridge would hit its 0.5s
+        # stale watchdog and failsafe to idle mid-gesture.
+        while True:
+            try:
+                req = json.loads(rum.recv())
+            except zmq.Again:
+                break
+            except Exception:            # noqa: BLE001 -- haptics are best-effort
+                break
+            st = float(req.get("strength", 0.8))
+            ms = int(req.get("ms", 180))
+            cnt = max(1, min(5, int(req.get("count", 1))))
+            gap = max(0.05, float(req.get("gap_ms", 180)) / 1000.0)
+            base = time.monotonic()
+            for k in range(cnt):
+                pulse_q.append((base + k * (ms / 1000.0 + gap), st, ms))
+        if pulse_q:
+            _now = time.monotonic()
+            due = [q for q in pulse_q if q[0] <= _now]
+            pulse_q[:] = [q for q in pulse_q if q[0] > _now]
+            for _, st, ms in due:
+                rumble(st, ms)
         # Hot-plug: BT drops are a thing. On device loss publish nothing
         # (bridge's 0.5s stale watchdog -> failsafe idle), reset ritual
         # state, and block until the pad returns.
@@ -120,12 +155,20 @@ def main() -> int:
         now = time.monotonic()
         axes = [round(js.get_axis(i), 3) for i in range(js.get_numaxes())]
         btns = [js.get_button(i) for i in range(js.get_numbuttons())]
+        # Hats (D-pad). On Xbox pads via xpadneo the D-pad is a HAT, not
+        # buttons, so without this it never reaches ZMQ consumers at all --
+        # a D-pad binding in pad_locomotion_bridge silently never fires.
+        try:
+            hats = [list(js.get_hat(i)) for i in range(js.get_numhats())]
+        except Exception:
+            hats = []
 
         # 1) broadcast on change (and 5 Hz heartbeat)
-        state = (axes, btns)
+        state = (axes, btns, hats)
         if state != last_state or (last_state is not None and now % 0.2 < tick):
             pub.send_multipart([b"pad_state", json.dumps(
-                {"axes": axes, "buttons": btns, "ts": time.time()}
+                {"axes": axes, "buttons": btns, "hats": hats,
+                 "ts": time.time()}
             ).encode()])
             last_state = state
 

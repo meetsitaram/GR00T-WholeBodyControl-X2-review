@@ -34,6 +34,7 @@ import zmq
 # indices under SDL2 for sticks/shoulders; verify with --probe if unsure).
 AXIS_LX, AXIS_LY = 0, 1
 AXIS_RX = 3          # right stick X (some pads: 2 -- use --probe / --axis-rx)
+AXIS_RY = 4          # right stick Y (SDL Xbox: 0=LX 1=LY 2=LT 3=RX 4=RY 5=RT)
 AXIS_LT, AXIS_RT = 2, 5
 BTN_LB, BTN_RB = 4, 5   # L1 / R1
 
@@ -66,6 +67,10 @@ class _ZmqPad:
         self._axes[AXIS_LT] = -1.0
         self._axes[AXIS_RT] = -1.0
         self._buttons = [0] * 16
+        # D-pad arrives as hats over ZMQ (see pc2_pad_daemon). Without
+        # this the bridge reports zero hats and any D-pad binding is a
+        # silent no-op.
+        self._hats = []
         self._last_rx = 0.0
         self._stale_s = stale_s
 
@@ -80,6 +85,7 @@ class _ZmqPad:
             bt = d.get("buttons", [])
             self._axes[:len(ax)] = ax
             self._buttons[:len(bt)] = bt
+            self._hats = [tuple(h) for h in d.get("hats", [])]
             self._last_rx = time.monotonic()
         if self._last_rx and time.monotonic() - self._last_rx > self._stale_s:
             # feed lost -> fail safe to released
@@ -90,6 +96,12 @@ class _ZmqPad:
 
     def get_axis(self, i: int) -> float:
         return self._axes[i] if i < len(self._axes) else 0.0
+
+    def get_numhats(self) -> int:
+        return len(self._hats)
+
+    def get_hat(self, i: int):
+        return self._hats[i] if i < len(self._hats) else (0, 0)
 
     def get_button(self, i: int) -> int:
         return self._buttons[i] if i < len(self._buttons) else 0
@@ -138,6 +150,35 @@ def main() -> int:
                     help="print axis/button events and exit on ctrl-c")
     ap.add_argument("--invert-ly", action="store_true", default=True,
                     help="stick up (-1 in SDL) = forward (default on)")
+    ap.add_argument("--clip-key-dpad-up", default="",
+                    help="single motion_key fired by L1 + D-pad UP. Separate from "
+                         "the two cycling banks: this is a fixed showcase clip, so "
+                         "it is always the same motion regardless of bank state.")
+    ap.add_argument("--clip-keys-b", default="",
+                    help="second bank, cycled with L1+X (next) / L1+B (prev). "
+                         "STOP moves to L1+R1 when this is used.")
+    ap.add_argument("--clip-keys-m", default="",
+                    help="MEDIUM-dance bank, cycled forward with L1+B. Setting "
+                         "this takes L1+B over from 'bank B previous', so every "
+                         "face button owns one bank: Y=dances X=combat "
+                         "A=gestures B=medium.")
+    ap.add_argument("--clip-keys-turn", default="",
+                    help="RIGHT-STICK 4-way clip bank, comma separated in the "
+                         "order LEFT,RIGHT,UP,DOWN. Fires only while the deadman "
+                         "is RELEASED (the stick is yaw when it is held). "
+                         "LEFT/RIGHT fire immediately -- they are in-place turns "
+                         "that do not travel. UP/DOWN require a hold "
+                         "(--turn-hold-s) because those clips cover ground.")
+    ap.add_argument("--turn-hold-s", type=float, default=2.0,
+                    help="dwell required for the travelling UP/DOWN clips")
+    ap.add_argument("--turn-deflect", type=float, default=0.6,
+                    help="stick magnitude that counts as a deflection")
+    ap.add_argument("--clip-keys-g", default="",
+                    help="GESTURE bank, cycled forward with L1+A. Setting this "
+                         "takes L1+A over from 'bank A previous' -- bank A then "
+                         "only advances (L1+Y).")
+    ap.add_argument("--rumble-port", type=int, default=5570,
+                    help="pc2_pad_daemon PULL port for haptics")
     args = ap.parse_args()
 
     if args.source == "zmq":
@@ -186,17 +227,46 @@ def main() -> int:
     # Dance chord wire (optional): separate PUB to the recorder's
     # motion_clip_cmd SUB. Payload mirrors play_locomotion.py exactly.
     clip_sock = None
-    btn_play, btn_stop, btn_prev = 3, 1, 0   # Xbox: Y / B / A
-    clip_list: list[str] = []
-    clip_cur = -1                            # first L1+Y plays clip_list[0]
+    # TWO independent dance banks, each with its own next/prev pair:
+    #   L1+Y / L1+A  -> bank A ("easy")
+    #   L1+X / L1+B  -> bank B ("medium")
+    # STOP moved to L1+R1 because B is now bank-B-previous. Keeping a stop is
+    # worth a chord: some clips can tip the robot (dance_freedom_wheels_001__A465
+    # falls in sim under BOTH .pt and ONNX), so aborting mid-clip matters.
+    btn_a_next, btn_a_prev = 3, 0            # Xbox: Y / A
+    btn_b_next, btn_b_prev = 2, 1            # Xbox: X / B
+    clip_list: list[str] = []                # bank A
+    clip_list_b: list[str] = []              # bank B
+    clip_list_g: list[str] = []              # bank G (gestures, L1+A)
+    clip_list_m: list[str] = []              # bank M (medium dances, L1+B)
+    clip_cur = -1
+    clip_cur_b = -1
+    clip_cur_g = -1
+    clip_cur_m = -1
+    turn_list: list[str] = []                # [LEFT, RIGHT, UP, DOWN]
+    turn_prev_dir = None                     # debounce: fire once per entry
+    turn_hold_start = None
     if args.clip_pkl:
         pad_name = js.get_name().lower() if hasattr(js, "get_name") else ""
         if any(k in pad_name for k in ("dualsense", "sony", "playstation")):
-            btn_play, btn_stop, btn_prev = 2, 1, 0  # PS: Triangle/Circle/Cross
+            # PS face cluster: Triangle / Cross for bank A, Square / Circle for B
+            btn_a_next, btn_a_prev = 2, 0
+            btn_b_next, btn_b_prev = 3, 1
         if args.clip_keys:
             clip_list = [k for k in args.clip_keys.split(",") if k.strip()]
         elif args.clip_key:
             clip_list = [args.clip_key]
+        if getattr(args, "clip_keys_b", ""):
+            clip_list_b = [k for k in args.clip_keys_b.split(",") if k.strip()]
+        if getattr(args, "clip_keys_g", ""):
+            clip_list_g = [k for k in args.clip_keys_g.split(",") if k.strip()]
+        if getattr(args, "clip_keys_m", ""):
+            clip_list_m = [k for k in args.clip_keys_m.split(",") if k.strip()]
+        if getattr(args, "clip_keys_turn", ""):
+            turn_list = [k.strip() for k in args.clip_keys_turn.split(",")]
+            if len(turn_list) != 4:
+                raise SystemExit("--clip-keys-turn needs exactly 4 keys: "
+                                 "LEFT,RIGHT,UP,DOWN")
         clip_sock = ctx.socket(zmq.PUB)
         clip_sock.setsockopt(zmq.SNDHWM, 10)
         clip_sock.connect(f"tcp://{args.clip_host}:{args.clip_port}")
@@ -208,16 +278,36 @@ def main() -> int:
         clip_sock.send_multipart([args.clip_topic.encode("ascii"),
                                   json.dumps(payload).encode("utf-8")])
 
-    def buzz(strength: float, ms: int) -> None:
-        """Haptic cue on a locally-attached pad. No-op for the ZMQ-fed
-        pad (pc2_pad_daemon owns rumble on the robot) and when rumble is
-        unsupported by the transport."""
-        rumble = getattr(js, "rumble", None)
+    # Rumble path for the ZMQ-fed pad. This process reads the pad but never
+    # HOLDS it -- pc2_pad_daemon owns the pygame joystick, so it owns rumble.
+    # Before this socket existed, every buzz() on the robot was a silent no-op.
+    rumble_sock = None
+    if args.source == "zmq":
+        rumble_sock = ctx.socket(zmq.PUSH)
+        rumble_sock.setsockopt(zmq.SNDHWM, 10)
+        rumble_sock.setsockopt(zmq.LINGER, 0)
+        rumble_sock.setsockopt(zmq.SNDTIMEO, 0)     # never block the 50Hz loop
+        rumble_sock.connect(f"tcp://{args.pad_host}:{args.rumble_port}")
+        print(f"[pad-bridge] rumble PUSH -> "
+              f"tcp://{args.pad_host}:{args.rumble_port}", flush=True)
+
+    def buzz(strength: float, ms: int, count: int = 1, gap_ms: int = 180) -> None:
+        """Haptic cue. Multi-pulse patterns are scheduled by the DAEMON, not
+        slept through here -- a sleep would stall intent publishing."""
+        if rumble_sock is not None:
+            try:
+                rumble_sock.send_json({"strength": strength, "ms": ms,
+                                       "count": count, "gap_ms": gap_ms})
+            except Exception:  # noqa: BLE001 -- haptics are best-effort
+                pass
+            return
+        rumble = getattr(js, "rumble", None)      # locally-attached pad
         if rumble is None:
             return
         try:
-            rumble(strength, strength, ms)
-        except Exception:  # noqa: BLE001 -- haptics are best-effort
+            for _ in range(count):
+                rumble(strength, strength, ms)
+        except Exception:  # noqa: BLE001
             pass
 
     tick = 1.0 / RATE_HZ
@@ -225,7 +315,10 @@ def main() -> int:
     last_pub_ts = 0.0
     was_live = False
     prev_lb = prev_rb = False
-    prev_play = prev_stop = prev_prev = False
+    prev_a_next = prev_a_prev = prev_b_next = prev_b_prev = prev_rb = False
+    prev_hat_up = False
+    showcase_hold_start = None      # L2+R2+Y hold timer
+    showcase_buzzed = False
     clip_cooldown_until = 0.0
     pending_delta = 0.0
 
@@ -248,6 +341,79 @@ def main() -> int:
         deadman_held = lt if args.deadman == "left" else (lt and rt)
         live = deadman_held and not (lb and rb)   # all-four = e-stop chord: go dead
 
+        # ---- Showcase clip: L2 + R2 + Y held together for 2 s ----------------
+        # Deliberately a HOLD, not a tap: this clip commits the robot to ~10 s of
+        # continuous walking with ~293 deg of turning, so it needs room and must
+        # be impossible to fire by accident. Two short buzzes confirm.
+        # No collision with the dance chords: those require the deadman RELEASED
+        # (L1+face), while this one requires it HELD (L2+R2+face).
+        if clip_sock is not None and args.clip_key_dpad_up:
+            y_btn = bool(js.get_button(btn_a_next))
+            if lt and rt and y_btn:
+                now_s = time.monotonic()
+                if showcase_hold_start is None:
+                    showcase_hold_start = now_s
+                    showcase_buzzed = False
+                elif (now_s - showcase_hold_start) >= 2.0 and not showcase_buzzed:
+                    showcase_buzzed = True
+                    send_clip({"action": "play", "pkl": args.clip_pkl,
+                               "kind": "locomotion",
+                               "motion_key": args.clip_key_dpad_up})
+                    clip_cooldown_until = now_s + 3.0
+                    buzz(0.8, 180, count=2, gap_ms=180)   # two pulses = fired
+                    print(f"[pad-bridge] SHOWCASE (L2+R2+Y 2s) -> "
+                          f"{args.clip_key_dpad_up}", flush=True)
+            else:
+                showcase_hold_start = None
+                showcase_buzzed = False
+
+        # ---- RIGHT-STICK 4-way clip bank -----------------------------
+        # Deadman RELEASED only: with it held the right stick is yaw, so the
+        # two uses can never collide. LEFT/RIGHT are in-place turns (~0.09 m
+        # of travel) and fire on entry -- no dwell, nothing to guard against.
+        # UP/DOWN cover ground (3.5 m / 5.1 m) so they need a deliberate hold.
+        # L1 must be held, same as every other clip trigger -- an
+        # ungated stick is the one surface a knock can fire.
+        if clip_sock is not None and turn_list and not live and lb:
+            rx = js.get_axis(args.axis_rx)
+            ry = js.get_axis(AXIS_RY)
+            ry = -ry if args.invert_ly else ry          # stick up = +ry
+            d_ = args.turn_deflect
+            tdir = None
+            if max(abs(rx), abs(ry)) >= d_:             # dominant axis wins
+                tdir = ("R" if rx > 0 else "L") if abs(rx) >= abs(ry) else \
+                       ("U" if ry > 0 else "D")
+            now_t = time.monotonic()
+            if tdir is None:
+                turn_prev_dir = None
+                turn_hold_start = None
+            elif tdir != turn_prev_dir:
+                turn_prev_dir = tdir                    # fresh entry
+                turn_hold_start = now_t
+                if tdir in ("U", "D"):
+                    # tell the operator the hold timer is COUNTING; without
+                    # this a 2 s wait is indistinguishable from a dead binding.
+                    buzz(0.5, 90)
+                if tdir in ("L", "R") and now_t >= clip_cooldown_until:
+                    key = turn_list[0 if tdir == "L" else 1]
+                    send_clip({"action": "play", "pkl": args.clip_pkl,
+                               "kind": "locomotion", "motion_key": key})
+                    clip_cooldown_until = now_t + 5.5   # clip is ~4.8 s
+                    buzz(0.7, 120)
+                    print(f"[pad-bridge] TURN {tdir} -> {key}", flush=True)
+                    turn_hold_start = None              # consumed
+            elif (tdir in ("U", "D") and turn_hold_start is not None
+                  and now_t - turn_hold_start >= args.turn_hold_s
+                  and now_t >= clip_cooldown_until):
+                key = turn_list[2 if tdir == "U" else 3]
+                send_clip({"action": "play", "pkl": args.clip_pkl,
+                           "kind": "locomotion", "motion_key": key})
+                clip_cooldown_until = now_t + 3.0
+                buzz(0.8, 180, count=2, gap_ms=180)
+                print(f"[pad-bridge] TRAVEL {tdir} (held "
+                      f"{args.turn_hold_s:g}s) -> {key}", flush=True)
+                turn_hold_start = None                  # consumed
+
         # Speed nudges: shoulder taps while deadman held (rising edges).
         # Suppressed entirely in --lock-speed mode (constant-speed demos:
         # stray shoulder presses while gripping the triggers are easy).
@@ -262,32 +428,73 @@ def main() -> int:
         # 2s cooldown. Stop chord: L1 + stop-button. Both no-ops mid-drive
         # so a dance can never preempt active locomotion.
         if clip_sock is not None:
-            play_b = bool(js.get_button(btn_play))
-            stop_b = bool(js.get_button(btn_stop))
-            prev_b = bool(js.get_button(btn_prev))
+            # D-pad: pygame exposes it as a hat, (x, y) with y=+1 up.
+            # Guard on get_numhats -- the ZMQ-fed pad and some layouts have none.
+            hat_up = False
+            try:
+                if getattr(js, "get_numhats", None) and js.get_numhats() > 0:
+                    hat_up = js.get_hat(0)[1] > 0
+            except Exception:
+                hat_up = False
+            a_next_b = bool(js.get_button(btn_a_next))
+            a_prev_b = bool(js.get_button(btn_a_prev))
+            b_next_b = bool(js.get_button(btn_b_next))
+            b_prev_b = bool(js.get_button(btn_b_prev))
+            rb_b     = bool(js.get_button(BTN_RB))
             now_c = time.monotonic()
-            step = 0
-            if (lb and play_b and not prev_play and not live
-                    and now_c >= clip_cooldown_until):
-                step = 1        # L1+Y: next dance
-            elif (lb and prev_b and not prev_prev and not live
-                    and now_c >= clip_cooldown_until):
-                step = -1       # L1+A: previous dance
-            if step and clip_list:
-                clip_cur = (clip_cur + step) % len(clip_list)
-                key = clip_list[clip_cur]
+            ready = (not live) and now_c >= clip_cooldown_until
+            bank = None; step = 0
+            if lb and a_next_b and not prev_a_next and ready:
+                bank, step = "A", 1          # L1+Y
+            elif lb and a_prev_b and not prev_a_prev and ready:
+                # L1+A = GESTURE bank, cycles forward. It is deliberately NOT
+                # "bank A previous" any more -- with 8 gestures a prev button
+                # is worth less than a third group.
+                bank, step = "G", 1          # L1+A
+            elif lb and b_next_b and not prev_b_next and ready:
+                bank, step = "B", 1          # L1+X
+            elif lb and b_prev_b and not prev_b_prev and ready:
+                # L1+B = MEDIUM dances, cycles forward. One bank per face
+                # button beats next/prev on two of them.
+                bank, step = "M", 1          # L1+B
+
+            lst = {"A": clip_list, "B": clip_list_b,
+                   "G": clip_list_g, "M": clip_list_m}.get(bank, [])
+            if bank and lst:
+                if bank == "A":
+                    clip_cur = (clip_cur + step) % len(lst); idx = clip_cur
+                elif bank == "G":
+                    clip_cur_g = (clip_cur_g + step) % len(lst); idx = clip_cur_g
+                elif bank == "M":
+                    clip_cur_m = (clip_cur_m + step) % len(lst); idx = clip_cur_m
+                else:
+                    clip_cur_b = (clip_cur_b + step) % len(lst); idx = clip_cur_b
+                key = lst[idx]
                 send_clip({"action": "play", "pkl": args.clip_pkl,
                            "kind": "locomotion", "motion_key": key})
                 clip_cooldown_until = now_c + 2.0
                 buzz(0.7, 200)   # dance fired: single firm pulse
-                print(f"[pad-bridge] DANCE {clip_cur + 1}/{len(clip_list)} "
+                print(f"[pad-bridge] DANCE[{bank}] {idx + 1}/{len(lst)} "
                       f"-> {key}", flush=True)
-            elif lb and stop_b and not prev_stop and not live:
+            elif (lb and hat_up and not prev_hat_up and ready
+                    and args.clip_key_dpad_up):
+                # L1 + D-pad UP -> fixed showcase clip
+                send_clip({"action": "play", "pkl": args.clip_pkl,
+                           "kind": "locomotion",
+                           "motion_key": args.clip_key_dpad_up})
+                clip_cooldown_until = now_c + 2.0
+                buzz(0.7, 200)
+                print(f"[pad-bridge] DPAD-UP -> {args.clip_key_dpad_up}", flush=True)
+            elif lb and rb_b and not prev_rb and not live:
+                # L1+R1 = STOP (moved off B, which is now bank-B-previous)
                 send_clip({"action": "stop"})
                 clip_cooldown_until = now_c + 1.0
                 buzz(0.3, 100)   # stop: weak blip
-                print("[pad-bridge] dance STOP chord -> idle", flush=True)
-            prev_play, prev_stop, prev_prev = play_b, stop_b, prev_b
+                print("[pad-bridge] dance STOP chord (L1+R1) -> idle", flush=True)
+            prev_a_next, prev_a_prev = a_next_b, a_prev_b
+            prev_b_next, prev_b_prev = b_next_b, b_prev_b
+            prev_rb = rb_b
+            prev_hat_up = hat_up
 
         # Input-change logging: every deadman transition and (throttled)
         # stick change is printed so the operator can see what the pad

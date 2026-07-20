@@ -2813,8 +2813,17 @@ if [[ "${PAD_ONLY}" -eq 1 ]]; then
     if [[ -n "${PAD_CLIP_PKL:-}" ]]; then
         PAD_BRIDGE_EXTRA+=(--clip-pkl "${PAD_CLIP_PKL}")
         [[ -n "${PAD_CLIP_KEY:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-key "${PAD_CLIP_KEY}")
-        # PAD_CLIP_KEYS: comma list -> L1+Y/L1+A cycle through all clips.
+        # One bank per face button (matches the robot ritual):
+        #   PAD_CLIP_KEYS   L1+Y  easy dances
+        #   PAD_CLIP_KEYS_X L1+X  combat
+        #   PAD_CLIP_KEYS_M L1+B  medium dances
+        #   PAD_CLIP_KEYS_G L1+A  gestures
+        #   PAD_CLIP_KEYS_TURN    right-stick 4-way: LEFT,RIGHT,UP,DOWN
         [[ -n "${PAD_CLIP_KEYS:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys "${PAD_CLIP_KEYS}")
+        [[ -n "${PAD_CLIP_KEYS_X:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-b "${PAD_CLIP_KEYS_X}")
+        [[ -n "${PAD_CLIP_KEYS_M:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-m "${PAD_CLIP_KEYS_M}")
+        [[ -n "${PAD_CLIP_KEYS_G:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-g "${PAD_CLIP_KEYS_G}")
+        [[ -n "${PAD_CLIP_KEYS_TURN:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-turn "${PAD_CLIP_KEYS_TURN}")
     fi
     "${PYTHON}" "${REPO_ROOT}/gear_sonic/scripts/pad_locomotion_bridge.py" \
         --bind --port "${PLANNER_CMD_PORT}" --topic "${PLANNER_CMD_TOPIC}" \

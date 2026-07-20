@@ -262,7 +262,14 @@ export KPLANNER_FIXED_FWD_MPS=0.3
 export PAD_LOCK_SPEED=1
 export PAD_DEADMAN=left
 export PAD_CLIP_PKL=gear_sonic/data/motions/x2_dances_easy.pkl
-export PAD_CLIP_KEYS="$(ls "$DANCES" | sed 's/\.x2m2$//' | paste -sd,)"
+# Same four banks as the robot ritual -- do NOT glob the dances dir: that put
+# gestures, turn clips and combat all on one button and made sim behaviour
+# diverge from the robot.
+export PAD_CLIP_KEYS="dance_party_hips_003__A467,dance_party_hips_003__A464,dance_party_hips_003__A465"
+export PAD_CLIP_KEYS_X="shadow_boxing_R_003__A359_M,shadow_boxing_R_003__A359"
+export PAD_CLIP_KEYS_M="egipt_dance_R_001__A438,dance_hiphop_stick_n_roll_dancehall_R_loop_003__A324,dance_distraction_dance_001__A466"
+export PAD_CLIP_KEYS_G="right_wave_001,both_heart_002,right_kiss_001,right_five_001,right_shake_001,turn_wave_right_001,turn_wave_left_001"
+export PAD_CLIP_KEYS_TURN="locowalk__idle_turn_270_002__A056_M,locowalk__idle_turn_270_002__A056,relaxed_walk_forward,walk_circle_001"
 
 MODE_FLAG=()
 [[ "$GRAPH" == "template" ]] && MODE_FLAG=(--kplanner-planner-mode "${MODE:-slow_walk}")

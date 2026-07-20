@@ -123,9 +123,24 @@ def _load_x2m2(path: Path) -> dict:
     }
 
 
-def _take_first_motion(pkl_data: dict):
+def _take_first_motion(pkl_data: dict, key: str | None = None):
+    """First clip, or the first whose name contains ``key``.
+
+    Multi-clip corpora (33k+ entries) are unusable without selection: the
+    caller cannot reach anything but entry 0.
+    """
     if not isinstance(pkl_data, dict) or not pkl_data:
         raise ValueError("PKL is not a non-empty dict-of-motions")
+    if key:
+        hits = [k for k in pkl_data if key.lower() in k.lower()]
+        if not hits:
+            raise KeyError(
+                f"no clip matching {key!r}; {len(pkl_data)} clips in file"
+            )
+        if len(hits) > 1:
+            print(f"[play_motion] {len(hits)} clips match {key!r}; "
+                  f"using {hits[0]}", flush=True)
+        return hits[0], pkl_data[hits[0]]
     name = next(iter(pkl_data))
     return name, pkl_data[name]
 
@@ -156,6 +171,7 @@ def play(
     loop: bool = True,
     start_frame: int = 0,
     fixed_root_z: float | None = None,
+    key: str | None = None,
 ) -> int:
     print(f"[play_motion] loading {motion_path} ...", flush=True)
     suffix = motion_path.suffix.lower()
@@ -173,7 +189,7 @@ def play(
         )
     else:
         data = joblib.load(motion_path)
-    name, motion = _take_first_motion(data)
+    name, motion = _take_first_motion(data, key)
     _validate(motion)
 
     dof = np.asarray(motion["dof"], dtype=np.float64)
@@ -241,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--motion", required=True, type=Path,
                    help="Motion-lib .pkl path or baked .x2m2 path.")
+    p.add_argument("--key", default=None,
+                   help="substring match to pick a clip inside a multi-clip PKL")
     p.add_argument("--mjcf", type=Path, default=Path(DEFAULT_MJCF),
                    help=f"MJCF to load (default: {DEFAULT_MJCF})")
     p.add_argument("--speed", type=float, default=1.0,
@@ -265,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         loop=args.loop,
         start_frame=args.start_frame,
         fixed_root_z=args.fixed_root_z,
+        key=args.key,
     )
 
 

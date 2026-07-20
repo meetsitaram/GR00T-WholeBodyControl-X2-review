@@ -191,6 +191,25 @@ _TEST_FIXED_SIDE_MPS: float = 0.30
 _TEST_FIXED_TURN_RAD_S: float = 0.30
 _FWD_LATERAL_DEADBAND: float = 0.35
 
+# Strafe gating (2026-07-18). The resolver below is a SIGN function: any
+# non-zero lateral component becomes a FULL _TEST_FIXED_SIDE_MPS strafe. With
+# forward and lateral sharing one stick, a mild diagonal push therefore
+# injected a full 0.3 m/s side-step into what the operator intended as a
+# walking turn -- observed on hardware as intents (yaw=+0.3, vel_x=-0.3,
+# vel_z=+0.3) and felt as "unclean steps". There is also no good side-step
+# clip in the corpus, so an unintended strafe is worse than no strafe.
+#
+# The old magnitude-only rule (|side| < 0.35 while moving forward) was too
+# permissive: a 45 deg push has |side| ~= 0.7 and sailed through. Replaced by
+# an ANGLE rule -- lateral must dominate, i.e. the push must be close to pure
+# sideways. Strafe engages only when BOTH hold:
+#   * |side| >= _LATERAL_MIN_MAG        (a decisive push, not a lean)
+#   * |fwd|  <= |side| * tan(theta_max) (within theta_max of the lateral axis)
+# tan(25 deg) ~= 0.466, so a 45 deg diagonal (ratio 1.0) is rejected and only a
+# near-90-degree push strafes. Raise _LATERAL_MAX_TAN to loosen.
+_LATERAL_MIN_MAG: float = 0.60
+_LATERAL_MAX_TAN: float = 0.466   # tan(25 deg)
+
 _TURN_15_RAD_S: float = 0.5
 _TURN_30_RAD_S: float = 1.0
 _TURN_45_RAD_S: float = 1.5
@@ -244,9 +263,13 @@ def _resolve_locomotion_continuous(
     shaped_side = _shape_stick(stick_side)
     shaped_yaw = _shape_stick(stick_yaw)
 
-    # Forward-dominance lateral deadband on the LEFT stick.
-    if shaped_fwd > 0.0 and abs(shaped_side) < _FWD_LATERAL_DEADBAND:
-        shaped_side = 0.0
+    # Strafe requires a near-pure sideways push (see _LATERAL_MIN_MAG /
+    # _LATERAL_MAX_TAN). Applies in BOTH travel directions -- the old rule only
+    # gated lateral while moving forward, so a diagonal pull-back still strafed.
+    if shaped_side != 0.0:
+        if (abs(shaped_side) < _LATERAL_MIN_MAG
+                or abs(shaped_fwd) > abs(shaped_side) * _LATERAL_MAX_TAN):
+            shaped_side = 0.0
 
     if shaped_fwd > 0.0:
         vel_z = _SPEED_SETPOINT           # deterministic setpoint mode
@@ -1321,6 +1344,41 @@ def _yaw_of_quat_xyzw(q: np.ndarray) -> float:
     return yaw_from_quat_wxyz(np.array([q[3], q[0], q[1], q[2]], dtype=np.float64))
 
 
+def _wrap_pi(a: float) -> float:
+    """Wrap an angle to (-pi, pi]."""
+    return (float(a) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _quat_wxyz_from_yaw(yaw_rad: float) -> np.ndarray:
+    """``R_z(yaw)`` packed as (qw, qx, qy, qz).
+
+    Yaw-only by construction: pitch/roll are dropped on purpose, mirroring
+    ``x2_kplanner._yaw_only_wxyz_from_pelvis`` -- a transient leg lean (fall
+    recovery, slip) must not bleed into the published reference and pull SONIC
+    outside its upright-reference training distribution.
+    """
+    half = 0.5 * float(yaw_rad)
+    return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float32)
+
+
+# Closed-loop idle yaw resync (port of x2_kplanner.py:3094).
+# Max age of a measured-yaw sample we will trust; matches x2_kplanner's
+# ``pose_feedback_max_age_s`` default. Stale -> hold last good, never revert to
+# identity (identity == world +X is a KNOWN-WRONG heading the deploy actively
+# twists the body toward).
+POSE_FEEDBACK_MAX_AGE_S: float = 0.5
+# Rate cap on how fast the reference yaw may be re-anchored. Defence in depth:
+# resync is an ASSIGNMENT (no feedback term, so it cannot wind up), but a cap
+# means even a wrong sign or frame error can only leak slowly instead of
+# spinning the robot. See the 2026-07-18 runaway-spin incident.
+MAX_YAW_RESYNC_RAD_S: float = 1.5
+
+# PLAYING -> IDLE stop blend length. 16 ticks @ 50 Hz = 320 ms -- long enough to
+# take a 1.2 rad snap down to ~0.075 rad/tick, short enough that the robot still
+# settles promptly when the operator releases.
+STOP_BLEND_FRAMES: int = 16
+
+
 # ---------------------------------------------------------------------------
 # Dance playback
 # ---------------------------------------------------------------------------
@@ -1916,28 +1974,56 @@ def run(args: argparse.Namespace) -> int:
             return qs
         return [_reb1(q) for q in qs]
 
-    def _track_idle_yaw() -> None:
-        """While IDLE, let the reference heading FOLLOW the robot's measured yaw.
+    def _resync_idle_yaw_from_measured() -> None:
+        """IDLE-only: re-anchor the reference heading to the MEASURED yaw.
 
-        A one-shot offset makes idle hold a *world-absolute* heading: nudge the
-        robot and the reference stays put, so SONIC sees yaw error and drives it
-        back. That restoring torque is the "it fights me back to one orientation"
-        symptom -- world coordinates leaking into idle.
+        Port of ``x2_kplanner.py:3094`` ("Yaw-only resync from robot_pose
+        feedback"), whose omission is listed as a known deviation at the top of
+        this file. Without it ``current_root_wxyz`` is only ever written by the
+        model's own predictions, so anything that moves the real robot off-yaw
+        while the stick is centred -- a push, a slip, fall recovery -- leaves us
+        publishing a stale ABSOLUTE yaw target. The C++ tokenizer feeds SONIC
+        ``rel = inv(measured) * reference``, so a stale reference makes the policy
+        twist the body back to the old heading: the "robot always tries to recover
+        to the same world orientation" symptom.
 
-        The one-shot rule exists so the offset never double-counts the planner's
-        own yaw integration -- but the planner only integrates yaw while PLAYING.
-        IDLE republishes a frozen anchor and integrates nothing, so tracking the
-        measurement here is safe and removes the yaw stiffness.
+        WHY THIS IS SAFE, where the 2026-07-18 runaway spin was not:
+        that incident PRE-MULTIPLIED the published quat by a live-updating offset,
+        so the planner's frozen -35 deg residual survived as a constant lead and
+        the robot chased it forever. This REPLACES the planner's internal heading
+        belief with the measurement, discarding the residual. At rest the
+        commanded heading equals the measured heading, so the error is exactly
+        zero and there is no constant to chase. Assignment, not feedback.
 
-        Called only from the idle path. During PLAYING the offset stays frozen at
-        whatever heading idle last observed, which is exactly what we want: drive
-        and turns come out relative to the heading the robot was actually facing.
+        FRAME: ``current_root_wxyz`` is in the PLANNER frame, but what reaches the
+        wire is ``_reb1()`` = ``R_z(yaw_offset) (x) current_root_wxyz``, and
+        ``measured_yaw`` is world-frame. So the planner-frame target is
+        ``measured - yaw_offset``; the published yaw then comes out as exactly
+        ``measured``. Writing ``R_z(measured)`` here instead would double-count
+        the ignition offset.
+
+        Also fixes turn-start drift: ``_build_warm_qpos()`` seeds the ring from
+        ``current_root_wxyz`` on IDLE -> PLAYING, so keeping it truthful means each
+        turn begins from where the robot ACTUALLY points rather than from
+        accumulated open-loop error. (Within a single sustained turn PLAYING still
+        publishes model-predicted yaw verbatim -- deliberately, so commanded turns
+        execute as intended.)
         """
+        nonlocal current_root_wxyz
         if yaw_offset[0] is None:
             return                      # rebase not armed (sim / no x2_debug)
-        cur = measured_yaw.get(max_age_s=1.0)
-        if cur is not None:             # stale/absent -> keep the last good offset
-            yaw_offset[0] = cur
+        m = measured_yaw.get(max_age_s=POSE_FEEDBACK_MAX_AGE_S)
+        if m is None:
+            return                      # stale -> HOLD LAST GOOD, never identity
+        target = _wrap_pi(float(m) - float(yaw_offset[0]))   # -> planner frame
+        cur = _yaw_of_quat_xyzw(_idle_root_xyzw())
+        step = _wrap_pi(target - cur)
+        cap = MAX_YAW_RESYNC_RAD_S / OUTPUT_FPS
+        if step > cap:
+            step = cap
+        elif step < -cap:
+            step = -cap
+        current_root_wxyz = _quat_wxyz_from_yaw(_wrap_pi(cur + step))
 
     global_tick = 0
     last_intent_log: tuple[float, float, float, float] = _IDLE_INTENT
@@ -1946,6 +2032,24 @@ def run(args: argparse.Namespace) -> int:
     dance_started_t = 0.0
     post_dance_hold_until: Optional[float] = None
     _watchdog_last_log_t = 0.0
+
+    # ---- PLAYING -> IDLE stop blend (2026-07-19) --------------------------
+    # Releasing the stick used to snap the reference from the mid-stride gait
+    # frame straight to the frozen idle anchor in ONE 20 ms tick. Measured on
+    # the real robot (docs/experiments/incident_20260719_yaw_oscillation_fall):
+    # single-tick reference jumps up to 1.213 rad (69.5 deg) on ankle_pitch --
+    # ~3475 deg/s of commanded joint velocity, physically untrackable. Two of
+    # those landed in the seconds before the robot lost balance.
+    #
+    # G1's stock stack never does this: its idle is a MODE, not a pose. The
+    # controller keeps feeding the model the current velocity + heading and the
+    # model generates a natural stop, which is why the G1 takes another step or
+    # two after you release the key. We can't generate a stop without the model,
+    # but we can stop TELEPORTING: cross-fade the last gait frame into the
+    # anchor over STOP_BLEND_FRAMES with a half-cosine ease.
+    stop_blend_from: Optional[np.ndarray] = None
+    stop_blend_left: int = 0
+    last_gait_jpos: Optional[np.ndarray] = None
 
     def _idle_root_xyzw() -> np.ndarray:
         return _wxyz_to_xyzw(current_root_wxyz)
@@ -1964,17 +2068,26 @@ def run(args: argparse.Namespace) -> int:
         smoother shapes only the CURRENT frame; the future window stays
         raw -- same as x2_kplanner (futures are built pre-smoother)."""
         nonlocal global_tick
-        # DISABLED 2026-07-18 after a runaway-spin incident on hardware.
-        # _track_idle_yaw() removed yaw stiffness so idle would stop fighting
-        # hand-nudges. The unchecked assumption was that anchor ticks never
-        # publish while the robot is rotating. If they do, it is positive
-        # feedback: robot turns -> offset tracks the new heading -> reference
-        # rotates further -> robot turns more. Re-enable ONLY with a guard that
-        # refuses to track while is_playing, plus a slew limit (rad/s cap) so a
-        # feedback loop cannot run away even if the guard is wrong.
-        # _track_idle_yaw()
+        # Close the yaw loop for IDLE only. This is the ASSIGNMENT form (replace
+        # the planner's internal belief with the measurement), NOT the multiply
+        # form that caused the 2026-07-18 runaway spin. Reached only from the
+        # ``not is_playing`` branch, so PLAYING keeps publishing model-predicted
+        # yaw verbatim and commanded turns still execute as intended.
+        nonlocal stop_blend_left
+        _resync_idle_yaw_from_measured()
         xyzw = _reb1(_idle_root_xyzw())
-        jpos = ref_smoother.update(anchor_jpos, time.monotonic())
+
+        # Stop blend: ease the last gait frame into the anchor instead of
+        # snapping. w goes 0 -> 1 over STOP_BLEND_FRAMES (half-cosine, so the
+        # derivative is zero at BOTH ends -- no velocity step at entry or exit).
+        target_jpos = anchor_jpos
+        if stop_blend_left > 0 and stop_blend_from is not None:
+            done = 1.0 - (stop_blend_left / float(STOP_BLEND_FRAMES))
+            w = 0.5 * (1.0 - math.cos(math.pi * done))
+            target_jpos = (stop_blend_from * (1.0 - w)
+                           + anchor_jpos * w).astype(anchor_jpos.dtype)
+            stop_blend_left -= 1
+        jpos = ref_smoother.update(target_jpos, time.monotonic())
         payload = build_pose_payload_np(
             jpos, xyzw, current_root_xy, current_root_z, global_tick,
             future_jpos=[anchor_jpos] * NUM_FUTURE,
@@ -1997,25 +2110,50 @@ def run(args: argparse.Namespace) -> int:
             # generous fail-safe timeout proceeds unrebased if x2_debug
             # never appears (deploy never started / regression escape).
             if yaw_rebase_enabled:
-                deadline = time.monotonic() + max(0.0, args.yaw_capture_timeout_s)
+                # FAIL-STOP, NOT FAIL-OPEN (2026-07-18). This wait used to give
+                # up after --yaw-capture-timeout-s and publish unrebased. That
+                # is the WORST possible fallback: an unrebased publish is
+                # identity == world +X, a KNOWN-WRONG heading SONIC actively
+                # twists the body toward. Measured on hardware: commanded yaw
+                # pinned at exactly 0.0 deg while a 40 deg hand-nudge was driven
+                # back to -0.5 deg in ~1.5s.
+                #
+                # It also could not succeed on a clean start: x2_debug is
+                # published by the DEPLOY, which the ritual starts AFTER this
+                # planner, so a bounded wait always expired. It only ever armed
+                # when a PREVIOUS deploy happened to still be alive.
+                #
+                # Waiting indefinitely IS the lazy-arm: we latch on the first
+                # x2_debug frame whenever it arrives (seconds after the deploy
+                # comes up). Staying silent meanwhile is safe and intended --
+                # the watchdog holds the robot on its own measured-yaw-rebased
+                # idle clip, and the ritual's pre-deploy pose gate is satisfied
+                # by the watchdog's COLD_IDLE, not by us. No stream, no snap.
+                warn_every_s = max(5.0, float(args.yaw_capture_timeout_s))
+                next_warn = time.monotonic() + warn_every_s
+                waited_s = 0.0
                 log.info("waiting for x2_debug to capture ignition heading "
-                         "(silent; watchdog holds) -- up to %.0fs...",
-                         args.yaw_capture_timeout_s)
+                         "(silent; watchdog holds; will NOT proceed unrebased)...")
                 while not stop_event.is_set():
                     cap = measured_yaw.get(max_age_s=1.0)
                     if cap is not None:
                         yaw_offset[0] = cap
-                        log.info("measured-yaw rebase ARMED: ignition heading "
-                                 "%.1f deg (root quats -> robot frame)",
-                                 math.degrees(cap))
+                        log.info("measured-yaw rebase ARMED after %.1fs: "
+                                 "ignition heading %.1f deg "
+                                 "(root quats -> robot frame)",
+                                 waited_s, math.degrees(cap))
                         break
-                    if time.monotonic() >= deadline:
-                        log.warning("no x2_debug within %.0fs -- proceeding "
-                                    "WITHOUT rebase (world +X; SONIC may twist "
-                                    "to spawn heading)",
-                                    args.yaw_capture_timeout_s)
-                        break
+                    now_w = time.monotonic()
+                    if now_w >= next_warn:
+                        next_warn = now_w + warn_every_s
+                        log.warning("still no x2_debug after %.0fs -- staying "
+                                    "SILENT (watchdog holds the robot). This is "
+                                    "expected until the deploy starts; it "
+                                    "publishes x2_debug. Planner will arm and "
+                                    "begin publishing automatically.",
+                                    waited_s)
                     time.sleep(period_s)   # SILENT: do not publish pre-capture
+                    waited_s += period_s
 
             # ---- Quiet-stand warmup (frozen anchor).
             warmup_n = int(round(max(0.0, args.warmup_quiet_stand_s) * OUTPUT_FPS))
@@ -2172,9 +2310,16 @@ def run(args: argparse.Namespace) -> int:
                             warm[3:7].tolist(),
                         )
                     else:
+                        # Arm the stop blend from the LAST gait frame so the
+                        # reference eases into the anchor instead of snapping.
+                        if last_gait_jpos is not None:
+                            stop_blend_from = last_gait_jpos.copy()
+                            stop_blend_left = STOP_BLEND_FRAMES
                         log.info(
                             "state: PLAYING -> IDLE_LOOP (intent back to "
-                            "idle); freezing at root_xy=%s yaw_wxyz=%s",
+                            "idle); blending to anchor over %d ticks; "
+                            "freezing at root_xy=%s yaw_wxyz=%s",
+                            STOP_BLEND_FRAMES,
                             current_root_xy.tolist(),
                             current_root_wxyz.tolist(),
                         )
@@ -2215,6 +2360,10 @@ def run(args: argparse.Namespace) -> int:
                     jpos = ref_smoother.update(
                         qpos_np[7:].astype(np.float32), time.monotonic()
                     )
+                    # Remember what SONIC actually last received, so the stop
+                    # blend starts from the published frame (exact continuity)
+                    # rather than the raw planner frame.
+                    last_gait_jpos = jpos.copy()
                     payload = build_pose_payload_np(
                         jpos,
                         _reb1(_wxyz_to_xyzw(qpos_np[3:7])),
