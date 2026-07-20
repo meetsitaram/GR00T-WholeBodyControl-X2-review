@@ -64,6 +64,70 @@ CONTACT_Z_M = 0.02        # foot counts as planted within 2 cm of the
 # hand-trimmed relaxed-walk clips that drove the real robot reliably.
 SLIDE_REF_M_S = 0.12
 
+# Swing-event thresholds (see swing_events below).
+SWING_Z_M = 0.015          # foot must rise this far above its own stance floor
+SWING_KNEE_RAD = 0.12      # same leg's knee must flex this far from stance
+SWING_XY_M_PER_FRAME = 0.01  # foot must translate in the body frame
+_KNEE_DOF = {0: 3, 1: 9}   # left_knee, right_knee dof indices
+
+
+def swing_events(dof: np.ndarray, root_rot_xyzw: np.ndarray,
+                 root_trans: np.ndarray, mjcf: str | None = None
+                 ) -> list[tuple[int, int, int, int]]:
+    """Count SWING events per foot: rise + same-leg knee flexion + body-frame
+    foot translation, coincident for >=3 frames.
+
+    THE stepping metric. Foot-Z range alone is NOT one: body lean moves it
+    ~5-10 mm with zero actual steps (retraction, 2026-07-20). The three-way
+    conjunction cannot be produced by leaning.
+
+    Calibration (must reproduce before trusting a modified version):
+        REAL robot walks (run 20260719_205421,  L=7-10 R=8-11 swings
+            joint_pos + imu quat, fixed-height root; ~7s @0.3m/s each)
+        REF walk  (walk_forward_relax_001)      L=22 R=15 swings
+        REF turn  (idle_turn_270_R_004, 44f)    L=1  R=0   (the real step)
+        P100k slide / fullmask-hot 50k          0 everywhere (0 risen frames)
+
+    Returns per foot: (swing_count, frames_risen, frames_flexed, frames_both).
+    """
+    model = mujoco.MjModel.from_xml_path(_mjcf_path(mjcf))
+    data = mujoco.MjData(model)
+    bids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b)
+            for b in FOOT_BODIES]
+    T = len(dof)
+    F = np.zeros((T, 2, 3))
+    for t in range(T):
+        data.qpos[0:3] = root_trans[t]
+        q = root_rot_xyzw[t]
+        data.qpos[3:7] = [q[3], q[0], q[1], q[2]]
+        data.qpos[7:7 + dof.shape[1]] = dof[t]
+        mujoco.mj_kinematics(model, data)
+        for i, b in enumerate(bids):
+            F[t, i] = data.xpos[b]
+    yaw = _wxyz_yaw(np.stack([root_rot_xyzw[:, 3], root_rot_xyzw[:, 0],
+                              root_rot_xyzw[:, 1], root_rot_xyzw[:, 2]], 1))
+    out = []
+    for i in range(2):
+        zf = F[:, i, 2]
+        risen = zf > np.percentile(zf, 5) + SWING_Z_M
+        knee = dof[:, _KNEE_DOF[i]]
+        stance = np.median(knee[~risen]) if (~risen).any() else np.median(knee)
+        flexed = np.abs(knee - stance) > SWING_KNEE_RAD
+        dxy = F[:, i, :2] - root_trans[:, :2]
+        bx = dxy[:, 0] * np.cos(-yaw) - dxy[:, 1] * np.sin(-yaw)
+        by = dxy[:, 0] * np.sin(-yaw) + dxy[:, 1] * np.cos(-yaw)
+        sp = np.zeros(T)
+        sp[1:] = np.hypot(np.diff(bx), np.diff(by))
+        swing = risen & flexed & (sp > SWING_XY_M_PER_FRAME)
+        n = runs = 0
+        for u in swing:
+            n = n + 1 if u else 0
+            if n == 3:
+                runs += 1
+        out.append((runs, int(risen.sum()), int(flexed.sum()),
+                    int((risen & flexed).sum())))
+    return out
+
 
 def _mjcf_path(explicit: str | None) -> str:
     if explicit:

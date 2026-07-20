@@ -642,6 +642,10 @@ def _load_onnx_contract(onnx_path: Path, sidecar: Optional[Path]) -> dict:
 class OnnxPlannerBackend:
     """Ring buffer + onnxruntime fused-graph replan (torch-free)."""
 
+    # Flipped by --ort-gpu in main(). Class-level so the flag set once at
+    # startup reaches every backend instance without threading it through.
+    USE_GPU: bool = False
+
     def __init__(
         self,
         onnx_path: Path,
@@ -651,10 +655,24 @@ class OnnxPlannerBackend:
     ) -> None:
         import onnxruntime as ort
 
+        # Provider order: GPU (CUDA) first with CPU fallback when --ort-gpu is
+        # set, else CPU-only (the safe default that has always shipped). ORT
+        # silently drops any provider not present in the build, so on a CPU-only
+        # onnxruntime this still runs on CPU -- the flag is a no-op until a
+        # Jetson GPU build of onnxruntime is installed in the venv.
+        # NOTE: CUDA kernels may sample differently from CPU for the same
+        # random_seed. Fine for deploy; but an intent-tape replay must use the
+        # SAME provider it was recorded under to stay bit-exact.
+        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                     if OnnxPlannerBackend.USE_GPU
+                     else ["CPUExecutionProvider"])
         t0 = time.monotonic()
-        self._sess = ort.InferenceSession(
-            str(onnx_path), providers=["CPUExecutionProvider"]
-        )
+        self._sess = ort.InferenceSession(str(onnx_path), providers=providers)
+        _active = self._sess.get_providers()
+        log.info("onnxruntime providers requested=%s active=%s", providers, _active)
+        if OnnxPlannerBackend.USE_GPU and "CUDAExecutionProvider" not in _active:
+            log.warning("--ort-gpu set but CUDAExecutionProvider NOT active -- "
+                        "onnxruntime build lacks CUDA; running on CPU.")
         self._contract = contract
         sess_inputs = {i.name for i in self._sess.get_inputs()}
         sess_outputs = [o.name for o in self._sess.get_outputs()]
@@ -844,6 +862,18 @@ class OnnxPlannerBackend:
         self._resample_active = True
         frame = self._resampled_output_frame(0.0)
         step = self._model_fps / self._resample_output_fps
+        # Starvation telemetry: serving at/past the last buffered frame means
+        # SONIC receives a frozen reference at full 50 Hz -- invisible to the
+        # silence-based pose watchdog (tape 20260719: stumbles). Should be
+        # unreachable with replan threshold 32; scream if it ever recurs.
+        if self._read_pos >= self._buf.shape[0] - 1:
+            self._starved_ticks = getattr(self, "_starved_ticks", 0) + 1
+            if self._starved_ticks in (1, 25) or self._starved_ticks % 250 == 0:
+                log.warning("ring STARVED: serving frozen end-of-buffer frame "
+                            "(tick %d of this episode)", self._starved_ticks)
+            _TAPE.ev("starved", n=self._starved_ticks)
+        else:
+            self._starved_ticks = 0
         self._read_pos += step
         self._cursor = int(np.floor(self._read_pos))
         if self._blend_prev_buf is not None:
@@ -906,6 +936,12 @@ class OnnxPlannerBackend:
             )
             feeds[roles["mode"]] = np.asarray([self.mode_idx], dtype=np.int64)
             feeds[roles["random_seed"]] = np.asarray([seed], dtype=np.int64)
+            _TAPE.ev("replan_prep", seed=seed, mode=int(self.mode_idx),
+                     target=list(target))
+        # Snapshot the serve position so commit can fast-forward the new
+        # buffer by whatever played during inference (see replan_commit).
+        self._prep_read_pos = float(self._read_pos)
+        self._prep_cursor = int(self._cursor)
         for name, spec in (self._contract.get("extra_inputs") or {}).items():
             dtype = np.int64 if spec.get("dtype", "f32") == "i64" else np.float32
             arr = np.asarray(spec["value"], dtype=dtype)
@@ -957,10 +993,31 @@ class OnnxPlannerBackend:
             self._blend_prev_buf = self._buf
             self._blend_prev_pos = float(self._read_pos)
             self._blend_remaining = self.BLEND_FRAMES
+        # REWIND FIX (run 20260719_214150): the new chunk continues from the
+        # PREP-time context, but the publisher kept serving the old buffer
+        # during the 0.3-0.6 s inference. Restarting the new buffer at 0
+        # therefore rewound the served reference by the frames consumed
+        # during inference (~18 = half a gait cycle at walk cadence); the
+        # 8-tick seam blend then averaged antiphase leg poses into a
+        # near-still reference. Fast-forward the new buffer by exactly the
+        # frames consumed since prep so served content stays continuous.
+        base = NUM_FRAMES_PER_TOKEN - PRED_OFFSETS  # == 0
+        consumed = 0.0
+        if getattr(self, "commit_fastforward", True):
+            if self._resample_active:
+                consumed = max(0.0, float(self._read_pos)
+                               - getattr(self, "_prep_read_pos", self._read_pos))
+            else:
+                consumed = float(max(0, self._cursor
+                                     - getattr(self, "_prep_cursor", self._cursor)))
+            consumed = min(consumed, max(0.0, float(npf - 2)))
         self._buf = pred
-        self._cursor = NUM_FRAMES_PER_TOKEN - PRED_OFFSETS  # == 0
+        self._cursor = int(base + consumed)
         if self._resample_active:
-            self._read_pos = float(NUM_FRAMES_PER_TOKEN - PRED_OFFSETS)
+            self._read_pos = float(base) + consumed
+        if consumed > 0:
+            _TAPE.ev("commit_ff", consumed=round(consumed, 2), npf=int(npf))
+        _TAPE.chunk(pred, npf)
         return npf
 
     def replan(self, target: tuple[float, float, float, float]) -> int:
@@ -1326,6 +1383,8 @@ class PosePublisher:
 
     def publish(self, payload: dict[str, np.ndarray]) -> None:
         self._sock.send(pack_pose_message(payload, topic=self._topic, version=4))
+        self._tape_seq = getattr(self, "_tape_seq", -1) + 1
+        _TAPE.ev("tick", seq=self._tape_seq)
 
     def close(self) -> None:
         self._sock.close(linger=0)
@@ -1534,6 +1593,9 @@ def _zmq_command_thread(
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 log.warning("planner_cmd: bad payload %r: %s", parts[1], exc)
                 continue
+            _TAPE.ev("intent_recv", intent=intent, magnitude=magnitude,
+                     stick_fwd=stick_fwd, stick_side=stick_side,
+                     stick_yaw=stick_yaw, direct_velocity=direct_velocity)
             cmd_queue.put(
                 LocomotionCommand(
                     intent=intent,
@@ -1713,7 +1775,20 @@ def _planner_worker(
                 needs_replan = backend.should_replan()
         else:
             replan_event.clear()
-            needs_replan = True
+            # Stale-event guard (tape 20260719_205421: every mid-walk replan
+            # double-fired). The 50 Hz loop re-arms this event on every tick
+            # the buffer is below threshold -- including the whole inference
+            # window of the replan already refilling it -- so a fresh commit
+            # was immediately followed by a redundant replan and a second
+            # overlapping seam blend. Re-check the actual buffer state after
+            # clearing; explicit forces (IDLE->PLAYING reseed) still pass via
+            # the _force_replan flag because reset() leaves the ring full and
+            # should_replan() alone would skip them.
+            with replan_lock:
+                forced = getattr(backend, "_force_replan", False)
+                if forced:
+                    backend._force_replan = False
+                needs_replan = forced or backend.should_replan()
         if not needs_replan or stop_event.is_set():
             continue
         if dance_active.is_set():
@@ -1756,9 +1831,38 @@ def _planner_worker(
             # cannot (it fuses inference with the buffer swap) and falls back
             # to the fully-locked path.
             if hasattr(backend, "replan_prepare"):
-                with replan_lock:
-                    prep = backend.replan_prepare(target)
-                pred, npf = backend.replan_infer(prep)      # <-- no lock
+                # Chunk LIVENESS GATE (run 20260719_214150: the model emitted
+                # a standing chunk mid-walk -> 2.0 s dead reference -> violent
+                # catch-up). A committed standing chunk contaminates the next
+                # replan's context, making the collapse self-sustaining. So:
+                # while a walk is commanded, reject statistically-still chunks
+                # BEFORE commit (old, still-walking buffer keeps streaming),
+                # re-roll with a fresh seed; after N failures commit anyway
+                # and scream -- a sliding reference beats a starved one.
+                # Threshold from measured data: walking chunks show hip-pitch
+                # std ~0.12 rad, the dead-window reference ~0.01.
+                walk_cmded = (abs(target[0]) + abs(target[1])
+                              + abs(target[2])) > 0.10
+                for attempt in range(3):
+                    with replan_lock:
+                        prep = backend.replan_prepare(target)
+                    pred, npf = backend.replan_infer(prep)  # <-- no lock
+                    if not walk_cmded:
+                        break
+                    hp_std = float(max(np.std(pred[:npf, 7]),
+                                       np.std(pred[:npf, 13])))
+                    if hp_std > 0.045:
+                        break
+                    _TAPE.ev("chunk_rejected", attempt=attempt + 1,
+                             hip_pitch_std=round(hp_std, 4),
+                             target=list(target))
+                    log.warning(
+                        "liveness gate: standing chunk while walk commanded "
+                        "(hip_pitch_std=%.4f, attempt %d/3) -- re-rolling",
+                        hp_std, attempt + 1)
+                else:
+                    log.error("liveness gate: 3 standing chunks in a row; "
+                              "committing anyway (reference may slide)")
                 with replan_lock:
                     backend.replan_commit(pred, npf)
             else:
@@ -1770,11 +1874,112 @@ def _planner_worker(
             continue
         log.debug("worker: replan done in %.1fms (frames_remaining=%d)",
                   (time.monotonic() - t0) * 1000.0, backend.frames_remaining)
+        _TAPE.ev("replan_done", ms=round((time.monotonic() - t0) * 1000.0, 1),
+                 frames_remaining=int(backend.frames_remaining))
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
+
+class _IntentTape:
+    """Machine-readable replay tape: jsonl of every intent (received and
+    applied), every replan (with its RNG seed -> bit-exact offline replay),
+    and every published tick, each stamped with monotonic + wall time.
+
+    Exists because the human-readable daemon log has no reliable per-event
+    timing (kplanner_gen_from_log.py had to invent a timing template). One
+    tape per daemon start; capture_robot_run.py harvests it next to the
+    deploy telemetry. Never raises: a broken tape must not touch the robot.
+
+    Env: KPLANNER_TAPE=0 disables; KPLANNER_TAPE_DIR overrides the default
+    <PC2_PREFIX or .>/log/kplanner_tape/ location.
+    """
+
+    def __init__(self) -> None:
+        self._fh = None
+        self._t0 = time.monotonic()
+        if os.environ.get("KPLANNER_TAPE", "1") == "0":
+            return
+        try:
+            root = os.environ.get("KPLANNER_TAPE_DIR")
+            if not root:
+                # rituals launch us with cwd=/ and no env: derive from the
+                # script's own home (on PC2 that is /home/run/getsolo, which
+                # has log/); fall back to /tmp rather than dying.
+                prefix = os.environ.get("PC2_PREFIX", "")
+                script_home = os.path.dirname(os.path.abspath(__file__))
+                for base in (prefix, script_home, "."):
+                    if base and os.path.isdir(os.path.join(base, "log")):
+                        root = os.path.join(base, "log", "kplanner_tape")
+                        break
+                else:
+                    import tempfile
+                    root = os.path.join(tempfile.gettempdir(), "kplanner_tape")
+            os.makedirs(root, exist_ok=True)
+            path = os.path.join(
+                root, time.strftime("tape_%Y%m%d_%H%M%S.jsonl"))
+            self._fh = open(path, "a", buffering=1)
+            # FRAME TAPE (full-content observability, run 20260719_214150:
+            # source of a dead reference could not be attributed because no
+            # artifact records what the planner actually puts on the wire).
+            # Binary f32 records, 40 per tick:
+            #   [tm, branch, root_xy(2), root_z, quat_xyzw(4), jpos(31)]
+            # branch: 0=ring/planner 1=idle-anchor 2=stop-blend 3=dance.
+            # Committed chunks are dumped whole as <session>_chunks/*.npy.
+            self._ffh = open(path.replace(".jsonl", ".frames.f32"), "ab")
+            self._chunk_dir = path.replace(".jsonl", "_chunks")
+            os.makedirs(self._chunk_dir, exist_ok=True)
+            self.ev("start", wall=time.time(), argv=sys.argv[1:])
+            log.info("intent tape: %s (+frames.f32, +chunks/)", path)
+        except Exception as exc:  # noqa: BLE001 - tape must never kill the daemon
+            log.warning("intent tape disabled: %s", exc)
+            self._fh = None
+            self._ffh = None
+
+    def frame(self, branch: float, xy, z: float, quat_xyzw, jpos) -> None:
+        if getattr(self, "_ffh", None) is None:
+            return
+        try:
+            rec = np.empty(40, dtype=np.float32)
+            rec[0] = time.monotonic() - self._t0
+            rec[1] = branch
+            rec[2:4] = np.asarray(xy, dtype=np.float32)[:2]
+            rec[4] = z
+            rec[5:9] = np.asarray(quat_xyzw, dtype=np.float32)[:4]
+            rec[9:40] = np.asarray(jpos, dtype=np.float32)[:31]
+            rec.tofile(self._ffh)
+            self._ffh.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def chunk(self, pred: "np.ndarray", npf: int) -> None:
+        if getattr(self, "_chunk_dir", None) is None:
+            return
+        try:
+            tm = time.monotonic() - self._t0
+            np.save(os.path.join(self._chunk_dir, f"chunk_{tm:09.3f}.npy"),
+                    np.asarray(pred[:npf], dtype=np.float32))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def ev(self, kind: str, **kw) -> None:
+        if self._fh is None:
+            return
+        try:
+            kw["ev"] = kind
+            kw["tm"] = round(time.monotonic() - self._t0, 6)
+            kw["tw"] = round(time.time(), 3)
+            self._fh.write(json.dumps(kw, default=str) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_TAPE = _IntentTape.__new__(_IntentTape)
+_TAPE._fh = None   # inert until run() replaces it
+_TAPE._ffh = None
+_TAPE._chunk_dir = None
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -1787,6 +1992,9 @@ def _setup_logging(verbose: bool) -> None:
 
 def run(args: argparse.Namespace) -> int:
     _setup_logging(args.verbose)
+    OnnxPlannerBackend.USE_GPU = bool(getattr(args, "ort_gpu", False))
+    global _TAPE
+    _TAPE = _IntentTape()
 
     global _RUNTIME_TURN_LEFT_SCALE, _RUNTIME_TURN_RIGHT_SCALE
     global _RUNTIME_FORWARD_SCALE, _RUNTIME_BACKWARD_SCALE, _RUNTIME_LATERAL_SCALE
@@ -1961,18 +2169,54 @@ def run(args: argparse.Namespace) -> int:
     # counts the planner's own yaw integration during PLAYING. None ==
     # no x2_debug (sim/laptop) -> rebase is a no-op.
     yaw_offset: list[Optional[float]] = [None]
+    # PLAYING-scope heading trim (2026-07-20). The mid-walk complement of the
+    # IDLE yaw resync: a slew-limited, deadbanded wire-frame rotation that
+    # bleeds reference-vs-measured heading error DURING walks, so nudges and
+    # the root model's open-loop yaw wander (measured 6-33 deg per walk;
+    # reference-led whip at the worst stumble) never accumulate into a
+    # violent SONIC correction. ASSIGNMENT-form servo on the published error
+    # (converges; step -> 0 as published -> measured), never the multiply
+    # form of the 2026-07-18 runaway. Gated off while a turn is commanded so
+    # deliberate turns still lead the robot. Default OFF (--playing-yaw-
+    # resync-dps 0); evaluate in the sim stack first.
+    yaw_trim: list[float] = [0.0]
+
+    def _eff_off() -> Optional[float]:
+        if yaw_offset[0] is None:
+            return None
+        return yaw_offset[0] + yaw_trim[0]
 
     def _reb1(q_xyzw: np.ndarray) -> np.ndarray:
-        if yaw_offset[0] is None:
+        off = _eff_off()
+        if off is None:
             return q_xyzw
         return rebase_quats_xyzw_by_yaw(
-            np.asarray(q_xyzw, dtype=np.float32).reshape(1, 4), yaw_offset[0]
+            np.asarray(q_xyzw, dtype=np.float32).reshape(1, 4), off
         )[0]
 
     def _rebL(qs: list[np.ndarray]) -> list[np.ndarray]:
         if yaw_offset[0] is None:
             return qs
         return [_reb1(q) for q in qs]
+
+    def _reb_xy(xy: np.ndarray) -> np.ndarray:
+        """Rotate a planner-frame root XY into the wire frame.
+
+        The quat has ALWAYS been rebased by R_z(yaw_offset) (_reb1) but the
+        XY went out raw -- so published position and orientation were in
+        frames that disagree by the ignition heading. Nothing on the robot
+        consumed XY (SONIC's tokenizer obs is joints + relative orientation
+        only), but every tape consumer (frame tape, overlay, gait metrics)
+        saw forward walks as world-frame crab-walks (2026-07-20, operator-
+        caught). Rotate XY by the same offset so the wire is self-consistent.
+        """
+        off = _eff_off()
+        if off is None:
+            return xy
+        c = math.cos(off)
+        s = math.sin(off)
+        return np.array([c * xy[0] - s * xy[1],
+                         s * xy[0] + c * xy[1]], dtype=np.float64)
 
     def _resync_idle_yaw_from_measured() -> None:
         """IDLE-only: re-anchor the reference heading to the MEASURED yaw.
@@ -2010,12 +2254,13 @@ def run(args: argparse.Namespace) -> int:
         execute as intended.)
         """
         nonlocal current_root_wxyz
-        if yaw_offset[0] is None:
+        off = _eff_off()
+        if off is None:
             return                      # rebase not armed (sim / no x2_debug)
         m = measured_yaw.get(max_age_s=POSE_FEEDBACK_MAX_AGE_S)
         if m is None:
             return                      # stale -> HOLD LAST GOOD, never identity
-        target = _wrap_pi(float(m) - float(yaw_offset[0]))   # -> planner frame
+        target = _wrap_pi(float(m) - float(off))   # -> planner frame
         cur = _yaw_of_quat_xyzw(_idle_root_xyzw())
         step = _wrap_pi(target - cur)
         cap = MAX_YAW_RESYNC_RAD_S / OUTPUT_FPS
@@ -2088,13 +2333,16 @@ def run(args: argparse.Namespace) -> int:
                            + anchor_jpos * w).astype(anchor_jpos.dtype)
             stop_blend_left -= 1
         jpos = ref_smoother.update(target_jpos, time.monotonic())
+        wire_xy = _reb_xy(current_root_xy)
         payload = build_pose_payload_np(
-            jpos, xyzw, current_root_xy, current_root_z, global_tick,
+            jpos, xyzw, wire_xy, current_root_z, global_tick,
             future_jpos=[anchor_jpos] * NUM_FUTURE,
             future_quat=[xyzw] * NUM_FUTURE,
             hand_dof=args.hand_dof,
         )
         publisher.publish(payload)
+        _TAPE.frame(2.0 if stop_blend_left > 0 else 1.0,
+                    wire_xy, current_root_z, xyzw, jpos)
         global_tick += 1
 
     try:
@@ -2218,6 +2466,9 @@ def run(args: argparse.Namespace) -> int:
                         log.info("intent applied (%s, %s, %s) -> target=%s",
                                  latest_cmd.intent, latest_cmd.magnitude,
                                  latest_cmd.source, target)
+                        _TAPE.ev("intent_applied", target=list(target),
+                                 intent=latest_cmd.intent,
+                                 magnitude=latest_cmd.magnitude)
                         last_intent_log = target
 
                 # ---- Stale-command watchdog (opt-in, default OFF).
@@ -2252,7 +2503,8 @@ def run(args: argparse.Namespace) -> int:
                         <= ref_smoother.ramp_duration_s,
                     )
                     payload = build_pose_payload_np(
-                        jpos_s, _reb1(quat), current_root_xy, current_root_z,
+                        jpos_s, _reb1(quat), _reb_xy(current_root_xy),
+                        current_root_z,
                         global_tick, future_jpos=fut_j,
                         future_quat=_rebL(fut_q),
                         hand_dof=args.hand_dof,
@@ -2302,6 +2554,7 @@ def run(args: argparse.Namespace) -> int:
                         warm = _build_warm_qpos()
                         with replan_lock:
                             backend.reset(warm)
+                            backend._force_replan = True
                         replan_event.set()
                         log.info(
                             "state: IDLE_LOOP -> PLAYING (intent=%s); buffer "
@@ -2364,10 +2617,33 @@ def run(args: argparse.Namespace) -> int:
                     # blend starts from the published frame (exact continuity)
                     # rather than the raw planner frame.
                     last_gait_jpos = jpos.copy()
+                    # PLAYING yaw resync (see yaw_trim above): bleed the
+                    # published-vs-measured heading error, slew-limited and
+                    # deadbanded, only while no turn is commanded.
+                    if (args.playing_yaw_resync_dps > 0.0
+                            and yaw_offset[0] is not None
+                            and abs(float(current_target[0])) < 0.05):
+                        m_yaw = measured_yaw.get(
+                            max_age_s=POSE_FEEDBACK_MAX_AGE_S)
+                        if m_yaw is not None:
+                            pub_yaw = _wrap_pi(
+                                _yaw_of_quat_xyzw(_wxyz_to_xyzw(qpos_np[3:7]))
+                                + _eff_off())
+                            err = _wrap_pi(float(m_yaw) - pub_yaw)
+                            dead = math.radians(
+                                args.playing_yaw_resync_deadband_deg)
+                            if abs(err) > dead:
+                                cap = (math.radians(
+                                    args.playing_yaw_resync_dps) / OUTPUT_FPS)
+                                yaw_trim[0] = float(np.clip(
+                                    yaw_trim[0] + max(-cap, min(cap, err)),
+                                    -0.6, 0.6))
+                    wire_xyzw = _reb1(_wxyz_to_xyzw(qpos_np[3:7]))
+                    wire_xy = _reb_xy(current_root_xy)
                     payload = build_pose_payload_np(
                         jpos,
-                        _reb1(_wxyz_to_xyzw(qpos_np[3:7])),
-                        current_root_xy,
+                        wire_xyzw,
+                        wire_xy,
                         current_root_z,
                         global_tick,
                         future_jpos=[fq[7:].astype(np.float32)
@@ -2377,6 +2653,8 @@ def run(args: argparse.Namespace) -> int:
                         hand_dof=args.hand_dof,
                     )
                     publisher.publish(payload)
+                    _TAPE.frame(0.0, wire_xy, current_root_z,
+                                wire_xyzw, jpos)
                     global_tick += 1
 
                 next_tick += period_s
@@ -2477,9 +2755,19 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Idle-anchor stream duration after a clip ends or "
                         "is stopped, before the planner resumes.")
 
-    p.add_argument("--replan-threshold-frames", type=int, default=16)
+    p.add_argument(
+        "--replan-threshold-frames", type=int, default=32,
+        help="Replan when this many model frames (30fps) remain. Was 16 = "
+             "0.53s, which PC2's 0.3-0.6s CPU inference consumed entirely, "
+             "starving the ring at every mid-walk seam (tape 20260719). 32 "
+             "gives ~0.4s commit margin at worst-case latency.")
     p.add_argument("--duration-s", type=float, default=0.0)
     p.add_argument("--hand-dof", type=int, default=DEFAULT_HAND_DOF)
+    p.add_argument("--ort-gpu", action="store_true",
+                   help="request CUDAExecutionProvider (CPU fallback). No-op "
+                        "unless the venv has a Jetson GPU build of onnxruntime. "
+                        "GPU inference (~tens of ms vs 0.3-0.6s CPU) would also "
+                        "let --replan-threshold-frames drop back toward 16.")
     p.add_argument("--pid-file", type=Path,
                    default=Path("/tmp/pc2_kplanner_onnx.pid"))
 
@@ -2497,6 +2785,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     tune.add_argument("--continuous-forward-min-mps", type=float,
                       default=_DEFAULT_CONTINUOUS_FORWARD_MIN_MPS)
     tune.add_argument("--yaw-lock-epsilon", type=float, default=0.0)
+    tune.add_argument("--playing-yaw-resync-dps", type=float, default=0.0,
+                      help="If >0, bleed published-vs-measured heading error "
+                           "DURING walks at this slew rate (deg/s), deadbanded, "
+                           "gated off while a turn is commanded. Assignment-"
+                           "form wire trim; 0 = off (legacy). Try ~10.")
+    tune.add_argument("--playing-yaw-resync-deadband-deg", type=float,
+                      default=2.0,
+                      help="No resync while |error| is under this (noise).")
     tune.add_argument("--cold-start-ramp-tau-s", type=float, default=0.0)
     tune.add_argument("--command-watchdog-s", type=float, default=0.0)
 

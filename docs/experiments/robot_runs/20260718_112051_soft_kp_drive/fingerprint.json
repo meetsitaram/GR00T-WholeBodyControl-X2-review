@@ -1,0 +1,27 @@
+{
+  "sonic_md5": "44e71de6a98158131c51664e833ad82f",
+  "planner_tmpl_md5": "b9b84d689ab27335346ad588897dc30b",
+  "runtime_md5": "48a8e3551cd6fc19dabfe4a5d3a61550",
+  "ritual_md5": "d8886e8817d6a7a767425803a654ef4c",
+  "tuning_file": "walking_soft_kp.yaml",
+  "anchor": "kplanner_idle_anchor_g1teleop_v3",
+  "smoother": "halfcos",
+  "stop_blend": "1",
+  "gains": {
+    "kp_scale_ankle_pitch": 1.4,
+    "kp_scale_ankle_roll": 1.15,
+    "kp_scale_knee": 1.2,
+    "kp_scale_waist_yaw": 1.0,
+    "kp_scale_waist_pr": 2.0,
+    "kd_scale_ankle_pitch": 2.0,
+    "kd_scale_ankle_roll": 1.5,
+    "kd_scale_knee": 0.792,
+    "kd_scale_hip": 0.476,
+    "kd_scale_waist_yaw": 1.5,
+    "kd_scale_waist_pr": 5.51
+  },
+  "run_dir": "/home/run/getsolo/log/deploy_20260719_021645",
+  "captured_at": "20260718_112051",
+  "label": "soft_kp_drive",
+  "note": "drove with planner: walk + turns + stick releases. operator: clicks IMPROVED vs previous configs"
+}

@@ -19,7 +19,7 @@ start_tmux x2_motor_monitor "bash /home/run/getsolo/log/start_x2_motor_monitor.s
 start_tmux pc2_kplanner "PYTHONPATH=$PS:$PS/motionbricks stdbuf -oL -eL $PY /home/run/getsolo/pc2_kplanner_onnx.py \
   --onnx $PS/models/planner_onnx/x2_planner_template.onnx --planner-mode slow_walk \
   --warmup-qpos $PS/models/kplanner_idle_anchor_g1teleop_v3.pkl \
-  --dances-dir $PS/models/dances_x2m2 2>&1 | tee -a /home/run/getsolo/log/pc2_kplanner.log"
+  --dances-dir $PS/models/dances_x2m2 --ort-gpu --playing-yaw-resync-dps 10 2>&1 | tee -a /home/run/getsolo/log/pc2_kplanner.log"
 sleep 3
 # Curated dance banks (was: every clip in dances_x2m2, 14 of them).
 #   L1+Y / L1+A  -> EASY

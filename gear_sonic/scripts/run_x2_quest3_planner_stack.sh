@@ -1523,7 +1523,10 @@ fi
 # present unless the operator overrode them explicitly via
 # ``--kplanner-*-ckpt`` (in which case we trust the path and let the
 # Python daemon raise a clean FileNotFoundError on boot).
-if [[ "${VLA_MODE}" -eq 0 && "${PLANNER_KIND}" == "kplanner" ]]; then
+if [[ "${VLA_MODE}" -eq 0 && "${PLANNER_KIND}" == "kplanner" && -z "${KPLANNER_ONNX:-}" ]]; then
+    # ONNX mode (KPLANNER_ONNX set) loads a fused graph and never touches these
+    # torch checkpoints -- so skip the check entirely for it. Otherwise a run
+    # that IS using the ONNX would abort on missing torch ckpts it never reads.
     # Must mirror x2_kplanner.py's argparse defaults + load_x2_planner.py's
     # X2PlannerPaths.default(). Pinned step checkpoints (not last.ckpt) so
     # a fresh training run doesn't silently re-point inference at an

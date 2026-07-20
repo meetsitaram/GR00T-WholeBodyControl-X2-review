@@ -1,0 +1,27 @@
+{
+  "sonic_md5": "44e71de6a98158131c51664e833ad82f",
+  "planner_tmpl_md5": "e21eab87f81a676fc6fcc0f8cc48acdf",
+  "runtime_md5": "bf0d7b87b317a3c5395f1b55a969ffbf",
+  "ritual_md5": "e585f2717d1b4ac0295ed0c9597ed5a6",
+  "tuning_file": "walking_soft_kp.yaml",
+  "anchor": "kplanner_idle_anchor_g1teleop_v3",
+  "smoother": "",
+  "stop_blend": "1",
+  "gains": {
+    "kp_scale_ankle_pitch": 1.4,
+    "kp_scale_ankle_roll": 1.15,
+    "kp_scale_knee": 1.2,
+    "kp_scale_waist_yaw": 1.0,
+    "kp_scale_waist_pr": 2.0,
+    "kd_scale_ankle_pitch": 2.0,
+    "kd_scale_ankle_roll": 1.5,
+    "kd_scale_knee": 0.792,
+    "kd_scale_hip": 0.476,
+    "kd_scale_waist_yaw": 1.5,
+    "kd_scale_waist_pr": 5.51
+  },
+  "run_dir": "/home/run/getsolo/log/deploy_20260720_225906",
+  "captured_at": "20260720_080239",
+  "label": "gpu_first_session_360turns",
+  "note": "first GPU-inference session; smooth walks; full 360 in-place turns BOTH?; nudge still fought (resync off)"
+}

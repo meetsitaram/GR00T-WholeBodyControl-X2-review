@@ -80,7 +80,33 @@ REMOTE=$(ssh -o ConnectTimeout=8 "run@$PC2_IP" "
     fi
   done
   echo \"handoff \$(grep -c get_next_frame_resampled $R_RUNTIME 2>/dev/null || echo 0) \$(date -r $R_RUNTIME '+%Y-%m-%d_%H:%M:%S' 2>/dev/null || echo -)\"
-" 2>/dev/null) || { echo "  ERROR: cannot reach run@$PC2_IP" >&2; exit 3; }
+" 2>/dev/null) && REMOTE_RC=0 || REMOTE_RC=$?
+if [[ $REMOTE_RC -ne 0 ]]; then
+  # PC2 unreachable. A sim-only validation run must NOT require the robot to be
+  # online -- the whole point is to test a candidate BEFORE deploying. So:
+  #   ALLOW_MISMATCH=1 -> warn and proceed with NO identity comparison.
+  #   otherwise        -> abort (a certification run must confirm the robot).
+  if [[ "${ALLOW_MISMATCH:-0}" == "1" ]]; then
+    echo "  WARN: cannot reach run@$PC2_IP -- no robot identity comparison possible."
+    echo "        Proceeding validates the CANDIDATE with NO check against the robot."
+    # A manual keypress, not just the env var: skipping the robot check is a
+    # deliberate act each run, never a silent default. Read from the terminal
+    # (/dev/tty) so a piped stdin can't auto-answer; no tty -> treat as 'no'.
+    printf "  Proceed OFFLINE without the robot check? [y/N] "
+    read -r _off_ans </dev/tty 2>/dev/null || _off_ans=""
+    if [[ "$_off_ans" != "y" && "$_off_ans" != "Y" ]]; then
+      echo "  aborted -- no offline confirmation." >&2
+      exit 3
+    fi
+    echo "  confirmed -- running OFFLINE, candidate results only."
+    REMOTE=""
+    GATE_OFFLINE=1
+  else
+    echo "  ERROR: cannot reach run@$PC2_IP" >&2
+    echo "         (set ALLOW_MISMATCH=1 to validate a candidate without the robot)" >&2
+    exit 3
+  fi
+fi
 
 r_field() { echo "$REMOTE" | awk -v k="$1" '$1 ~ k {print $2; exit}'; }
 r_time()  { echo "$REMOTE" | awk -v k="$1" '$1 ~ k {print $3; exit}'; }

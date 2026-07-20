@@ -224,15 +224,28 @@ def _load_planner(args, device: str = "cpu"):
         load_x2_planner,
     )
 
+    # Version dir (hparams/stats/skeleton) MUST come from the checkpoint's own
+    # run dir, NOT the default. A checkpoint trained on one corpus carries its
+    # own normalization stats; pairing it with a different run's stats is a
+    # silent mismatch that --verify cannot catch (parity uses the same config on
+    # both torch and onnx sides). Standard Lightning layout:
+    #   <version_dir>/checkpoints/<ckpt>  ->  version_dir = ckpt.parents[1]
     default_paths = X2PlannerPaths.default()
+
+    def _vdir(ckpt: str) -> Path:
+        vd = Path(ckpt).resolve().parents[1]
+        return vd if (vd / "hparams.yaml").exists() else default_paths.vqvae_version_dir
+
     paths = X2PlannerPaths(
         vqvae_ckpt=Path(args.vqvae_ckpt),
         pose_ckpt=Path(args.pose_ckpt),
         root_ckpt=Path(args.root_ckpt),
-        vqvae_version_dir=default_paths.vqvae_version_dir,
-        pose_version_dir=default_paths.pose_version_dir,
-        root_version_dir=default_paths.root_version_dir,
+        vqvae_version_dir=_vdir(args.vqvae_ckpt),
+        pose_version_dir=_vdir(args.pose_ckpt),
+        root_version_dir=_vdir(args.root_ckpt),
     )
+    log.info("version dirs: vqvae=%s pose=%s root=%s",
+             paths.vqvae_version_dir, paths.pose_version_dir, paths.root_version_dir)
     t0 = time.time()
     core = load_x2_planner(paths, device=device, clip_library_ckpt=Path(args.clip_ckpt))
     log.info("planner loaded in %.1fs (device=%s)", time.time() - t0, device)

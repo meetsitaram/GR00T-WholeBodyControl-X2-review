@@ -74,7 +74,24 @@ visible in every training sample**, so the 100%-masked regime that generation
 actually runs in is never trained; ambiguous-conditioning motions (idle vs
 turn) collapse to the idle mode.
 
-## 5. The fix (novel over stock): `fully_masked_sample_prob`
+## 5. `fully_masked_sample_prob` — mechanism verified, EFFICACY NOT DEMONSTRATED
+
+**Retraction (2026-07-20):** an apparent standing-turn improvement at
+hot-run +50k (foot-Z range 6→10 mm) was a metric artifact — lean/ankle
+geometry, not stepping. The operator caught it visually; a calibrated
+STEP-EVENT metric (foot >2 cm above its own stance floor for ≥3 frames)
+scores: reference turn 1 event, known-slide P100k 0, fullmask-hot +50k
+0 in both directions. Through +50k the warm-start fullmask fine-tune has
+produced **zero actual steps** — its output never even lifts a foot 1.5 cm.
+
+**Standard stepping metric going forward**: `swing_events()` in
+`gear_sonic/scripts/kplanner_frame_eval.py` — a three-way conjunction
+(foot rise above own stance floor + same-leg knee flexion from stance +
+body-frame foot translation, coincident ≥3 frames) that body lean cannot
+fake. Calibration: REF walk 22/15 swings, REF turn 1/0 (the real step),
+P100k and fullmask-hot 0 everywhere. Foot-Z range is NOT a stepping
+metric. The mid-turn-continuation result (§3) predates this metric and
+needs re-verification before anything (e.g. the primer plan) relies on it.
 
 `motionbricks/motion_backbone/models/pose_model.py::_get_token_masks` now
 supports `fully_masked_sample_prob` (hparams key next to `masked_token_ratio`;

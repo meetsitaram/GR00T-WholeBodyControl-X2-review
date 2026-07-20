@@ -130,6 +130,32 @@ def main() -> int:
     if wd:
         subprocess.run(["scp", "-q", f"run@{args.pc2}:{wd}",
                         str(out / "pose_watchdog.log")], capture_output=True)
+    # intent tape (jsonl; the replay key: gamepad intents + replan seeds +
+    # publish ticks with precise timing). Newest tape = this daemon session.
+    tape = ssh(args.pc2, f"ls -t {GETSOLO}/log/kplanner_tape/tape_*.jsonl "
+                         f"2>/dev/null | head -1")
+    if tape:
+        subprocess.run(["scp", "-q", f"run@{args.pc2}:{tape}",
+                        str(out / "intent_tape.jsonl")], capture_output=True)
+        p = out / "intent_tape.jsonl"
+        if p.exists():
+            n = sum(1 for _ in open(p))
+            print(f"    pulled intent_tape.jsonl ({n} events)")
+        # full-content frame tape + committed chunks (same session stem)
+        stem = tape[:-len(".jsonl")]
+        subprocess.run(["scp", "-q", f"run@{args.pc2}:{stem}.frames.f32",
+                        str(out / "frame_tape.f32")], capture_output=True)
+        fp2 = out / "frame_tape.f32"
+        if fp2.exists():
+            print(f"    pulled frame_tape.f32 ({fp2.stat().st_size // 160} ticks)")
+        subprocess.run(["scp", "-q", "-r", f"run@{args.pc2}:{stem}_chunks",
+                        str(out / "chunks")], capture_output=True)
+        cd = out / "chunks"
+        if cd.exists():
+            print(f"    pulled chunks/ ({len(list(cd.glob('*.npy')))} committed chunks)")
+    else:
+        print("    WARNING: no intent tape found -- daemon predates the tape "
+              "patch or KPLANNER_TAPE=0")
 
     (out / "fingerprint.json").write_text(json.dumps(fp, indent=2))
     print(f"\n  wrote fingerprint.json  ({len(fp.get('gains', {}))} gain values)")

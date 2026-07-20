@@ -1,0 +1,10 @@
+# Robot-run captures: keep the analysis (ANALYSIS.md), provenance
+# (fingerprint.json), graphs (png) and replay keys (intent_tape.jsonl);
+# exclude the bulk telemetry — regenerable from the robot or too large.
+*.csv
+*.f32
+*.mp4
+*.npy
+*.pkl
+*.log
+chunks/
