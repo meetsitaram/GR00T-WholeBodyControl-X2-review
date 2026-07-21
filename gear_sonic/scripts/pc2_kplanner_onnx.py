@@ -134,6 +134,7 @@ log = logging.getLogger("pc2_kplanner_onnx")
 # ---------------------------------------------------------------------------
 OUTPUT_FPS: float = 50.0
 MODEL_FPS: float = 30.0     # kplanner model output rate (resample source rate)
+
 QPOS_DIM: int = 38
 NUM_FUTURE: int = 9         # future-window slots on the wire
 STEP_TICKS: int = 5         # 50 Hz ticks between future slots (= 0.1 s)
@@ -188,7 +189,29 @@ _BACK_SPEED_MPS: float = 0.45
 
 _TEST_FIXED_BACK_MPS: float = 0.30
 _TEST_FIXED_SIDE_MPS: float = 0.30
-_TEST_FIXED_TURN_RAD_S: float = 0.30
+# Turn-rate setpoint. 0.30 was the original conservative test value; the
+# 2026-07-21 sweep (kplanner_turnrate_sweep.py) showed the root head scales
+# to 1.3 rad/s with NO still chunks at >=0.8 (strong conditioning escapes
+# the idle attractor and the pose head generates real turn stepping), and
+# the robot tracks the reference heading ~1:1. Override like the forward
+# setpoint: env KPLANNER_FIXED_TURN_RAD_S.
+_TEST_FIXED_TURN_RAD_S: float = float(
+    os.environ.get("KPLANNER_FIXED_TURN_RAD_S") or 0.30)
+# Arc-turn rate: yaw applied WHILE walking. At the standing-turn rate the
+# arc is too tight ("turns much more than walking" -- operator, sim,
+# 2026-07-21); walking + full yaw makes the heading win over travel. A
+# separate, lower setpoint gives a good turning walk without giving up the
+# brisk standing 360s.
+_TEST_FIXED_ARC_TURN_RAD_S: float = float(
+    os.environ.get("KPLANNER_FIXED_ARC_TURN_RAD_S") or 0.55)
+# Optional arc forward boost (default 1.0 = NO change). SONIC's obs carries
+# no reference root translation -- forward progress is implied by gait
+# joints while heading error is explicit -- so tracked arcs under-translate
+# vs the reference (sim, 2026-07-21). A boost >1 over-commands forward
+# during arcs to compensate AT THE INTENT LAYER. Deliberately opt-in: it is
+# a tracker-era workaround that a better future model should not inherit.
+_ARC_FWD_BOOST: float = float(
+    os.environ.get("KPLANNER_ARC_FWD_BOOST") or 1.0)
 _FWD_LATERAL_DEADBAND: float = 0.35
 
 # Strafe gating (2026-07-18). The resolver below is a SIGN function: any
@@ -283,12 +306,16 @@ def _resolve_locomotion_continuous(
         vel_x = _TEST_FIXED_SIDE_MPS
     else:
         vel_x = 0.0
+    turn_mag = (_TEST_FIXED_ARC_TURN_RAD_S if vel_z != 0.0
+                else _TEST_FIXED_TURN_RAD_S)
     if shaped_yaw > 0.0:
-        yaw_rate = -_TEST_FIXED_TURN_RAD_S  # stick right -> turn-right -> -yaw
+        yaw_rate = -turn_mag              # stick right -> turn-right -> -yaw
     elif shaped_yaw < 0.0:
-        yaw_rate = _TEST_FIXED_TURN_RAD_S
+        yaw_rate = turn_mag
     else:
         yaw_rate = 0.0
+    if yaw_rate != 0.0 and vel_z > 0.0 and _ARC_FWD_BOOST != 1.0:
+        vel_z = vel_z * _ARC_FWD_BOOST
     return (yaw_rate, vel_x, vel_z, _HIP_HEIGHT_M)
 
 
@@ -666,6 +693,15 @@ class OnnxPlannerBackend:
         providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
                      if OnnxPlannerBackend.USE_GPU
                      else ["CPUExecutionProvider"])
+        if OnnxPlannerBackend.USE_GPU and hasattr(ort, "preload_dlls"):
+            # Desktop pip installs ship CUDA/cuDNN as nvidia-* wheels that
+            # are not on the loader path; preload_dlls() (ORT >= 1.21) loads
+            # them from site-packages. No-op where libs resolve system-wide
+            # (Jetson) -- guarded so a CPU-only or old ORT is unaffected.
+            try:
+                ort.preload_dlls()
+            except Exception as exc:  # never let GPU setup kill the daemon
+                log.warning("ort.preload_dlls() failed (%s); continuing", exc)
         t0 = time.monotonic()
         self._sess = ort.InferenceSession(str(onnx_path), providers=providers)
         _active = self._sess.get_providers()

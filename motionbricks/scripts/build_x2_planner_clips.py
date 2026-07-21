@@ -220,10 +220,36 @@ G1TELEOP_MODES: tuple[ModeSpec, ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# G1-TELEOP STANCE mode table — same clips as g1teleop but each gait window
+# is cut to that clip's LONGEST fully-grounded stretch (both feet within 3 cm
+# of their own floor, FK-measured 2026-07-21). Rationale: the planner samples
+# a uniform-random 4-frame target window per replan (start = seed % (n-4)),
+# and with the wide g1teleop windows 34% (slow_walk) / 54% (walk) of draws
+# anchor the chunk on a MID-SWING keyframe -> generation is constrained to
+# end airborne -> improvised landings, the "bumpy step" the operator saw.
+# Narrow grounded windows make every draw a stance anchor while keeping the
+# teleop gait style. Select with ``--modes g1teleop_stance``.
+# ---------------------------------------------------------------------------
+G1TELEOP_STANCE_MODES: tuple[ModeSpec, ...] = (
+    ModeSpec(name="idle", clip_key="Idle_Right_001__A019",
+             start_frame=0, end_frame=200, avg_root_vel=0.0),
+    ModeSpec(name="slow_walk", clip_key="slow_walk_0.3_001",
+             start_frame=165, end_frame=190, avg_root_vel=0.22,
+             source_pkl=_G1TELEOP_PKL),
+    ModeSpec(name="walk", clip_key="walk_002",
+             start_frame=181, end_frame=227, avg_root_vel=0.51,
+             source_pkl=_G1TELEOP_PKL),
+    ModeSpec(name="run_proxy", clip_key="run_001",
+             start_frame=142, end_frame=164, avg_root_vel=1.04,
+             source_pkl=_G1TELEOP_PKL),
+)
+
 _MODE_TABLES: dict[str, tuple[ModeSpec, ...]] = {
     "default": DEFAULT_MODES,
     "g1style": G1STYLE_MODES,
     "g1teleop": G1TELEOP_MODES,
+    "g1teleop_stance": G1TELEOP_STANCE_MODES,
 }
 
 

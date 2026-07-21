@@ -1,0 +1,27 @@
+{
+  "sonic_md5": "44e71de6a98158131c51664e833ad82f",
+  "planner_tmpl_md5": "e21eab87f81a676fc6fcc0f8cc48acdf",
+  "runtime_md5": "c2b98f4fe877e06fc0feeb68ffbd5a5e",
+  "ritual_md5": "b4b3e7b5fa33b22012c08c91196c6e9c",
+  "tuning_file": "walking_soft_kp.yaml",
+  "anchor": "kplanner_idle_anchor_g1teleop_v3",
+  "smoother": "",
+  "stop_blend": "1",
+  "gains": {
+    "kp_scale_ankle_pitch": 1.4,
+    "kp_scale_ankle_roll": 1.15,
+    "kp_scale_knee": 1.2,
+    "kp_scale_waist_yaw": 1.0,
+    "kp_scale_waist_pr": 2.0,
+    "kd_scale_ankle_pitch": 2.0,
+    "kd_scale_ankle_roll": 1.5,
+    "kd_scale_knee": 0.792,
+    "kd_scale_hip": 0.476,
+    "kd_scale_waist_yaw": 1.5,
+    "kd_scale_waist_pr": 5.51
+  },
+  "run_dir": "/home/run/getsolo/log/deploy_20260721_224224",
+  "captured_at": "20260721_075434",
+  "label": "p500k_fwd05_stability",
+  "note": "p500k graphs both synced; fwd 0.5, turns 1.0/0.55 dual-rate, resync on; operator: amazing walk stability"
+}

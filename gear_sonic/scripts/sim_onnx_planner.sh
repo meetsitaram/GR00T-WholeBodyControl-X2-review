@@ -284,7 +284,10 @@ trap summary EXIT
 
 export KPLANNER_ONNX="$PLANNER_ONNX"
 export KPLANNER_DANCES_DIR="$DANCES"
-export KPLANNER_FIXED_FWD_MPS=0.3
+# Respect a caller-provided speed (was a hard export that silently clobbered
+# any KPLANNER_FIXED_FWD_MPS the operator set -- "no matter what fwd mps I
+# set, it walks the same", 2026-07-21).
+export KPLANNER_FIXED_FWD_MPS="${KPLANNER_FIXED_FWD_MPS:-0.3}"
 export PAD_LOCK_SPEED=1
 export PAD_DEADMAN=left
 export PAD_CLIP_PKL=gear_sonic/data/motions/x2_dances_easy.pkl

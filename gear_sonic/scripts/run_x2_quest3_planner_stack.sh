@@ -2551,6 +2551,14 @@ else
         if [[ -n "${KPLANNER_PLANNER_MODE}" && "${KPLANNER_PLANNER_MODE}" != "none" ]]; then
             PLANNER_ARGS+=(--planner-mode "${KPLANNER_PLANNER_MODE}")
         fi
+        # GPU inference: DEFAULT ON (2026-07-21) -- CUDA EP with CPU
+        # fallback, same flag the robot ritual runs. Safe when the env has a
+        # CPU-only onnxruntime (daemon warns + falls back); matching the
+        # robot's provider also matches its sampling (CPU-vs-GPU draws
+        # differ). Opt out with KPLANNER_ORT_GPU=0.
+        if [[ "${KPLANNER_ORT_GPU:-1}" == "1" ]]; then
+            PLANNER_ARGS+=(--ort-gpu)
+        fi
         # Sim has no C++ deploy -> no x2_debug PUB. Disable the measured-yaw
         # rebase (and its silent capture-wait) unless the caller opts in via
         # KPLANNER_YAW_REBASE=1 (e.g. a sim harness with a mock x2_debug).
