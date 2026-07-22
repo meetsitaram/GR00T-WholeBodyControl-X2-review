@@ -215,3 +215,46 @@ DISPLAY=:1 ~/projects/g1-kitchen-sim/.venv/bin/python -u -m gear_sonic.scripts.e
 ---
 
 *Key files touched this session:* `gear_sonic/scripts/x2-navigation/run_x2_kplanner_env2.py` (ring writer + all fixes + idle-writer + DIAG + terrain gate + head cam + labeler + replan knob), `gear_sonic/scripts/x2-navigation/` (launchers + isolation test + clip extraction — this session's toolkit), `gear_sonic_deploy/scripts/x2_isaaclab_bridge.py` (direct-wire mode, shelved), `gear_sonic/envs/manager_env/modular_tracking_env_cfg.py` (world keys, config-gated), `gear_sonic/envs/nav_house/nav_kitchen_v1.yaml` (training config), `gear_sonic/data/motions/{x2_sonic_feasible_stand_single,x2_idle_right_A019_single,kp4_isolation_test}.pkl`, `~/projects/x2-kitchen-sim/configs/waypoints.json`.
+
+---
+
+# Day 2 — Overnight Training → The Policy Drives the Robot
+
+**Date:** 2026-07-22 (continuation of the same arc)
+**Outcome:** The stage-0 nav teacher trained overnight to **99.96%** on the 56-route benchmark, then **drove the full kplanner+SONIC rig through multi-stop kitchen tours autonomously** — including the first-ever completion of the hard pantry→entrance passage.
+
+## 10. Overnight training (stage-0 teacher)
+
+- `train_nav_teacher.py` (x2-navigation/): rsl_rl PPO, 4096 vectorized 2D agents on the real kitchen grid (`nav_grid.npz`) + waypoint registry; yaml-faithful actions (virtual gamepad, 0.3–1.0 envelope, 200 ms ticks), rewards (progress/time/clearance/reach+heading/action-rate), 75/25 goal mix.
+- v1 saturated the benchmark at **100% by iteration 400** → hardened (latency 0–0.8 s, ray noise σ0.1, vel noise, 0.25 rad heading tol) and retrained overnight: **100k iterations / 2.57 h / ~10 B env-steps; final 100.0%, last-50 mean 99.96%, worst post-20k dip 98.2%** (= one route). Artifacts: `~/projects/x2-kitchen-sim/runs/nav_teacher_hardened_0722c/`, wandb `x2-kitchen-nav/5tibg857`.
+- wandb gotcha: rsl_rl's `WandbSummaryWriter` mixes iteration- and time-stepped metrics → wandb silently drops everything ("ignoring partial history"). Fixed by monkeypatching `add_scalar` to log steplessly with `iteration` as a field (set chart x-axis to `iteration`).
+- `build_walkable_mask.py`: kitchen grid from the collision USD. Splat scans under-sample floors → floor detection fails; use **reachability**: walkable = (ESDF > robot radius) component connected to the waypoints. 13 m². `SimulationApp.close()` kills the process — must be the last statement.
+- `viz_nav_policy.py`: rolls all 56 routes from a checkpoint → trajectory maps + smoothness histograms. Smoothness finding: the policy re-aims nearly every tick (holds hug the 200 ms floor) — action-rate penalty too weak; holds must be structural in the next training round.
+
+## 11. The policy drives the rig (`nav_policy_bridge.py`)
+
+Replaces the pad bridge: `robot_pose:6570` (env2's offset ports!) → rebuild the 28-dim obs (waypoint goal in body frame, finite-difference EMA velocity, ESDF rays) → checkpoint inference → stick JSON on `planner_cmd:5563` at 2 Hz. **Stick sign chart (x2_kplanner.py:398): side>0 = RIGHT, yaw>0 = TURN-RIGHT — both inverted vs robotics convention**; the first attempt mirror-steered the robot out of the kitchen. Daemon quantizes magnitude to its fixed 0.3 m/s (direction+stop control only until stage-1).
+
+Results: `pantry` 28–30 s reliably; multi-stop tours (pantry→entrance→dining_table→hallway) completing except at one pinch; **user verdict: "the navigation results look AMAZING."**
+
+## 12. The drift discovery (user-diagnosed) + recovery reflexes
+
+**User observation: the yellow markers reached the entrance while the robot lagged behind and hit the fridge wall.** Root cause: with `pose_reseed_scope=none` (deploy parity) the planner integrates its own frame open-loop; SONIC under-tracks translation; reference drifts ahead, and the policy's (true-pose-based) corrections act through a displaced frame. Frames only re-align at IDLE→PLAYING re-seeds.
+
+Bridge reflexes shipped:
+1. **Micro-resync stops** — 1.2 s halt per 8 s of motion → planner re-seeds at the robot's true pose, zeroing drift.
+2. **Stuck-skip** — no progress ⇒ abandon leg, continue route.
+3. **Escape primitive** — 8 s stall ⇒ reverse 2.5 s, rotate toward the open side (ESDF rays), resume; 2 tries/leg. First deployment: the entrance leg **completed for the first time** (70.5 s, two escapes ratcheting 3.39 m → 1.83 m → arrived), confirmed visually ("it is now at the door").
+
+Ceiling reached for bridge-level fixes: tight-passage traversal ≈ coin flip. The durable fixes are **stage-1 training changes**: train against the real planner's execution (drift + slip as dynamics), **non-terminal contacts** (escape must be *learned* — terminal-contact training produced zero un-wedge skill), clearance-penalty tuning vs true corridor widths (the hardened teacher circles in local minima at narrow necks), walkable mask at 0.45 m erosion. Geometry fact: the pantry→entrance direct line is blocked by the island (ESDF 0.18–0.35 m); the only route threads the NW neck.
+
+## 13. Camera rig (final form)
+
+The default perspective camera is steered by something in the stack — never fight it; pin viewports to dedicated USD camera prims:
+- **Main**: `KPFixedCam` — static interior wide shot (`KP_CAM_EYE`/`KP_CAM_LOOKAT`).
+- **Sub "KP Chase View"**: `KPChaseCam` — driven per tick behind the robot **facing its heading** (frame always leads with clean interior splat; EMA-smoothed; `KP_CHASE="back,height,ahead"`).
+- F key toggles the wrapper's robot-tracking mode; `update_view_to_asset_root` uses `ViewerCfg.eye` (default 7.5,7.5,7.5 — 11 m away!) as the offset, not the yaml `viewer_eye`.
+
+## 14. Where this leaves the program
+
+Stage-0 complete and *demonstrated end-to-end on the deploy stack*. Stage-1 (planner-in-the-loop training) has its full requirements list written by today's failures — plus the queued gates: planner batching benchmark, turn-rate asymmetry (right ≈2.7× commanded), TiledCamera×NuRec throughput, intent→response latency measurement. Stage-2 remains the camera student (RGB distillation; debug_vis off; one robot per kitchen clone).

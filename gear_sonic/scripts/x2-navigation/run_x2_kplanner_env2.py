@@ -930,6 +930,11 @@ class _Driver:
             try:
                 lf = "/tmp/claude-1000/kp_label"
                 mt = os.path.getmtime(lf) if os.path.exists(lf) else 0
+                if not hasattr(self, "_label_mtime"):
+                    # ignore a PRE-EXISTING label file: only writes made
+                    # after this run booted may trigger a capture (a stale
+                    # file once re-captured 'hallway' at spawn on restart)
+                    self._label_mtime = mt
                 if mt > getattr(self, "_label_mtime", 0):
                     self._label_mtime = mt
                     with open(lf) as fh:
@@ -964,6 +969,101 @@ class _Driver:
                               flush=True)
             except Exception as e:
                 print(f"[kp-env2] waypoint label failed: {e}", flush=True)
+
+        # 5d. auto follow-cam: enter the wrapper's robot-tracking camera mode
+        # (normally the F key) once at startup — viewer_eye then acts as the
+        # small follow offset instead of a world position in the void.
+        if not getattr(self, "_cam_focused", False) and self.ticks == 50:
+            self._cam_focused = True
+            if not os.environ.get("KP_NO_FOLLOW_CAM"):
+                try:
+                    # MAIN viewport = FIXED interior view (user 2026-07-22:
+                    # KP view as main; splat renders clean from interior).
+                    # KP_CAM_EYE/KP_CAM_LOOKAT (world "x,y,z") to tune.
+                    # Something in the stack keeps re-aiming the DEFAULT
+                    # perspective camera, so the main viewport gets its own
+                    # dedicated static camera prim instead — un-steerable.
+                    from pxr import Gf as _Gf, UsdGeom as _UsdGeom
+                    import omni.usd as _ousd
+                    from omni.kit.viewport.utility import get_active_viewport
+                    eye = [float(v) for v in os.environ.get(
+                        "KP_CAM_EYE", "-18.6,-78.3,2.1").split(",")]
+                    lk = [float(v) for v in os.environ.get(
+                        "KP_CAM_LOOKAT", "-20.6,-75.6,0.7").split(",")]
+                    _stage = _ousd.get_context().get_stage()
+                    fcam = _UsdGeom.Camera.Define(_stage, "/World/KPFixedCam")
+                    fcam.GetFocalLengthAttr().Set(14.0)
+                    fview = _Gf.Matrix4d()
+                    fview.SetLookAt(_Gf.Vec3d(*eye), _Gf.Vec3d(*lk),
+                                    _Gf.Vec3d(0, 0, 1))
+                    _UsdGeom.Xformable(fcam.GetPrim()).AddTransformOp().Set(
+                        fview.GetInverse())
+                    get_active_viewport().camera_path = "/World/KPFixedCam"
+                    print(f"[kp-env2] main viewport pinned to KPFixedCam: "
+                          f"eye={eye} lookat={lk}", flush=True)
+                    # SUB viewport = CHASE CAM: behind the robot, facing its
+                    # heading, driven per tick (section 5e) with smoothing.
+                    # KP_CHASE="back,height,ahead" tunes framing;
+                    # KP_NO_CAM2=1 disables.
+                    if not os.environ.get("KP_NO_CAM2"):
+                        from pxr import Gf, UsdGeom
+                        import omni.usd
+                        from omni.kit.viewport.utility import (
+                            create_viewport_window,
+                        )
+                        stage = omni.usd.get_context().get_stage()
+                        camc = UsdGeom.Camera.Define(stage,
+                                                     "/World/KPChaseCam")
+                        camc.GetFocalLengthAttr().Set(16.0)
+                        self._chase_op = UsdGeom.Xformable(
+                            camc.GetPrim()).AddTransformOp()
+                        self._chase_Gf = Gf
+                        self._chase_par = [float(v) for v in os.environ.get(
+                            "KP_CHASE", "1.3,0.65,1.5").split(",")]
+                        self._chase_eye = None
+                        vp2 = create_viewport_window(
+                            "KP Chase View", width=860, height=540)
+                        vp2.viewport_api.camera_path = "/World/KPChaseCam"
+                        print("[kp-env2] chase-cam sub-viewport up "
+                              f"(back,h,ahead={self._chase_par})", flush=True)
+                except Exception as e:
+                    print(f"[kp-env2] follow-cam failed: {e}", flush=True)
+
+        # 5e. chase-cam steering: every 5 ticks place the chase camera
+        # BEHIND the robot along its heading, looking FORWARD past it —
+        # the frame always leads with interior splat (no boundary fuzz).
+        # EMA-smoothed so gait sway/yaw wobble doesn't shake the shot.
+        if getattr(self, "_chase_op", None) is not None \
+                and self.ticks % 5 == 0:
+            try:
+                import math as _cm
+                rob = self.cmd._env.scene["robot"].data.root_state_w[
+                    0].cpu().numpy()
+                ryaw = _cm.atan2(2 * (rob[3] * rob[6] + rob[4] * rob[5]),
+                                 1 - 2 * (rob[5] ** 2 + rob[6] ** 2))
+                back, h, ahead = self._chase_par
+                cx, sx = _cm.cos(ryaw), _cm.sin(ryaw)
+                eye_t = [rob[0] - back * cx, rob[1] - back * sx,
+                         rob[2] + h]
+                lk_t = [rob[0] + ahead * cx, rob[1] + ahead * sx,
+                        rob[2] + 0.2]
+                a = 0.12
+                if self._chase_eye is None:
+                    self._chase_eye, self._chase_lk = eye_t, lk_t
+                else:
+                    self._chase_eye = [p + a * (t - p) for p, t in
+                                       zip(self._chase_eye, eye_t)]
+                    self._chase_lk = [p + a * (t - p) for p, t in
+                                      zip(self._chase_lk, lk_t)]
+                Gf = self._chase_Gf
+                view = Gf.Matrix4d()
+                view.SetLookAt(Gf.Vec3d(*self._chase_eye),
+                               Gf.Vec3d(*self._chase_lk),
+                               Gf.Vec3d(0, 0, 1))
+                self._chase_op.Set(view.GetInverse())
+            except Exception as e:
+                print(f"[kp-env2] chase-cam update failed: {e}", flush=True)
+                self._chase_op = None
 
         # 6. heartbeat + timeline
         if self.ticks % 50 == 0:

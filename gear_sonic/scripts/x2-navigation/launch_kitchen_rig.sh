@@ -40,6 +40,8 @@ KP_PAD=1 KP_HIDE_TERRAIN=1 KP_HEAD_CAM="${KP_HEAD_CAM:-1}" DISPLAY="${DISPLAY:-:
   ++manager_env.config.world_usd="$KITCHEN/kitchen_splat.usdz" \
   ++manager_env.config.world_collision_usd="$KITCHEN/kitchen_collision.usd" \
   '++manager_env.config.world_pos=[-19.99,-75.96,0.0]' \
+  '++manager_env.config.viewer_eye=[2.2,2.2,1.8]' \
+  '++manager_env.config.viewer_lookat=[0.0,0.0,0.6]' \
   ++manager_env.terminations.ee_body_pos=null \
   ++manager_env.terminations.foot_pos_xyz=null \
   ++manager_env.terminations.anchor_ori_full=null \
