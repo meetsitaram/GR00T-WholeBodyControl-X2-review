@@ -354,6 +354,25 @@ class MySceneCfg(InteractiveSceneCfg):
         else:
             raise ValueError(f"Unknown terrain type: {terrain_type}")
 
+        # Optional static world layers (x2-kitchen-sim: NuRec splat visual +
+        # wall collision mesh). Config-gated; absent keys leave training
+        # scenes untouched. Global prims — intended for num_envs=1 eval runs.
+        world_usd = config.get("world_usd", None)
+        world_pos = tuple(config.get("world_pos", (0.0, 0.0, 0.0)))
+        if world_usd:
+            self.world_visual = AssetBaseCfg(
+                prim_path="/World/WorldVisual",
+                init_state=AssetBaseCfg.InitialStateCfg(pos=world_pos),
+                spawn=sim_utils.UsdFileCfg(usd_path=world_usd),
+            )
+        world_collision_usd = config.get("world_collision_usd", None)
+        if world_collision_usd:
+            self.world_collision = AssetBaseCfg(
+                prim_path="/World/WorldCollision",
+                init_state=AssetBaseCfg.InitialStateCfg(pos=world_pos),
+                spawn=sim_utils.UsdFileCfg(usd_path=world_collision_usd),
+            )
+
         # robots
         self.robot: ArticulationCfg = dataclasses.MISSING
 

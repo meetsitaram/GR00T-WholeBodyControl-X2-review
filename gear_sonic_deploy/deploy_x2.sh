@@ -216,6 +216,7 @@ maybe_relaunch_in_docker() {
     cd "$compose_dir"
     export X2_DEPLOY_IN_DOCKER=1
     exec docker compose run --rm --service-ports \
+        -e X2_WORLD -e X2_ISAAC_HOST \
         "${tty_args[@]}" \
         "${env_overrides[@]}" \
         -e "X2_DEPLOY_IN_DOCKER=1" \
@@ -3504,9 +3505,21 @@ if [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_HAND_ZMQ_TOPIC" ]]       && BRIDGE_ARGS+=("--hand-zmq-topic" "$SIM_HAND_ZMQ_TOPIC")
     $SIM_NO_HAND_ZMQ                     && BRIDGE_ARGS+=("--no-hand-zmq")
 
+    if [[ "${X2_WORLD:-mujoco}" == "isaaclab" ]]; then
+        # IsaacLab world topology: the physics lives OUTSIDE this container in
+        # x2_isaaclab_bridge.py --dds (host, Isaac python). In here we only run
+        # the DDS<->ZMQ adapter. Start the host side first:
+        #   conda activate env_isaaclab && python gear_sonic_deploy/scripts/\
+        #     x2_isaaclab_bridge.py --dds --scene-usdz <world.usdz> [--collision-usd ...]
+        echo -e "$(ts) ${BLUE}[sim]${NC} X2_WORLD=isaaclab: backgrounding DDS<->ZMQ adapter (physics on host)"
+        "$SIM_PYTHON" "$SCRIPT_DIR/scripts/x2_dds_zmq_adapter.py" \
+            --isaac-host "${X2_ISAAC_HOST:-127.0.0.1}" &
+        SIM_BRIDGE_PID=$!
+    else
     echo -e "$(ts) ${BLUE}[sim]${NC} backgrounding: $SIM_PYTHON $SIM_BRIDGE_REL ${BRIDGE_ARGS[*]}"
     "$SIM_PYTHON" "$SCRIPT_DIR/$SIM_BRIDGE_REL" "${BRIDGE_ARGS[@]}" &
     SIM_BRIDGE_PID=$!
+    fi
     # cleanup_sim trap was installed above (before bridge launch).
 
     if [[ -n "$SIM_RECORD_COMMANDS" ]]; then

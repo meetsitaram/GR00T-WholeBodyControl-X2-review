@@ -50,9 +50,11 @@ ALLOW_MISMATCH=1 \
 
 
 ALLOW_MISMATCH=1 \
-  SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx \
-  PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_ft \
-  ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
+KPLANNER_FIXED_FWD_MPS=0.5 KPLANNER_FIXED_TURN_RAD_S=1.0 \
+KPLANNER_TAPE_DIR=~/kplanner_sim_tapes ALLOW_MISMATCH=1 \
+SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx \
+PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_p500k_stance \
+./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
 
 
 

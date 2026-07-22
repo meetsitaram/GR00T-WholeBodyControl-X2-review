@@ -1,0 +1,94 @@
+# Navigation training config v1 — x2-kitchen-sim (M3)
+# Design frozen 2026-07-22 from the interactive kitchen session (user + Claude).
+# This file is the source of truth the nav task package will consume; values
+# marked MEASURE are placeholders pending their queued measurement task.
+
+world:
+  splat_usd: /home/stickbot/projects/x2-kitchen-sim/assets/kitchen/kitchen_splat.usdz
+  collision_usd: /home/stickbot/projects/x2-kitchen-sim/assets/kitchen/kitchen_collision.usd
+  world_pos: [-19.99, -75.96, 0.0]      # env-origin offset (measured M1)
+  hide_terrain_visual: true             # gray plane z-fights splat floor
+  walkable_mask: /home/stickbot/projects/x2-kitchen-sim/assets/walkable_mask.png  # TODO: generate (floor raster - obstacles, eroded by robot_radius)
+  robot_radius: 0.35
+
+waypoints:
+  registry: /home/stickbot/projects/x2-kitchen-sim/configs/waypoints.json
+  # 8 teleop-labeled poses (kitchen frame, pos+yaw+radius):
+  # cooking_range, dining_table, dishwasher, entrance, fridge, hallway, pantry, sink
+
+goal_sampling:
+  random_fraction: 0.75                 # spawn+goal from walkable mask
+  waypoint_fraction: 0.25               # start at waypoint A, goal waypoint B
+  start_jitter_pos_m: 0.3               # applied to ALL episode starts
+  start_jitter_yaw_rad: 0.52            # ~30 deg
+  pair_distance_m: [1.0, 5.0]           # random-goal episode range
+  curriculum: line_of_sight_first       # occluded pairs unlock later
+  goal_obs: body_frame_relative         # position (+yaw when waypoint has one);
+                                        # policy NEVER sees names/world coords/maps
+
+action_space:
+  # "virtual gamepad": same planner_cmd wire as pad_locomotion_bridge
+  commands: [forward, backward, sidestep_left, sidestep_right, turn_left, turn_right, stop]
+  fwd_mps_range: [0.3, 1.0]             # KPLANNER_FIXED_FWD_MPS envelope (user 2026-07-22)
+  turn_rad_s_range: [0.3, 1.0]          # KPLANNER_FIXED_TURN_RAD_S envelope
+  decision_hz: 5                        # 200 ms tick = minimum hold
+  hold_envelope_s: [0.2, 5.0]           # holding = re-emitting same intent (free);
+                                        # 5 s = re-commitment ceiling
+  stop_is_instant: true                 # zero-intent may interrupt any hold
+  slew_limited: true                    # same smoothing/deadband path as pad bridge
+
+planner_rollout:                        # stage 1: kinematic, no SONIC, no dynamics
+  mode: kinematic_playback
+  planner_mode: slow_walk               # template conditioning (ritual parity)
+  replan_threshold_frames: 32           # half-chunk ~1.07 s commitment (user A/B 2026-07-22)
+  chunk_frames: 64
+  batching: MEASURE                     # M3 gate: torch core batch>1 vs staggered sequential
+  known_issue_turn_asymmetry: "right turns ~2.7x commanded rate vs left ~1.07x (kp4 sweep) — resolve before treating +/-yaw as symmetric"
+
+rewards:
+  progress_to_goal: potential_based     # delta distance per step (the workhorse)
+  time_cost: small_negative_per_step    # makes wall-grinding/stalling net-negative
+  clearance:
+    penalty_ramp_below_m: 0.30          # capsule-vs-collision-mesh distance query
+    contact_terminal: true              # kinematic rollout has no stumble; mesh query IS the wall
+  goal_reach:
+    bonus: terminal_positive
+    radius_m: from_waypoint_or_0.3
+    heading_tolerance_rad: 0.35         # only when goal specifies yaw
+  action_rate: penalty_on_intent_change # prices switching; shapes long holds
+  # NO stability/gait terms — SONIC's job; enters at eval (M4) / stage-2 (M3.5)
+
+terminations:
+  goal_reached: true
+  collision_contact: true
+  timeout_s: 60
+  falls: false                          # kinematic stage has no dynamics
+
+observations:
+  policy_student: [ego_rgb, proprio_from_planner, goal_body_frame]
+  teacher_privileged: [goal_body_frame, root_vel_from_planner, intent_history]
+  camera:
+    frame: stereo_head_front_left       # IMU eye; rectified-fisheye-to-pinhole at deploy
+    sim_mount: head_pitch_link          # KP_HEAD_CAM smoke rig 2026-07-22
+    resolution: [96, 96]                # policy input (train); smoke rig used 960x600
+    debug_vis_must_be_false: true       # markers are stage prims — visible to policy cam (verified)
+
+domain_randomization:
+  intent_latency_s: [0.0, 0.5]
+  camera_pose_jitter: small
+  rgb_augmentation: in_distill_dataloader   # splat lighting is baked
+  spawn_pose_noise: see_goal_sampling
+  planner_seed: randomize
+
+eval:
+  suite: waypoint_pairs                 # 56 ordered routes from the registry
+  trials_per_route: 20
+  metrics: [success_rate, time_to_goal, min_clearance]
+  full_stack: intent -> kplanner -> SONIC(softland_4800) -> physics  # M4 gate
+
+pending_measurements:
+  - walkable mask generation from kitchen_collision.usd
+  - intent->response latency per command type (from 2026-07-22 driving logs) -> validate hold floor
+  - planner batching throughput (env-count ceiling)
+  - turn-rate asymmetry root cause
+  - splat-in-Camera-sensor PNG check (viewport confirmed; sensor path = gate artifact)
