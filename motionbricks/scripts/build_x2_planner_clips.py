@@ -106,6 +106,18 @@ _RELAXED_WALK_PKL = (
     REPO_ROOT / "gear_sonic" / "data" / "motions" / "x2_ultra_relaxed_walk_forward_v1.pkl"
 )
 
+# Dedicated, CHECKED-IN planner dependency file (2026-07-21): exactly the
+# four clips the deployed mode tables reference, extracted from their source
+# corpora (slow_walk_0.3_001 / walk_002 / run_001 from x2_g1teleop_30fps.pkl,
+# Idle_Right_001__A019 from x2_ultra_locowalk.pkl). Before this, rebuilding
+# the template library needed a 1.5 GB untracked corpus + an untracked teleop
+# pkl that lived only on one workstation. See planner_deps/README.md.
+_PLANNER_DEPS_PKL = (
+    REPO_ROOT / "gear_sonic" / "data" / "motions" / "planner_deps"
+    / "x2_planner_mode_clips.pkl"
+)
+_G1TELEOP_PKL = _PLANNER_DEPS_PKL
+
 
 DEFAULT_MODES: tuple[ModeSpec, ...] = (
     ModeSpec(
@@ -114,6 +126,7 @@ DEFAULT_MODES: tuple[ModeSpec, ...] = (
         start_frame=0,
         end_frame=200,
         avg_root_vel=0.0,
+        source_pkl=_PLANNER_DEPS_PKL,
     ),
     ModeSpec(
         name="slow_walk",
@@ -180,9 +193,6 @@ G1STYLE_MODES: tuple[ModeSpec, ...] = (
 # documented for the old Loop_Forward_Walk template. Select with
 # ``--modes g1teleop``.
 # ---------------------------------------------------------------------------
-_G1TELEOP_PKL = (
-    REPO_ROOT / "gear_sonic" / "data" / "motions" / "x2_g1teleop_30fps.pkl"
-)
 
 G1TELEOP_MODES: tuple[ModeSpec, ...] = (
     # idle keeps the proven locowalk idle clip (our clips' idle lead-ins are
@@ -193,6 +203,7 @@ G1TELEOP_MODES: tuple[ModeSpec, ...] = (
         start_frame=0,
         end_frame=200,
         avg_root_vel=0.0,
+        source_pkl=_PLANNER_DEPS_PKL,
     ),
     ModeSpec(
         name="slow_walk",
@@ -233,7 +244,8 @@ G1TELEOP_MODES: tuple[ModeSpec, ...] = (
 # ---------------------------------------------------------------------------
 G1TELEOP_STANCE_MODES: tuple[ModeSpec, ...] = (
     ModeSpec(name="idle", clip_key="Idle_Right_001__A019",
-             start_frame=0, end_frame=200, avg_root_vel=0.0),
+             start_frame=0, end_frame=200, avg_root_vel=0.0,
+             source_pkl=_PLANNER_DEPS_PKL),
     ModeSpec(name="slow_walk", clip_key="slow_walk_0.3_001",
              start_frame=165, end_frame=190, avg_root_vel=0.22,
              source_pkl=_G1TELEOP_PKL),
