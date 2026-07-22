@@ -255,6 +255,81 @@ The default perspective camera is steered by something in the stack — never fi
 - **Sub "KP Chase View"**: `KPChaseCam` — driven per tick behind the robot **facing its heading** (frame always leads with clean interior splat; EMA-smoothed; `KP_CHASE="back,height,ahead"`).
 - F key toggles the wrapper's robot-tracking mode; `update_view_to_asset_root` uses `ViewerCfg.eye` (default 7.5,7.5,7.5 — 11 m away!) as the offset, not the yaml `viewer_eye`.
 
-## 14. Where this leaves the program
+## 14. Day 3 — the multi-robot showcase (and the bug that wore six costumes)
 
-Stage-0 complete and *demonstrated end-to-end on the deploy stack*. Stage-1 (planner-in-the-loop training) has its full requirements list written by today's failures — plus the queued gates: planner batching benchmark, turn-rate asymmetry (right ≈2.7× commanded), TiledCamera×NuRec throughput, intent→response latency measurement. Stage-2 remains the camera student (RGB distillation; debug_vis off; one robot per kitchen clone).
+Goal: Flexion-style crowd shot — multiple X2s navigating the kitchen at once. A full
+day of "explosions" ended with one root cause and a clean recipe.
+
+### The real root cause (supersedes every collision/spawn theory from the day)
+
+`video_showcase_rig._fix_bodies` rebuilds reference body tensors from the clip pkl
+and computed velocities as ONE finite difference over the concatenated rows. The
+first row of every clip after the first therefore carried
+`(clip_i_start − clip_{i−1}_END) × fps` — ~120 m/s. The env RESET writes the robot's
+initial root state **from those command tensors** (`commands.py` ≈2989:
+`root_pos = self.body_pos_w[:, 0]`, velocity likewise), so every robot assigned
+motion i>0 spawned already moving, slammed into the floor, and PhysX's depenetration
+blasted it across the room. This single bug produced, in different costumes: the
+"only one robot survives" pattern, "spawn-in-mesh ejections" at perfectly open
+spawns, the machine-gun respawn loop (fall-reset re-wrote the same bad velocity
+every reset), the bare-ground stack "explosion", and the on-the-furniture landings.
+**Fix**: `lv[lib.length_starts.long()] = 0` + a 2 m/s safety clamp with a
+`VEL-CLAMP HIT` log line (both in `_fix_bodies`).
+
+Debug chain that cornered it (worth reusing): per-env z heartbeat → termination
+`dones` probe (anchor_pos fired env1 every step) → spy wrapper on the term function
+(robot anchor at z≈1.0 two steps post-reset) → per-step `[eject]` tracer (correct
+pose at ts=1 but vz=−1.58 → blasted 1.6 m by ts=2). All three probes remain in the
+rig behind heartbeat prints.
+
+Secondary real bug: with `replicate_physics=false` the scene gains a THIRD origins
+tensor (`scene._default_env_origins`, grid-spaced) that the reset path read while
+references used the pinned terrain origins — robots spawned meters east of their
+refs. Fix: pin all three origin tensors, re-pinned every tick.
+
+### The working recipe (user-designed): capture executed motions, replay jointly
+
+1. **Author solo**: generate policy→planner route clips (`gen_policy_route_clips.py`;
+   `--goals`/`--routes "x,y:goal"`, `--goal-fan` door-queue, `--stagger-s`,
+   `--lead-in-s`, `--depart-stagger`), then play each route ALONE in the showcase rig
+   with `KP_RECORD=<pkl> KP_RECORD_KEY=<key> KP_RECORD_EXIT=1` — records the
+   **executed** root+dof at 50 Hz for one clean cycle and exits.
+2. **Merge + gate**: stack the executed clips into one pkl; executed refs replay
+   through SONIC near-exactly, so pairwise-distance gates are trustworthy.
+3. **Joint playback**: N envs, one motion each, all physically simulated at once.
+   `anchor_pos` (height) termination stays ON as fall auto-reset.
+
+Pipelines are scripted end-to-end (routes → captures → merge → headless verify gate
+→ windowed record → sim-rate retime): see session scratchpad `six_robot_pipeline.sh`
+/ `three_takes.sh` patterns.
+
+### Settled and shipped
+
+- **Cross-env robot-robot contact is OFF** (finally measured clean: executed paths
+  pass within 5 cm during the 6-robot burst, nobody wobbles — envs are ghosts).
+  Every "collision" observed during the day was the velocity bug.
+- 6-robot simultaneous burst from a mid-kitchen stack to pantry / entrance / fridge /
+  sink / dishwasher / cooking_range: verified headless (all upright, zero
+  terminations, multiple loops), recorded. Videos in `x2-kitchen-sim/media/`:
+  `showcase_converge_exec.mp4` (2-robot door queue),
+  `showcase_6robots_mid[_realtime].mp4`, takes `showcase_6robots_v{1..3}_realtime.mp4`.
+- Screen-capture videos run slow (sim ≈0.27× realtime): heartbeats now carry wall
+  stamps; retime with `setpts=PTS*<factor>`. Off-screen recording: run the windowed
+  rig on Xvfb `:2` and x11grab that display. True in-sim frame rendering
+  (`overview_camera`/`render_results`) queued for stage-1.
+- Waypoint coords were captured from the planner's drifted pose — fine as goals
+  (0.4 m radius), untrustworthy as exact spawn points.
+- `KP_VERBOSE=1` on `launch_showcase.sh` injects `--verbose` into SimulationApp
+  (post-Hydra) for kit-level debug logs; `NO_WORLD=1` bare-ground isolation;
+  `NO_FALL_RESET=1` disables the fall auto-reset.
+
+## 15. Where this leaves the program
+
+Stage-0 complete and *demonstrated end-to-end on the deploy stack*, plus a working
+multi-robot showcase pipeline on executed clips. Stage-1 (planner-in-the-loop
+training) has its full requirements list written by these failures — plus the queued
+gates: planner batching benchmark, turn-rate asymmetry (right ≈2.7× commanded),
+TiledCamera×NuRec throughput, intent→response latency measurement, live N-env
+dispatch rig (dynamic planner+policy triggering), in-sim video rendering. Stage-2
+remains the camera student (RGB distillation; debug_vis off; one robot per kitchen
+clone).
