@@ -226,7 +226,13 @@ _FIXED_FWD_MPS: Optional[float] = _SPEED_SETPOINT
 _TEST_FIXED_FORWARD_MPS: float = 0.30  # (superseded by the analog band above)
 _TEST_FIXED_BACK_MPS: float = 0.30
 _TEST_FIXED_SIDE_MPS: float = 0.30
-_TEST_FIXED_TURN_RAD_S: float = 0.30
+# In-place / continuous-stick turn rate. Deploy default stays 0.30 (parity);
+# KPLANNER_FIXED_TURN_RAD_S overrides (turnrate sweep certified up to 1.0,
+# module guidance above puts 0.75 as the comfort ceiling — see the
+# _CONTINUOUS_TURN_MAX_RAD_S discussion; the analog path that knob served
+# was replaced by this fixed magnitude).
+_TEST_FIXED_TURN_RAD_S: float = float(
+    os.environ.get("KPLANNER_FIXED_TURN_RAD_S") or 0.30)
 # Forward-dominance lateral deadband on the LEFT stick: while the
 # operator is pushing forward, the shaped side-stick magnitude must
 # exceed this (wider than the normal stick deadzone) before ANY lateral
@@ -924,6 +930,7 @@ def _zmq_command_thread(
     port: int,
     topic: str,
     stop_event: threading.Event,
+    bind: bool = False,
 ) -> None:
     import zmq
 
@@ -932,8 +939,14 @@ def _zmq_command_thread(
     sock.setsockopt(zmq.LINGER, 0)
     sock.setsockopt_string(zmq.SUBSCRIBE, topic)
     sock.setsockopt(zmq.RCVTIMEO, 200)
-    sock.connect(f"tcp://{host}:{port}")
-    log.info("zmq command source: SUB %s on tcp://%s:%d", topic, host, port)
+    if bind:
+        # Dual-source mode (pad bridge + quest3 manager): the SUB owns the
+        # bind so any number of command PUBs can connect.
+        sock.bind(f"tcp://*:{port}")
+        log.info("zmq command source: SUB bind %s on tcp://*:%d", topic, port)
+    else:
+        sock.connect(f"tcp://{host}:{port}")
+        log.info("zmq command source: SUB %s on tcp://%s:%d", topic, host, port)
     try:
         while not stop_event.is_set():
             try:
@@ -2266,6 +2279,7 @@ def run(
     zmq_cmd_host: Optional[str],
     zmq_cmd_port: Optional[int],
     zmq_cmd_topic: str,
+    zmq_cmd_bind: bool,
     duration_s: float,
     hand_dof: int,
     verbose: bool,
@@ -2561,7 +2575,8 @@ def run(
     if zmq_cmd_host is not None and zmq_cmd_port is not None:
         thr = threading.Thread(
             target=_zmq_command_thread,
-            args=(cmd_queue, zmq_cmd_host, zmq_cmd_port, zmq_cmd_topic, stop_event),
+            args=(cmd_queue, zmq_cmd_host, zmq_cmd_port, zmq_cmd_topic, stop_event,
+                  zmq_cmd_bind),
             name="cmd-zmq",
             daemon=True,
         )
@@ -3437,6 +3452,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--zmq-cmd-topic", default="planner_cmd",
         help="Topic prefix expected on the command SUB socket.",
     )
+    p.add_argument(
+        "--zmq-cmd-bind", action="store_true",
+        help="Bind the command SUB instead of connecting, so multiple "
+             "sources (pad bridge + quest3 manager) can PUB-connect into "
+             "it; --zmq-cmd-host is then ignored (bind is on *).",
+    )
     p.add_argument("--duration-s", type=float, default=0.0)
     p.add_argument("--hand-dof", type=int, default=10)
     p.add_argument(
@@ -3750,6 +3771,7 @@ def main(argv: list[str] | None = None) -> int:
         zmq_cmd_host=args.zmq_cmd_host,
         zmq_cmd_port=args.zmq_cmd_port,
         zmq_cmd_topic=args.zmq_cmd_topic,
+        zmq_cmd_bind=args.zmq_cmd_bind,
         duration_s=args.duration_s,
         hand_dof=args.hand_dof,
         verbose=args.verbose,

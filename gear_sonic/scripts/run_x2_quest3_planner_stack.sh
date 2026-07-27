@@ -503,6 +503,14 @@ KPLANNER_PLANNER_MODE="${KPLANNER_PLANNER_MODE:-slow_walk}"
 # manager-death teardown protects it identically. (Killing the manager to
 # swap in the bridge post-hoc tears the whole stack down — don't.)
 PAD_ONLY=0
+# --pad-and-vr (2026-07-24): spawn BOTH quest3_manager_x2 AND the pad
+# bridge. The kplanner's planner_cmd SUB flips to bind (--cmd-bind /
+# --zmq-cmd-bind) and both sources PUB-connect into it — two PUBs cannot
+# share one bound port, but one bound SUB accepts any number of connected
+# PUBs. Arbitration is behavioral: the pad publishes only while its
+# deadman is held (one idle cmd on release) and the manager only when the
+# operator engages via chord, so last-writer-wins with one active source.
+PAD_AND_VR=0
 # Opt-in safety watchdog (seconds) for stale upstream intents. **OFF by
 # default for Quest 3 live control** because the IntentDecoder emits new
 # planner_cmd messages only when the stick value changes; a held stick
@@ -960,6 +968,7 @@ while [[ $# -gt 0 ]]; do
         --vla-deploy-filters) VLA_DEPLOY_FILTERS=1; shift ;;
         --vla-no-policy) VLA_NO_POLICY=1; shift ;;
         --pad-only) PAD_ONLY=1; shift ;;
+        --pad-and-vr) PAD_AND_VR=1; shift ;;
         --pc2-host) PC2_HOST="$2"; shift 2 ;;
         --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
         --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
@@ -1438,6 +1447,7 @@ DEPLOY_PID=""
 DEPLOY_LOG=""
 PLANNER_PID=""
 MANAGER_PID=""
+PAD_BRIDGE_PID=""
 RECORDER_PID=""
 RECORDER_PGID=""
 VLA_BRIDGE_PID=""
@@ -1452,6 +1462,8 @@ cleanup_children() {
         kill_pgid_graceful "${RECORDER_PGID}" "recorder" 8
     fi
     kill_pid_quiet "${MANAGER_PID}"  "manager"
+    # --pad-and-vr sidecar; empty (no-op) in every other mode.
+    kill_pid_quiet "${PAD_BRIDGE_PID}" "pad-bridge"
     kill_pid_quiet "${PLANNER_PID}"  "planner"
     # x2_debug -> robot_pose bridge: stateless republisher, single
     # SIGTERM is fine.
@@ -2383,6 +2395,11 @@ else
         --device "${KPLANNER_DEVICE}"
         --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
     )
+    if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+        # Dual-source: kplanner owns the SUB bind; manager + pad bridge
+        # both PUB-connect.
+        PLANNER_ARGS+=(--zmq-cmd-bind)
+    fi
     if [[ -n "${PLANNER_DEMO}" ]]; then
         PLANNER_ARGS+=(--demo "${PLANNER_DEMO}")
     fi
@@ -2545,6 +2562,11 @@ else
             --replan-threshold-frames "${KPLANNER_REPLAN_THRESHOLD_FRAMES}"
             --dances-dir "${KPLANNER_DANCES_DIR:-${HOME}/x2_cloud_checkpoints/dances_x2m2}"
         )
+        if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+            # Dual-source: kplanner owns the SUB bind; manager + pad
+            # bridge both PUB-connect.
+            PLANNER_ARGS+=(--cmd-bind)
+        fi
         if [[ -n "${KPLANNER_WARMUP_QPOS}" ]]; then
             PLANNER_ARGS+=(--warmup-qpos "${KPLANNER_WARMUP_QPOS}")
         fi
@@ -2801,10 +2823,9 @@ if [[ -n "${QUEST3_RIGHT_WRIST_OFFSET_RPY_DEG}" ]]; then
     log "  RIGHT wrist op-quat offset: rpy_deg=(${_RIGHT_RPY[0]}, ${_RIGHT_RPY[1]}, ${_RIGHT_RPY[2]})"
 fi
 
-if [[ "${PAD_ONLY}" -eq 1 ]]; then
-    log "Step 3/4 — PAD-ONLY: spawning pad_locomotion_bridge (no headset) -> ${MANAGER_LOG}"
-    # PAD_SOURCE=zmq PAD_HOST=<PC2> env vars switch the bridge to consume the
-    # robot-resident pad (pc2_pad_daemon broadcast) instead of a local pad.
+# PAD_SOURCE=zmq PAD_HOST=<PC2> env vars switch the bridge to consume the
+# robot-resident pad (pc2_pad_daemon broadcast) instead of a local pad.
+build_pad_bridge_extra() {
     PAD_BRIDGE_EXTRA=()
     if [[ "${PAD_SOURCE:-local}" == "zmq" ]]; then
         PAD_BRIDGE_EXTRA+=(--source zmq --pad-host "${PAD_HOST:-192.168.86.32}")
@@ -2836,6 +2857,11 @@ if [[ "${PAD_ONLY}" -eq 1 ]]; then
         [[ -n "${PAD_CLIP_KEYS_G:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-g "${PAD_CLIP_KEYS_G}")
         [[ -n "${PAD_CLIP_KEYS_TURN:-}" ]] && PAD_BRIDGE_EXTRA+=(--clip-keys-turn "${PAD_CLIP_KEYS_TURN}")
     fi
+}
+
+if [[ "${PAD_ONLY}" -eq 1 ]]; then
+    log "Step 3/4 — PAD-ONLY: spawning pad_locomotion_bridge (no headset) -> ${MANAGER_LOG}"
+    build_pad_bridge_extra
     "${PYTHON}" "${REPO_ROOT}/gear_sonic/scripts/pad_locomotion_bridge.py" \
         --bind --port "${PLANNER_CMD_PORT}" --topic "${PLANNER_CMD_TOPIC}" \
         "${PAD_BRIDGE_EXTRA[@]}" \
@@ -2848,6 +2874,11 @@ if [[ "${PAD_ONLY}" -eq 1 ]]; then
     log "  pad bridge READY (pid=${MANAGER_PID}); hold L2+R2 to drive; settle 0.5s ..."
     sleep 0.5
 else
+if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+    # Dual-source: the kplanner owns the planner_cmd SUB bind, so the
+    # manager must PUB-connect instead of its default bind.
+    MANAGER_ARGS+=(--planner-cmd-connect)
+fi
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
 MANAGER_PID=$!
@@ -2866,6 +2897,27 @@ if ! wait_for_log_marker "${MANAGER_LOG}" "${MANAGER_PID}" \
 fi
 log "  manager READY (pid=${MANAGER_PID}); settle 0.5s before recorder ..."
 sleep 0.5
+
+if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+    # --pad-and-vr sidecar: the gamepad bridge PUB-connects into the
+    # kplanner's bound SUB alongside the manager. The pad publishes only
+    # while its deadman is held (one idle cmd on release) and the manager
+    # only when engaged via chord, so the two sources interleave cleanly.
+    PAD_BRIDGE_LOG="${LOG_DIR}/pad_bridge.log"
+    log "Step 3b/4 — PAD+VR: spawning pad_locomotion_bridge sidecar -> ${PAD_BRIDGE_LOG}"
+    build_pad_bridge_extra
+    "${PYTHON}" "${REPO_ROOT}/gear_sonic/scripts/pad_locomotion_bridge.py" \
+        --host 127.0.0.1 --port "${PLANNER_CMD_PORT}" --topic "${PLANNER_CMD_TOPIC}" \
+        "${PAD_BRIDGE_EXTRA[@]}" \
+        >"${PAD_BRIDGE_LOG}" 2>&1 &
+    PAD_BRIDGE_PID=$!
+    if ! wait_for_log_marker "${PAD_BRIDGE_LOG}" "${PAD_BRIDGE_PID}" \
+            "PUB connect" 15 "pad-bridge"; then
+        exit 1
+    fi
+    log "  pad bridge READY (pid=${PAD_BRIDGE_PID}); hold L2+R2 to drive; settle 0.5s ..."
+    sleep 0.5
+fi
 fi
 
 cat <<EOF
@@ -3454,6 +3506,9 @@ if [[ "${VLA_MODE}" -eq 1 ]]; then
 else
     PIDS_TO_WATCH=("DEPLOY_PID" "PLANNER_PID" "MANAGER_PID" "RECORDER_PID")
 fi
+if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+    PIDS_TO_WATCH+=("PAD_BRIDGE_PID")
+fi
 
 START_TS=$(date +%s)
 LAST_HEARTBEAT_TS=${START_TS}
@@ -3468,6 +3523,7 @@ while :; do
                 DEPLOY_PID)     tail -n 30 "${DEPLOY_LOG:-/dev/null}"     >&2 || true ;;
                 PLANNER_PID)    tail -n 30 "${PLANNER_LOG}"               >&2 || true ;;
                 MANAGER_PID)    tail -n 30 "${MANAGER_LOG}"               >&2 || true ;;
+                PAD_BRIDGE_PID) tail -n 30 "${PAD_BRIDGE_LOG:-/dev/null}" >&2 || true ;;
                 RECORDER_PID)   tail -n 30 "${RECORDER_LOG}"              >&2 || true ;;
                 VLA_BRIDGE_PID) tail -n 30 "${VLA_BRIDGE_LOG:-/dev/null}" >&2 || true ;;
             esac

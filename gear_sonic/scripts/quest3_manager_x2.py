@@ -160,6 +160,9 @@ class ManagerConfig:
     planner_cmd_host: str = "*"
     planner_cmd_port: int = 5563
     planner_cmd_topic: str = "planner_cmd"
+    # Dual-source mode: PUB-connect to a kplanner that owns the SUB bind
+    # (--cmd-bind / --zmq-cmd-bind), so the pad bridge can publish too.
+    planner_cmd_connect: bool = False
 
     recorder_pub_host: str = "*"
     recorder_pub_port: int = 5564
@@ -736,13 +739,26 @@ class Quest3ManagerX2:
         self._ctx = zmq.Context.instance()
         self._planner_sock = self._ctx.socket(zmq.PUB)
         self._planner_sock.setsockopt(zmq.LINGER, 0)
-        self._planner_sock.bind(
-            f"tcp://{cfg.planner_cmd_host}:{cfg.planner_cmd_port}"
-        )
-        log.info(
-            "planner_cmd PUB bound at tcp://%s:%d (topic=%s)",
-            cfg.planner_cmd_host, cfg.planner_cmd_port, cfg.planner_cmd_topic,
-        )
+        if cfg.planner_cmd_connect:
+            _cmd_host = (cfg.planner_cmd_host
+                         if cfg.planner_cmd_host not in ("*", "0.0.0.0")
+                         else "127.0.0.1")
+            self._planner_sock.connect(
+                f"tcp://{_cmd_host}:{cfg.planner_cmd_port}"
+            )
+            log.info(
+                "planner_cmd PUB connected to tcp://%s:%d (topic=%s; "
+                "dual-source mode, kplanner owns the SUB bind)",
+                _cmd_host, cfg.planner_cmd_port, cfg.planner_cmd_topic,
+            )
+        else:
+            self._planner_sock.bind(
+                f"tcp://{cfg.planner_cmd_host}:{cfg.planner_cmd_port}"
+            )
+            log.info(
+                "planner_cmd PUB bound at tcp://%s:%d (topic=%s)",
+                cfg.planner_cmd_host, cfg.planner_cmd_port, cfg.planner_cmd_topic,
+            )
         self._recorder_sock = self._ctx.socket(zmq.PUB)
         self._recorder_sock.setsockopt(zmq.LINGER, 0)
         self._recorder_sock.bind(
@@ -2355,6 +2371,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--planner-cmd-host", default="*")
     p.add_argument("--planner-cmd-port", type=int, default=5563)
     p.add_argument("--planner-cmd-topic", default="planner_cmd")
+    p.add_argument(
+        "--planner-cmd-connect", action="store_true",
+        help="PUB-connect the planner_cmd socket instead of binding it. "
+             "Dual-source (pad + VR) mode: the kplanner runs with "
+             "--cmd-bind/--zmq-cmd-bind and owns the SUB bind; both this "
+             "manager and pad_locomotion_bridge PUB-connect into it.",
+    )
 
     # Recorder output
     p.add_argument("--recorder-pub-host", default="*")
@@ -2855,6 +2878,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         planner_cmd_host=args.planner_cmd_host,
         planner_cmd_port=args.planner_cmd_port,
         planner_cmd_topic=args.planner_cmd_topic,
+        planner_cmd_connect=args.planner_cmd_connect,
         recorder_pub_host=args.recorder_pub_host,
         recorder_pub_port=args.recorder_pub_port,
         intent_stick_deadzone=args.stick_deadzone,

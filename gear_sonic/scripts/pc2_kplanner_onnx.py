@@ -1574,10 +1574,16 @@ def _zmq_command_thread(
     port: int,
     topic: str,
     stop_event: threading.Event,
+    bind: bool = False,
 ) -> None:
     """SUB planner_cmd (port of x2_kplanner._zmq_command_thread minus the
     waist fields the pad bridge never sends -- hip_height/direct_velocity
-    passthroughs kept for x2_pkl_command_source compatibility)."""
+    passthroughs kept for x2_pkl_command_source compatibility).
+
+    ``bind=True`` flips the SUB to bind so MULTIPLE command sources
+    (pad bridge + quest3 manager, each PUB-connect) can coexist —
+    two PUBs cannot share one bound port, but one bound SUB accepts
+    any number of connected PUBs."""
     import zmq
 
     ctx = zmq.Context.instance()
@@ -1585,8 +1591,12 @@ def _zmq_command_thread(
     sock.setsockopt(zmq.LINGER, 0)
     sock.setsockopt_string(zmq.SUBSCRIBE, topic)
     sock.setsockopt(zmq.RCVTIMEO, 200)
-    sock.connect(f"tcp://{host}:{port}")
-    log.info("planner_cmd source: SUB %r on tcp://%s:%d", topic, host, port)
+    if bind:
+        sock.bind(f"tcp://*:{port}")
+        log.info("planner_cmd source: SUB bind %r on tcp://*:%d", topic, port)
+    else:
+        sock.connect(f"tcp://{host}:{port}")
+        log.info("planner_cmd source: SUB %r on tcp://%s:%d", topic, host, port)
     try:
         while not stop_event.is_set():
             try:
@@ -2139,7 +2149,8 @@ def run(args: argparse.Namespace) -> int:
 
     thr = threading.Thread(
         target=_zmq_command_thread,
-        args=(cmd_queue, args.cmd_host, cmd_port, args.cmd_topic, stop_event),
+        args=(cmd_queue, args.cmd_host, cmd_port, args.cmd_topic, stop_event,
+              bool(args.cmd_bind)),
         name="cmd-zmq", daemon=True,
     )
     thr.start()
@@ -2760,6 +2771,10 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                      help="planner_cmd SUB connect host (pad bridge --bind).")
     net.add_argument("--cmd-port", type=int, default=DEFAULT_CMD_PORT)
     net.add_argument("--cmd-topic", default="planner_cmd")
+    net.add_argument("--cmd-bind", action="store_true",
+                     help="bind the planner_cmd SUB instead of connecting, so "
+                          "multiple sources (pad bridge + quest3 manager) can "
+                          "PUB-connect into it; --cmd-host is ignored.")
     net.add_argument("--clip-cmd-port", type=int, default=DEFAULT_CLIP_CMD_PORT,
                      help="motion_clip_cmd SUB bind port.")
     net.add_argument("--clip-cmd-topic", default="motion_clip_cmd")

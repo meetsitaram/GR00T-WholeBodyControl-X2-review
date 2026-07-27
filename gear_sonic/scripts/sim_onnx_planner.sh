@@ -40,6 +40,11 @@
 # Controls: L2 = deadman drive (locked 0.3), L1+Y/A = cycle dances, L1+B = stop.
 # Needs a pad visible to pygame BEFORE launch (--pad-only tears the stack down
 # otherwise) and the env_isaaclab conda env.
+#
+# --vr: dual-source input (pad + Quest 3). Spawns quest3_manager_x2 alongside
+# the pad bridge (stack --pad-and-vr); the kplanner SUB binds :5563 and both
+# sources PUB-connect. Open https://<laptop-ip>:8443 in the Quest 3 browser,
+# A+B+X+Y to engage; the pad keeps working whenever its deadman is held.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -47,14 +52,19 @@ cd "$(dirname "$0")/../.."
 # demo command sheet documents, and silently treating "--pc2-host" as a hostname
 # produces a baffling "cannot reach run@--pc2-host".
 PC2_IP=""
-case "${1:-}" in
-  --pc2-host|--pc2) PC2_IP="${2:-}" ;;
-  --*)              echo "unknown option: $1" >&2; PC2_IP="" ;;
-  *)                PC2_IP="${1:-}" ;;
-esac
+VR_MODE=0
+ORIG_ARGS=("$@")
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pc2-host|--pc2) PC2_IP="${2:-}"; shift 2 ;;
+    --vr)             VR_MODE=1; shift ;;
+    --*)              echo "unknown option: $1" >&2; shift ;;
+    *)                PC2_IP="$1"; shift ;;
+  esac
+done
 if [[ -z "$PC2_IP" ]]; then
   echo "usage: $0 <PC2_IP>            # e.g. $0 192.168.86.32" >&2
-  echo "       $0 --pc2-host <PC2_IP>" >&2
+  echo "       $0 --pc2-host <PC2_IP> [--vr]" >&2
   echo "  the robot's IP is required: it is what makes this run certifiable." >&2
   exit 2
 fi
@@ -214,7 +224,7 @@ else
     echo "  Whatever you saw in the viewer would NOT be evidence about the robot."
     echo
     echo "  If this is deliberate (validating a candidate before deploying it):"
-    echo "      ALLOW_MISMATCH=1 $0 $*"
+    echo "      ALLOW_MISMATCH=1 $0 ${ORIG_ARGS[*]}"
     echo "  Otherwise sync the mismatched artifact(s) to the robot and re-run."
     exit 6
   fi
@@ -274,6 +284,7 @@ summary() {
   printf '  dances             : %s\n' "$DANCES"
   printf '  warmup qpos        : kplanner_idle_anchor_g1teleop_v3.pkl\n'
   printf '  sonic .pt          : none (ONNX-only, matches robot)\n'
+  printf '  input mode         : %s\n' "$([[ "$VR_MODE" -eq 1 ]] && echo 'pad + Quest 3 VR (dual-source)' || echo 'pad only')"
   echo "  --------------------------------------------------------"
   if [[ "$GATE" != "MATCHED" ]]; then
     echo "  REMINDER: gate was $GATE -- results do NOT certify the robot's build."
@@ -305,9 +316,14 @@ MODE_FLAG=()
 SONIC_CKPT_FLAG=(--no-sonic-checkpoint)
 [[ -n "${SONIC_CKPT:-}" ]] && SONIC_CKPT_FLAG=(--sonic-checkpoint "$SONIC_CKPT")
 
+# --vr swaps --pad-only for --pad-and-vr: quest3_manager_x2 + pad bridge both
+# feed the kplanner's bound planner_cmd SUB (dual-source; see stack script).
+INPUT_FLAG=(--pad-only)
+[[ "$VR_MODE" -eq 1 ]] && INPUT_FLAG=(--pad-and-vr)
+
 # NOT exec'd: we must survive the stack to print the summary trap.
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
-  --duration 0 --pad-only "${MODE_FLAG[@]}" "${SONIC_CKPT_FLAG[@]}" \
+  --duration 0 "${INPUT_FLAG[@]}" "${MODE_FLAG[@]}" "${SONIC_CKPT_FLAG[@]}" \
   --kplanner-warmup-qpos gear_sonic/data/motions/kplanner_idle_anchor_g1teleop_v3.pkl \
   --model "$SONIC_ONNX" \
   --kplanner-python "$HOME/miniconda3/envs/env_isaaclab/bin/python" || true
