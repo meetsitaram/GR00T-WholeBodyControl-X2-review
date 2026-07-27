@@ -208,6 +208,12 @@ class G1OnnxPolicyShim(torch.nn.Module):
         # optional executed-trajectory recording (env var G1_SHIM_RECORD_DIR)
         self._rec_dir = os.environ.get("G1_SHIM_RECORD_DIR")
         self._rec_state = None  # lazily-built per-env recording state (see _record_step)
+        if self._rec_dir:
+            # Terminated (fallen) envs never reach their clip length, so their
+            # buffers would be dropped on exit — flush partials so falls are
+            # captured too (the post-fall frozen tail is part of the record).
+            import atexit
+            atexit.register(self._flush_unfinished)
 
         # Sanity: the ONNX I/O dims must match our offset maps.
         enc_shape = self.encoder.get_inputs()[0].shape
@@ -424,8 +430,25 @@ class G1OnnxPolicyShim(torch.nn.Module):
             if st["step"][i] >= st["len"][i]:  # clip complete -> write once
                 self._flush_clip(i)
                 st["done"][i] = True
+            elif st["step"][i] % 250 == 0:
+                # periodic partial write: Isaac hard-exits without running
+                # atexit, so clips cut short (falls, eval end) would otherwise
+                # vanish. Keep the buffer; the final write overwrites.
+                self._flush_clip(i, keep_buffer=True)
 
-    def _flush_clip(self, i):
+    def _flush_unfinished(self):
+        """atexit: write partial CSVs for envs that never completed their clip
+        (terminated/fallen). Without this, exactly the clips where the robot
+        fell — the most interesting ones to review — are silently missing."""
+        st = self._rec_state
+        if st is None:
+            return
+        for i in range(len(st["mid"])):
+            if st["buf"][i] is not None and not st["done"][i]:
+                self._flush_clip(i)
+                st["done"][i] = True
+
+    def _flush_clip(self, i, keep_buffer=False):
         st = self._rec_state
         buf = st["buf"][i]
         if not buf or not buf["root"]:
@@ -440,7 +463,8 @@ class G1OnnxPolicyShim(torch.nn.Module):
         out = os.path.join(self._rec_dir, f"{key}.csv")
         np.savetxt(tmp, rows, delimiter=",", header=",".join(header), comments="", fmt="%.6f")
         os.replace(tmp, out)
-        st["buf"][i] = None  # free memory
+        if not keep_buffer:
+            st["buf"][i] = None  # free memory
 
     def _dump_debug(self, path, obs_dict, enc_in, prop, tokens, actions):
         info = {

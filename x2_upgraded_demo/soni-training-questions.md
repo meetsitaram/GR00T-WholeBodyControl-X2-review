@@ -1,0 +1,21 @@
+- kplanner - was it trained only on the 145k boneseed or includes other datasets mentioned in the paper as well
+- kplanner - training discards any motions more than 200 frames (what is exact number). are bigger motion files broken down into smaller ones or discarded?
+- kplanner - when trained for 1M steps on 32 gpus, will training 1M steps on 8 gpus achieve approx. 1/4th success of the full run?
+- kplanner - if we want to resume training for another 1M steps, since pose model is dependent on vqvae, does pose has to be started from scratch after vqvae runs for another 1M steps?
+- kplanner - i found it hard to get the model to  execute in-place turns for manipulation tasks. have you observed similar under performance for such moves? or is there somewthing we can do to prioritize such motions during fine-turning at later stages
+- kplanner - in order to save compute costs, how can we conclude that a training run has finally converged and it is time to stop further training.
+
+- sonic - i observed that the model doesn't track fast moving arms well - especialy for combat moves. I have added extra reward to track arm velocity. will it impact overall balance across all rewards
+- sonic - if we want to fine tune for specific style of motions - fluid dance moves - is there any specific parameter that can be tuned? v.s. if we want it for manipulation tasks - anything to tune to have it more steardy and firm positioning?
+- sonic - the arms go down when we try to do pick ad place teleop for manipultions tasks. does the existing training incluce the max load capacity of the arms? or is there any config that can be added to improve overall weight holdign capacity of the arms. i observed the robot gets unbalanced and keeps falling forward where there is weight in the arms
+- sonic - how can we conclude that the training run has finally converged
+- sonic - adaptive sampling bins - if there are really hard motions in the dataset that the robot can never successed - will such moves take up a big portion of the overall compute used for the training? can we drop such moves to cut costs. there are motions in the boneseed that are impossible for the robot to train on - like climbing a ladder. are such moves discarded during trainging?
+- sonic - we have planning to use a 8 gpu nodes for this training. will the convergance be reasonable and we just expect it to take much longer comparedc to a 128 node run?
+- sonic - how much of the model degradation can occur if we just choose to traing  on roughly 40K locomotion and manipulatino tasks? what kind of abilities we will lose by such reduction
+- sonic - in order to cut costs, we are runnign the 145K boneseed motions on the g1 stock model to filter out any motios that the g1 sonic model already fails. is this a reasonable?
+- sonic - additional reward for soft steps - we observed our robot lands with hard steps during walks.  have you explored adding any reward for soft landing feet? if we add such reward, would it impact the overall balance of rewards?
+- sonic - instead of one big trianing run, can we pause in the middle, check how the model runs, tweek settings and resume for there? 
+- sonic - torque settings of motor - we had some challenges with waist torque settings for our robot. should the training follow exactly the specs provided by the manufacturer? or adjust something to make it work better in isaaclac?
+- sonic - encoders - can we limit the training to just robot encoder and skip smpl/human/hubrid encoders to limit scope and cut down compute costs? for manipulation tasks that require teleop, can we use the robot encoder for lower body control, and ik for arms with 3 point teleop?
+- sonic - we also noticed our wrists are trained well due to min-max limits of the robot wrist joint. have you observed any such challenges during training? or any tips on improving the wrist control?
+- sonic - do you have any upcoming PRs for the repo for supporting new robot embodiments? right now we have written a ton of extra code to support our robot. wondering if there is awy to just pass in a urdf and get the trianing run ready for any new robot.

@@ -133,13 +133,20 @@ DEFAULT_JOINT_POS = {
     "right_shoulder_pitch": 0.2,
 }
 
-# Effort limits from x2_ultra.py actuator config
+# Effort limits from x2_ultra.py actuator config. These feed
+# action_scale = 0.25 * effort / kp, so they MUST match the limits the
+# checkpoint was trained with or the action->target mapping is distorted
+# (a stale waist 48 vs trained 36 over-pitched the torso 1.33x -> constant
+# forward-fall/recovery-stepping on standing clips).
+# Values below = x2_ultra.py after the 2026-07-14 motor-datasheet fix
+# (waist pitch/roll 36 physical peak, wrist pitch/roll 6 per PFP-41-50).
+# Checkpoints trained BEFORE that fix need waist 48 / wrist 4.8 here.
 EFFORT_LIMITS = {
     "hip_yaw": 120.0, "hip_roll": 120.0, "hip_pitch": 120.0, "knee": 120.0,
     "ankle_pitch": 36.0, "ankle_roll": 24.0,
-    "waist_yaw": 120.0, "waist_pitch": 48.0, "waist_roll": 48.0,
+    "waist_yaw": 120.0, "waist_pitch": 36.0, "waist_roll": 36.0,
     "shoulder_pitch": 36.0, "shoulder_roll": 36.0, "shoulder_yaw": 24.0, "elbow": 24.0,
-    "wrist_yaw": 24.0, "wrist_pitch": 4.8, "wrist_roll": 4.8,
+    "wrist_yaw": 24.0, "wrist_pitch": 6.0, "wrist_roll": 6.0,
     "head_yaw": 2.6, "head_pitch": 0.6,
 }
 
@@ -723,6 +730,17 @@ def main():
              "auto-advancing (default 0 = play the full clip once). E.g. 5 = a 5 s "
              "snippet of each. Keyboard N/B still override to step manually.")
     parser.add_argument(
+        "--debug-obs", action="store_true",
+        help="Print the per-step obs/action debug block every 250 steps "
+             "(old default). Off by default so clip titles, [end] lines and "
+             "★ RATING lines stay readable.")
+    parser.add_argument(
+        "--clip-pause", type=float, default=0.0,
+        help="With --motions, hold the sim frozen this many seconds between "
+             "clips (robot freezes at its final pose, terminal shows which clip "
+             "just ended). Rating keys E/M/D still apply to the finished clip "
+             "during the pause; N skips the wait. E.g. 15 for demo triage.")
+    parser.add_argument(
         "--clip", default=None,
         help="With --motions, only play clips whose name CONTAINS this substring "
              "(case-insensitive). E.g. --clip dance_disco_fever_001__A465 plays just "
@@ -1142,6 +1160,7 @@ def main():
                 _rec["qpos"].append(qpos_j.copy())
                 _rec["qvel"].append(qvel_j.copy())
                 _rec["target"].append(target_pos.copy())
+                _rec.setdefault("root", []).append(mj_data.qpos[0:7].copy())
 
             # -- Manual forward push (key 'P'): external force at the head/neck
             # (--push-body, default head_pitch_link -- high up for a large moment
@@ -1210,6 +1229,7 @@ def main():
                              qpos=np.array(_rec["qpos"]),
                              qvel=np.array(_rec["qvel"]),
                              target=np.array(_rec["target"]),
+                             root=np.array(_rec.get("root", [])),
                              clip=(clip_names[clip_idx] if clip_names else ""),
                              fps=float(motion_fps))
                     print(f"[record] wrote {len(_rec['t'])} steps ({_dur:.1f}s) to "
@@ -1241,6 +1261,27 @@ def main():
             if reset_reason is not None:
                 print(f"  [end] DANCE {clip_idx + 1}/{n_clips} {clip_names[clip_idx]} "
                       f"ran {episode_seconds:.2f}s ({reset_reason})", flush=True)
+                if args.clip_pause > 0 and n_clips > 1:
+                    # Freeze at the final pose so the just-played clip can be
+                    # rated/noted before the next one starts. E/M/D rate the
+                    # finished clip; N cuts the pause short.
+                    print(f"  [pause] holding {args.clip_pause:.0f}s after "
+                          f"{clip_names[clip_idx]} (E/M/D to rate, N to skip wait)",
+                          flush=True)
+                    pause_end = time.time() + args.clip_pause
+                    while viewer.is_running() and time.time() < pause_end:
+                        if pending_rating is not None:
+                            print(f"  ★ RATING {pending_rating} | DANCE "
+                                  f"{clip_idx + 1}/{n_clips}: {clip_names[clip_idx]}",
+                                  flush=True)
+                            pending_rating = None
+                        if pending_clip_jump != 0:
+                            pending_clip_jump = 0
+                            break
+                        viewer.sync()
+                        time.sleep(0.05)
+                    if not viewer.is_running():
+                        break
                 if n_clips > 1:
                     # Advance to the next dance clip (RSI-reset happens in reset_state).
                     clip_idx += 1
@@ -1254,7 +1295,7 @@ def main():
                 wall_start = time.time() - sim_time
                 continue
 
-            if step_count <= 5 or step_count % 250 == 0:
+            if args.debug_obs and (step_count <= 5 or step_count % 250 == 0):
                 h = mj_data.qpos[2]
                 print(f"\n[ep {episode_count}] step={step_count}  sim={sim_time:.2f}s  "
                       f"frame={motion_frame}/{total_frames}  height={h:.3f}m",
