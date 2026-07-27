@@ -302,6 +302,26 @@ class _ShowDriver:
             view.GetInverse())
         get_active_viewport().camera_path = "/World/KPFixedCam"
 
+        if os.environ.get("KP_CLEAN_UI"):
+            # off-screen takes: strip editor panels so the recording is a
+            # clean full-viewport frame (window resize happens earlier, at
+            # tick 3, so the viewport has settled before we place cameras)
+            try:
+                import omni.ui as _ui
+                for wname in ("Stage", "Property", "Content", "Console",
+                              "Layer", "Render Settings", "Layers",
+                              "Semantics Schema Editor", "IsaacLab",
+                              "Simulation Settings", "Main ToolBar"):
+                    try:
+                        w_ = _ui.Workspace.get_window(wname)
+                        if w_ is not None:
+                            w_.visible = False
+                    except Exception:
+                        pass
+                print("[showcase] clean UI: panels hidden", flush=True)
+            except Exception as e:
+                print(f"[showcase] clean UI failed: {e}", flush=True)
+
         # chase camera + bottom-right sub-window (~80% of previous size)
         ccam = UsdGeom.Camera.Define(stage, "/World/KPChaseCam")
         ccam.GetFocalLengthAttr().Set(16.0)
@@ -310,6 +330,7 @@ class _ShowDriver:
         w, h = 690, 430
         vp2 = create_viewport_window("KP Chase View", width=w, height=h)
         vp2.viewport_api.camera_path = "/World/KPChaseCam"
+        self._vp2, self._vp2_wh = vp2, (w, h)
         try:
             vw = ui.Workspace.get_window("Viewport")
             vp2.position_x = int(vw.position_x + vw.width - w - 16)
@@ -395,8 +416,361 @@ class _ShowDriver:
                        data.root_quat_w[0].cpu().numpy().copy(),
                        data.joint_pos[0].cpu().numpy().copy()))
 
+    def _poc_data_tick(self):
+        """G3: synced (rgb, teacher_obs28, teacher_action3) samples at 5 Hz.
+        Proves the DAgger data path: camera sensor + state->teacher-obs
+        reconstruction + frozen stage-0 policy inference in one sim loop.
+        Saves 200 samples to npz then prints a verdict."""
+        import numpy as np
+        import torch as _t
+        if self.ticks % 10:                      # 5 Hz (50 Hz control)
+            return
+        if getattr(self, "_poc_done", False):
+            return
+        if not hasattr(self, "_poc"):            # lazy init
+            import glob as _g
+            nav_dir = os.path.join(REPO_ROOT, "gear_sonic", "scripts",
+                                   "x2-navigation")
+            if nav_dir not in sys.path:
+                sys.path.insert(0, nav_dir)
+            from train_nav_teacher import NavKitchenEnv
+            from rsl_rl.runners import OnPolicyRunner
+            env = NavKitchenEnv(1, "cuda", seed=0)
+            cfg = {
+                "num_steps_per_env": 24, "save_interval": 500,
+                "empirical_normalization": True, "logger": "tensorboard",
+                "obs_groups": {"policy": ["critic"], "critic": ["critic"]},
+                "policy": {"class_name": "ActorCritic", "activation": "elu",
+                           "actor_hidden_dims": [256, 128, 64],
+                           "critic_hidden_dims": [256, 128, 64],
+                           "init_noise_std": 1.0},
+                "algorithm": {"class_name": "PPO", "value_loss_coef": 1.0,
+                              "use_clipped_value_loss": True,
+                              "clip_param": 0.2, "entropy_coef": 0.005,
+                              "num_learning_epochs": 5,
+                              "num_mini_batches": 4, "learning_rate": 1e-3,
+                              "schedule": "adaptive", "gamma": 0.99,
+                              "lam": 0.95, "desired_kl": 0.01,
+                              "max_grad_norm": 1.0},
+            }
+            runner = OnPolicyRunner(env, cfg, log_dir=None, device="cuda")
+            ckpt = sorted(_g.glob(os.path.expanduser(
+                "~/projects/x2-kitchen-sim/runs/nav_teacher_hardened_0722c"
+                "/model_*.pt")),
+                key=lambda p: int(p.split("_")[-1][:-3]))[-1]
+            runner.load(ckpt)
+            gname = os.environ.get("KP_POC_GOAL", "entrance")
+            gi = env.wp_names.index(gname)
+            self._poc = {
+                "env": env, "policy": runner.get_inference_policy("cuda"),
+                "goal": env.wp_xy[gi], "gyaw": float(env.wp_yaw[gi]),
+                "prev_root": None, "vel_ema": np.zeros(3),
+                "prev_act": _t.zeros(1, 3, device="cuda"),
+                "rgb": [], "obs": [], "act": [], "t0": None,
+            }
+            print(f"[poc] G3 armed: teacher={os.path.basename(ckpt)} "
+                  f"goal={gname}", flush=True)
+        import time as _time
+        import math
+        p = self._poc
+        env = p["env"]
+        if p["t0"] is None:
+            p["t0"] = _time.time()
+        scene = self.cmd._env.scene
+        rs = scene["robot"].data.root_state_w[0]
+        kx = float(rs[0]) - WORLD_POS[0]
+        ky = float(rs[1]) - WORLD_POS[1]
+        qw, qx, qy, qz = [float(v) for v in rs[3:7]]
+        yaw = math.atan2(2 * (qw * qz + qx * qy),
+                         1 - 2 * (qy * qy + qz * qz))
+        if p["prev_root"] is not None:
+            import numpy as np
+            vw = (np.array([kx, ky]) - p["prev_root"][:2]) / 0.2
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            vb = np.array([cy * vw[0] + sy * vw[1],
+                           -sy * vw[0] + cy * vw[1],
+                           math.atan2(math.sin(yaw - p["prev_root"][2]),
+                                      math.cos(yaw - p["prev_root"][2])) / 0.2])
+            p["vel_ema"] = 0.6 * p["vel_ema"] + 0.4 * vb
+        import numpy as np
+        p["prev_root"] = np.array([kx, ky, yaw])
+        gxy = p["goal"].cpu().numpy()
+        d = gxy - np.array([kx, ky])
+        dist = float(np.linalg.norm(d))
+        dyaw = math.atan2(math.sin(p["gyaw"] - yaw),
+                          math.cos(p["gyaw"] - yaw))
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        gb = np.array([cy * d[0] + sy * d[1], -sy * d[0] + cy * d[1]])
+        kpos = _t.tensor([[kx, ky]], dtype=_t.float32, device="cuda")
+        wa = _t.tensor(yaw, device="cuda") + env.ray_ang
+        rr = []
+        for r in (0.4, 0.8):
+            pp = kpos + r * _t.stack((_t.cos(wa), _t.sin(wa)), dim=1)
+            rr.append(env._esdf_at(pp))
+        rays = _t.minimum(rr[0], rr[1]).clamp(max=2.0) / 2.0
+        obs = _t.cat([
+            _t.tensor([[gb[0] / 5, gb[1] / 5, dist / 5,
+                        math.cos(dyaw), math.sin(dyaw), 1.0]],
+                      dtype=_t.float32, device="cuda"),
+            _t.tensor(p["vel_ema"], dtype=_t.float32,
+                      device="cuda").unsqueeze(0),
+            p["prev_act"], rays.unsqueeze(0)], dim=1)
+        with _t.no_grad():
+            act = p["policy"](obs).clamp(-1, 1)
+        p["prev_act"] = act
+        try:
+            rgb = scene["eval_camera"].data.output["rgb"][0]
+            arr = rgb.detach().float().cpu().numpy()[..., :3]
+            if arr.max() <= 1.5:
+                arr = arr * 255.0
+            p["rgb"].append(arr.astype(np.uint8))
+        except Exception:
+            p["rgb"].append(np.zeros((8, 8, 3), np.uint8))
+        p["obs"].append(obs[0].cpu().numpy())
+        p["act"].append(act[0].cpu().numpy())
+        n = len(p["act"])
+        if n % 50 == 0:
+            print(f"[poc] G3 samples={n}", flush=True)
+        if n >= 200:
+            self._poc_done = True
+            rate = n / (_time.time() - p["t0"])
+            acts = np.stack(p["act"])
+            out = "/tmp/claude-1000/poc_g3_samples.npz"
+            np.savez_compressed(
+                out, rgb=np.stack(p["rgb"]), obs=np.stack(p["obs"]),
+                act=acts)
+            std = acts.std(axis=0)
+            verdict = ("PASS" if rate >= 10 and float(std.max()) > 0.05
+                       else "FAIL")
+            print(f"[poc] G3 VERDICT: {verdict} — 200 samples @ "
+                  f"{rate:.1f}/s wall, action std={std.round(3).tolist()} "
+                  f"-> {out}", flush=True)
+
+    def _bake_gallery(self):
+        """KP_BAKE: render the splat kitchen from every walkable pose bin
+        through the SENSOR path (robot head height, 16 headings x ~0.2m
+        grid) into a gallery npz. Runs in ONE tick via force_recompute —
+        no physics stepping. Robot is parked out of frame first."""
+        import math
+        import numpy as np
+        import torch as _t
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        out = os.environ.get("KP_BAKE", "/tmp/claude-1000/kitchen_gallery.npz")
+        step = float(os.environ.get("KP_BAKE_STEP", "0.2"))
+        nyaw = int(os.environ.get("KP_BAKE_YAWS", "16"))
+        res = int(os.environ.get("KP_BAKE_RES", "96"))
+        # park the robot below the world so it never photobombs
+        robot = self.cmd._env.scene["robot"]
+        rs = robot.data.root_state_w.clone()
+        rs[:, 0:3] = _t.tensor([0.0, 0.0, -10.0], device=rs.device)
+        rs[:, 7:13] = 0
+        robot.write_root_state_to_sim(rs)
+        # walkable cells from the nav grid, subsampled to `step`
+        nav_dir = os.path.join(REPO_ROOT, "gear_sonic", "scripts",
+                               "x2-navigation")
+        if nav_dir not in sys.path:
+            sys.path.insert(0, nav_dir)
+        from train_nav_teacher import NavKitchenEnv
+        env = NavKitchenEnv(1, "cuda", seed=0)
+        xy = env.free_xy.cpu().numpy()
+        q = np.round(xy / step).astype(np.int64)
+        _, keep = np.unique(q, axis=0, return_index=True)
+        cells = xy[np.sort(keep)]
+        print(f"[bake] {len(cells)} cells x {nyaw} yaws = "
+              f"{len(cells) * nyaw} renders", flush=True)
+        cam = self.cmd._env.scene["eval_camera"]
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath("/World/envs/env_0/eval_camera")
+        xf = UsdGeom.Xformable(prim)
+        xf.ClearXformOpOrder()
+        op = xf.AddTransformOp()
+        import omni.kit.app
+        app = omni.kit.app.get_app()
+        imgs, poses = [], []
+        t0 = __import__("time").time()
+        for ci, (cx, cy) in enumerate(cells):
+            for yi in range(nyaw):
+                yaw = 2 * math.pi * yi / nyaw
+                ex = cx + WORLD_POS[0]
+                ey = cy + WORLD_POS[1]
+                view = Gf.Matrix4d()
+                view.SetLookAt(
+                    Gf.Vec3d(ex, ey, 1.15),
+                    Gf.Vec3d(ex + 1.5 * math.cos(yaw),
+                             ey + 1.5 * math.sin(yaw), 0.75),
+                    Gf.Vec3d(0, 0, 1))
+                op.Set(view.GetInverse())
+                app.update()          # pump the renderer for the new pose
+                try:
+                    cam.update(dt=0.02, force_recompute=True)
+                except TypeError:
+                    cam.update(0.02)
+                arr = cam.data.output["rgb"][0].detach().float().cpu().numpy()
+                arr = arr[..., :3]
+                if arr.max() <= 1.5:
+                    arr = arr * 255.0
+                if arr.shape[0] != res:
+                    import torch.nn.functional as _F
+                    tt = _t.tensor(arr).permute(2, 0, 1)[None]
+                    arr = _F.interpolate(tt, size=(res, res),
+                                         mode="bilinear")[0]
+                    arr = arr.permute(1, 2, 0).numpy()
+                imgs.append(arr.astype(np.uint8))
+                poses.append([cx, cy, yaw])
+            if ci % 50 == 0:
+                r = (ci * nyaw + nyaw) / max(1e-9, __import__("time").time() - t0)
+                print(f"[bake] cell {ci}/{len(cells)} ({r:.0f} renders/s)",
+                      flush=True)
+        np.savez_compressed(out, imgs=np.stack(imgs),
+                            poses=np.array(poses, np.float32),
+                            step=step, nyaw=nyaw)
+        dt = __import__("time").time() - t0
+        print(f"[bake] DONE: {len(imgs)} renders in {dt:.0f}s -> {out}",
+              flush=True)
+        os._exit(0)
+
+    def _bake_step(self):
+        """Per-tick bake pipeline: harvest the render for the pose set last
+        tick, then author the next pose. One pose per tick — the sim loop
+        itself pumps the renderer (nested app.update() is a no-op)."""
+        import math
+        import time as _time
+        import numpy as np
+        import torch as _t
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        if not hasattr(self, "_bk"):
+            out = os.environ.get("KP_BAKE")
+            step = float(os.environ.get("KP_BAKE_STEP", "0.2"))
+            nyaw = int(os.environ.get("KP_BAKE_YAWS", "16"))
+            robot = self.cmd._env.scene["robot"]
+            rs = robot.data.root_state_w.clone()
+            rs[:, 0:3] = _t.tensor([0.0, 0.0, -10.0], device=rs.device)
+            rs[:, 7:13] = 0
+            robot.write_root_state_to_sim(rs)
+            nav_dir = os.path.join(REPO_ROOT, "gear_sonic", "scripts",
+                                   "x2-navigation")
+            if nav_dir not in sys.path:
+                sys.path.insert(0, nav_dir)
+            from train_nav_teacher import NavKitchenEnv
+            env = NavKitchenEnv(1, "cuda", seed=0)
+            xy = env.free_xy.cpu().numpy()
+            q = np.round(xy / step).astype(np.int64)
+            _, keep = np.unique(q, axis=0, return_index=True)
+            cells = xy[np.sort(keep)]
+            poses = []
+            for cx, cy in cells:
+                for yi in range(nyaw):
+                    poses.append((float(cx), float(cy),
+                                  2 * math.pi * yi / nyaw))
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath("/World/envs/env_0/eval_camera")
+            xf = UsdGeom.Xformable(prim)
+            xf.ClearXformOpOrder()
+            self._bk = {
+                "out": out, "step": step, "nyaw": nyaw,
+                "res": int(os.environ.get("KP_BAKE_RES", "96")),
+                "poses": poses, "i": 0, "op": xf.AddTransformOp(),
+                "cam": self.cmd._env.scene["eval_camera"],
+                "imgs": [], "done_poses": [], "pending": None,
+                "t0": _time.time(), "Gf": Gf,
+            }
+            print(f"[bake] {len(poses)} poses queued (1/tick)", flush=True)
+        bk = self._bk
+        Gf = bk["Gf"]
+        # 1) harvest previous pose's render
+        if bk["pending"] is not None:
+            try:
+                bk["cam"].update(dt=0.02, force_recompute=True)
+            except TypeError:
+                bk["cam"].update(0.02)
+            arr = bk["cam"].data.output["rgb"][0].detach().float() \
+                .cpu().numpy()[..., :3]
+            if arr.max() <= 1.5:
+                arr = arr * 255.0
+            if arr.shape[0] != bk["res"]:
+                import torch.nn.functional as _F
+                tt = _t.tensor(arr).permute(2, 0, 1)[None]
+                arr = _F.interpolate(tt, size=(bk["res"], bk["res"]),
+                                     mode="bilinear")[0].permute(1, 2, 0) \
+                    .numpy()
+            bk["imgs"].append(arr.astype(np.uint8))
+            bk["done_poses"].append(bk["pending"])
+            bk["pending"] = None
+        # 2) finished?
+        if bk["i"] >= len(bk["poses"]):
+            if len(bk["imgs"]) >= len(bk["poses"]):
+                dt = _time.time() - bk["t0"]
+                np.savez_compressed(
+                    bk["out"], imgs=np.stack(bk["imgs"]),
+                    poses=np.array(bk["done_poses"], np.float32),
+                    step=bk["step"], nyaw=bk["nyaw"])
+                print(f"[bake] DONE: {len(bk['imgs'])} renders in {dt:.0f}s "
+                      f"-> {bk['out']}", flush=True)
+                os._exit(0)
+            return
+        # 3) author next pose
+        cx, cy, yaw = bk["poses"][bk["i"]]
+        bk["i"] += 1
+        ex, ey = cx + WORLD_POS[0], cy + WORLD_POS[1]
+        view = Gf.Matrix4d()
+        view.SetLookAt(Gf.Vec3d(ex, ey, 1.15),
+                       Gf.Vec3d(ex + 1.5 * math.cos(yaw),
+                                ey + 1.5 * math.sin(yaw), 0.75),
+                       Gf.Vec3d(0, 0, 1))
+        bk["op"].Set(view.GetInverse())
+        bk["pending"] = (cx, cy, yaw)
+        if bk["i"] % 500 == 0:
+            r = bk["i"] / max(1e-9, _time.time() - bk["t0"])
+            eta = (len(bk["poses"]) - bk["i"]) / max(r, 1e-9)
+            print(f"[bake] {bk['i']}/{len(bk['poses'])} "
+                  f"({r:.0f}/s, eta {eta/60:.1f} min)", flush=True)
+
+    def _kinematic_tick(self):
+        """KP_KINEMATIC=1: write the REFERENCE state directly to every
+        robot each tick — pure kinematic playback of the commanded
+        trajectories (no SONIC tracking in the loop, hence zero execution
+        drift). The honest visualization of what the policy commanded."""
+        import torch as _t
+        cmd = self.cmd
+        lib = cmd.motion_lib
+        env = cmd._env
+        gs = (lib.length_starts[cmd.motion_ids] + cmd.time_steps).long()
+        robot = env.scene["robot"]
+        rs = robot.data.root_state_w.clone()
+        origins = env.scene.env_origins
+        rs[:, 0:3] = lib.body_pos_w[gs, 0] + origins
+        rs[:, 3:7] = lib.body_quat_w[gs, 0]
+        rs[:, 7:13] = 0.0
+        robot.write_root_state_to_sim(rs)
+        jp = lib.dof_pos[gs]
+        jv = _t.zeros_like(jp)
+        robot.write_joint_state_to_sim(jp, jv)
+
     def tick(self):
         self.ticks += 1
+        if os.environ.get("KP_KINEMATIC"):
+            try:
+                self._kinematic_tick()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        if os.environ.get("KP_BAKE") and self.ticks >= 200:
+            try:
+                self._bake_step()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                os._exit(1)
+            return
+        if os.environ.get("KP_POC_DATA"):
+            try:
+                self._poc_data_tick()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                self._poc_done = True
         if True:
             # idempotent re-pin EVERY tick: something restores stale origins
             # between resets (reset z lands +0.4 above reference)
@@ -526,6 +900,87 @@ class _ShowDriver:
                           flush=True)
             except Exception as e:
                 print(f"[showcase] hb err: {e}", flush=True)
+        if self.ticks == 3 and os.environ.get("KP_CLEAN_UI"):
+            try:
+                import omni.appwindow
+                aw = omni.appwindow.get_default_app_window()
+                aw.resize(int(os.environ.get("KP_WIN_W", "2560")),
+                          int(os.environ.get("KP_WIN_H", "1440")))
+                print("[showcase] app window resized", flush=True)
+            except Exception as e:
+                print(f"[showcase] window resize failed: {e}", flush=True)
+        if self.ticks == 140 and getattr(self, "_vp2", None) is not None:
+            # re-dock the chase view bottom-right with SETTLED viewport dims
+            # (at setup time a fresh window resize hasn't propagated yet)
+            try:
+                import omni.ui as _ui
+                vw = _ui.Workspace.get_window("Viewport")
+                w, h = self._vp2_wh
+                self._vp2.position_x = int(vw.position_x + vw.width - w - 16)
+                self._vp2.position_y = int(vw.position_y + vw.height - h - 16)
+                print("[showcase] chase view re-docked", flush=True)
+            except Exception as e:
+                print(f"[showcase] chase re-dock failed: {e}", flush=True)
+        if os.environ.get("KP_TILED_GATE") and self.ticks % 150 == 5:
+            # N0 GATE: does the NuRec splat render through the TiledCamera
+            # SENSOR path (not the viewport)? Position eval_camera at the
+            # showcase eye, print stats, dump one frame.
+            try:
+                import torch as _t
+                cam = self.cmd._env.scene["eval_camera"]
+                # KP_CAM_EYE/LOOKAT are ABSOLUTE world coords (same as _setup)
+                eye = [float(v) for v in os.environ.get(
+                    "KP_CAM_EYE", "-18.4,-73.9,2.1").split(",")]
+                tgt = [float(v) for v in os.environ.get(
+                    "KP_CAM_LOOKAT", "-20.6,-75.6,0.7").split(",")]
+                # sensor-API pose writes don't stick (readback stayed 0,0,0)
+                # -> author the USD camera prim directly, like KPFixedCam
+                pass  # fixed showcase eye (overhead z=6 sits in ceiling fuzz)
+                from pxr import Gf, UsdGeom
+                import omni.usd
+                stage = omni.usd.get_context().get_stage()
+                prim = stage.GetPrimAtPath("/World/envs/env_0/eval_camera")
+                if prim.IsValid():
+                    view = Gf.Matrix4d()
+                    view.SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*tgt),
+                                   Gf.Vec3d(0, 0, 1))
+                    xf = UsdGeom.Xformable(prim)
+                    if not getattr(self, "_gate_xf_reset", False):
+                        # spawned op is translate (Vec3d) — replace with a
+                        # single matrix transform op we can look-at through
+                        xf.ClearXformOpOrder()
+                        self._gate_xf_reset = True
+                    ops = xf.GetOrderedXformOps()
+                    op = ops[0] if ops else xf.AddTransformOp()
+                    op.Set(view.GetInverse())
+                    print(f"[gate] prim-posed eye={[round(v,1) for v in eye]}",
+                          flush=True)
+                else:
+                    print("[gate] eval_camera prim NOT FOUND", flush=True)
+                try:
+                    cam.update(dt=0.02, force_recompute=True)
+                except TypeError:
+                    cam.update(0.02)
+                rgb = cam.data.output["rgb"]
+                arr = rgb[0].detach().float().cpu().numpy()
+                print(f"[gate] tiled rgb shape={tuple(arr.shape)} "
+                      f"mean={arr.mean():.1f} std={arr.std():.1f} "
+                      f"min={arr.min():.0f} max={arr.max():.0f}", flush=True)
+                if self.ticks > 300 and not getattr(self, "_gate_png", False):
+                    self._gate_png = True
+                    import numpy as _np
+                    from PIL import Image
+                    a8 = arr[..., :3]
+                    if a8.max() <= 1.5:
+                        a8 = a8 * 255.0
+                    Image.fromarray(_np.clip(a8, 0, 255).astype("uint8")).save(
+                        "/tmp/claude-1000/tiled_gate_frame.png")
+                    print("[gate] frame saved: "
+                          "/tmp/claude-1000/tiled_gate_frame.png", flush=True)
+            except Exception:
+                import traceback as _tb
+                print("[gate] tiled gate err:\n"
+                      + _tb.format_exc().strip().splitlines()[-1], flush=True)
         if not self.setup_done and self.ticks >= 10:
             self.setup_done = True
             try:

@@ -63,6 +63,30 @@ def main() -> int:
                     help="stagger DEPARTURES i*stagger_s apart (peel-off "
                          "look for shared-spawn different-goal scenes) "
                          "instead of arrival-time choreography")
+    ap.add_argument("--student-ckpt", default=None,
+                    help="drive with the CAMERA STUDENT (StudentNet .pt) "
+                         "instead of the teacher: gallery-rendered RGB + "
+                         "drift-corrupted belief (its training condition)")
+    ap.add_argument("--gallery",
+                    default="/tmp/claude-1000/kitchen_gallery.npz")
+    ap.add_argument("--drift-rate", type=float, default=0.15,
+                    help="odometry drift m per m walked (student mode)")
+    ap.add_argument("--approach-dist", type=float, default=0.0,
+                    help="two-stage arrival: first reach a staging point "
+                         "this many meters IN FRONT of the goal along its "
+                         "heading (e.g. in the hallway before the entrance "
+                         "door), then drive the final straight segment — "
+                         "produces the natural approach-corridor path")
+    ap.add_argument("--precision-goals", default="entrance",
+                    help="comma list of goals that get recenter+staging "
+                         "(doorway-type). Appliance goals keep their stored "
+                         "coords — low clearance there is intentional.")
+    ap.add_argument("--recenter-goals", action="store_true",
+                    help="snap each goal to the local clearance maximum "
+                         "within +-0.8m perpendicular to its heading — "
+                         "corrects waypoint coords captured from the "
+                         "planner's drifted pose (e.g. entrance sits right "
+                         "of the actual doorway)")
     args = ap.parse_args()
     device = "cuda"
 
@@ -90,6 +114,21 @@ def main() -> int:
     runner.load(ckpt)
     policy = runner.get_inference_policy(device=device)
     print(f"[gen] policy {os.path.basename(ckpt)}")
+
+    student = gallery = None
+    if args.student_ckpt:
+        nav_house = os.path.join(REPO, "gear_sonic", "envs", "nav_house")
+        sys.path.insert(0, nav_house)
+        from poc_student_bc import StudentNet
+        from train_student_dagger import Gallery, augment
+        student = StudentNet(state_dim=12).to(device)
+        student.load_state_dict(torch.load(args.student_ckpt,
+                                           map_location=device))
+        student.eval()
+        gallery = Gallery(args.gallery, device)
+        globals()["_augment"] = augment
+        print(f"[gen] STUDENT mode: {os.path.basename(args.student_ckpt)} "
+              f"drift={args.drift_rate}/m", flush=True)
 
     # planner backend (the deployed ONNX runtime, as gen_kplanner_clip does)
     spec = importlib.util.spec_from_file_location(
@@ -139,6 +178,21 @@ def main() -> int:
         gxy = env.wp_xy[wi].cpu().numpy().copy()
         gyaw = float(env.wp_yaw[wi])
         grad = float(env.wp_rad[wi])
+        precision = goal_name in args.precision_goals.split(",")
+        if args.recenter_goals and precision:
+            perp = np.array([-math.sin(gyaw), math.cos(gyaw)])
+            best = (None, 0.0)
+            for k in range(-16, 17):
+                cand = gxy + (0.05 * k) * perp
+                ct = torch.tensor(cand[None], dtype=torch.float32,
+                                  device=device)
+                e = float(env._esdf_at(ct)[0])
+                if best[0] is None or e > best[0]:
+                    best = (e, 0.05 * k, cand)
+            if abs(best[1]) > 0.01:
+                print(f"[gen] recenter {goal_name}: {best[1]:+.2f}m perp "
+                      f"(esdf {best[0]:.2f})", flush=True)
+                gxy = best[2]
         if args.goal_fan > 0.0 and ri > 0:
             # arrival queue: the goal is a doorway (esdf ~0.18 at the
             # waypoint — no lateral room), so later robots stop at
@@ -174,6 +228,23 @@ def main() -> int:
         prev_root = None
         vel_ema = np.zeros(3)
         prev_act = torch.zeros(1, 3, device=device)
+        walked = 0.0
+        last_xy = None
+        # two-stage arrival: staging point in front of the goal heading
+        stage_p = None
+        if args.approach_dist > 0.0 and precision:
+            fwd_g = np.array([math.cos(gyaw), math.sin(gyaw)])
+            # staging point is BEFORE the goal along the approach: the
+            # robot passes it travelling in +gyaw direction into the goal
+            cand = gxy - args.approach_dist * fwd_g
+            ct = torch.tensor(cand[None], dtype=torch.float32,
+                              device=device)
+            if float(env._esdf_at(ct)[0]) >= 0.25:
+                stage_p = cand - spawn      # planner frame
+                print(f"[gen] staging point for {goal_name}: "
+                      f"({cand[0]:+.2f},{cand[1]:+.2f})", flush=True)
+        drift_ang = 2.399963 * ri          # golden-angle spread per route
+        drift_u = np.array([math.cos(drift_ang), math.sin(drift_ang)])
         intent = (0.0, 0.0, 0.0, 0.687)
         backend.replan(intent)
         reached = False
@@ -197,12 +268,26 @@ def main() -> int:
                 vel_ema = 0.6 * vel_ema + 0.4 * vb
             prev_root = np.array([px, py, yaw])
 
-            d = goal_p - np.array([px, py])
+            staging = stage_p is not None
+            tgt_p = stage_p if staging else goal_p
+            d = tgt_p - np.array([px, py])
             dist = float(np.linalg.norm(d))
             dyaw = math.atan2(math.sin(gyaw_p - yaw), math.cos(gyaw_p - yaw))
-            if dist < grad and abs(dyaw) < 0.35:
-                reached = True
-                break
+            if staging:
+                if dist < 0.30:
+                    stage_p = None          # staging reached -> final leg
+                    continue
+            # precision arrival: tight position gate, then an in-place
+            # ALIGN phase to the waypoint heading (planner turns natively)
+            pos_tol = min(grad, 0.30)
+            if not staging and dist < pos_tol:
+                if abs(dyaw) < 0.15:
+                    reached = True
+                    break
+                intent = (float(np.clip(2.0 * dyaw, -0.8, 0.8)), 0.0, 0.0,
+                          0.687)
+                backend.replan(intent)
+                continue
             cy, sy = math.cos(yaw), math.sin(yaw)
             gb = np.array([cy * d[0] + sy * d[1], -sy * d[0] + cy * d[1]])
             # rays from the kitchen ESDF at the KITCHEN-frame position
@@ -217,13 +302,37 @@ def main() -> int:
             rays = torch.minimum(rr[0], rr[1]).clamp(max=2.0) / 2.0
             obs = torch.cat([
                 torch.tensor([[gb[0] / 5, gb[1] / 5, dist / 5,
-                               math.cos(dyaw), math.sin(dyaw), 1.0]],
+                               math.cos(dyaw), math.sin(dyaw),
+                               0.0 if staging else 1.0]],
                              dtype=torch.float32, device=device),
                 torch.tensor(vel_ema, dtype=torch.float32,
                              device=device).unsqueeze(0),
                 prev_act, rays.unsqueeze(0)], dim=1)
             with torch.no_grad():
-                act = policy(obs).clamp(-1, 1)
+                if student is not None:
+                    # student drives: gallery eyes at TRUE pose, belief
+                    # corrupted by EMPIRICAL turn-gated drift (accrues in
+                    # curved motion + in-place slip; straights ~free)
+                    if last_xy is not None:
+                        step_d = float(np.hypot(px - last_xy[0],
+                                                py - last_xy[1]))
+                        step_y = abs(math.atan2(
+                            math.sin(yaw - last_xy[2]),
+                            math.cos(yaw - last_xy[2])))
+                        g_ = min(1.0, step_y / (0.3 * step_d + 1e-6))
+                        walked = min(walked + args.drift_rate * g_ * step_d
+                                     + 0.04 * step_y, 1.6)
+                    last_xy = (px, py, yaw)
+                    bias = walked * drift_u
+                    s12 = obs[:, :12].clone()
+                    s12[0, 0] += bias[0] / 5.0
+                    s12[0, 1] += bias[1] / 5.0
+                    rgb = gallery.lookup(kpos, torch.tensor([yaw],
+                                                            device=device))
+                    act = student(_augment(rgb, train=False),
+                                  s12).clamp(-1, 1)
+                else:
+                    act = policy(obs).clamp(-1, 1)
             cmd = env._envelope(act)[0].cpu().numpy()
             prev_act = act
             # DEPLOY-HONEST CLAMP: the live rig's daemon quantizes to the

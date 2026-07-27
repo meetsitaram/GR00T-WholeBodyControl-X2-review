@@ -19,6 +19,8 @@ export KP_ORIGINS_JSON="${MOTION_FILE:-gear_sonic/data/motions/kp6_converge.pkl}
 # NO_FALL_RESET=1: disable the anchor_pos (height) fall-reset termination
 WORLD_KEYS=()
 [[ -n "${NO_FALL_RESET:-}" ]] && WORLD_KEYS+=("++manager_env.terminations.anchor_pos=null")
+# EXTRA_KEYS: space-separated additional hydra overrides
+[[ -n "${EXTRA_KEYS:-}" ]] && read -ra _EK <<< "$EXTRA_KEYS" && WORLD_KEYS+=("${_EK[@]}")
 if [[ -z "${NO_WORLD:-}" ]]; then
   WORLD_KEYS+=(
     "++manager_env.config.world_usd=$KITCHEN/kitchen_splat.usdz"

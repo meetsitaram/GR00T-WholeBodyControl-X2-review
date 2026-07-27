@@ -752,7 +752,10 @@ class NeuralPlannerCore(nn.Module):
     def _predict_with_velocity(
         self, input_state: dict, num_tokens: Optional[int] = None
     ) -> tuple[t.Tensor, t.Tensor, t.Tensor]:
-        batch_size = 1
+        # PoC G2: derive batch from input instead of hardcoding 1 — the
+        # tensor plumbing below is already [B, ...]-shaped throughout.
+        batch_size = int(input_state["velocity_intent"].shape[0]) \
+            if "velocity_intent" in input_state else 1
         MASKED_NUM_TOKENS = self._inferencer._root_model.backbone_net.MASKED_NUM_TOKENS
         fps = self._inferencer.local_motion_rep.fps
         root_joint_idx = 0

@@ -201,6 +201,9 @@ def _start_daemon_thread():
         demo_yaml=None, enable_keyboard=False,
         zmq_cmd_host="127.0.0.1", zmq_cmd_port=CMD_PORT,
         zmq_cmd_topic="planner_cmd",
+        # new dual-source param (2026-07-24): env2's driver owns the bind
+        # on CMD_PORT; the daemon stays a connecting SUB (legacy wiring)
+        zmq_cmd_bind=False,
         duration_s=0.0, hand_dof=10, verbose=True,
         warmup_quiet_stand_s=2.0,
         body_pose_port=None, device="cuda",
@@ -227,6 +230,276 @@ def _start_daemon_thread():
           f"pose:{POSE_PUB_PORT} cmd:{CMD_PORT} feedback:{FEEDBACK_PORT}",
           flush=True)
     return th
+
+
+# ---------------------------------------------------------------------------
+# KP_STUDENT: in-process camera-student pilot — the N4 closed-loop live rig.
+# Every 0.2 s: gallery render at the robot's EXECUTED pose (truth channel) +
+# goal state from the planner's COMMANDED ring pose (the drifting odometry
+# analog) -> StudentNet -> stick intents onto the daemon wire. SONIC's
+# tracking drift is therefore INSIDE the loop and vision corrects it — the
+# exact condition the student was trained for (capture-then-replay was not).
+#
+# Env vars: KP_STUDENT=<StudentNet .pt>  KP_GALLERY=<npz>
+#           KP_GOAL_XY="x,y" KP_GOAL_YAW=<rad> [KP_STAGE_XY="x,y"]
+#           [KP_REC_OUT=<pkl> KP_RECORD_KEY=<key> KP_EXIT_ON_DONE=1]
+#           [KP_POS_TOL=0.30 KP_PILOT_START_S=6 KP_MAX_S=90]
+# ---------------------------------------------------------------------------
+class _StudentPilot:
+    def __init__(self, driver):
+        import numpy as np
+        import torch
+        self.np, self.torch = np, torch
+        self.drv = driver
+        self.dev = "cuda"
+        for p in (os.path.join(REPO_ROOT, "gear_sonic", "envs", "nav_house"),
+                  os.path.dirname(os.path.abspath(__file__))):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from poc_student_bc import StudentNet
+        from train_student_dagger import Gallery, augment
+        self.augment = augment
+        self.net = StudentNet(state_dim=12).to(self.dev)
+        self.net.load_state_dict(torch.load(os.environ["KP_STUDENT"],
+                                            map_location=self.dev))
+        self.net.eval()
+        self.gallery = Gallery(os.environ.get(
+            "KP_GALLERY", "/tmp/claude-1000/kitchen_gallery.npz"), self.dev)
+        self.wpos = np.array([float(v) for v in os.environ.get(
+            "KP_WORLD_POS", "-19.99,-75.96,0").split(",")][:2])
+        self.goal = np.array([float(v) for v in
+                              os.environ["KP_GOAL_XY"].split(",")])
+        self.gyaw = float(os.environ["KP_GOAL_YAW"])
+        st = os.environ.get("KP_STAGE_XY")
+        self.stage = (np.array([float(v) for v in st.split(",")])
+                      if st else None)
+        self.pos_tol = float(os.environ.get("KP_POS_TOL", "0.30"))
+        self.ref_rad = float(os.environ.get("KP_REF_RAD", "0.35"))
+        self.ref_yaw = float(os.environ.get("KP_REF_YAW", "0.2"))
+        # Odometry belief = TRUE executed pose + turn-gated synthetic slip
+        # (the empirically measured model: rate*gate*dist + rot*|dyaw|).
+        # The planner's integrated pose is NOT usable as belief — its frame
+        # jumps a little on every replan (known planner-drift artifact) and
+        # at 5 Hz intent changes the jumps compound to >1 m/10 s, far past
+        # anything real leg-kinematics odometry does.
+        self.rate = float(os.environ.get("KP_DRIFT_RATE", "0.184"))
+        self.rot_rate = float(os.environ.get("KP_DRIFT_ROT", "0.04"))
+        self.cap = float(os.environ.get("KP_DRIFT_CAP", "1.6"))
+        _ang = float(os.environ.get("KP_DRIFT_ANG", "2.4"))
+        import math as _pm
+        self.u = np.array([_pm.cos(_ang), _pm.sin(_ang)])
+        self.acc = 0.0
+        self.prev_true = None
+        self.belief_stop_logged = False
+        self.start_tick = int(
+            float(os.environ.get("KP_PILOT_START_S", "6.0")) * 50)
+        self.max_tick = self.start_tick + int(
+            float(os.environ.get("KP_MAX_S", "90")) * 50)
+        self.rec_out = os.environ.get("KP_REC_OUT")
+        self.sticks = (0.0, 0.0, 0.0)
+        self.prev_act = torch.zeros(1, 3, device=self.dev)
+        self.vel_ema = np.zeros(3)
+        self.prev_bel = None
+        self.frames = []
+        self.reached_tick = None
+        self.done = False
+        print(f"[pilot] STUDENT pilot armed: "
+              f"goal=({self.goal[0]:+.2f},{self.goal[1]:+.2f}) "
+              f"yaw={self.gyaw:+.2f} stage={st} tol={self.pos_tol} "
+              f"start@{self.start_tick / 50.0:.0f}s", flush=True)
+
+    def _finish(self, verdict, d_true, drift):
+        self.done = True
+        print(f"[pilot] RESULT {verdict}: true dist-to-goal {d_true:.2f} m, "
+              f"odometry drift {drift:.2f} m, "
+              f"{len(self.frames)} exec frames", flush=True)
+        if self.rec_out and len(self.frames) > 50:
+            np = self.np
+            rp = np.stack([f[0] for f in self.frames])
+            rq = np.stack([f[1] for f in self.frames])   # wxyz
+            jp = np.stack([f[2] for f in self.frames])   # IL dof order
+            rp[:, 0] -= self.wpos[0]
+            rp[:, 1] -= self.wpos[1]
+            il2mj = np.argsort(self.drv.mj2il)
+            n = rp.shape[0]
+            import joblib
+            key = os.environ.get("KP_RECORD_KEY", "route_live_entrance")
+            joblib.dump({key: {
+                "root_trans_offset": rp.astype(np.float32),
+                "root_rot": rq[:, [1, 2, 3, 0]].astype(np.float32),  # xyzw
+                "dof": jp[:, il2mj].astype(np.float32),
+                "fps": 50.0,
+                "pose_aa": np.zeros((n, 32, 3), np.float32),
+            }}, self.rec_out, compress=3)
+            print(f"[pilot] wrote {self.rec_out}: {n} frames "
+                  f"({n / 50.0:.1f}s)", flush=True)
+        if os.environ.get("KP_EXIT_ON_DONE"):
+            os._exit(0)
+
+    def tick(self):
+        import math as m
+        drv = self.drv
+        t = drv.ticks
+        env = drv.cmd._env
+        data = env.scene["robot"].data
+        if self.rec_out and t >= self.start_tick and not self.done:
+            self.frames.append((data.root_pos_w[0].cpu().numpy().copy(),
+                                data.root_quat_w[0].cpu().numpy().copy(),
+                                data.joint_pos[0].cpu().numpy().copy()))
+        if self.done:
+            return (0.0, 0.0, 0.0)
+        if t < self.start_tick or t % 10 != 0:
+            return self.sticks
+        np, torch = self.np, self.torch
+        rob = data.root_state_w[0].cpu().numpy()
+        t_yaw = m.atan2(2 * (rob[3] * rob[6] + rob[4] * rob[5]),
+                        1 - 2 * (rob[5] ** 2 + rob[6] ** 2))
+        true_k = rob[0:2] - self.wpos            # executed pose, kitchen frame
+        # env-reset guard: an RSI teleport (>1 m true jump between 0.2 s
+        # decisions) invalidates the run — dump what we have and stop
+        if self.prev_true is not None and float(np.hypot(
+                true_k[0] - self.prev_true[0],
+                true_k[1] - self.prev_true[1])) > 1.0:
+            d_now = float(np.hypot(self.goal[0] - self.prev_true[0],
+                                   self.goal[1] - self.prev_true[1]))
+            self._finish("ENV-RESET", d_now, self.acc)
+            return (0.0, 0.0, 0.0)
+        # accrue odometry slip from EXECUTED motion. Distance-proportional
+        # at the measured PER-ROUTE rate (0.184 median / 0.29 p90) + rot
+        # term — NO turn gate here: under the live bang-bang gait every
+        # step reads as "turny", the gate degenerates to 1 and charges
+        # ~0.8 m/m, double the worst measured route. The gate belongs to
+        # smooth-path models; per-route overall rate IS the measurement.
+        if self.prev_true is not None:
+            step_d = float(np.hypot(true_k[0] - self.prev_true[0],
+                                    true_k[1] - self.prev_true[1]))
+            step_y = abs(m.atan2(m.sin(t_yaw - self.prev_true[2]),
+                                 m.cos(t_yaw - self.prev_true[2])))
+            self.acc = min(self.acc + self.rate * step_d
+                           + self.rot_rate * step_y, self.cap)
+        self.prev_true = (float(true_k[0]), float(true_k[1]), float(t_yaw))
+        bel_k = true_k + self.acc * self.u       # believed position
+        byaw = t_yaw                             # yaw belief stays true
+        drift = self.acc
+        d_true = float(np.hypot(self.goal[0] - true_k[0],
+                                self.goal[1] - true_k[1]))
+        tdyaw = m.atan2(m.sin(self.gyaw - t_yaw), m.cos(self.gyaw - t_yaw))
+        if self.prev_bel is not None:            # belief velocity, EMA
+            vw = (bel_k - self.prev_bel[:2]) / 0.2
+            cy, sy = m.cos(byaw), m.sin(byaw)
+            vb = np.array([cy * vw[0] + sy * vw[1],
+                           -sy * vw[0] + cy * vw[1],
+                           m.atan2(m.sin(byaw - self.prev_bel[2]),
+                                   m.cos(byaw - self.prev_bel[2])) / 0.2])
+            self.vel_ema = 0.6 * self.vel_ema + 0.4 * vb
+        self.prev_bel = np.array([bel_k[0], bel_k[1], byaw])
+        if t >= self.max_tick:
+            self._finish("TIMEOUT", d_true, drift)
+            return (0.0, 0.0, 0.0)
+        # STICKY latch: once the referee fired, never re-chase — the stop
+        # transition slides a walking biped ~0.3-0.4 m out of the ring and
+        # re-approaching turns into a wall-grinding doorway dance (user-
+        # observed). Report the true resting distance instead.
+        if self.reached_tick is not None:
+            self.sticks = (0.0, 0.0, 0.0)
+            if t - self.reached_tick >= 150:
+                self._finish("REACHED", d_true, drift)
+            return self.sticks
+        staging = self.stage is not None
+        tgt = self.stage if staging else self.goal
+        d = tgt - bel_k
+        dist = float(np.linalg.norm(d))
+        dyaw = m.atan2(m.sin(self.gyaw - byaw), m.cos(self.gyaw - byaw))
+        phase = "STAGE" if staging else "GOAL"
+        if staging and (dist < 0.30 or float(np.hypot(
+                self.stage[0] - true_k[0], self.stage[1] - true_k[1])) < 0.45):
+            # belief switch (student parks at the believed staging point —
+            # has_yaw=0 legs carry no landmark identity to pixel-correct) OR
+            # truth-proximity referee, so a moving-carrot belief can't stall
+            # the handoff before drift caps
+            self.stage = None
+            staging = False
+            tgt = self.goal
+            d = tgt - bel_k
+            dist = float(np.linalg.norm(d))
+            print("[pilot] staging reached -> final leg", flush=True)
+        # belief-only arrival: what odometry-only nav would do (log, don't
+        # stop) — the gap between this and the truth-referee IS the demo
+        if (not staging and dist < self.pos_tol
+                and not self.belief_stop_logged):
+            self.belief_stop_logged = True
+            print(f"[pilot] BELIEF-STOP point: odometry-only nav would park "
+                  f"here — true dist {d_true:.2f} m off the door "
+                  f"(drift {drift:.2f} m)", flush=True)
+        # truth-referee arrival (the training env's true-radius termination
+        # analog): end the episode; the student's driving got us here
+        if not staging and d_true < self.ref_rad:
+            if abs(tdyaw) < self.ref_yaw:
+                if self.reached_tick is None:
+                    self.reached_tick = t
+                    print(f"[pilot] REACHED (true): dist {d_true:.2f} m, "
+                          f"belief drift {drift:.2f} m — settling",
+                          flush=True)
+                self.sticks = (0.0, 0.0, 0.0)
+                if t - self.reached_tick >= 150:
+                    self._finish("REACHED", d_true, drift)
+                return self.sticks
+            # ALIGN: in-place turn to the door heading (stick sign only;
+            # stick_yaw>0 is turn-RIGHT/-yaw)
+            self.sticks = (0.0, 0.0, -1.0 if tdyaw > 0 else 1.0)
+            phase = "ALIGN"
+        if phase != "ALIGN":
+            cy, sy = m.cos(byaw), m.sin(byaw)
+            gb = (cy * d[0] + sy * d[1], -sy * d[0] + cy * d[1])
+            s12 = torch.tensor(
+                [[gb[0] / 5, gb[1] / 5, dist / 5, m.cos(dyaw), m.sin(dyaw),
+                  0.0 if staging else 1.0,
+                  self.vel_ema[0], self.vel_ema[1], self.vel_ema[2],
+                  float(self.prev_act[0, 0]), float(self.prev_act[0, 1]),
+                  float(self.prev_act[0, 2])]],
+                dtype=torch.float32, device=self.dev)
+            kpos = torch.tensor([[true_k[0], true_k[1]]],
+                                dtype=torch.float32, device=self.dev)
+            with torch.no_grad():
+                rgb = self.gallery.lookup(
+                    kpos, torch.tensor([t_yaw], device=self.dev))
+                act = self.net(self.augment(rgb, train=False),
+                               s12).clamp(-1, 1)
+            self.prev_act = act
+            a = act[0].cpu().numpy()
+
+            # teacher envelope deadband (0.15) -> sign-only sticks: the
+            # daemon quantizes to certified fixed magnitudes anyway (fwd
+            # setpoint 0.30 m/s, turn 0.30 rad/s). Conventions: a[1]>0 =
+            # +vel_x = side-LEFT = stick_side<0; a[2]>0 = +yaw (CCW) =
+            # stick_yaw<0.
+            def ax(x):
+                return 0.0 if abs(x) < 0.15 else m.copysign(1.0, x)
+
+            new = (ax(a[0]), -ax(a[1]), -ax(a[2]))
+            # steering hysteresis (KP_HOLD_N decisions, default 2 = 0.4 s):
+            # adopt a changed intent only when consecutive decisions agree —
+            # single-decision pulses under the 5 Hz sign-only wire read as
+            # weave once SONIC's lag stretches them (user: the path should
+            # be turn-straight-turn-straight, not a wobble)
+            hold_n = int(os.environ.get("KP_HOLD_N", "2"))
+            if new == self.sticks:
+                self._pend = None
+            elif new == getattr(self, "_pend", None):
+                self._pend_n += 1
+                if self._pend_n >= hold_n:
+                    self.sticks = new
+                    self._pend = None
+            else:
+                self._pend = new
+                self._pend_n = 1
+                if hold_n <= 1:
+                    self.sticks = new
+                    self._pend = None
+        if t % 50 == 0:
+            print(f"[pilot] {json.dumps(dict(t=round(t / 50.0, 1), ph=phase, dist=round(dist, 2), d_true=round(d_true, 2), dyaw=round(dyaw, 2), drift=round(drift, 2), st=[round(s, 1) for s in self.sticks]))}",
+                  flush=True)
+        return self.sticks
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +642,10 @@ class _Driver:
             self.pad_sub.bind(f"tcp://127.0.0.1:{PAD_IN_PORT}")
             print(f"[kp-env2] PAD MODE: listening for pad_locomotion_bridge "
                   f"on :{PAD_IN_PORT} (schedule disabled)", flush=True)
+        self.pilot = None
+        self._belief = None
+        if os.environ.get("KP_STUDENT"):
+            self.pilot = _StudentPilot(self)
 
         self.last_sticks = None
         self.wall0 = time.monotonic()
@@ -688,6 +965,7 @@ class _Driver:
                 self._pb = None          # force base re-capture next payload
                 self._quiet_ticks = 0
                 self._idle_active = False
+                self._belief = (float(r_xy[0]), float(r_xy[1]), float(r_yaw))
                 print(f"[kp-env2] env reset (play {self._last_play}->{play})"
                       f" — ring+markers re-anchored at spawn "
                       f"({r_xy[0]:+.2f},{r_xy[1]:+.2f}, yaw {r_yaw:+.2f})",
@@ -696,7 +974,9 @@ class _Driver:
                 print(f"[kp-env2] reset re-anchor failed: {e}", flush=True)
         self._last_play = play
 
-        if _PAD_MODE:
+        if self.pilot is not None:
+            sticks = self.pilot.tick()
+        elif _PAD_MODE:
             # drain latest pad frame(s); pad liveness judged on wall clock
             # (it's a real input device at wall rate; sim consumes latest)
             import zmq as _zmq
@@ -773,6 +1053,8 @@ class _Driver:
             self._idle_row0 = play + 1
             self._idle_next = play + 1
             self._idle_active = True
+            self._belief = (self._idle_held[0], self._idle_held[1],
+                            self._idle_held[2])
             print(f"[kp-env2] idle-writer ON (SONIC-executed stand; held xy="
                   f"({self._idle_held[0]:+.2f},{self._idle_held[1]:+.2f}) "
                   f"yaw={h_yaw:+.2f} dyaw="
@@ -886,6 +1168,10 @@ class _Driver:
                                   1.0 / self.fps,
                                   prev=getattr(self, "_chain_cur", None))
             self._chain_cur = cur
+            # commanded/odometry pose for the student pilot (env-local)
+            self._belief = (float(tr[0]), float(tr[1]),
+                            _m.atan2(2.0 * (qx[3] * qx[2] + qx[0] * qx[1]),
+                                     1.0 - 2.0 * (qx[1] ** 2 + qx[2] ** 2)))
             jw = fields.get("joint_pos_mj_future")
             qw = fields.get("root_quat_xyzw_future")
             if jw is not None:
