@@ -1,0 +1,36 @@
+# @package _global_
+# SONIC X2 Ultra — dance fine-tune v5: v3 target set + Ultimate Bots dances +
+# X2 captured gestures (275 clips total).
+#
+# Inherits sonic_x2_ultra_dance_finetune (arm-dynamics base: wrist_roll PALM
+# tracking + arm-scoped velocity reward, finetune_sample_rate 0.3). Only the
+# target corpus changes: v3's 182 clips + 54 Ultimate Bots dance moves
+# (studio.ultimatebots.com, retargeted G1->X2, @30fps) + 39 distinct X2 MC
+# gestures (@30fps). Mixed native fps is fine -- motion-lib resamples each clip
+# to the 50 Hz control rate at load.
+#
+# The dance/gesture spikes some clips carry (a few isolated frames >25 rad/s)
+# are negligible for a TRACKING policy: SONIC learns to follow a reference, so
+# an un-trackable frame is one bad reward step among hundreds, not a behavior it
+# reproduces (that concern is specific to the GENERATIVE kplanner corpus).
+#
+# Warm start: resume from the latest softland_4800_g1 checkpoint
+# (model_step_004800.pt) via the launcher's +checkpoint=. Obs/action dims
+# unchanged, loads cleanly.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_x2_ultra_dance_finetune
+  - _self_
+
+exp_var: dance_finetune_v5
+project_name: TRL_X2Ultra_Dance
+
+manager_env:
+  commands:
+    motion:
+      motion_lib_cfg:
+        fine_tune_dataset:
+          # 275 target clips: v3's 182 + 54 Ultimate Bots dances + 39 X2 gestures.
+          motion_file: gear_sonic/data/motions/x2_all_finetune_v5.pkl
+          override_corpus: true
+          finetune_sample_rate: 0.3

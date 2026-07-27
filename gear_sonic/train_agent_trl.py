@@ -234,7 +234,11 @@ def main(config: OmegaConf):
             project=project_name,
             entity=config.wandb.wandb_entity,
             name=run_name,
-            sync_tensorboard=True,
+            # sync_tensorboard was dropped: with it on, wandb ignores the
+            # explicit step=global_step in WandbCallback.on_log and auto-counts
+            # from 0, so a resumed run's dashboard restarted at 0. All training
+            # metrics go through wandb.log (no TB-only scalars in this path), so
+            # honoring step=global_step gives a continuous 2000->5000 x-axis.
             config=unresolved_conf,
             dir=wandb_dir,
             id=config.wandb.wandb_id,
