@@ -180,7 +180,12 @@ def main(config: OmegaConf):
     import torch  # noqa: E402
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=6000))
+    # SONIC_PG_TIMEOUT_S: elastic multi-node runs set this low (~300) so a
+    # preempted node aborts collectives quickly and torchrun can re-rendezvous,
+    # instead of hanging survivors for the full default 100 minutes.
+    kwargs = InitProcessGroupKwargs(
+        timeout=timedelta(seconds=int(os.environ.get("SONIC_PG_TIMEOUT_S", "6000")))
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs, kwargs],
