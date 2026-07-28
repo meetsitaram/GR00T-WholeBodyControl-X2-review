@@ -68,13 +68,28 @@ pad bridge. The script identity-checks the planner dir by md5 against the
 robot manifest when reachable — sim must validate the SAME planner the robot
 runs, not a stale local copy.
 
-### 3d. VR teleop in sim
+### 3d. Direct PKL playback in sim (no VR, no pad)
+```bash
+# terminal 1 — bring up sim deploy + recorder (MuJoCo window opens):
+bash gear_sonic/scripts/run_x2_pkl_direct_stack.sh --model $CKPT/sonic_policy/x2_sonic_policy.onnx
+
+# terminal 2 — trigger clips:
+python gear_sonic/scripts/play_gesture.py --list                 # catalog
+python gear_sonic/scripts/play_gesture.py sit_stand_sit_A538     # named gesture
+python gear_sonic/scripts/play_gesture.py --pkl gear_sonic/data/motions/x2_dances_easy.pkl
+python gear_sonic/scripts/play_locomotion.py --pkl <walk_or_turn.pkl>  # walks keep authored heading
+python gear_sonic/scripts/play_gesture.py --release              # abort / release held pose
+```
+
+### 3e. Quest 3 VR teleop in sim
 ```bash
 bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh   # sim is the default
 ```
 Quest 3 over WebXR; operator calibration file required
 (`data/operator_calibrations/<id>.yaml`, create via
-`vr_operator_calibrate.py`; `default.yaml` ships).
+`vr_operator_calibrate.py`; `default.yaml` ships). While driving: VR sticks
+= locomotion intent through the kplanner; controller buttons per
+`gear_sonic/utils/teleop/vr/button_state_machine.py`.
 
 ## 4. Real robot
 
@@ -96,6 +111,25 @@ Sequence:
    is spawned; the recorder's PUB binds LAN-visible and PC2 connects out.
 4. **Verify before moving**: robot holds idle stand; planner md5 identity
    check passes; telemetry posture sane.
+
+### Real-robot command reference (`<PC2_IP>` = robot's LAN address)
+
+```bash
+# Direct PKL play on the REAL robot (same two-terminal flow as sim):
+bash gear_sonic/scripts/run_x2_pkl_direct_stack.sh --pc2-host <PC2_IP>
+python gear_sonic/scripts/play_gesture.py sit_stand_sit_A538     # terminal 2
+
+# Quest 3 VR teleop on the real robot:
+bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh --pc2-host <PC2_IP>
+
+# Gamepad driving with the certifiable sim-parity check (md5-verifies the
+# planner + policy against what PC2 actually runs before anything moves):
+bash gear_sonic/scripts/sim_onnx_planner.sh <PC2_IP>
+bash gear_sonic/scripts/sim_onnx_planner.sh --pc2-host <PC2_IP> --vr   # VR variant
+```
+
+Same safety rituals apply regardless of entrypoint: preflight first, MC
+handoff before killing anything, telemetry before re-engaging.
 
 ### Safety rituals (non-negotiable)
 - **Never kill a live deploy without a motion-controller handoff.** SONIC
