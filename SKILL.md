@@ -24,18 +24,52 @@ pip install -e ./motionbricks
 
 GPU torch is only needed for training; every runtime below works on CPU.
 
-## 2. Models
+## 2. Models — download once, point the stacks at them
 
-Weights are hosted separately (HF repo `tinkerbuggy/sonic-x2`). Expected
-local layout (pass paths explicitly — defaults reference the maintainers'
-machines):
+Weights are NOT in this repo. They are hosted on Hugging Face at
+**`tinkerbuggy/sonic-x2`** (private during review; public at release — until
+then request access or use `hf auth login` with a granted token). Every
+deployment artifact there is md5-verified byte-identical to the copies
+running on the reference robot.
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download tinkerbuggy/sonic-x2 --local-dir "$HOME/x2_models"
+export CKPT="$HOME/x2_models"
+```
+
+Layout you get:
 
 ```
-$CKPT/sonic_policy/x2_sonic_policy.onnx     # fused SONIC tracking policy
-$CKPT/sonic_policy/x2_sonic_policy.pt       # source ckpt (parity / finetune)
-$CKPT/kplanner_onnx/x2_kplanner_template.onnx   # torch-free planner graph
-$CKPT/kplanner_torch/{vqvae,pose,root}/...      # planner finetuning tier
+$CKPT/sonic_policy/x2_sonic_policy.onnx        # fused SONIC tracking policy (deploy)
+$CKPT/sonic_policy/x2_sonic_policy.pt          # source ckpt (parity checks / finetune)
+$CKPT/kplanner_onnx/x2_kplanner_template.onnx  # torch-free planner graph (template mode)
+$CKPT/kplanner_onnx/x2_kplanner_velocity.onnx  # legacy velocity-mode graph
+$CKPT/kplanner_torch/{vqvae,pose,root}/...     # planner finetuning tier (+ x2_clip.ckpt)
 ```
+
+**Wiring the stacks to your download** (script defaults reference the
+maintainers' machines — always pass these explicitly):
+
+```bash
+# quest3 VR stack (sim or --pc2-host):
+KPLANNER_ONNX=$CKPT/kplanner_onnx/x2_kplanner_template.onnx \
+  bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
+       --model $CKPT/sonic_policy/x2_sonic_policy.onnx
+
+# pkl-direct stack:
+bash gear_sonic/scripts/run_x2_pkl_direct_stack.sh \
+     --model $CKPT/sonic_policy/x2_sonic_policy.onnx
+
+# headless policy eval:
+python gear_sonic/scripts/eval_x2_mujoco_onnx.py \
+       --onnx $CKPT/sonic_policy/x2_sonic_policy.onnx --motion <pkl> --no-viewer
+```
+
+Without `KPLANNER_ONNX` the quest3 stack tries the torch kplanner, which
+needs the `kplanner_torch/` tier on disk at the paths in
+`motionbricks/out/` — the ONNX graph is the recommended (robot-identical)
+path.
 
 ## 3. Sim — fastest first
 
