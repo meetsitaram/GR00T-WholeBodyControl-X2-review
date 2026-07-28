@@ -57,6 +57,10 @@ LOG_FILE=${LOG_FILE:-$HOME/elastic.log}
 
 export SONIC_PG_TIMEOUT_S=${SONIC_PG_TIMEOUT_S:-600}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# INFO prints the selected inter-node transport at init ("NCCL INFO Using
+# network IB" vs Socket) — the only way to confirm the IB rails are in use.
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMNI_KIT_ACCEPT_EULA=YES
 export ACCEPT_EULA=Y
