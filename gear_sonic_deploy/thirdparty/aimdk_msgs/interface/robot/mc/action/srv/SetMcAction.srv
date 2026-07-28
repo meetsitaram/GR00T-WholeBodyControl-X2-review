@@ -1,0 +1,12 @@
+# 请求头
+RequestHeader header
+
+# 输入源
+string source
+
+# Action命令
+McActionCommand command
+
+---
+
+CommonResponse response

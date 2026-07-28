@@ -84,10 +84,14 @@ changes — the same stack scripts take `--pc2-host 10.0.1.41`.
 
 Sequence:
 1. **Preflight** on the workstation: step 3b, plus `x2_preflight.py` on the
-   robot side (ROS 2 / rclpy — runs on PC2, not locally).
-2. **PC2 bringup**: the onboard daemons must be running before any teleop
-   (deploy error messages name the bringup script). Verify the pose proxy
-   and planner runtime are up before proceeding.
+   robot side (ROS 2 / rclpy — runs on PC2, not locally), and
+   `gear_sonic_deploy/scripts/pc2_preflight.sh` against the robot.
+2. **PC2 bringup** (one-time provisioning + per-session daemons):
+   `gear_sonic_deploy/scripts/pc2_bringup.sh` provisions the onboard PC2
+   staging tree (`/home/run/gear-sonic/` — models, planner graphs, runtimes);
+   `x2_pc2_daemons.sh start` brings up the per-session daemons and
+   `x2_pc2_cameras.sh` the head-camera bridge. Verify the pose proxy and
+   planner runtime are up before proceeding.
 3. **Launch**: same entrypoints as sim with `--pc2-host` — no local deploy
    is spawned; the recorder's PUB binds LAN-visible and PC2 connects out.
 4. **Verify before moving**: robot holds idle stand; planner md5 identity

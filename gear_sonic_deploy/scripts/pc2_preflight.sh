@@ -10,7 +10,7 @@
 #
 #     ./gear_sonic_deploy/scripts/pc2_preflight.sh \
 #         [--pc2-host 10.0.1.41] [--pc2-user run] \
-#         [--pc2-ws /home/run/getsolo/ws] \
+#         [--pc2-ws /home/run/gear-sonic/ws] \
 #         [--pc1-host 10.0.1.40]
 #
 # Each section is gated independently so a failure in one (e.g. tmux
@@ -36,7 +36,7 @@ PC2_USER="${PC2_USER:-run}"
 PC2_HOST="${PC2_HOST:-10.0.1.41}"
 PC1_HOST="${PC1_HOST:-10.0.1.40}"
 PC1_EM_PORT="${PC1_EM_PORT:-50080}"
-PC2_PREFIX="${PC2_PREFIX:-/home/run/getsolo}"
+PC2_PREFIX="${PC2_PREFIX:-/home/run/gear-sonic}"
 PC2_WS="${PC2_WS:-${PC2_PREFIX}/ws}"
 PC2_LOG_ROOT="${PC2_LOG_ROOT:-${PC2_PREFIX}/log}"
 PC2_VENV="${PC2_VENV:-${PC2_PREFIX}/venv}"

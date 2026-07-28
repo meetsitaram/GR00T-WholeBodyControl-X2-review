@@ -8,7 +8,7 @@
 # Modeled on the lean Dockerfile from agitbot-x2-record-and-replay (which is
 # already battle-tested for talking to the real X2 Orin via DDS), with three
 # changes for our use-case:
-#   * vendors aimdk_msgs from agibot-x2-references/lx2501_3-v0.9.0.4 (so
+#   * vendors aimdk_msgs from gear_sonic_deploy/thirdparty/aimdk_msgs (SDK lx2501_3-v0.9.0.4) (so
 #     this repo is self-contained -- no need to side-clone the SDK)
 #   * drops the song-playback Python deps (lerobot, ruckig)
 #   * adds the bridge's deps: mujoco, scipy, joblib, torch (CPU). torch is
@@ -89,7 +89,7 @@ ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}
 # Build aimdk_msgs from the SDK source vendored in this repo. We use the
 # upstream layout (interface/ + package.xml + CMakeLists.txt) verbatim.
 WORKDIR /ros2_ws/src
-COPY agibot-x2-references/lx2501_3-v0.9.0.4/src/aimdk_msgs/ aimdk_msgs/
+COPY gear_sonic_deploy/thirdparty/aimdk_msgs/ aimdk_msgs/
 WORKDIR /ros2_ws
 RUN source /opt/ros/humble/setup.bash && \
     colcon build --packages-select aimdk_msgs \

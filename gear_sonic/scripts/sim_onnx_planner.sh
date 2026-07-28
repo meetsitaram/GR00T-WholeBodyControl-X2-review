@@ -73,9 +73,9 @@ CKPT_ROOT="${CKPT_ROOT:-$HOME/x2_cloud_checkpoints}"
 GRAPH="${PLANNER:-template}"   # template | velocity
 DANCES="$CKPT_ROOT/dances_x2m2"
 LOCAL_PLANNER_DIR="$CKPT_ROOT/planner_onnx"
-R_SONIC=/home/run/getsolo/policies/agibot_x2_sonic.onnx
-R_PLAN=/home/run/getsolo/planner_stack/models/planner_onnx
-R_RUNTIME=/home/run/getsolo/pc2_kplanner_onnx.py
+R_SONIC=/home/run/gear-sonic/policies/agibot_x2_sonic.onnx
+R_PLAN=/home/run/gear-sonic/planner_stack/models/planner_onnx
+R_RUNTIME=/home/run/gear-sonic/pc2_kplanner_onnx.py
 
 # ---------------------------------------------------------------------------
 # Fetch md5 + mtime for every robot-side artifact in ONE ssh round trip.

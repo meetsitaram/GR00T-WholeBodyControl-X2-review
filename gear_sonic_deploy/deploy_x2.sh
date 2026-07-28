@@ -24,7 +24,7 @@ set -e
 #            WiFi disconnect mid-run. Assumes ``pc2_bringup.sh`` has
 #            already staged the colcon workspace, Python venv, ONNX
 #            Runtime and ONNX policies under ``$ONBOT_PREFIX`` (default
-#            /home/run/getsolo). The hand bridge and motor monitor are
+#            /home/run/gear-sonic). The hand bridge and motor monitor are
 #            launched separately by x2_pc2_daemons.sh (so they share
 #            the same lifecycle as the deploy but in their own tmux
 #            sessions). The recorder lives on the laptop with the
@@ -254,7 +254,7 @@ ROBOT_USER_DEFAULT="agi"
 #     policies/*.onnx             <- pre-staged ONNX checkpoints
 #     log/                        <- per-run CSV dirs, monitor JSONLs,
 #                                    tmux launch scripts
-ONBOT_PREFIX_DEFAULT="/home/run/getsolo"
+ONBOT_PREFIX_DEFAULT="/home/run/gear-sonic"
 ONBOT_WS_DEFAULT="${ONBOT_PREFIX_DEFAULT}/ws"
 ONBOT_VENV_DEFAULT="${ONBOT_PREFIX_DEFAULT}/venv"
 ONBOT_ONNXRUNTIME_DEFAULT="${ONBOT_PREFIX_DEFAULT}/onnxruntime"
@@ -1258,9 +1258,9 @@ Examples:
   # inside the x2_deploy tmux session:
   $0 onbot \\
       --vla --vla-zmq-host 192.168.86.22 --vla-zmq-port 5556 \\
-      --model /home/run/getsolo/policies/agibot_x2_sonic.onnx \\
+      --model /home/run/gear-sonic/policies/agibot_x2_sonic.onnx \\
       --tuning-config /tmp/expressive.yaml --wrist-bypass ik \\
-      --log-dir /home/run/getsolo/log/x2_powered_\$(date +%Y%m%d_%H%M%S)
+      --log-dir /home/run/gear-sonic/log/x2_powered_\$(date +%Y%m%d_%H%M%S)
 
   # Closed-loop sim in MuJoCo with viewer (no robot needed):
   $0 sim \\
@@ -2270,7 +2270,7 @@ dump_pose_proxy_log_tail() {
     # log into the same scrollback makes the actual error obvious in
     # one place. Idempotent and safe to call even when no proxy log
     # exists (e.g. local-mode deploy with no proxy in the loop).
-    local log_root="${PC2_LOG_ROOT:-/home/run/getsolo/log}"
+    local log_root="${PC2_LOG_ROOT:-/home/run/gear-sonic/log}"
     local newest
     newest="$(ls -t "${log_root}"/pose_proxy_*.log 2>/dev/null | head -n 1 || true)"
     if [[ -z "$newest" || ! -r "$newest" ]]; then
@@ -3711,7 +3711,7 @@ else
                     echo -e "${YELLOW}    (split-topology) The PC2 pose proxy is not running. Check:${NC}"
                     echo -e "${YELLOW}      x2_pc2_daemons.sh logs proxy --pc2-host <pc2_ip>${NC}"
                     echo -e "${YELLOW}      x2_pc2_daemons.sh status --pc2-host <pc2_ip>${NC}"
-                    echo -e "${YELLOW}    If the proxy session exited, look in ${PC2_LOG_ROOT:-/home/run/getsolo/log}/pose_proxy_*.log${NC}"
+                    echo -e "${YELLOW}    If the proxy session exited, look in ${PC2_LOG_ROOT:-/home/run/gear-sonic/log}/pose_proxy_*.log${NC}"
                     # Inline the actual proxy log tail so the operator
                     # doesn't have to leave the pane to figure out WHY
                     # the proxy died (argparse error from a stale
