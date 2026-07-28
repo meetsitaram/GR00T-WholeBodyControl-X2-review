@@ -332,7 +332,7 @@ GESTURE_CATALOG="${REPO_ROOT}/gear_sonic/data/motions/gestures/gestures_v1.yaml"
 # --------------------------------------------------------------------------
 
 DURATION_S=0  # 0 = unlimited (run until Ctrl-C). Pass --duration N for a fixed N-sec cap.
-WITH_RECORD=0
+WITH_RECORD=1   # default ON (2026-07-29 user directive); --no-record to disable
 OUTPUT_DIR=""
 TASK=""
 
@@ -364,7 +364,7 @@ SIM_VIEWER=1
 SIM_PROFILE="parity"
 SIM_PROFILE_EXPLICIT=0   # set to 1 when the operator passes --sim-profile
 SIM_RSI_PKL="${REPO_ROOT}/data/sim_to_real_anchors/browse_sonic/baked_pkls/x2_planner_rsi_anchor.pkl"
-SIM_MODEL="${X2_PLANNER_SMOKE_MODEL:-$HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx}"
+SIM_MODEL="${X2_PLANNER_SMOKE_MODEL:-/home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx}"
 SIM_CAM_TRACK_BODY="pelvis"
 SIM_CAM_DISTANCE="3.5"
 SIM_CAM_ELEVATION="-12"
@@ -825,6 +825,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --duration) DURATION_S="$2"; shift 2 ;;
         --with-record) WITH_RECORD=1; shift ;;
+        --no-record) WITH_RECORD=0; shift ;;
         --head-cameras) HEAD_CAMERAS=1; shift ;;
         --no-head-cameras) HEAD_CAMERAS=0; shift ;;
         --camera-host) CAMERA_HOST="$2"; shift 2 ;;
