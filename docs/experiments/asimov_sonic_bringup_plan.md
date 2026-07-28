@@ -131,3 +131,66 @@ convention errors.
 - Training stable (no explosion at spawn — else KP/KD/action-scale wrong).
 - im_eval on the walk subset: success on idle + 4-direction walk clips,
   mpjpe in family with early X2 numbers; visually stable stand and walks.
+
+## Issues encountered during bring-up (post-mortem, 2026-07-27/28)
+
+The first overnight run (8k iterations, ~11 h) was trained on a broken asset
+and discarded. All four asset bugs were invisible to the numeric gates and
+were caught **visually** — by rendering the robot and looking at it. That is
+now a mandatory gate (below).
+
+### 1. URDF collision = full visual meshes (the run-killer)
+- **Symptom**: policy trained to 8k but evals crawled and looked mangled;
+  nothing numerically obviously wrong.
+- **How identified**: operator watched the IsaacLab viewport and called out
+  "broken joint mappings / broken robot"; inspection showed every link's
+  visual mesh had been emitted as its collider -> convex hulls overlapped at
+  every joint -> phantom self-collision storms poisoned every rollout.
+- **Root cause**: the URDF generator gave each link its display mesh as
+  `<collision>`; the real Asimov collision model is 21 primitives
+  (13 capsules + 8 foot spheres, the contype!=0 geoms in the MJCF).
+- **Fix**: `mjcf_to_urdf_asimov.py` emits collision ONLY for contype!=0
+  geoms (capsule->cylinder + `replace_cylinders_with_capsules`, spheres,
+  fromto handled). Verified 21/21 primitives match the MJCF.
+
+### 2. Neck fusion double-applied mesh-alignment corrections
+- **Symptom**: head detached / rotated ~90 deg, 3.4-4.8 cm off.
+- **How identified**: side-by-side render vs the original MJCF; geom
+  positions diffed numerically once the visual flagged it.
+- **Root cause**: the fuse script composed transforms from COMPILED
+  `geom_pos/geom_quat`. MuJoCo bakes each mesh's alignment correction into
+  compiled values; writing them back into XML applies the correction twice.
+- **Fix**: `fuse_asimov_neck.py` composes RAW XML attributes only (body+geom
+  chains, `fromto` endpoints transformed). Verified all 48 geoms match the
+  original to 4e-10 and whole-robot mass/COM exact.
+
+### 3. IsaacLab URDF importer drops nonzero visual origins
+- **Symptom**: exploded/misplaced link visuals in IsaacLab (fine in MuJoCo).
+- **Root cause**: `<visual><origin>` offsets are discarded by the importer.
+- **Fix**: bake the transform into each link's STL vertices
+  (`_bake_mesh_stl`) and emit `origin 0 0 0`; one STL per (body, mesh) pair.
+
+### 4. Baking from raw STL vertices instead of compiled vertices
+- **Symptom**: jumbled hip meshes after fix 3.
+- **Root cause**: raw STL vertex arrays combined with compiled transforms —
+  mixing two conventions; compiled `mesh_vert` already includes the
+  compiler's re-centering.
+- **Fix**: bake from `model.mesh_vert`/`mesh_face` (compiled), not the STL.
+
+### Framework port bugs (non-asset)
+- `Humanoid_Batch` requires an `<actuator>` block — mjlab MJCFs ship none;
+  the fuse script now injects it.
+- `Humanoid_Batch` parsed joint axes with `int()` — Asimov's canted wrist
+  axis (0.766, 0, -0.643) crashed it; parse as float (3 sites, float32).
+- Obs term `joint_pos_multi_future_wrist_for_smpl` hardcodes G1 wrist
+  `joints_idx` [23-28] -> out-of-bounds CUDA device-assert on 23 DOF.
+  Diagnosed with `CUDA_LAUNCH_BLOCKING=1`; asimov yaml overrides to [21,22].
+
+### Process lessons
+- **Numeric gates verify FRAMES, not GEOMS.** FK parity (7 nm), joint-order
+  and mass/COM checks all passed on the broken asset. After ANY asset
+  transformation, render in BOTH MuJoCo and IsaacLab and look — a human eye
+  catches in seconds what the gates cannot.
+- im_eval with a broken policy is pathologically slow (termination-retry
+  rounds) — do not read "slow eval" as an infra problem.
+- Cost of skipping the visual gate: ~11 h train + ~8 h eval/debug = ~19 h.
