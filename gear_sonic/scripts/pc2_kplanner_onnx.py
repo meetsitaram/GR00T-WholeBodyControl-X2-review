@@ -77,9 +77,9 @@ Known deviations from x2_kplanner (all intentional, documented):
 
 PC2 launch (defaults are the real PC2 ports/paths)::
 
-    PYTHONPATH=/home/run/gear-sonic/planner_stack/gear_sonic \
+    PYTHONPATH=/home/run/getsolo/planner_stack/gear_sonic \
     python pc2_kplanner_onnx.py \
-        --onnx /home/run/gear-sonic/planner_stack/models/planner_onnx/x2_planner_velocity.onnx
+        --onnx /home/run/getsolo/planner_stack/models/planner_onnx/x2_planner_velocity.onnx
 
 Laptop A/B (live stack owns 5556/5563/5568 -- offset everything)::
 
@@ -145,10 +145,10 @@ DEFAULT_PUB_PORT: int = 5556           # PUB bind, topic "pose"
 DEFAULT_CMD_PORT: int = 5563           # SUB connect, topic "planner_cmd"
 DEFAULT_CLIP_CMD_PORT: int = 5568      # SUB bind, topic "motion_clip_cmd"
 DEFAULT_WARMUP_PKL = Path(
-    "/home/run/gear-sonic/planner_stack/models/kplanner_idle_anchor_g1teleop_v3.pkl"
+    "/home/run/getsolo/planner_stack/models/kplanner_idle_anchor_g1teleop_v3.pkl"
 )
 DEFAULT_DANCES_DIR = Path(
-    "/home/run/gear-sonic/planner_stack/models/dances_x2m2"
+    "/home/run/getsolo/planner_stack/models/dances_x2m2"
 )
 
 
@@ -248,7 +248,7 @@ HOLD_TORSO_INTENT: str = "hold_torso"
 # one-shot "speed_delta" field, clamped to [_SETPOINT_MIN, _SETPOINT_MAX].
 _SETPOINT_MIN: float = 0.2
 _SETPOINT_MAX: float = 1.0
-_SPEED_SETPOINT: float = float(os.environ.get("KPLANNER_FIXED_FWD_MPS") or 0.30)
+_SPEED_SETPOINT: float = float(os.environ.get("KPLANNER_FIXED_FWD_MPS") or 0.50)
 
 _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS: float = 0.30
 _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
@@ -1952,7 +1952,7 @@ class _IntentTape:
             root = os.environ.get("KPLANNER_TAPE_DIR")
             if not root:
                 # rituals launch us with cwd=/ and no env: derive from the
-                # script's own home (on PC2 that is /home/run/gear-sonic, which
+                # script's own home (on PC2 that is /home/run/getsolo, which
                 # has log/); fall back to /tmp rather than dying.
                 prefix = os.environ.get("PC2_PREFIX", "")
                 script_home = os.path.dirname(os.path.abspath(__file__))
