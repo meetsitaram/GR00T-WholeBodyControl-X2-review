@@ -332,7 +332,7 @@ GESTURE_CATALOG="${REPO_ROOT}/gear_sonic/data/motions/gestures/gestures_v1.yaml"
 # --------------------------------------------------------------------------
 
 DURATION_S=0  # 0 = unlimited (run until Ctrl-C). Pass --duration N for a fixed N-sec cap.
-WITH_RECORD=0
+WITH_RECORD=1   # default ON (2026-07-29 user directive); --no-record to disable
 OUTPUT_DIR=""
 TASK=""
 
@@ -825,6 +825,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --duration) DURATION_S="$2"; shift 2 ;;
         --with-record) WITH_RECORD=1; shift ;;
+        --no-record) WITH_RECORD=0; shift ;;
         --head-cameras) HEAD_CAMERAS=1; shift ;;
         --no-head-cameras) HEAD_CAMERAS=0; shift ;;
         --camera-host) CAMERA_HOST="$2"; shift 2 ;;
