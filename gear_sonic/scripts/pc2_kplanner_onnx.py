@@ -248,7 +248,7 @@ HOLD_TORSO_INTENT: str = "hold_torso"
 # one-shot "speed_delta" field, clamped to [_SETPOINT_MIN, _SETPOINT_MAX].
 _SETPOINT_MIN: float = 0.2
 _SETPOINT_MAX: float = 1.0
-_SPEED_SETPOINT: float = float(os.environ.get("KPLANNER_FIXED_FWD_MPS") or 0.30)
+_SPEED_SETPOINT: float = float(os.environ.get("KPLANNER_FIXED_FWD_MPS") or 0.50)
 
 _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS: float = 0.30
 _RUNTIME_CONTINUOUS_FORWARD_MIN_MPS: float = _DEFAULT_CONTINUOUS_FORWARD_MIN_MPS
