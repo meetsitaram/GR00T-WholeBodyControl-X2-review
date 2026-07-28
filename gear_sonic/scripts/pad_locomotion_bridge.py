@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import pygame
@@ -148,6 +149,14 @@ def main() -> int:
                     help="log every button-index rising edge (pad mapping aid)")
     ap.add_argument("--probe", action="store_true",
                     help="print axis/button events and exit on ctrl-c")
+    ap.add_argument("--pad-name", default=os.environ.get("PAD_NAME", ""),
+                    help="Bind the gamepad whose name contains this substring "
+                         "(case-insensitive). Required (with "
+                         "--allow-multiple-pads) when >1 pad is connected.")
+    ap.add_argument("--allow-multiple-pads", action="store_true",
+                    help="Override the exclusive-access refusal when multiple "
+                         "gamepads are connected; --pad-name must uniquely "
+                         "select one.")
     ap.add_argument("--invert-ly", action="store_true", default=True,
                     help="stick up (-1 in SDL) = forward (default on)")
     ap.add_argument("--clip-key-dpad-up", default="",
@@ -188,11 +197,36 @@ def main() -> int:
     else:
         pygame.init()
         pygame.joystick.init()
-        if pygame.joystick.get_count() == 0:
+        n_pads = pygame.joystick.get_count()
+        if n_pads == 0:
             print("[pad-bridge] no gamepad found"); return 1
-        js = pygame.joystick.Joystick(0); js.init()
+        pads = [pygame.joystick.Joystick(i) for i in range(n_pads)]
+        names = [p.get_name() for p in pads]
+        # EXCLUSIVE-ACCESS GUARD (2026-07-29 incident): binding Joystick(0)
+        # with multiple pads connected let a stray paired controller (with a
+        # different driver axis layout) become the robot's input. Rules:
+        #   - exactly one pad connected -> use it;
+        #   - multiple pads -> REFUSE unless --pad-name uniquely selects one
+        #     AND --allow-multiple-pads is explicitly passed.
+        if n_pads > 1 and not args.allow_multiple_pads:
+            print(f"[pad-bridge] REFUSING to start: {n_pads} gamepads connected "
+                  f"({', '.join(names)}). Disconnect/unpair the extras, or pass "
+                  f"--pad-name <substring> --allow-multiple-pads to bind one "
+                  f"explicitly.", flush=True)
+            return 1
+        idx = 0
+        if args.pad_name:
+            want = args.pad_name.lower()
+            matches = [i for i, nm in enumerate(names) if want in nm.lower()]
+            if len(matches) != 1:
+                print(f"[pad-bridge] REFUSING: --pad-name '{args.pad_name}' "
+                      f"matches {len(matches)} of {names}", flush=True)
+                return 1
+            idx = matches[0]
+        js = pads[idx]; js.init()
         print(f"[pad-bridge] pad: {js.get_name()} "
-              f"(axes={js.get_numaxes()} buttons={js.get_numbuttons()})")
+              f"(axes={js.get_numaxes()} buttons={js.get_numbuttons()}); "
+              f"{n_pads} pad(s) enumerated, bound index {idx}", flush=True)
 
     if args.probe:
         prev = None
