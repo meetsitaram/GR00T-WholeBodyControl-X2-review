@@ -600,12 +600,15 @@ def main(argv: list[str] | None = None) -> int:
     # ``ensure_runtime_deps`` call has a chance to materialise them
     # before the dataset writer tries to ``import datasets``.
     from gear_sonic.utils.install import (
+        CALIBRATION_DEPS,
         RECORDER_DEPS,
         ensure_runtime_deps,
     )
 
+    # --teleop-only never touches the LeRobot dataset writer, so don't drag
+    # the multi-GB lerobot/datasets/torch chain onto teleop operators.
     ensure_runtime_deps(
-        RECORDER_DEPS,
+        CALIBRATION_DEPS if args.teleop_only else RECORDER_DEPS,
         purpose="X2 dataset recorder (LeRobot writer + Quest 3 audio)",
     )
 
