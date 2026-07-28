@@ -90,17 +90,33 @@ multi-node mode.
   on surviving nodes; agents/supervisors handle the rest automatically. A
   stall-detector loop (iteration count unchanged for ~5 min → kill local
   workers) is the robust automation; monitor scripts already track the count.
-- Scaling reference (H100, 12288 envs/GPU, X2 v5): 1 node ≈ 8.0s/iter,
+- Scaling reference (H100 + 8×400G IB, 12288 envs/GPU, X2 v5): 1 node ≈ 8.0s/iter,
   3 nodes ≈ 8.9s, 4 nodes ≈ 9.25s → 3.5× env throughput at 4 nodes (~86%
   efficiency). Watch envs/sec, not iteration time.
 
-## Fabric
+## Fabric (Nebius InfiniBand — measured on this cluster 2026-07-28)
 
-Nodes have 8 InfiniBand rails each (mlx5 HCAs, PORT_ACTIVE, one per GPU) —
-NCCL should pick `NET/IB` automatically; `eth0` is only management/VPC (ssh,
-rendezvous TCP, shared FS). The `ibp*` IPoIB interfaces being DOWN is normal
-(NCCL uses verbs, not IP). The launcher sets `NCCL_DEBUG=INFO` so init logs
-show the chosen transport — check for "NCCL INFO Using network IB".
+Each node has **8 InfiniBand rails: mlx5 HCAs, one per GPU, `ibstat` Rate
+400 Gb/s (NDR) each, all PORT_ACTIVE** → 3.2 Tb/s aggregate per node. This
+is Nebius's GPU-cluster fabric — you get it by creating the instances inside
+a "GPU cluster" object; standalone instances get no IB. The rail-per-GPU
+design lets NCCL do GPUDirect RDMA: each GPU's gradient shard leaves its own
+NIC without bouncing through host memory.
+
+- `eth0` (VPC network) is management-only: ssh, the c10d rendezvous TCP
+  store, wandb, and the shared virtiofs filesystem. Its speed is irrelevant
+  to the all-reduce (gradients never touch it when IB is selected).
+- The `ibp*` IPoIB interfaces show DOWN — normal. NCCL uses IB **verbs**
+  directly, not IP-over-IB.
+- **Verify NCCL actually picked IB** (it auto-selects but can silently fall
+  back to `NET/Socket` over eth0): the launcher sets `NCCL_DEBUG=INFO`,
+  `NCCL_DEBUG_SUBSYS=INIT,NET`; grep an elastic.log for
+  "NCCL INFO Using network IB" (bad: "Using network Socket").
+- Sizing intuition: the per-iteration all-reduce moves ~2× model size
+  (~400 MB checkpoint → sub-second on even one 400G rail), so the observed
+  ~1s/iter multi-node premium is dominated by synchronization latency and
+  rank skew (slowest Isaac step sets the pace), NOT bandwidth. Don't buy
+  bandwidth to fix it; reduce per-rank jitter instead.
 
 ## Auto-heal (no human in the loop)
 
