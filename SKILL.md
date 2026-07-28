@@ -153,3 +153,23 @@ handoff before killing anything, telemetry before re-engaging.
 | validate-only fails wanting a robot host | add `--no-x2-debug-bridge` |
 | sim behaves unlike robot | planner identity mismatch — let the script auto-select the dir that md5-matches the robot, don't pin stale graphs |
 | recorder import-fails on `lerobot` | only `--with-record` needs it; default teleop path runs without |
+
+## 6. VLA workflow (record → train → run)
+
+```bash
+# RECORD demonstrations (VR teleop + LeRobot dataset writing):
+bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh --with-record   # sim
+bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh --pc2-host <PC2_IP> --with-record
+
+# REPLAY a recorded dataset (kinematic or through the policy):
+bash gear_sonic/scripts/run_x2_replay_stack.sh --dataset <lerobot_dataset_dir>
+
+# TRAIN the GR00T VLA on your recordings:
+bash gear_sonic/scripts/train_groot_vla.sh --dataset <lerobot_dataset_dir> \
+    --modality-config gear_sonic/data/x2_modality_config_10dof.py
+
+# RUN VLA inference driving the robot/sim:
+bash gear_sonic/scripts/run_x2_vla_runtime.sh --checkpoint <finetuned_ckpt_dir>          # sim
+bash gear_sonic/scripts/run_x2_vla_runtime.sh --checkpoint <ckpt> --pc2-host <PC2_IP>    # real
+python gear_sonic/scripts/mock_vla_publish_stand_token.py   # wire test without a model
+```

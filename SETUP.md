@@ -215,3 +215,28 @@ Notes:
 
 No source files were missing from the lean cut — all three smokes ran from
 the checkout as-is.
+
+## VLA pipeline (record / replay / train / inference)
+
+The X2 VLA workflow depends on **NVIDIA Isaac-GR00T as a pinned upstream
+dependency** — no local modifications:
+
+```bash
+git clone https://github.com/NVIDIA/Isaac-GR00T external_dependencies/Isaac-GR00T
+git -C external_dependencies/Isaac-GR00T checkout 3df8b38   # pinned; newer main likely fine
+```
+The train/inference scripts set `PYTHONPATH=external_dependencies/Isaac-GR00T`.
+
+External models/data (not in this repo): base VLM `nvidia/Cosmos-Reason2-2B`
+(HF, pulled by the finetune launcher), your recorded LeRobot-v2.1 dataset
+(produced by `record_x2_dataset.py --with-record`; `features_x2_vla.py`
+generates its `meta/modality.json`), and the SONIC motion-token decoder
+checkpoint for runtime.
+
+Entry points: record `record_x2_dataset.py`, replay
+`run_x2_replay_stack.sh`, train `train_groot_vla.sh` (wraps
+`launch_finetune_x2.py`), inference `run_x2_vla_runtime.sh`.
+
+Known gap: `x2_pose_proxy.py` referenced by the replay/runtime stacks is a
+PC2-side component not present in this repository — real-robot replay
+requires the PC2 provisioning (see `pc2_bringup.sh`).
