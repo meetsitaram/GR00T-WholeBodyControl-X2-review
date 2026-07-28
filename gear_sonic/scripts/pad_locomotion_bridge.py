@@ -227,6 +227,21 @@ def main() -> int:
         print(f"[pad-bridge] pad: {js.get_name()} "
               f"(axes={js.get_numaxes()} buttons={js.get_numbuttons()}); "
               f"{n_pads} pad(s) enumerated, bound index {idx}", flush=True)
+        # DEADMAN-AXIS SANITY (2026-07-29 incident, second layer): SDL triggers
+        # rest at -1.0; stick axes rest near 0. If the configured deadman axis
+        # does not rest deep-negative, the driver's axis layout is not what we
+        # assume (e.g. a stick landed on the trigger slot) and rest-noise can
+        # phantom-engage the deadman. Refuse rather than guess.
+        pygame.event.pump()
+        _lt_rest = js.get_axis(AXIS_LT)
+        _rt_rest = js.get_axis(AXIS_RT)
+        if _lt_rest > -0.5 or (args.deadman != "left" and _rt_rest > -0.5):
+            print(f"[pad-bridge] REFUSING: deadman axis rest values LT={_lt_rest:+.2f} "
+                  f"RT={_rt_rest:+.2f} (expected < -0.5 for triggers). Wrong "
+                  f"controller/driver axis layout — do NOT trust this mapping. "
+                  f"(Release the triggers and restart if you were holding them.)",
+                  flush=True)
+            return 1
 
     if args.probe:
         prev = None
