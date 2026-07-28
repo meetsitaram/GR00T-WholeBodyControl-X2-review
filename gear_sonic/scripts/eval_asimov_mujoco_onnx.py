@@ -152,7 +152,30 @@ assert (np.asarray(MJ_TO_IL_DOF)[IL_TO_MJ_DOF] == np.arange(NUM_DOFS)).all()
 # Hardware-characterized per-joint parameters (robots/asimov.py
 # ASIMOV_JOINT_PARAMS, from mjlab asimov_1_constant.py):
 # basename -> (kp, kd, effort_hard_clamp)
+#
+# MUST mirror ASIMOV_JOINT_PARAMS exactly — effort feeds both the torque
+# clamp AND the action scale (0.25*effort/kp), so a mismatch changes action
+# semantics vs training. 2026-07-28: efforts = SATURATION ratings (knee-bend
+# fix). Checkpoints trained BEFORE the fix (bigrun/locoft1 lineage,
+# global_step <= ~6k) used the old continuous-limit scale — pass
+# --legacy-continuous-efforts to evaluate those faithfully.
 JOINT_PARAMS = {
+    "hip_pitch": (150.0, 5.0, 120.0),
+    "hip_roll": (150.0, 5.0, 90.0),
+    "hip_yaw": (150.0, 5.0, 60.0),
+    "knee": (150.0, 5.0, 75.0),
+    "ankle_pitch": (440.0, 20.0, 145.4),
+    "ankle_roll": (440.0, 20.0, 57.6),
+    "waist_yaw": (65.0, 5.0, 120.0),
+    "shoulder_pitch": (57.0, 5.0, 90.0),
+    "shoulder_roll": (86.0, 5.0, 75.0),
+    "shoulder_yaw": (96.0, 5.0, 60.0),
+    "elbow": (40.0, 2.0, 36.0),
+    "wrist_yaw": (40.0, 2.0, 36.0),
+}
+
+# Pre-fix (continuous) efforts for evaluating legacy checkpoints.
+JOINT_PARAMS_LEGACY = {
     "hip_pitch": (150.0, 5.0, 40.0),
     "hip_roll": (150.0, 5.0, 30.0),
     "hip_yaw": (150.0, 5.0, 20.0),
@@ -187,14 +210,15 @@ def _basename(jname: str) -> str:
     return jname.replace("left_", "").replace("right_", "").replace("_joint", "")
 
 
-def _build_arrays():
+def _build_arrays(params=None):
+    params = JOINT_PARAMS if params is None else params
     kp = np.zeros(NUM_DOFS)
     kd = np.zeros(NUM_DOFS)
     effort = np.zeros(NUM_DOFS)
     action_scale = np.zeros(NUM_DOFS)
     default_pos = np.zeros(NUM_DOFS)
     for i, jname in enumerate(MUJOCO_JOINT_NAMES):
-        p_kp, p_kd, p_eff = JOINT_PARAMS[_basename(jname)]
+        p_kp, p_kd, p_eff = params[_basename(jname)]
         kp[i], kd[i], effort[i] = p_kp, p_kd, p_eff
         # Repo convention (ASIMOV_ACTION_SCALE): 0.25 * effort / kp.
         action_scale[i] = 0.25 * p_eff / p_kp
@@ -203,6 +227,14 @@ def _build_arrays():
 
 
 KP, KD, EFFORT_LIMIT, ACTION_SCALE, DEFAULT_DOF = _build_arrays()
+
+
+def use_legacy_efforts():
+    """Switch module-level gain arrays to pre-fix continuous-limit efforts."""
+    global KP, KD, EFFORT_LIMIT, ACTION_SCALE, DEFAULT_DOF
+    KP, KD, EFFORT_LIMIT, ACTION_SCALE, DEFAULT_DOF = _build_arrays(
+        JOINT_PARAMS_LEGACY
+    )
 
 
 # ---------- Actors ----------
@@ -586,7 +618,15 @@ def main():
                              "= hardware-characterized gains verbatim).")
     parser.add_argument("--kd-scale", type=float, default=1.0,
                         help="Global multiplier on deployed KD.")
+    parser.add_argument("--legacy-continuous-efforts", action="store_true",
+                        help="Use pre-2026-07-28 continuous-limit efforts / "
+                             "action scale — REQUIRED for checkpoints trained "
+                             "before the saturation-effort knee-bend fix "
+                             "(bigrun/locoft1 lineage).")
     args = parser.parse_args()
+
+    if args.legacy_continuous_efforts:
+        use_legacy_efforts()
 
     kp = KP * float(args.kp_scale)
     kd = KD * float(args.kd_scale)

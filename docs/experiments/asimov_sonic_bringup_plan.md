@@ -194,3 +194,30 @@ now a mandatory gate (below).
 - im_eval with a broken policy is pathologically slow (termination-retry
   rounds) — do not read "slow eval" as an infra problem.
 - Cost of skipping the visual gate: ~11 h train + ~8 h eval/debug = ~19 h.
+
+### 5. Continuous-vs-saturation effort limits (the knee-bend fix, 2026-07-28)
+- **Symptom**: policy walks with completely straight legs; knees hover at
+  default pose (operator-caught in the MuJoCo viewer). Reference clips bend
+  knees 0 -> 1.46 rad (verified against G1 source 14-78 deg), so the data
+  was fine — the policy physically could not track it.
+- **How identified**: computed reference knee range from the pkl (healthy),
+  then audited actuation: knee kp=150 with effort=25 Nm meant (a) action
+  scale 0.25*effort/kp = 0.042 rad/unit — far too little command authority
+  for 1.46 rad of knee travel; (b) PD saturates at only 0.17 rad of error,
+  so no swing-phase torque transients.
+- **Root cause**: ASIMOV_JOINT_PARAMS took the mjlab hardware constants'
+  `effort_limit` (CONTINUOUS/thermal rating) as the sim effort clamp. The
+  hardware's `saturation_effort` (peak, what gait transients actually use,
+  and what G1 sim uses — knee 139 Nm is G1's peak) is 3.0-3.6x higher
+  (knee 25 -> 75, ankle_pitch 40 -> 145.4, hip_pitch 40 -> 120, ...).
+- **Fix**: all ASIMOV_JOINT_PARAMS efforts switched to saturation ratings
+  (kp/kd unchanged — deploy parity); action scales rise proportionally.
+  eval_asimov_mujoco_onnx.py mirrors the new table and grew
+  `--legacy-continuous-efforts` for checkpoints trained pre-fix
+  (bigrun/locoft1 lineage, global_step <= ~6k — action semantics differ).
+  Training relaunched warm-started from the locoft1 walker.
+- **Lesson (X2 deja vu)**: this is the SECOND embodiment where wrong effort
+  limits silently shaped the gait (X2: stale waist/ankle numbers caused
+  forward falls). For every new robot: check BOTH ratings in the vendor
+  datasheet, put PEAK in sim, continuous in the deploy-side safety clamps,
+  and eyeball a walk for joint-range sanity before long training.

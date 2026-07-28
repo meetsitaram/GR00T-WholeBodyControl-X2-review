@@ -39,19 +39,30 @@ ASSET_DIR = "gear_sonic/data/assets"
 
 # Hardware-characterized per-joint parameters from mjlab asimov_1_constant.py:
 # joint basename -> (kp, kd, effort_hard_clamp, velocity_limit, armature)
+#
+# EFFORT = the actuator's SATURATION (peak) rating, not the continuous limit
+# (2026-07-28 knee-bend fix). Sim convention (G1 knee 139 Nm = peak) is peak
+# torque in sim, thermal/continuous limits at deploy. Using continuous limits
+# had two effects that killed knee flexion in walking:
+#   1. action scale 0.25*effort/kp -> knee 0.042 rad/unit; the reference
+#      needs 1.46 rad of knee travel the policy could never command;
+#   2. kp 150 * 0.17 rad error already hit the 25 Nm clamp -> no swing-phase
+#      transients. Continuous limits (for deploy-side clamps):
+#      hip_pitch/waist 40, hip_roll/shoulder_pitch 30, hip_yaw/shoulder_yaw 20,
+#      knee/shoulder_roll 25, ankle_pitch 40, ankle_roll 17, elbow/wrist 12.
 ASIMOV_JOINT_PARAMS = {
-    "hip_pitch": (150.0, 5.0, 40.0, 12.57, 0.0698),
-    "hip_roll": (150.0, 5.0, 30.0, 3.98, 0.1400),
-    "hip_yaw": (150.0, 5.0, 20.0, 5.45, 0.0687),
-    "knee": (150.0, 5.0, 25.0, 12.25, 0.0330),
-    "ankle_pitch": (440.0, 20.0, 40.0, 9.32, 0.0484),
-    "ankle_roll": (440.0, 20.0, 17.0, 9.32, 0.0484),
-    "waist_yaw": (65.0, 5.0, 40.0, 12.57, 0.0698),
-    "shoulder_pitch": (57.0, 5.0, 30.0, 3.98, 0.1400),
-    "shoulder_roll": (86.0, 5.0, 25.0, 12.25, 0.0330),
-    "shoulder_yaw": (96.0, 5.0, 20.0, 5.45, 0.0687),
-    "elbow": (40.0, 2.0, 12.0, 9.32, 0.0242),
-    "wrist_yaw": (40.0, 2.0, 12.0, 9.32, 0.0242),
+    "hip_pitch": (150.0, 5.0, 120.0, 12.57, 0.0698),
+    "hip_roll": (150.0, 5.0, 90.0, 3.98, 0.1400),
+    "hip_yaw": (150.0, 5.0, 60.0, 5.45, 0.0687),
+    "knee": (150.0, 5.0, 75.0, 12.25, 0.0330),
+    "ankle_pitch": (440.0, 20.0, 145.4, 9.32, 0.0484),
+    "ankle_roll": (440.0, 20.0, 57.6, 9.32, 0.0484),
+    "waist_yaw": (65.0, 5.0, 120.0, 12.57, 0.0698),
+    "shoulder_pitch": (57.0, 5.0, 90.0, 3.98, 0.1400),
+    "shoulder_roll": (86.0, 5.0, 75.0, 12.25, 0.0330),
+    "shoulder_yaw": (96.0, 5.0, 60.0, 5.45, 0.0687),
+    "elbow": (40.0, 2.0, 36.0, 9.32, 0.0242),
+    "wrist_yaw": (40.0, 2.0, 36.0, 9.32, 0.0242),
 }
 
 # MuJoCo orders, straight from mjcf/asimov.xml (DFS in XML order).
