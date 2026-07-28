@@ -48,6 +48,10 @@ MOTION_FILE=${MOTION_FILE:-/mnt/shared/corpus/asimov_sonic_executed_feasible.pkl
 EXPERIMENT_DIR=${EXPERIMENT_DIR:-/mnt/shared/ckpts/asimov_elastic_run1}
 USE_WANDB=${USE_WANDB:-True}
 MAX_RESTARTS=${MAX_RESTARTS:-100}
+# RDZV_IS_HOST=1 on the node whose IP is in RDZV_ENDPOINT. torchrun's
+# auto-detection resolves the machine hostname (127.0.1.1 on cloud images), so
+# it never matches the endpoint IP and no node binds the store without this.
+RDZV_IS_HOST=${RDZV_IS_HOST:-0}
 EXTRA_FLAGS=${EXTRA_FLAGS:-}
 LOG_FILE=${LOG_FILE:-$HOME/elastic.log}
 
@@ -95,6 +99,7 @@ while true; do
     --rdzv-backend=c10d \
     --rdzv-endpoint="$RDZV_ENDPOINT" \
     --rdzv-id=asimov_elastic \
+    --rdzv-conf="is_host=$RDZV_IS_HOST" \
     --max-restarts="$MAX_RESTARTS" \
     gear_sonic/train_agent_trl.py \
     --config-name=base \
