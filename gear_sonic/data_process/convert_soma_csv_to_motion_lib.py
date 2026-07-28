@@ -97,6 +97,39 @@ X2_MJCF_FILE = "x2_ultra.xml"
 
 
 # ---------------------------------------------------------------------------
+# Asimov v1 23-DOF robot constants
+# GENERATED from the name lists in gear_sonic/envs/manager_env/robots/asimov.py
+# via mapping_utils (do not hand-edit; regenerate if either order changes).
+# MJCF joint order: legs L(6), legs R(6), waist_yaw, RIGHT arm(5), LEFT arm(5).
+# The welded neck bodies are fused (scripts/dev/fuse_asimov_neck.py), so
+# NUM_BODIES == 1 + NUM_DOF == 24 like every other robot here.
+# ---------------------------------------------------------------------------
+
+ASIMOV_MJ_TO_IL = np.array(
+    [0, 3, 7, 11, 15, 19, 1, 4, 8, 12, 16, 20, 2,
+     6, 10, 14, 18, 22, 5, 9, 13, 17, 21],
+    dtype=np.int32,
+)
+
+ASIMOV_NUM_DOF = 23
+ASIMOV_NUM_BODIES = 24
+# Local MJCF jnt_axis per MuJoCo-ordered joint. NOTE: Asimov's right side is
+# sign-mirrored vs the left, and the wrist axis is canted (0.766, 0, -0.643).
+ASIMOV_DOF_AXIS = np.array(
+    [
+        [0, 1, 0], [1, 0, 0], [0, 0, -1], [0, 1, 0], [0, 1, 0], [-1, 0, 0],    # left leg
+        [0, -1, 0], [1, 0, 0], [0, 0, -1], [0, -1, 0], [0, -1, 0], [-1, 0, 0],  # right leg
+        [0, 0, 1],                                                               # waist_yaw
+        [0, -1, 0], [-1, 0, 0], [0, 0, -1], [0, 1, 0], [0.766044, 0, -0.642788],  # right arm
+        [0, 1, 0], [-1, 0, 0], [0, 0, -1], [0, -1, 0], [0.766044, 0, -0.642788],  # left arm
+    ],
+    dtype=np.float32,
+)
+
+ASIMOV_MJCF_FILE = "asimov.xml"
+
+
+# ---------------------------------------------------------------------------
 # Robot config registry
 # ---------------------------------------------------------------------------
 
@@ -114,6 +147,13 @@ ROBOT_CONFIGS = {
         "num_bodies": X2_NUM_BODIES,
         "dof_axis": X2_DOF_AXIS,
         "mjcf_file": X2_MJCF_FILE,
+    },
+    "asimov": {
+        "mj_to_il": ASIMOV_MJ_TO_IL,
+        "num_dof": ASIMOV_NUM_DOF,
+        "num_bodies": ASIMOV_NUM_BODIES,
+        "dof_axis": ASIMOV_DOF_AXIS,
+        "mjcf_file": ASIMOV_MJCF_FILE,
     },
 }
 

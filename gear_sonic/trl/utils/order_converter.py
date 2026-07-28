@@ -221,11 +221,41 @@ class X2UltraConverter(IsaacLabMuJoCoConverter):
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 
+class AsimovConverter(IsaacLabMuJoCoConverter):
+    """Asimov v1 joint/body order converter between IsaacLab and MuJoCo conventions.
+
+    Wired from the GENERATED mapping dict (robots/mapping_utils.py) instead of
+    hand-typed arrays; associations mirror X2UltraConverter's:
+    DOF_MAPPINGS[("isaaclab","mujoco")][i] = MuJoCo index of the IL joint i.
+    """
+
+    def __init__(self):
+        from gear_sonic.envs.manager_env.robots.asimov import (
+            ASIMOV_ISAACLAB_TO_MUJOCO_MAPPING as M,
+        )
+
+        self.JOINT_NAMES = M["isaaclab_joints"]
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): M["mujoco_to_isaaclab_dof"],
+            ("mujoco", "isaaclab"): M["isaaclab_to_mujoco_dof"],
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): M["mujoco_to_isaaclab_body"],
+            ("mujoco", "isaaclab"): M["isaaclab_to_mujoco_body"],
+        }
+
+    # Asimov training assets rename waist_yaw_link->torso_link (framework
+    # conventions); single wrist body per arm (wrist_yaw_link).
+    VR_3POINTS_BODY_NAMES = ["torso_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+    FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+
 _CONVERTER_REGISTRY = {
     "g1": G1Converter,
     "g1_model_12_dex": G1Converter,
     "h2": H2Converter,
     "x2_ultra": X2UltraConverter,
+    "asimov": AsimovConverter,
 }
 
 _SKELETON_TO_ROBOT = {
@@ -233,6 +263,7 @@ _SKELETON_TO_ROBOT = {
     "motion_g1": "g1",
     "motion_h2": "h2",
     "motion_x2_ultra": "x2_ultra",
+    "motion_asimov": "asimov",
     "motion_x2_ultra_extended_toe": "x2_ultra",
     "motion": "g1",
 }

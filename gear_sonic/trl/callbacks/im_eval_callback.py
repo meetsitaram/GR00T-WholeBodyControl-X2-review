@@ -180,6 +180,7 @@ class ImEvalCallback(TrainerCallback):
                         "pred_pos": self.pred_pos_all,  # list of (T, n_bodies, 3) global, robot
                         "gt_pos": self.gt_pos_all,  # list of (T, n_bodies, 3) global, reference
                         "mpjpe": self.mpjpe_all,
+                        "exec_qpos": self.exec_qpos_all,  # list of (T, 7+num_dof): root pos+quat(wxyz) world + joint_pos (IsaacLab order)
                     },
                     tf,
                 )
@@ -317,6 +318,7 @@ class ImEvalCallback(TrainerCallback):
         self.gt_pos, self.gt_pos_all = [], []
         self.gt_rot, self.gt_rot_all = [], []
         self.pred_pos, self.pred_pos_all = [], []
+        self.exec_qpos, self.exec_qpos_all = [], []  # executed root+dof (IM_EVAL_DUMP_TRAJ)
         self.pred_rot, self.pred_rot_all = [], []
         self.sampled_motion_idx = []
         self.time_eval_start = time.time()
@@ -383,6 +385,12 @@ class ImEvalCallback(TrainerCallback):
             self.gt_pos.append(gt_pos.cpu().numpy())
             self.pred_pos.append(pred_pos.cpu().numpy())
             self.mpjpe.append(mpjpe.cpu())
+        if os.environ.get("IM_EVAL_DUMP_TRAJ"):
+            robot = self.env.scene["robot"]
+            import torch as _t
+            self.exec_qpos.append(_t.cat(
+                [robot.data.root_state_w[:, :7], robot.data.joint_pos], dim=-1
+            ).cpu().numpy())
 
         # Collect object tracking errors if object exists in scene
         if self._has_object:
@@ -479,6 +487,7 @@ class ImEvalCallback(TrainerCallback):
                 )
 
             all_body_pos_pred = np.stack(self.pred_pos)
+            all_exec_qpos = np.stack(self.exec_qpos) if self.exec_qpos else None
             all_body_pos_gt = np.stack(self.gt_pos)
             # all_body_rot_pred = np.stack(self.pred_rot)
             # all_body_rot_gt = np.stack(self.gt_rot)
@@ -505,6 +514,13 @@ class ImEvalCallback(TrainerCallback):
             # all_body_rot_gt = [all_body_rot_gt[: (i - 1), idx] for idx, i in enumerate(self.env._motion_lib.get_motion_num_steps())]
 
             self.mpjpe_all.append(all_mpjpe)
+            if all_exec_qpos is not None:
+                self.exec_qpos_all += [
+                    all_exec_qpos[: (i - 1), idx]
+                    for idx, i in enumerate(
+                        self.env._motion_lib.get_motion_num_steps(self.env.motion_ids)
+                    )
+                ]
             self.pred_pos_all += all_body_pos_pred
             self.gt_pos_all += all_body_pos_gt
             # self.pred_rot_all += all_body_rot_pred
@@ -913,6 +929,7 @@ class ImEvalCallback(TrainerCallback):
 
             self.pbar.update(1)
             self.pbar.refresh()
+            self.exec_qpos = []
             (
                 self.mpjpe,
                 self.gt_pos,

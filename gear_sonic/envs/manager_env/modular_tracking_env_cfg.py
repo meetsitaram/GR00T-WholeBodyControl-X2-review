@@ -16,7 +16,7 @@ import joblib
 import pxr
 
 from gear_sonic.envs.manager_env.mdp import terrain
-from gear_sonic.envs.manager_env.robots import g1, h2, x2_ultra
+from gear_sonic.envs.manager_env.robots import asimov, g1, h2, x2_ultra
 from gear_sonic.trl.utils import common
 
 
@@ -1038,6 +1038,11 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
                 "robot_cfg": x2_ultra.X2_ULTRA_CFG,
                 "action_scale": x2_ultra.X2_ULTRA_ACTION_SCALE,
                 "isaaclab_to_mujoco_mapping": x2_ultra.X2_ULTRA_ISAACLAB_TO_MUJOCO_MAPPING,
+            },
+            "asimov": {
+                "robot_cfg": asimov.ASIMOV_CFG,
+                "action_scale": asimov.ASIMOV_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": asimov.ASIMOV_ISAACLAB_TO_MUJOCO_MAPPING,
             },
         }
 
