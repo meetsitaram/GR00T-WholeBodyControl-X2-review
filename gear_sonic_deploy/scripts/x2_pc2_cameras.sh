@@ -392,6 +392,13 @@ sleep 0.5
 # already installed.
 python3 -c "import zmq, msgpack, msgpack_numpy" 2>/dev/null \
     || pip3 install --user --quiet pyzmq msgpack msgpack-numpy
+# PC2's system cv2 / ROS stack is compiled against numpy 1.x. A stray
+# user-site numpy 2.x shadows the system copy and kills the bridge at
+# ``import cv2`` with "_ARRAY_API not found" (hit live 2026-07-28:
+# numpy 2.2.6 in ~/.local). Detect and pin back; idempotent no-op when
+# the user site is already 1.x-or-absent.
+python3 -c 'import numpy, sys; sys.exit(0 if numpy.__version__.startswith("1.") else 1)' 2>/dev/null \
+    || pip3 install --user --quiet "numpy<2"
 
 source /opt/ros/humble/setup.bash 2>/dev/null
 export FASTRTPS_DEFAULT_PROFILES_FILE=/agibot/software/entry/cfg/ros_dds_configuration.xml
