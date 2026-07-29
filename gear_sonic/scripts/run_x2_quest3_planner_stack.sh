@@ -3073,6 +3073,23 @@ if [[ "${HEAD_CAMERAS}" -eq 1 && "${WITH_RECORD}" -eq 1 ]]; then
         log "Camera bridge: --no-camera-autostart set; assuming bridge already" \
             "running on ${CAMERA_HOST}:${CAMERA_PORT}"
     fi
+    # HARD GATE (2026-07-28): a clean `serve` only proves the bridge
+    # process started -- it says nothing about the cameras behind it
+    # (Orbbec em-app stopped => bridge up, zero head_front frames, and
+    # the dataset silently records without the one stream VLA training
+    # actually needs). Require real JPEG frames from every head stream
+    # before the recorder is allowed to start; the probe prints the
+    # exact recovery command per missing stream (orbbec em-app vs
+    # restart-hal for the IMX900 Argus race).
+    log "Camera bridge: validating frame flow from ${CAMERA_HOST}:${CAMERA_PORT} …"
+    if ! "${PYTHON}" "${REPO_ROOT}/gear_sonic/scripts/probe_x2_head_cameras.py" \
+            --host "${CAMERA_HOST}" --port "${CAMERA_PORT}"; then
+        err "Head-camera validation FAILED -- refusing to record a dataset" \
+            "without verified camera streams. Fix the stream(s) named above" \
+            "and re-run (or drop --head-cameras to record without them" \
+            "deliberately)."
+        exit 1
+    fi
     RECORDER_ARGS+=(
         --head-cameras
         --camera-host "${CAMERA_HOST}"
