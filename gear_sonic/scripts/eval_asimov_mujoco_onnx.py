@@ -674,6 +674,9 @@ def main():
                         help="Only play clips whose name CONTAINS this substring "
                              "(case-insensitive). Default: all clips in the PKL, "
                              "iterated one-by-one with an RSI reset before each.")
+    parser.add_argument("--show-forces", action="store_true",
+                        help="Viewer: draw contact points and contact-force "
+                             "arrows (direction + magnitude).")
     parser.add_argument("--loop-clips", action="store_true",
                         help="With a multi-clip PKL, cycle back to the first clip "
                              "after the last (default: stop after one pass through "
@@ -1017,6 +1020,17 @@ def main():
             viewer.cam.lookat[:] = [0.0, 0.0, init_root_z]
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             viewer.cam.trackbodyid = pelvis_id
+            if args.show_forces:
+                # Contact points + force arrows (direction = arrow, magnitude
+                # = length). vis.map.force scales meters-per-Newton; the
+                # default is tuned for tiny models — shrink so a ~350 N
+                # heel-strike stays readable at robot scale.
+                viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+                viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+                mj_model.vis.map.force = 0.005
+                mj_model.vis.scale.contactwidth = 0.05
+                mj_model.vis.scale.contactheight = 0.02
+                mj_model.vis.scale.forcewidth = 0.02
 
             wall_start = time.time() - sim_time
             while viewer.is_running():
