@@ -205,6 +205,77 @@ DEFAULT_JOINT_POS = {
 # Action clip from the training wrapper (config action_clip_value: 20.0).
 ACTION_CLIP = 20.0
 
+# Local MJCF jnt_axis per MuJoCo-ordered joint (convert_soma_csv_to_motion_lib
+# ASIMOV_DOF_AXIS). Right side is sign-mirrored; wrist axis is canted.
+DOF_AXIS = np.array(
+    [
+        [0, 1, 0], [1, 0, 0], [0, 0, -1], [0, 1, 0], [0, 1, 0], [-1, 0, 0],      # left leg
+        [0, -1, 0], [1, 0, 0], [0, 0, -1], [0, -1, 0], [0, -1, 0], [-1, 0, 0],  # right leg
+        [0, 0, 1],                                                               # waist_yaw
+        [0, -1, 0], [-1, 0, 0], [0, 0, -1], [0, 1, 0], [0.766044, 0, -0.642788],  # right arm
+        [0, 1, 0], [-1, 0, 0], [0, 0, -1], [0, -1, 0], [0.766044, 0, -0.642788],  # left arm
+    ],
+    dtype=np.float64,
+)
+
+
+# ---------------------------------------------------------------------------
+# "Served" DOF convention (sim2sim-gap root cause, found 2026-07-28)
+# ---------------------------------------------------------------------------
+# The training motion lib does NOT serve the PKL's `dof` (MuJoCo-qpos
+# convention). It recomputes joint angles from `pose_aa` via
+# torch_humanoid_batch.rotation_matrices_to_dof: three independent atan2
+# extractions (x=atan2(R21,R22), y=atan2(R02,R00), z=atan2(R10,R11)) dotted
+# with the joint axis — which lands in the |axis| convention. Net effect vs
+# raw qpos: every negative-axis joint (mirrored right side, yaw axes,
+# ankle/shoulder rolls) is SIGN-FLIPPED, and the canted wrist axis gets a
+# nonlinear remap. Everything REFERENCE-side uses this served convention:
+#   * tokenizer command jpos (verified vs IsaacLab capture: 3.4e-4 mean)
+#   * tokenizer command jvel = forward-diff of served dof (1.9e-3 mean)
+#   * RSI reset joint state = served dof CLAMPED to the 0.9-soft joint
+#     limits (IsaacLab write clamps; residual 0.016 = reset noise)
+# while the PROPRIOCEPTION stream stays in raw MuJoCo/URDF qpos convention
+# (robot.data.joint_pos; deltas vs capture = configured obs noise only).
+# The policy was trained with this convention split, so deploy must
+# replicate it exactly — feeding raw-qpos references makes the policy
+# track a ghost target and collapse to the default pose (the pre-fix
+# "conservative gait": joint MAE ~0.29 vs IsaacLab-like ~0.17).
+
+def _served_dof_from_pose_aa(pose_aa: np.ndarray) -> np.ndarray:
+    """Motion-lib style DOF extraction, (T, 24, 3) pose_aa -> (T, 23) MJ order."""
+    aa = np.asarray(pose_aa, dtype=np.float64)[:, 1 : 1 + NUM_DOFS, :]
+    T = aa.shape[0]
+    R = Rot.from_rotvec(aa.reshape(-1, 3)).as_matrix().reshape(T, NUM_DOFS, 3, 3)
+    x = np.arctan2(R[..., 2, 1], R[..., 2, 2])
+    y = np.arctan2(R[..., 0, 2], R[..., 0, 0])
+    z = np.arctan2(R[..., 1, 0], R[..., 1, 1])
+    angles = np.stack([x, y, z], axis=-1)
+    return (angles * np.abs(DOF_AXIS)[None]).sum(-1)
+
+
+def _ensure_served(m) -> None:
+    """Attach served-convention dof/vel streams to a motion dict (cached).
+
+    ``_dof_served``: (T, 23) MJ order, motion-lib convention (see above).
+    ``_dof_vel_served``: forward difference * fps, last row repeated —
+    matches motion-lib dof_vel (verified 1.9e-3 mean vs capture).
+    Falls back to a per-joint sign flip of ``dof`` if ``pose_aa`` is missing
+    (exact for all joints except the two canted wrists).
+    """
+    if "_dof_served" in m:
+        return
+    if "pose_aa" in m:
+        served = _served_dof_from_pose_aa(m["pose_aa"])
+    else:
+        sign = np.array([a[np.argmax(np.abs(a))] for a in DOF_AXIS])
+        served = np.asarray(m["dof"], dtype=np.float64) * np.sign(sign)[None]
+    fps = float(m["fps"])
+    vel = np.empty_like(served)
+    vel[:-1] = (served[1:] - served[:-1]) * fps
+    vel[-1] = vel[-2] if len(served) > 1 else 0.0
+    m["_dof_served"] = served
+    m["_dof_vel_served"] = vel
+
 
 def _basename(jname: str) -> str:
     return jname.replace("left_", "").replace("right_", "").replace("_joint", "")
@@ -227,6 +298,21 @@ def _build_arrays(params=None):
 
 
 KP, KD, EFFORT_LIMIT, ACTION_SCALE, DEFAULT_DOF = _build_arrays()
+
+
+def _soft_joint_limits():
+    """0.9-soft joint limits from the MJCF, MJ order (IsaacLab
+    soft_joint_pos_limit_factor=0.9: mid +/- 0.9*half). RSI joint writes are
+    clamped to these — verified against the IsaacLab capture (clamped joints
+    land exactly on mid +/- 0.9*half: right_knee -0.075, left_elbow 0.122)."""
+    model = mujoco.MjModel.from_xml_path(MJCF_PATH)
+    rng = np.array([model.joint(n).range.copy() for n in MUJOCO_JOINT_NAMES])
+    mid = rng.mean(axis=1)
+    half = (rng[:, 1] - rng[:, 0]) / 2.0
+    return mid - 0.9 * half, mid + 0.9 * half
+
+
+SOFT_JPOS_LO, SOFT_JPOS_HI = _soft_joint_limits()
 
 
 def use_legacy_efforts():
@@ -320,22 +406,23 @@ def quat_rotate_inverse(q_wxyz, v):
 
 
 def compute_motion_state(motion_data, frame, fps):
-    """Full RSI reset state from a motion frame (see eval_x2_mujoco).
+    """Full RSI reset state from a motion frame.
 
-    PKL: ``dof`` in MuJoCo order, ``root_rot`` xyzw, ``root_trans_offset``
-    world frame; velocities reconstructed by one-step finite difference.
+    Joint state uses the SERVED convention clamped to the 0.9-soft limits —
+    mirroring IsaacLab's ``write_joint_state_to_sim`` of motion-lib data
+    (see the served-DOF note above). Root state comes from the PKL raw
+    streams (``root_rot`` xyzw, ``root_trans_offset`` world frame), with
+    velocities reconstructed by one-step finite difference.
     """
     m = _m(motion_data)
+    _ensure_served(m)
     n_frames = m["dof"].shape[0]
     f = int(frame) % n_frames
     f_next = min(f + 1, n_frames - 1)
     dt = 1.0 / float(fps)
 
-    joint_pos_mj = np.asarray(m["dof"][f], dtype=np.float64)
-    if f_next != f:
-        joint_vel_mj = (np.asarray(m["dof"][f_next], dtype=np.float64) - joint_pos_mj) / dt
-    else:
-        joint_vel_mj = np.zeros(NUM_DOFS, dtype=np.float64)
+    joint_pos_mj = np.clip(m["_dof_served"][f], SOFT_JPOS_LO, SOFT_JPOS_HI)
+    joint_vel_mj = m["_dof_vel_served"][f].copy()
 
     root_pos_w = np.asarray(m["root_trans_offset"][f], dtype=np.float64).copy()
     quat_xyzw = np.asarray(m["root_rot"][f], dtype=np.float64)
@@ -421,23 +508,30 @@ def build_tokenizer_obs(motion_data, current_time, base_quat_wxyz, motion_fps):
     DT_FUTURE_REF (TrackingCommand.future_time_steps_init).
     """
     m = _m(motion_data)
+    _ensure_served(m)
     total_frames = m["dof"].shape[0]
     dt = 1.0 / motion_fps
 
     cur_rot = Rot.from_quat([base_quat_wxyz[1], base_quat_wxyz[2],
                              base_quat_wxyz[3], base_quat_wxyz[0]])
 
+    # Future-frame indices in INTEGER step space, mirroring IsaacLab's
+    # ``arange(num_future_frames) * frame_skips`` (frame 0 = current frame).
+    # An earlier float version (``int((t + f*0.1) * fps)``) hit floor errors
+    # (e.g. 4.56*50 -> 227.99999 -> 227), corrupting the served jvel at
+    # velocity spikes.
+    base_frame = int(round(current_time * motion_fps))
+    frame_skip = int(round(DT_FUTURE_REF * motion_fps))
     jpos_frames, jvel_frames, ori_frames = [], [], []
     for f in range(NUM_FUTURE_FRAMES):
-        future_time = current_time + f * DT_FUTURE_REF
-        fi = min(int(future_time / dt), total_frames - 1)
+        fi = min(base_frame + f * frame_skip, total_frames - 1)
 
-        jpos_il = m["dof"][fi][IL_TO_MJ_DOF]
+        # Reference joint streams in the SERVED convention (see module note):
+        # this is what the policy was trained to consume; raw `dof` here is
+        # the sim2sim bug that made the policy track a ghost target.
+        jpos_il = m["_dof_served"][fi][IL_TO_MJ_DOF]
         jpos_frames.append(jpos_il.astype(np.float32))
-
-        prev_fi = max(0, fi - 1)
-        jvel_mj = (m["dof"][fi] - m["dof"][prev_fi]) * motion_fps
-        jvel_frames.append(jvel_mj[IL_TO_MJ_DOF].astype(np.float32))
+        jvel_frames.append(m["_dof_vel_served"][fi][IL_TO_MJ_DOF].astype(np.float32))
 
         fq = m["root_rot"][fi]  # xyzw
         relative = cur_rot.inv() * Rot.from_quat(fq)
