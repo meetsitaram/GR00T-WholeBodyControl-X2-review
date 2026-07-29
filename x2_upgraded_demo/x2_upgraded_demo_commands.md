@@ -6,27 +6,39 @@
 
 ### Start sonic on robot pc2
 
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach   
-    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22   
-    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx   
-    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery_loose.yaml   
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach \
+
+```
+--pc2-host 192.168.86.32 --laptop-host 192.168.86.22 \
+
+--model /home/run/getsolo/policies/agibot_x2_sonic.onnx
+```
+
+??
+
+./gear_sonic_deploy/scripts/x2_pc2_[daemons.sh](http://daemons.sh) start --attach --pc2-host 192.168.86.32 --laptop-host 192.168.86.22 --model /home/run/getsolo/policies/agibot_x2_sonic.onnx --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery_loose.yaml --lock-head-straight
+
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach  
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22  
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx  
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walking_recovery_loose.yaml  
     --lock-head-straight
 
-./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach   
-    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22   
-    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx   
-    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walk_101.yaml   
+./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start --attach  
+    --pc2-host 192.168.86.32 --laptop-host 192.168.86.22  
+    --model /home/run/getsolo/policies/agibot_x2_sonic.onnx  
+    --tuning gear_sonic_deploy/configs/real_deploy_tuning/walk_101.yaml  
     --lock-head-straight
 
 ### run the vr planner stack
 
-./gear_sonic/scripts/run_x2_quest3_planner_stack.sh   
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh  
     --pc2-host 192.168.86.32 
 
 ### play pkl motions
 
-python -m gear_sonic.scripts.play_locomotion   
-  --pkl gear_sonic/data/motions/x2_dances_easy.pkl   
+python -m gear_sonic.scripts.play_locomotion  
+  --pkl gear_sonic/data/motions/x2_dances_easy.pkl  
   --motion-key dance_party_hips_003__A467
 
 ### To Stop sonic on robot (*** this will collapse the robot and needs to be held)
@@ -50,27 +62,27 @@ python gear_sonic/scripts/play_x2_motion_mujoco.py   --motion gear_sonic/data/mo
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
 
-ALLOW_MISMATCH=1   
-  SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx   
-  PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_fixedscratch_p500k   
+ALLOW_MISMATCH=1  
+  SONIC_MODEL=~~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx~~  
+  ~~PLANNER_MODEL=~~/x2_cloud_checkpoints/planner_onnx_fixedscratch_p500k  
   ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
 
-ALLOW_MISMATCH=1   
-KPLANNER_FIXED_FWD_MPS=0.5 KPLANNER_FIXED_TURN_RAD_S=1.0   
-KPLANNER_TAPE_DIR=~/kplanner_sim_tapes ALLOW_MISMATCH=1   
-SONIC_MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx   
-PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_p500k_stance   
+ALLOW_MISMATCH=1  
+KPLANNER_FIXED_FWD_MPS=0.5 KPLANNER_FIXED_TURN_RAD_S=1.0  
+KPLANNER_TAPE_DIR=~~/kplanner_sim_tapes ALLOW_MISMATCH=1~~  
+~~SONIC_MODEL=~~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx  
+PLANNER_MODEL=~/x2_cloud_checkpoints/planner_onnx_p500k_stance  
 ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
 
-MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx   
+MODEL=~/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx  
   ./gear_sonic/scripts/sim_onnx_planner.sh --pc2-host 192.168.86.32
 
 ### various dance moves with sonic in mujoco
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
-.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py   
-  --checkpoint  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt   
-  --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl   
+.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py  
+  --checkpoint  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt  
+  --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl  
   --clip dance_party_hips_003__A467
 
 --checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/model_step_002000.pt
@@ -78,8 +90,8 @@ cd /home/stickbot/Projects/GR00T-WholeBodyControl
 --onnx -onnx /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/exported/softland_4800_g1.onnx
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
-.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py   
-  --checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt   
+.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py  
+  --checkpoint /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/softland_173528/model_step_004800.pt  
   --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl
 
 -- medium dance_latino_chase_mambo_kicks_R_fast_001__A314 (needs space - feet hitting each other on the robot, but ok)
@@ -95,8 +107,8 @@ cd /home/stickbot/Projects/GR00T-WholeBodyControl
 /home/stickbot/x2_cloud_checkpoints/dance_175030_step2000_full/model_step_002000.pt
 
 cd /home/stickbot/Projects/GR00T-WholeBodyControl
-.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py   
-  --checkpoint /home/stickbot/x2_cloud_checkpoints/dance_175030_step2000_full/model_step_002000.pt   
+.venv/bin/python gear_sonic/scripts/eval_x2_mujoco.py  
+  --checkpoint /home/stickbot/x2_cloud_checkpoints/dance_175030_step2000_full/model_step_002000.pt  
   --wrist-ref --motions gear_sonic/data/motions/x2_dances_easy.pkl 
 
   /home/stickbot/x2_cloud_checkpoints/dance_v3_3k_full/dance_v3_3k.pt
@@ -163,13 +175,13 @@ dance_distraction_dance_001__A465
 
 ### misc
 
-KPLANNER_FIXED_FWD_MPS=0.5 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh   
-  --duration 0   
-  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/ft_2082_g1.onnx   
-  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/vqvae/checkpoints/model-step=0250000.ckpt   
-  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/pose/checkpoints/model-step=0080000.ckpt   
-  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt   
-  --kplanner-planner-mode walk   
+KPLANNER_FIXED_FWD_MPS=0.5 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh  
+  --duration 0  
+  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/ft_2082_g1.onnx  
+  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/vqvae/checkpoints/model-step=0250000.ckpt  
+  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/pose/checkpoints/model-step=0080000.ckpt  
+  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt  
+  --kplanner-planner-mode walk  
   --kplanner-python /home/stickbot/miniconda3/envs/env_isaaclab/bin/python
 
 # planner (ONNX) + your pad bridge + sim consumer, standard sim ports (sim on pc)
@@ -196,13 +208,13 @@ cd ~/Projects/GR00T-WholeBodyControl
 
 # as "speed setpoint -> X" + per-replan "Replanning ... target_vel(fwd)".
 
-KPLANNER_FIXED_FWD_MPS=0.3 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh   
-  --duration 0   
-  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/walkft_3065_g1.onnx   
-  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/vqvae/checkpoints/model-step=0250000.ckpt   
-  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/pose/checkpoints/model-step=0080000.ckpt   
-  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt   
-  --kplanner-planner-mode slow_walk   
+KPLANNER_FIXED_FWD_MPS=0.3 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh  
+  --duration 0  
+  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/walkft_3065_g1.onnx  
+  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/vqvae/checkpoints/model-step=0250000.ckpt  
+  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/pose/checkpoints/model-step=0080000.ckpt  
+  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt  
+  --kplanner-planner-mode slow_walk  
   --kplanner-python /home/stickbot/miniconda3/envs/env_isaaclab/bin/python
 
 # NOTE: pose ckpt is the 80k intermediate -- swap to the 250k final tomorrow morning.
@@ -219,13 +231,13 @@ KPLANNER_FIXED_FWD_MPS=0.3 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh
 
 # Terminal 1 — stack with gamepad instead of Quest (add --pc2-host 192.168.86.32 for real robot):
 
-./gear_sonic/scripts/run_x2_quest3_planner_stack.sh   
-  --duration 0   
-  --pad-only   
-  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/walkft_3065_g1.onnx   
-  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/kplanner_g1ret/vqvae/vqvae_g1ret_250k.ckpt   
-  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/kplanner_g1ret/pose/pose_g1ret_250k.ckpt   
-  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt   
+./gear_sonic/scripts/run_x2_quest3_planner_stack.sh  
+  --duration 0  
+  --pad-only  
+  --model /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/sonic/snapshots/exported/walkft_3065_g1.onnx  
+  --kplanner-vqvae-ckpt /home/stickbot/x2_cloud_checkpoints/kplanner_g1ret/vqvae/vqvae_g1ret_250k.ckpt  
+  --kplanner-pose-ckpt  /home/stickbot/x2_cloud_checkpoints/kplanner_g1ret/pose/pose_g1ret_250k.ckpt  
+  --kplanner-root-ckpt  /home/stickbot/x2_cloud_checkpoints/g1teleop_overnight/kplanner/root/checkpoints/model-step=0250000.ckpt  
   --kplanner-python /home/stickbot/miniconda3/envs/env_isaaclab/bin/python
 
 # Terminal 2 — dance/gesture buttons + e-stop chord:
