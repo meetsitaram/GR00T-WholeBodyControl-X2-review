@@ -89,6 +89,14 @@ source ~/.x2/env.wifi   # PC2_HOST=<current PC2 ip>, LAPTOP_HOST=<this laptop's 
 Engage VR with A+B+X+Y in the headset. Episodes land as LeRobot v2.1
 with `observation.images.{head_front,stereo_left,stereo_right}`.
 
+Known startup failure: `kplanner checkpoint not found: ...model-step=
+0300000.ckpt` — the preflight hardcodes step 0300000 but disk ships
+0315000. Fix: append
+`--kplanner-root-ckpt motionbricks/out/motionbricks_root_x2/version_1/checkpoints/model-step=0315000.ckpt`
+(or set `KPLANNER_ONNX=<planner graph FILE, not dir>` to use the
+torch-free ONNX planner where the graphs exist). `--task` text is
+written into every episode — use a real task description.
+
 Camera gate failures print the exact fix per stream:
 - `head_front` (Orbbec, the stream VLA training needs most): the
   `orbbec_camera` em-app must be RUNNING on PC2.
