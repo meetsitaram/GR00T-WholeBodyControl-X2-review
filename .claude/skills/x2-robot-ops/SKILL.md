@@ -11,6 +11,25 @@ the robogym WiFi. **PC2's DHCP address moves** — find it by MAC
 Keep `~/.x2/env.wifi` on THIS laptop pointing at it, with `LAPTOP_HOST`
 set to THIS laptop's own robogym IP (it is machine-local, not in git).
 
+First-time setup on a new laptop:
+
+```bash
+mkdir -p ~/.x2
+ip -4 addr show | grep "192.168.86."        # this laptop's robogym IP
+# PC2 is DHCP; if .32 doesn't ping, sweep + match its MAC:
+#   for i in $(seq 1 254); do ping -c1 -W1 192.168.86.$i >/dev/null 2>&1 & done; wait
+#   arp -a | grep -i bc:d2:2c
+cat > ~/.x2/env.wifi <<'EOF'
+export PC2_HOST=192.168.86.32     # PC2 Jetson (MAC bc:d2:2c:60:c8:c7)
+export LAPTOP_HOST=192.168.86.XX  # THIS laptop's robogym IP
+export PC1_HOST=10.0.1.40
+EOF
+```
+
+`LAPTOP_HOST` must be this machine's own IP: the PC2 watchdog subscribes
+back to it for the pose stream in tethered mode. Wrong value => the
+deploy's wire-probe fails at startup (safe, but confusing).
+
 ## Safety invariants (non-negotiable)
 
 - NO ssh/commands to PC2/PC3 without explicit per-user-action approval.
