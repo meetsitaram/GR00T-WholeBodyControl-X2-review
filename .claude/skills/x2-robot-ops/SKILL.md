@@ -71,8 +71,11 @@ robot AP.
 source ~/.x2/env.wifi   # PC2_HOST=<current PC2 ip>, LAPTOP_HOST=<this laptop's ip>
 
 # 1. PC2 stack, tethered topology, proven tuning:
+#    (flag is --tuning, NOT --tuning-config -- that's deploy_x2.sh's inner
+#     flag; bare filename resolves under configs/real_deploy_tuning/ and
+#     is JIT-rsynced from this laptop to PC2 at start)
 ./gear_sonic_deploy/scripts/x2_pc2_daemons.sh start \
-    --pc2-host "$PC2_HOST" --tuning-config walking_soft_kp.yaml
+    --pc2-host "$PC2_HOST" --tuning walking_soft_kp.yaml
 # attach the deploy pane and answer the y/N safety gate at the keyboard
 
 # 2. VR stack + recorder (auto-serves the PC2 camera bridge, then HARD
