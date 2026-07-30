@@ -67,7 +67,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-data/
+/data/
 
 # PyBuilder
 .pybuilder/
@@ -205,8 +205,13 @@ uv.lock
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
-# Motion/training data (large local datasets, not tracked in git)
-data/
+# Motion/training data (large local datasets, not tracked in git).
+# Top-level data/ stays local except the whitelisted calibration dir;
+# generated/large motion pkls under gear_sonic/data/motions/ are ignored
+# (the small planner/gesture pkls that ship in-repo are force-added).
+data/*
+!data/operator_calibrations/
+gear_sonic/data/motions/*.pkl
 bones_seed_smpl/
 sonic_release/
 # Training output logs
@@ -219,3 +224,7 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+.venv/
+logs/
+__pycache__/
+*.pyc

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Regenerate the spoken obstacle warning and deploy it to the board that owns
+# the speaker.
+#
+# Why a pre-rendered WAV instead of PlayTts: the onboard TTS is a Chinese-only
+# Volcano (ByteDance) voice that reads English phonetically -- "Hi" comes out as
+# "hei". None of these changed it: voice_id 0-7 via SetTtsParameters (one engine
+# behind all of them), voice_id in PlayTtsRequest (commented out of the .msg),
+# SetRobotLanguage("en") (returns success, no effect), or voice_type set to
+# en_female_anna_mars_bigtts in BOTH copies of tts_config.conf with the caches
+# cleared and the agent restarted.
+#
+# The sample rate here must match the AudioInfo values in scan_guard_pub.py.
+set -euo pipefail
+
+TEXT="${1:-Object in front of me}"
+OUT="${OUT:-/home/run/getsolo/obstacle.wav}"
+SOC2="${SOC2:-10.0.1.42}"
+# NOT /tmp: it clears on reboot and the warning then goes silent with no error.
+DEST="${DEST:-/agibot/data/home/agi/audio/}"
+
+command -v espeak-ng >/dev/null || { echo "espeak-ng not installed: sudo apt install -y espeak-ng" >&2; exit 1; }
+
+espeak-ng -w "$OUT" "$TEXT"
+echo "rendered: $OUT ($(stat -c%s "$OUT") bytes) -- \"$TEXT\""
+
+# The file must exist on SOC2, which owns the audio hardware. PlayAudioFile
+# against a path that only exists on SOC1 returns SUCCESS and plays nothing.
+sshpass -p 1 ssh -o StrictHostKeyChecking=no "run@${SOC2}" "mkdir -p ${DEST}"
+sshpass -p 1 scp -o StrictHostKeyChecking=no "$OUT" "run@${SOC2}:${DEST}"
+echo "deployed: ${SOC2}:${DEST}$(basename "$OUT")"

@@ -4,13 +4,19 @@ Download GEAR-SONIC model checkpoints and training data from Hugging Face Hub.
 
 Repository: https://huggingface.co/nvidia/GEAR-SONIC
 
+X2 checkpoints (tinkerbuggy/sonic-x2) are supported via --robot x2.
+Default download root is the SONIC model cache: $SONIC_HOME
+(~/.cache/sonic), with per-robot subtrees g1/, x2/ (and future
+embodiments). The X2 subtree alone can be redirected via $SONIC_X2_MODELS.
+
 Usage:
-    python download_from_hf.py                    # ONNX models for deployment
+    python download_from_hf.py                    # G1 ONNX models for deployment
     python download_from_hf.py --low-latency      # Low-latency ONNX models
     python download_from_hf.py --training          # PyTorch checkpoint + SMPL data
     python download_from_hf.py --sample            # Sample data only (quick start)
     python download_from_hf.py --output-dir /path  # custom output directory
     python download_from_hf.py --no-planner        # skip planner model
+    python download_from_hf.py --robot x2          # full X2 model set -> $SONIC_HOME/x2
 """
 
 import argparse
@@ -21,6 +27,18 @@ import sys
 from pathlib import Path
 
 REPO_ID = "nvidia/GEAR-SONIC"
+X2_REPO_ID = "tinkerbuggy/sonic-x2"
+
+
+def sonic_home() -> Path:
+    """Root of the multi-embodiment SONIC model cache (~/.cache/sonic)."""
+    return Path(os.environ.get("SONIC_HOME", str(Path.home() / ".cache" / "sonic")))
+
+
+def x2_models_dir() -> Path:
+    """X2 subtree of the cache; $SONIC_X2_MODELS overrides just this subtree."""
+    override = os.environ.get("SONIC_X2_MODELS")
+    return Path(override) if override else sonic_home() / "x2"
 
 # (filename in HF repo, local destination relative to output_dir)
 POLICY_FILES = [
@@ -57,12 +75,25 @@ def parse_args():
         description="Download GEAR-SONIC checkpoints from Hugging Face Hub"
     )
     parser.add_argument(
+        "--robot",
+        choices=("g1", "x2"),
+        default="g1",
+        help=(
+            "Which embodiment's checkpoints to download. 'g1' (default) keeps "
+            "the original nvidia/GEAR-SONIC behaviour; 'x2' fetches the full "
+            "tinkerbuggy/sonic-x2 snapshot into $SONIC_HOME/x2 "
+            "(or $SONIC_X2_MODELS)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help=(
-            "Directory to save files. "
-            "Defaults to gear_sonic_deploy/ (deploy) or repo root (training)."
+            "Directory to save files. Defaults to the SONIC model cache: "
+            "$SONIC_HOME/g1 or $SONIC_HOME/x2 per --robot "
+            "(SONIC_HOME defaults to ~/.cache/sonic; "
+            "$SONIC_X2_MODELS overrides the x2 subtree)."
         ),
     )
     parser.add_argument(
@@ -190,6 +221,29 @@ def download_sample_data(snapshot_download, repo_id, output_dir, token=None):
         print(f"  -> {sample_dir} ({n_files} PKL files)")
 
 
+def download_x2(snapshot_download, output_dir, token=None):
+    """Download the full X2 model set (sonic policy + kplanner tiers)."""
+    print("=" * 60)
+    print("  SONIC-X2 — Hugging Face Model Downloader")
+    print(f"  Repository : {X2_REPO_ID}")
+    print(f"  Output dir : {output_dir}")
+    print("=" * 60)
+    print(
+        "\n  Note: the repo is private until release — if the download 401s,\n"
+        "  request access and authenticate via `hf auth login` (or pass --token).\n"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=X2_REPO_ID,
+        local_dir=str(output_dir),
+        token=token,
+    )
+    print("\n" + "=" * 60)
+    print("  Done! Files saved under:")
+    print(f"  {output_dir}")
+    print("=" * 60)
+
+
 def main():
     args = parse_args()
     if args.sample and args.low_latency:
@@ -198,12 +252,20 @@ def main():
 
     hf_hub_download, snapshot_download = _ensure_huggingface_hub()
 
-    repo_root = Path(__file__).resolve().parent
+    if args.robot == "x2":
+        if args.training or args.sample or args.low_latency:
+            print(
+                "ERROR: --robot x2 downloads the full tinkerbuggy/sonic-x2 "
+                "snapshot; the G1 selection flags (--training/--sample/"
+                "--low-latency) do not apply.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        output_dir = args.output_dir if args.output_dir else x2_models_dir()
+        download_x2(snapshot_download, output_dir, token=args.token)
+        return
 
-    if args.training or args.sample:
-        output_dir = args.output_dir if args.output_dir else repo_root
-    else:
-        output_dir = args.output_dir if args.output_dir else repo_root / "gear_sonic_deploy"
+    output_dir = args.output_dir if args.output_dir else sonic_home() / "g1"
 
     print("=" * 60)
     print("  GEAR-SONIC — Hugging Face Model Downloader")

@@ -1,0 +1,51 @@
+# Live-trigger gesture catalog for the Quest3 planner stack.
+# Loaded once at recorder startup; `play_gesture <name>` resolves
+# names against this file. Per-entry schema mirrors the offline
+# stitching playlists at gear_sonic/data/motions/playlists/.
+#
+# All entries are gestures recorded live from the real X2 robot
+# (self-generated motions). Add a new gesture by appending a row,
+# restart the recorder. `source` paths resolve relative to repo root.
+name: x2_ultra_gestures_v1
+gestures:
+  - name: wave_high
+    source: gear_sonic/data/motions/x2_recorded_gestures/left_wave_high_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: dynamic_wave
+    source: gear_sonic/data/motions/x2_recorded_gestures/mc/dynamic_wave_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: come_here
+    source: gear_sonic/data/motions/x2_recorded_gestures/come_here_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: hug
+    source: gear_sonic/data/motions/x2_recorded_gestures/hug1_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: both_heart
+    source: gear_sonic/data/motions/x2_recorded_gestures/mc/both_heart_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: bow
+    source: gear_sonic/data/motions/x2_recorded_gestures/mc/bow_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
+
+  - name: clap
+    source: gear_sonic/data/motions/x2_recorded_gestures/mc/clap_001.pkl
+    motion_key: null
+    start_frame: 0
+    n_frames: null
