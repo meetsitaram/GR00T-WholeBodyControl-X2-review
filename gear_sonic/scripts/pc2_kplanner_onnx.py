@@ -1462,6 +1462,142 @@ def build_pose_payload_np(
     return payload
 
 
+# ---------------------------------------------------------------------------
+# VR arm/hand target ingest (hop-in manipulation, 2026-07-30).
+#
+# The tethered laptop stack merges operator arm IK into the pose wire via the
+# dataset recorder. The onboard (ritual) stack has no recorder, so this class
+# is the robot-side replacement: a SUB (bind tcp://*:ARM_TARGET_PORT) that the
+# laptop manager PUB-connects to (--arm-connect), caching the operator's arm
+# and hand targets, plus an overlay applied at the PosePublisher choke point:
+#   * joint_pos_mj[15:22]/[22:29]      <- left/right arm q (7 DOF each)
+#   * joint_pos_mj_future[:, slices]   <- same pose pinned across the window
+#     (mirrors the recorder: arm_targets is a "current command", there is no
+#     arm trajectory to look ahead with)
+#   * left/right_hand_joints           <- hand q (the deploy hand bridge reads
+#     fingers straight off these pose-wire fields)
+# Semantics mirror the recorder exactly: the cache holds the last commanded
+# pose until a passthrough message clears it (link loss => arms HOLD, never
+# snap); a dance clip (dance_active) suspends the overlay so clips own the
+# whole body. Fail-open: no manager connected -> planner behaves as before.
+# ---------------------------------------------------------------------------
+
+_LEFT_ARM_MJ = slice(15, 22)
+_RIGHT_ARM_MJ = slice(22, 29)
+
+
+class ArmTargetIngest:
+    def __init__(self, port: int) -> None:
+        import zmq
+        self._lock = threading.Lock()
+        self._left: Optional[np.ndarray] = None
+        self._right: Optional[np.ndarray] = None
+        self._left_hand: Optional[np.ndarray] = None
+        self._right_hand: Optional[np.ndarray] = None
+        self._last_msg_t = 0.0
+        self._stop = threading.Event()
+        self._port = int(port)
+        self._thr = threading.Thread(
+            target=self._loop, name="arm-ingest", daemon=True)
+        self._thr.start()
+
+    def _loop(self) -> None:
+        import zmq
+        try:
+            import msgpack
+        except ImportError:
+            log.error("arm-ingest: msgpack unavailable; VR arm targets OFF")
+            return
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.LINGER, 0)
+        for t in ("arm_targets", "hand_finger_cmd"):
+            sock.setsockopt_string(zmq.SUBSCRIBE, t)
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        sock.bind(f"tcp://*:{self._port}")
+        log.info("arm-ingest: SUB bind tcp://*:%d (arm_targets, "
+                 "hand_finger_cmd); laptop manager PUB-connects here "
+                 "(--arm-connect)", self._port)
+        while not self._stop.is_set():
+            try:
+                parts = sock.recv_multipart()
+            except zmq.error.Again:
+                continue
+            if len(parts) < 2:
+                continue
+            try:
+                topic = parts[0].decode("ascii", errors="replace")
+                data = msgpack.unpackb(parts[1], raw=False)
+                if topic == "arm_targets":
+                    with self._lock:
+                        if data.get("passthrough_arm_targets"):
+                            self._left = None
+                            self._right = None
+                        else:
+                            lq = np.asarray(
+                                data.get("left_q_rad", ()), dtype=np.float32)
+                            rq = np.asarray(
+                                data.get("right_q_rad", ()), dtype=np.float32)
+                            if lq.shape == (7,) and rq.shape == (7,):
+                                self._left = lq
+                                self._right = rq
+                        self._last_msg_t = time.monotonic()
+                elif topic == "hand_finger_cmd":
+                    lh = np.asarray(
+                        data.get("left_hand_q", ()), dtype=np.float32)
+                    rh = np.asarray(
+                        data.get("right_hand_q", ()), dtype=np.float32)
+                    if lh.shape == (10,) and rh.shape == (10,):
+                        with self._lock:
+                            self._left_hand = lh
+                            self._right_hand = rh
+                            self._last_msg_t = time.monotonic()
+            except Exception as exc:  # malformed frame must never kill pose
+                log.warning("arm-ingest: bad frame dropped (%r)", exc)
+        sock.close(linger=0)
+
+    def overlay(self, payload: dict) -> bool:
+        """Apply cached targets to a pose payload. Returns True if the
+        arm slices were overlaid (used for state-transition logging)."""
+        with self._lock:
+            left, right = self._left, self._right
+            lh, rh = self._left_hand, self._right_hand
+        if left is not None and right is not None:
+            # COPY-ON-WRITE, never mutate in place: build_pose_payload_np's
+            # np.asarray typically aliases the planner's own anchor/output
+            # arrays — in-place writes would pollute planner state and the
+            # arm pose would survive a passthrough clear.
+            jpos = payload.get("joint_pos_mj")
+            if jpos is not None and jpos.shape == (31,):
+                jpos = jpos.copy()
+                jpos[_LEFT_ARM_MJ] = left
+                jpos[_RIGHT_ARM_MJ] = right
+                payload["joint_pos_mj"] = jpos
+            fut = payload.get("joint_pos_mj_future")
+            if fut is not None and fut.ndim == 2 and fut.shape[1] == 31:
+                fut = fut.copy()
+                fut[:, _LEFT_ARM_MJ] = left
+                fut[:, _RIGHT_ARM_MJ] = right
+                payload["joint_pos_mj_future"] = fut
+            # Future joint velocities were finite-differenced BEFORE the
+            # overlay pinned the arm slices; a pinned pose has zero arm
+            # velocity, so zero those slices for consistency.
+            jvel = payload.get("joint_vel_mj_future")
+            if jvel is not None and jvel.ndim == 2 and jvel.shape[1] == 31:
+                jvel = jvel.copy()
+                jvel[:, _LEFT_ARM_MJ] = 0.0
+                jvel[:, _RIGHT_ARM_MJ] = 0.0
+                payload["joint_vel_mj_future"] = jvel
+        if lh is not None and payload.get("left_hand_joints") is not None:
+            payload["left_hand_joints"] = lh
+        if rh is not None and payload.get("right_hand_joints") is not None:
+            payload["right_hand_joints"] = rh
+        return left is not None and right is not None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 class PosePublisher:
     """PUB bind + v4 packed encoder (port of x2_kplanner.PosePublisher,
     defaulting to bind-on-all-interfaces for the PC2 deployment)."""
@@ -1473,9 +1609,23 @@ class PosePublisher:
         self._sock.setsockopt(zmq.LINGER, 0)
         self._sock.bind(f"tcp://{host}:{port}")
         self._topic = topic
+        # Optional VR arm/hand overlay (hop-in manipulation). Wired by main
+        # when --arm-port > 0; dance_active suspends it so clips own the
+        # whole body (arms return to the held operator pose afterwards).
+        self.arm_ingest: Optional["ArmTargetIngest"] = None
+        self.dance_active: Optional[threading.Event] = None
         time.sleep(0.1)
 
     def publish(self, payload: dict[str, np.ndarray]) -> None:
+        if self.arm_ingest is not None and not (
+            self.dance_active is not None and self.dance_active.is_set()
+        ):
+            applied = self.arm_ingest.overlay(payload)
+            if applied != getattr(self, "_overlay_state", None):
+                log.info("arm overlay %s",
+                         "ACTIVE (operator arm/hand targets on the wire)"
+                         if applied else "cleared (planner arms restored)")
+                self._overlay_state = applied
         self._sock.send(pack_pose_message(payload, topic=self._topic, version=4))
         self._tape_seq = getattr(self, "_tape_seq", -1) + 1
         _TAPE.ev("tick", seq=self._tape_seq)
@@ -2255,8 +2405,13 @@ def run(args: argparse.Namespace) -> int:
              ref_smoother.trigger_rad, args.ref_smoother_joints,
              ref_smoother.enabled)
 
+    arm_ingest: Optional[ArmTargetIngest] = None
+    if int(getattr(args, "arm_port", 0)) > 0:
+        arm_ingest = ArmTargetIngest(int(args.arm_port))
+
     publisher = PosePublisher(host=args.pub_host, port=pub_port,
                               topic=args.pub_topic)
+    publisher.arm_ingest = arm_ingest
     log.info("publishing %r on tcp://%s:%d at %.1f Hz (backend=%s)",
              args.pub_topic, args.pub_host, pub_port, OUTPUT_FPS,
              backend.describe())
@@ -2267,6 +2422,7 @@ def run(args: argparse.Namespace) -> int:
     replan_event = threading.Event()
     replan_lock = threading.Lock()
     dance_active = threading.Event()
+    publisher.dance_active = dance_active
     threads: list[threading.Thread] = []
 
     thr = threading.Thread(
@@ -2907,6 +3063,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                      help="bind the planner_cmd SUB instead of connecting, so "
                           "multiple sources (pad bridge + quest3 manager) can "
                           "PUB-connect into it; --cmd-host is ignored.")
+    net.add_argument("--arm-port", type=int, default=5572,
+                     help="VR arm/hand target ingest: SUB bind port the "
+                          "laptop quest3 manager PUB-connects to with "
+                          "--arm-connect (arm_targets + hand_finger_cmd; "
+                          "overlaid onto the pose wire). 0 disables.")
     net.add_argument("--clip-cmd-port", type=int, default=DEFAULT_CLIP_CMD_PORT,
                      help="motion_clip_cmd SUB bind port.")
     net.add_argument("--clip-cmd-topic", default="motion_clip_cmd")

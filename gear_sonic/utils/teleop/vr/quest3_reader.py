@@ -708,7 +708,21 @@ class Quest3Reader:
             elif event == "controller_pose":
                 side = data.get("side", "?")
                 has_pose = data.get("has_pose", True)
-                if has_pose:
+                # Tracking flaps (IMU-only controllers at the edge of the
+                # camera cone) fire LOST/RECOVERED pairs several times a
+                # minute — rate-limit to one pair per side per 10 s. The
+                # heartbeat's controllers=N count stays authoritative.
+                import time as _t
+                if not hasattr(self, "_pose_log_ts"):
+                    self._pose_log_ts = {}
+                _suppress = (
+                    _t.monotonic() - self._pose_log_ts.get(side, 0.0) < 10.0
+                )
+                if not _suppress:
+                    self._pose_log_ts[side] = _t.monotonic()
+                if _suppress:
+                    pass
+                elif has_pose:
                     print(
                         f"[Quest3Reader] {side} controller pose RECOVERED "
                         f"(gripSpace getPose() succeeding again)"
@@ -757,7 +771,7 @@ class Quest3Reader:
             axes = data.get("axes", {})
             print(f"[Quest3Reader]   buttons: {btns}")
             print(f"[Quest3Reader]   axes: {axes}")
-        elif self._msg_count % 100 == 0 and not self.quiet_periodic:
+        elif self._msg_count % 2000 == 0 and not self.quiet_periodic:
             btns = data.get("buttons", {})
             axes = data.get("axes", {})
             has_input = any(v for k, v in btns.items() if k in ("a", "b", "x", "y") and v)

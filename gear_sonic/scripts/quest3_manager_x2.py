@@ -163,6 +163,10 @@ class ManagerConfig:
     # Dual-source mode: PUB-connect to a kplanner that owns the SUB bind
     # (--cmd-bind / --zmq-cmd-bind), so the pad bridge can publish too.
     planner_cmd_connect: bool = False
+    # Hop-in manipulation: "host:port" of the robot planner's arm-ingest
+    # SUB (pc2_kplanner_onnx --arm-port, default 5566). Empty = classic
+    # bind (tethered recorder topology).
+    arm_connect: str = ""
 
     recorder_pub_host: str = "*"
     recorder_pub_port: int = 5564
@@ -768,15 +772,30 @@ class Quest3ManagerX2:
             )
         self._recorder_sock = self._ctx.socket(zmq.PUB)
         self._recorder_sock.setsockopt(zmq.LINGER, 0)
-        self._recorder_sock.bind(
-            f"tcp://{cfg.recorder_pub_host}:{cfg.recorder_pub_port}"
-        )
-        log.info(
-            "recorder PUB bound at tcp://%s:%d (topics=%s, %s, %s, %s)",
-            cfg.recorder_pub_host, cfg.recorder_pub_port,
-            cfg.arm_targets_topic, cfg.hand_finger_cmd_topic,
-            cfg.stream_mode_topic, cfg.recorder_cmd_topic,
-        )
+        if cfg.arm_connect:
+            # Hop-in manipulation: the ROBOT planner owns the arm-ingest
+            # SUB bind (pc2_kplanner_onnx --arm-port); this PUB connects
+            # out, mirroring --planner-cmd-connect. Same socket still
+            # carries every recorder-wire topic; on the robot only
+            # arm_targets + hand_finger_cmd have a subscriber.
+            self._recorder_sock.connect(f"tcp://{cfg.arm_connect}")
+            log.info(
+                "recorder PUB connected to tcp://%s (hop-in arm targets; "
+                "topics=%s, %s, %s, %s)",
+                cfg.arm_connect,
+                cfg.arm_targets_topic, cfg.hand_finger_cmd_topic,
+                cfg.stream_mode_topic, cfg.recorder_cmd_topic,
+            )
+        else:
+            self._recorder_sock.bind(
+                f"tcp://{cfg.recorder_pub_host}:{cfg.recorder_pub_port}"
+            )
+            log.info(
+                "recorder PUB bound at tcp://%s:%d (topics=%s, %s, %s, %s)",
+                cfg.recorder_pub_host, cfg.recorder_pub_port,
+                cfg.arm_targets_topic, cfg.hand_finger_cmd_topic,
+                cfg.stream_mode_topic, cfg.recorder_cmd_topic,
+            )
 
         # Last published arm + hand targets (used for freezing in
         # LOCOMOTION mode so the recorder gets a steady stream).
@@ -1476,7 +1495,7 @@ class Quest3ManagerX2:
                 # the frozen last value and the recorder telemetry
                 # is the better diagnostic anyway.
                 if (
-                    tick % 250 == 0
+                    tick % 1500 == 0
                     and self._intent.mode == StreamMode.ARM_MANIPULATION
                 ):
                     lt, rt, lg, rg = triggers
@@ -2408,6 +2427,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "--cmd-bind/--zmq-cmd-bind and owns the SUB bind; both this "
              "manager and pad_locomotion_bridge PUB-connect into it.",
     )
+    p.add_argument(
+        "--arm-connect", default="",
+        help="host:port of the ROBOT planner's arm-ingest SUB "
+             "(pc2_kplanner_onnx --arm-port, default port 5572). PUB-connects "
+             "the arm/hand target wire out to the robot instead of binding "
+             "locally — hop-in manipulation against the onboard stack.",
+    )
 
     # Recorder output
     p.add_argument("--recorder-pub-host", default="*")
@@ -2909,6 +2935,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         planner_cmd_port=args.planner_cmd_port,
         planner_cmd_topic=args.planner_cmd_topic,
         planner_cmd_connect=args.planner_cmd_connect,
+        arm_connect=args.arm_connect,
         recorder_pub_host=args.recorder_pub_host,
         recorder_pub_port=args.recorder_pub_port,
         intent_stick_deadzone=args.stick_deadzone,
