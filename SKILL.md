@@ -276,7 +276,34 @@ bash gear_sonic_deploy/scripts/x2_pc2_cameras.sh serve --host <PC2_IP>      # he
 bash gear_sonic/scripts/run_x2_pkl_direct_stack.sh --pc2-host <PC2_IP>
 python gear_sonic/scripts/play_gesture.py wave_high     # terminal 2
 
-# Quest 3 VR teleop on the real robot:
+# Quest 3 VR teleop on the real robot — HOP-IN mode (recommended): the
+# robot runs its own onboard stack (pad ignition ritual as usual) and the
+# laptop runs ONLY the manager, which connects out for locomotion
+# (planner_cmd), arms + fingers (arm ingest :5572), and arm-pose
+# continuity (pose wire :5556). Pad and VR coexist — one owner at a
+# time, VR supersedes while engaged:
+source .venv/bin/activate
+python gear_sonic/scripts/quest3_manager_x2.py \
+    --planner-cmd-connect --planner-cmd-host <PC2_IP> \
+    --arm-connect <PC2_IP>:5572 \
+    --preserve-arms-on-engage \
+    --engage-pose-sub-host <PC2_IP> --engage-pose-sub-port 5556 \
+    2>&1 | tee /tmp/vr_manager.log
+# headset -> https://<LAPTOP_IP>:8443, engage A+B+X+Y; sticks walk,
+# B -> ARM_MANIPULATION, A -> arm tracking, triggers = fingers.
+# Arm behavior on the robot: targets are slew-limited (~3 rad/s) with
+# stream-gap extrapolation, blend in from the stand pose on engage, and
+# blend back to the planner's arms within ~2 s of disengage / VR loss /
+# killing the manager — a dead VR session can never leave the arms stuck.
+# Fingers dead but arms fine? The onboard hand bridge auto-detects the
+# OmniHands at ignition and idles forever if they reported late (boot
+# race). Fix WITHOUT restarting the stack — on PC2:
+#   tmux kill-session -t x2_hand_bridge
+#   tmux new-session -d -s x2_hand_bridge \
+#       "bash /home/run/getsolo/log/start_x2_hand_bridge.sh"
+# and confirm its stats line flips to 'sides L=True R=True'.
+
+# Tethered alternative (laptop runs the full planner+recorder pipeline):
 bash gear_sonic/scripts/run_x2_quest3_planner_stack.sh --pc2-host <PC2_IP>
 
 # Gamepad driving with the certifiable sim-parity check (md5-verifies the

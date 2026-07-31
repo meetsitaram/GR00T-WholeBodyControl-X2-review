@@ -956,6 +956,20 @@ def _zmq_command_thread(
             try:
                 parts = sock.recv_multipart()
             except zmq.error.Again:
+                # Clock-driven VR-silence release (parity with
+                # pc2_kplanner_onnx): a dead manager must not hold
+                # ownership until pad traffic happens to arrive.
+                if (_cmd_owner["src"] == "vr"
+                        and time.monotonic() - _cmd_owner["vr_ts"]
+                        > _VR_OWNER_TIMEOUT_S):
+                    log.warning(
+                        "cmd owner: VR silent %.1fs > %.1fs — releasing to "
+                        "idle; pad may re-acquire",
+                        time.monotonic() - _cmd_owner["vr_ts"],
+                        _VR_OWNER_TIMEOUT_S)
+                    _cmd_owner["src"] = None
+                    cmd_queue.put(LocomotionCommand(
+                        intent="idle", magnitude="default"))
                 continue
             if len(parts) < 2:
                 continue

@@ -436,6 +436,8 @@ _guard_latched = {"on": False}
 # expire when the manager is actually gone (crash / network loss).
 _VR_OWNER_TIMEOUT_S = 2.0
 _cmd_owner = {"src": None, "vr_ts": 0.0}
+# Set by main() when --arm-port is active; ownership release clears it.
+_ARM_INGEST_REF: list = [None]
 
 
 def _scan_guard_thread(stop_event) -> None:
@@ -1492,6 +1494,9 @@ class ArmTargetIngest:
         self._lock = threading.Lock()
         self._left: Optional[np.ndarray] = None
         self._right: Optional[np.ndarray] = None
+        self._vel_left: Optional[np.ndarray] = None
+        self._vel_right: Optional[np.ndarray] = None
+        self._arm_msg_t: float = 0.0
         self._left_hand: Optional[np.ndarray] = None
         self._right_hand: Optional[np.ndarray] = None
         self._last_msg_t = 0.0
@@ -1533,14 +1538,32 @@ class ArmTargetIngest:
                         if data.get("passthrough_arm_targets"):
                             self._left = None
                             self._right = None
+                            self._vel_left = None
+                            self._vel_right = None
                         else:
                             lq = np.asarray(
                                 data.get("left_q_rad", ()), dtype=np.float32)
                             rq = np.asarray(
                                 data.get("right_q_rad", ()), dtype=np.float32)
                             if lq.shape == (7,) and rq.shape == (7,):
+                                now_m = time.monotonic()
+                                # Per-joint target velocity from the last
+                                # two arrivals — used to extrapolate through
+                                # stream gaps (first-order hold).
+                                prev = self._left
+                                prev_t = self._arm_msg_t
+                                if prev is not None and prev_t and                                         0.005 < now_m - prev_t < 0.5:
+                                    dt = now_m - prev_t
+                                    self._vel_left = np.clip(
+                                        (lq - prev) / dt, -3.0, 3.0)
+                                    self._vel_right = np.clip(
+                                        (rq - self._right) / dt, -3.0, 3.0)
+                                else:
+                                    self._vel_left = None
+                                    self._vel_right = None
                                 self._left = lq
                                 self._right = rq
+                                self._arm_msg_t = now_m
                         self._last_msg_t = time.monotonic()
                 elif topic == "hand_finger_cmd":
                     lh = np.asarray(
@@ -1556,12 +1579,77 @@ class ArmTargetIngest:
                 log.warning("arm-ingest: bad frame dropped (%r)", exc)
         sock.close(linger=0)
 
+    # Max per-published-frame target step (rad @ 50 Hz => 3.0 rad/s arm,
+    # 7.5 rad/s fingers). Smooths the sample-and-hold chop from wifi /
+    # headset micro-stalls (measured: 29% frozen frames + 0.23 rad jumps
+    # during continuous motion) and doubles as blend-in on first engage
+    # (slew seeds from the planner's current arm pose, so arms ramp from
+    # stand to the operator pose instead of snapping).
+    ARM_SLEW_RAD_PER_FRAME = 0.06
+    HAND_SLEW_RAD_PER_FRAME = 0.15
+
+    @staticmethod
+    def _slew(cur: np.ndarray, target: np.ndarray, step: float) -> np.ndarray:
+        d = target - cur
+        return cur + np.clip(d, -step, step)
+
     def overlay(self, payload: dict) -> bool:
         """Apply cached targets to a pose payload. Returns True if the
         arm slices were overlaid (used for state-transition logging)."""
         with self._lock:
             left, right = self._left, self._right
             lh, rh = self._left_hand, self._right_hand
+            releasing = getattr(self, "_releasing", False)
+            vel_l, vel_r = self._vel_left, self._vel_right
+            arm_t = self._arm_msg_t
+        if left is not None and vel_l is not None and vel_r is not None:
+            # First-order hold: extrapolate along the last observed target
+            # velocity during stream gaps (wifi / headset micro-stalls), so
+            # motion continues instead of freezing. Capped at 250 ms — a
+            # genuinely dead stream degrades to a plain hold, and the
+            # ownership silence-release clears it at 2 s.
+            gap = time.monotonic() - arm_t
+            if 0.0 < gap:
+                h = min(gap, 0.25)
+                left = left + vel_l * h
+                right = right + vel_r * h
+        if releasing and left is None:
+            # Ownership released: slew back toward the planner's own arm
+            # pose; deactivate once converged (or state was never seeded).
+            jpos = payload.get("joint_pos_mj")
+            if (getattr(self, "_slew_left", None) is None or jpos is None
+                    or jpos.shape != (31,)):
+                self._releasing = False
+                self._slew_left = None
+                self._slew_right = None
+                self._slew_lh = None
+                self._slew_rh = None
+                return False
+            tgt_l = np.asarray(jpos[_LEFT_ARM_MJ], dtype=np.float32)
+            tgt_r = np.asarray(jpos[_RIGHT_ARM_MJ], dtype=np.float32)
+            self._slew_left = self._slew(
+                self._slew_left, tgt_l, self.ARM_SLEW_RAD_PER_FRAME)
+            self._slew_right = self._slew(
+                self._slew_right, tgt_r, self.ARM_SLEW_RAD_PER_FRAME)
+            done = (np.abs(self._slew_left - tgt_l).max() < 0.02
+                    and np.abs(self._slew_right - tgt_r).max() < 0.02)
+            jpos = jpos.copy()
+            jpos[_LEFT_ARM_MJ] = self._slew_left
+            jpos[_RIGHT_ARM_MJ] = self._slew_right
+            payload["joint_pos_mj"] = jpos
+            fut = payload.get("joint_pos_mj_future")
+            if fut is not None and fut.ndim == 2 and fut.shape[1] == 31:
+                fut = fut.copy()
+                fut[:, _LEFT_ARM_MJ] = self._slew_left
+                fut[:, _RIGHT_ARM_MJ] = self._slew_right
+                payload["joint_pos_mj_future"] = fut
+            if done:
+                self._releasing = False
+                self._slew_left = None
+                self._slew_right = None
+                self._slew_lh = None
+                self._slew_rh = None
+            return not done
         if left is not None and right is not None:
             # COPY-ON-WRITE, never mutate in place: build_pose_payload_np's
             # np.asarray typically aliases the planner's own anchor/output
@@ -1569,6 +1657,20 @@ class ArmTargetIngest:
             # arm pose would survive a passthrough clear.
             jpos = payload.get("joint_pos_mj")
             if jpos is not None and jpos.shape == (31,):
+                # Slew toward the operator target from the last frame we
+                # PUBLISHED (seeded from the planner's own arms on first
+                # engage), never jumping more than ARM_SLEW_RAD_PER_FRAME.
+                if getattr(self, "_slew_left", None) is None:
+                    self._slew_left = np.asarray(
+                        jpos[_LEFT_ARM_MJ], dtype=np.float32).copy()
+                    self._slew_right = np.asarray(
+                        jpos[_RIGHT_ARM_MJ], dtype=np.float32).copy()
+                self._slew_left = self._slew(
+                    self._slew_left, left, self.ARM_SLEW_RAD_PER_FRAME)
+                self._slew_right = self._slew(
+                    self._slew_right, right, self.ARM_SLEW_RAD_PER_FRAME)
+                left = self._slew_left
+                right = self._slew_right
                 jpos = jpos.copy()
                 jpos[_LEFT_ARM_MJ] = left
                 jpos[_RIGHT_ARM_MJ] = right
@@ -1589,10 +1691,41 @@ class ArmTargetIngest:
                 jvel[:, _RIGHT_ARM_MJ] = 0.0
                 payload["joint_vel_mj_future"] = jvel
         if lh is not None and payload.get("left_hand_joints") is not None:
-            payload["left_hand_joints"] = lh
+            if getattr(self, "_slew_lh", None) is None:
+                self._slew_lh = np.asarray(
+                    payload["left_hand_joints"], dtype=np.float32).copy()
+            self._slew_lh = self._slew(
+                self._slew_lh, lh, self.HAND_SLEW_RAD_PER_FRAME)
+            payload["left_hand_joints"] = self._slew_lh
         if rh is not None and payload.get("right_hand_joints") is not None:
-            payload["right_hand_joints"] = rh
+            if getattr(self, "_slew_rh", None) is None:
+                self._slew_rh = np.asarray(
+                    payload["right_hand_joints"], dtype=np.float32).copy()
+            self._slew_rh = self._slew(
+                self._slew_rh, rh, self.HAND_SLEW_RAD_PER_FRAME)
+            payload["right_hand_joints"] = self._slew_rh
         return left is not None and right is not None
+
+    def clear(self) -> None:
+        """Drop cached arm + hand targets (planner arms take over).
+
+        Called when VR command ownership releases — explicit disengage or
+        the crash-silence timeout — so a dead/disengaged manager can never
+        leave the robot stuck holding a stale manipulation pose (incident
+        2026-07-31: headset stream stalled mid-ARM_MAN, operator killed
+        the manager, arms held the frozen pose with no reset path).
+        """
+        with self._lock:
+            self._left = None
+            self._right = None
+            self._left_hand = None
+            self._right_hand = None
+            self._vel_left = None
+            self._vel_right = None
+            # Blend-out: if we were overlaying, keep slewing toward the
+            # PLANNER's arms until converged instead of snapping back in
+            # one frame (release can happen with arms fully extended).
+            self._releasing = getattr(self, "_slew_left", None) is not None
 
     def stop(self) -> None:
         self._stop.set()
@@ -1810,6 +1943,23 @@ def _zmq_command_thread(
             try:
                 parts = sock.recv_multipart()
             except zmq.error.Again:
+                # No message this cycle (200 ms tick). VR-silence release
+                # must NOT depend on pad traffic: a killed/disengaged
+                # manager with an idle pad would otherwise hold ownership
+                # (and the arm overlay) forever.
+                if (_cmd_owner["src"] == "vr"
+                        and time.monotonic() - _cmd_owner["vr_ts"]
+                        > _VR_OWNER_TIMEOUT_S):
+                    log.warning(
+                        "cmd owner: VR silent %.1fs > %.1fs — releasing to "
+                        "idle (arms restored); pad may re-acquire",
+                        time.monotonic() - _cmd_owner["vr_ts"],
+                        _VR_OWNER_TIMEOUT_S)
+                    _cmd_owner["src"] = None
+                    if _ARM_INGEST_REF[0] is not None:
+                        _ARM_INGEST_REF[0].clear()
+                    cmd_queue.put(LocomotionCommand(
+                        intent="idle", magnitude="default"))
                 continue
             if len(parts) < 2:
                 continue
@@ -1842,6 +1992,8 @@ def _zmq_command_thread(
                             log.warning("cmd owner: VR released — "
                                         "pad may re-acquire")
                             _cmd_owner["src"] = None
+                            if _ARM_INGEST_REF[0] is not None:
+                                _ARM_INGEST_REF[0].clear()
                         elif _cmd_owner["src"] == "pad":
                             continue  # stray release while pad drives
                     else:
@@ -1856,6 +2008,8 @@ def _zmq_command_thread(
                                 "to idle; pad re-acquires",
                                 now_own - _cmd_owner["vr_ts"], _VR_OWNER_TIMEOUT_S)
                             _cmd_owner["src"] = None
+                            if _ARM_INGEST_REF[0] is not None:
+                                _ARM_INGEST_REF[0].clear()
                             cmd_queue.put(LocomotionCommand(
                                 intent="idle", magnitude="default"))
                             continue  # this pad msg is dropped; next one owns
@@ -2408,6 +2562,7 @@ def run(args: argparse.Namespace) -> int:
     arm_ingest: Optional[ArmTargetIngest] = None
     if int(getattr(args, "arm_port", 0)) > 0:
         arm_ingest = ArmTargetIngest(int(args.arm_port))
+        _ARM_INGEST_REF[0] = arm_ingest
 
     publisher = PosePublisher(host=args.pub_host, port=pub_port,
                               topic=args.pub_topic)
