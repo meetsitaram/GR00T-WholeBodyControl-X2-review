@@ -716,6 +716,10 @@ MOTOR_MONITOR_TOPIC="motor_monitor"
 # CLI). For split-topology / real-robot --pc2-host auto-targets
 # PC2's IP for the host; you don't need to set it manually.
 PRESERVE_ARMS_ON_ENGAGE="${PRESERVE_ARMS_ON_ENGAGE:-0}"
+# Dual-source defaults (set after arg parsing, see below): --pad-and-vr /
+# --pad-only imply PRESERVE_ARMS_ON_ENGAGE=1 — handoff continuity across
+# engage/disengage is the point of dual-source. Opt out with
+# --no-preserve-arms-on-engage.
 ENGAGE_POSE_SUB_HOST="${ENGAGE_POSE_SUB_HOST:-127.0.0.1}"
 ENGAGE_POSE_SUB_PORT="${ENGAGE_POSE_SUB_PORT:-5558}"
 ENGAGE_POSE_SUB_TOPIC="${ENGAGE_POSE_SUB_TOPIC:-pose}"
@@ -995,16 +999,32 @@ while [[ $# -gt 0 ]]; do
         --remote-deploy) REMOTE_DEPLOY_HOST="$2"; shift 2 ;;
         --resume-pub-port) RESUME_PUB_PORT="$2"; shift 2 ;;
         --motor-monitor-port) MOTOR_MONITOR_PORT="$2"; shift 2 ;;
-        --preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=1; shift ;;
-        --no-preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=0; shift ;;
+        --preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=1; PRESERVE_ARMS_EXPLICIT=1; shift ;;
+        --no-preserve-arms-on-engage) PRESERVE_ARMS_ON_ENGAGE=0; PRESERVE_ARMS_EXPLICIT=1; shift ;;
         --engage-pose-sub-host) ENGAGE_POSE_SUB_HOST="$2"; shift 2 ;;
-        --engage-pose-sub-port) ENGAGE_POSE_SUB_PORT="$2"; shift 2 ;;
+        --engage-pose-sub-port) ENGAGE_POSE_SUB_PORT="$2"; ENGAGE_POSE_PORT_EXPLICIT=1; shift 2 ;;
         --engage-pose-sub-topic) ENGAGE_POSE_SUB_TOPIC="$2"; shift 2 ;;
         --engage-pose-sub-max-age-ms) ENGAGE_POSE_SUB_MAX_AGE_MS="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
 done
+
+# ---- dual-source implications (after arg parsing) --------------------------
+# --pad-and-vr exists for engage/disengage handoffs, so arm-pose continuity
+# across the handoff is on by default: preserve-arms snaps the freeze to the
+# wire's current pose on every engage. This stack's pose wire is the
+# recorder PUB on POSE_PORT (5556) — the 5558 default targets the VLA
+# pose-proxy topology, which this stack does not run. Explicit CLI flags
+# always win.
+if [[ "${PAD_AND_VR}" -eq 1 ]]; then
+    if [[ "${PRESERVE_ARMS_EXPLICIT:-0}" -eq 0 ]]; then
+        PRESERVE_ARMS_ON_ENGAGE=1
+    fi
+    if [[ "${ENGAGE_POSE_PORT_EXPLICIT:-0}" -eq 0 ]]; then
+        ENGAGE_POSE_SUB_PORT="${POSE_PORT}"
+    fi
+fi
 
 # Apply --pose-port override AFTER arg parsing so a non-empty
 # POSE_PORT_OVERRIDE replaces the hardcoded 5556 default everywhere

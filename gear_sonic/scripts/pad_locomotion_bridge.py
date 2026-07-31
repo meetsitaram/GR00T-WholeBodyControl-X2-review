@@ -270,6 +270,9 @@ def main() -> int:
     time.sleep(0.3)  # slow-joiner
 
     def send(payload: dict) -> None:
+        # Ownership tag: the planner's command SUB enforces single-source
+        # control (VR supersedes pad); untagged messages count as pad.
+        payload.setdefault("source", "pad")
         sock.send_multipart([args.topic.encode("ascii"),
                              json.dumps(payload).encode("utf-8")])
 

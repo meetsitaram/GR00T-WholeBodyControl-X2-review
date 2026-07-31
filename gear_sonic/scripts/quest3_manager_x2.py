@@ -536,7 +536,7 @@ def _default_calibration_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
+def _planner_cmd_payload(cmd: LocomotionCmd, release: bool = False) -> bytes:
     """Build the JSON payload the planner's _zmq_command_thread expects.
 
     For ``hold_torso`` commands we also serialize the continuous waist
@@ -552,7 +552,14 @@ def _planner_cmd_payload(cmd: LocomotionCmd) -> bytes:
     payload: dict[str, object] = {
         "intent": cmd.intent,
         "magnitude": cmd.magnitude,
+        # Ownership tag: the planner's command SUB enforces single-source
+        # control. Any unflagged "vr" message takes/holds ownership (a
+        # stand-still idle included); ONLY the disengage idle carries
+        # vr_release=True and hands control back to the pad.
+        "source": "vr",
     }
+    if release:
+        payload["vr_release"] = True
     if cmd.intent == "hold_torso":
         payload["waist_pitch_deg"] = float(cmd.waist_pitch_deg)
         payload["waist_roll_deg"] = float(cmd.waist_roll_deg)
@@ -1381,6 +1388,17 @@ class Quest3ManagerX2:
                         self._publish_planner_cmd(cmd)
                         self._sidecar_emit(cmd, tick)
 
+                # Ownership keepalive: while engaged, re-assert the last
+                # command every 0.5 s so a quiet held stick (the
+                # IntentDecoder emits only on change) cannot trip the
+                # planner's 2 s VR-silence release. OFF publishes idle on
+                # entry, which explicitly releases ownership — no
+                # keepalive there by design.
+                if (self._intent.mode != StreamMode.OFF
+                        and getattr(self, "_last_planner_cmd", None) is not None
+                        and tick_now - getattr(self, "_last_planner_pub_ts", 0.0) > 0.5):
+                    self._publish_planner_cmd(self._last_planner_cmd)
+
                 # In ARM_MANIPULATION the per-tick decoder output above
                 # is whatever ``hold_torso`` target the right stick is
                 # currently demanding (or None if the operator is
@@ -1733,7 +1751,10 @@ class Quest3ManagerX2:
         if transition.current == StreamMode.OFF and transition.previous != StreamMode.OFF:
             self._latched_waist = None
             self._waist_frozen = False
-            self._publish_planner_cmd(LocomotionCmd("idle", "default"))
+            # Disengage: the ONE place that releases command ownership
+            # back to the pad (vr_release=True on the wire).
+            self._publish_planner_cmd(
+                LocomotionCmd("idle", "default"), release=True)
             self._publish_recorder_cmd("estop", tick)
 
         # Headset audio cue for the transition. Mapping is the same
@@ -1753,17 +1774,26 @@ class Quest3ManagerX2:
 
     # -- publishers -----------------------------------------------------------
 
-    def _publish_planner_cmd(self, cmd: LocomotionCmd) -> None:
+    def _publish_planner_cmd(
+        self, cmd: LocomotionCmd, release: bool = False
+    ) -> None:
         try:
             self._planner_sock.send_multipart(
                 [
                     self._cfg.planner_cmd_topic.encode("ascii"),
-                    _planner_cmd_payload(cmd),
+                    _planner_cmd_payload(cmd, release=release),
                 ],
                 flags=zmq.NOBLOCK,
             )
         except zmq.Again:
             pass
+        # Ownership keepalive bookkeeping: the planner releases VR
+        # ownership after 2 s of VR silence (crash safety), and the
+        # IntentDecoder only emits on change — so the tick loop
+        # republishes the last command every 0.5 s while engaged.
+        # A release is terminal: never keepalive it.
+        self._last_planner_cmd = None if release else cmd
+        self._last_planner_pub_ts = time.monotonic()
         if self._cfg.verbose:
             log.debug("planner_cmd <- intent=%s magnitude=%s", cmd.intent, cmd.magnitude)
 

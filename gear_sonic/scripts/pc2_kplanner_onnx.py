@@ -409,6 +409,64 @@ def _apply_continuous_runtime_scales(
     return (yaw, vx, vz, hip_h)
 
 
+# ---- forward-obstacle guard -------------------------------------------------
+# Subscribes to scan_guard_pub.py over ZMQ rather than importing rclpy: this
+# process runs in the gear_sonic venv, which has no ROS bindings, and the gait
+# loop is the last place to add an import that can fail.
+#
+# Clamped HERE (planner_cmd ingest) rather than in the pad bridge so every
+# input source is covered -- pad, Quest/VR, anything else that publishes to
+# this socket.
+#
+# FAIL-OPEN: stale or absent guard data means no clamping. Freezing a walking
+# biped because a sensor process died is worse than not clamping; the operator
+# deadman is the real stop.
+_GUARD_PORT = 5571
+_GUARD_STALE_S = 0.5
+_guard_state = {"blocked": False, "dist": float("inf"), "ts": 0.0}
+# Latched stop: once an obstacle trips the guard, forward stays dead until
+# the operator releases the deadman (all sticks zero). Auto-release on a
+# clear path would let the robot resume walking without a human deciding to.
+_guard_latched = {"on": False}
+
+# ---- command-source ownership (pad vs VR mutual exclusion) ------------------
+# Enforced in _zmq_command_thread. VR supersedes pad while engaged; release
+# is explicit (VR idle on disengage) with a crash-safety silence timeout.
+# The VR manager keepalives every 0.5 s while engaged, so 2.0 s can only
+# expire when the manager is actually gone (crash / network loss).
+_VR_OWNER_TIMEOUT_S = 2.0
+_cmd_owner = {"src": None, "vr_ts": 0.0}
+
+
+def _scan_guard_thread(stop_event) -> None:
+    import zmq as _zmq
+    ctx = _zmq.Context.instance()
+    sock = ctx.socket(_zmq.SUB)
+    sock.setsockopt(_zmq.SUBSCRIBE, b"scan_guard")
+    sock.setsockopt(_zmq.RCVTIMEO, 200)
+    sock.connect(f"tcp://127.0.0.1:{_GUARD_PORT}")
+    log.info("scan guard: SUB tcp://127.0.0.1:%d", _GUARD_PORT)
+    while not stop_event.is_set():
+        try:
+            _, payload = sock.recv_multipart()
+        except Exception:  # noqa: BLE001 -- timeout is normal
+            continue
+        try:
+            d = json.loads(payload)
+            _guard_state["blocked"] = bool(d["blocked"])
+            _guard_state["dist"] = float(d["dist"])
+            _guard_state["ts"] = time.monotonic()
+        except Exception:  # noqa: BLE001
+            continue
+    sock.close(linger=0)
+
+
+def _guard_blocked() -> bool:
+    if time.monotonic() - _guard_state["ts"] > _GUARD_STALE_S:
+        return False
+    return _guard_state["blocked"]
+
+
 def intent_to_velocity(cmd: LocomotionCommand) -> tuple[float, float, float, float]:
     """LocomotionCommand -> 4-D velocity; port of x2_kplanner.intent_to_velocity."""
     if cmd.direct_velocity is not None:
@@ -1612,10 +1670,67 @@ def _zmq_command_thread(
                     log.info("planner_cmd source: shutdown received")
                     stop_event.set()
                     continue
+                # ---- source ownership (mutual exclusion) --------------------
+                # Multiple PUBs may be connected (pad bridge + VR manager),
+                # but exactly ONE source owns the robot at a time. VR
+                # SUPERSEDES pad: any VR message takes ownership and pad
+                # messages are dropped until VR explicitly releases (idle on
+                # disengage) or goes silent past the crash timeout (the
+                # manager keepalives every 0.5 s while engaged, so a quiet
+                # held stick cannot false-expire). On timeout release the
+                # planner idles; the pad re-acquires with its next message.
+                src = str(payload.get("source", "pad"))
+                now_own = time.monotonic()
+                if src == "vr":
+                    _cmd_owner["vr_ts"] = now_own
+                    if payload.get("vr_release"):
+                        # Explicit disengage from the manager: the ONLY
+                        # VR message that hands control back. A plain VR
+                        # idle is a stand-still command and keeps
+                        # ownership (sticks centered != disengage).
+                        if _cmd_owner["src"] == "vr":
+                            log.warning("cmd owner: VR released — "
+                                        "pad may re-acquire")
+                            _cmd_owner["src"] = None
+                        elif _cmd_owner["src"] == "pad":
+                            continue  # stray release while pad drives
+                    else:
+                        if _cmd_owner["src"] != "vr":
+                            log.warning("cmd owner: VR ENGAGED — pad input ignored")
+                            _cmd_owner["src"] = "vr"
+                else:  # pad (or untagged legacy = pad)
+                    if _cmd_owner["src"] == "vr":
+                        if now_own - _cmd_owner["vr_ts"] > _VR_OWNER_TIMEOUT_S:
+                            log.warning(
+                                "cmd owner: VR silent %.1fs > %.1fs — releasing "
+                                "to idle; pad re-acquires",
+                                now_own - _cmd_owner["vr_ts"], _VR_OWNER_TIMEOUT_S)
+                            _cmd_owner["src"] = None
+                            cmd_queue.put(LocomotionCommand(
+                                intent="idle", magnitude="default"))
+                            continue  # this pad msg is dropped; next one owns
+                        continue  # VR owns: drop pad message
+                    if _cmd_owner["src"] is None:
+                        _cmd_owner["src"] = "pad"
                 magnitude = str(payload.get("magnitude", "default"))
                 stick_fwd = float(payload.get("stick_fwd", 0.0))
                 stick_side = float(payload.get("stick_side", 0.0))
                 stick_yaw = float(payload.get("stick_yaw", 0.0))
+                # Forward-obstacle clamp. Yaw is deliberately untouched so the
+                # operator can turn away instead of being stuck facing a wall.
+                if _guard_blocked():
+                    if not _guard_latched["on"]:
+                        log.warning("OBSTACLE %.2fm -> LATCHED; release the "
+                                    "deadman to reset", _guard_state["dist"])
+                    _guard_latched["on"] = True
+                elif (stick_fwd == 0.0 and stick_side == 0.0
+                      and stick_yaw == 0.0 and _guard_latched["on"]):
+                    # deadman released (bridge sends an all-zero frame) -> reset
+                    log.info("guard latch reset")
+                    _guard_latched["on"] = False
+                if _guard_latched["on"]:
+                    stick_fwd = 0.0
+                    stick_side = 0.0
                 sd = payload.get("speed_delta")
                 if sd:
                     _adjust_speed_setpoint(float(sd))
@@ -1636,6 +1751,13 @@ def _zmq_command_thread(
                         )
                     else:
                         direct_velocity = tuple(float(v) for v in target_velocity)
+                        # VR/Quest sends velocity directly, bypassing sticks.
+                        if _guard_latched["on"] and direct_velocity[0] > 0.0:
+                            log.warning("OBSTACLE %.2fm -> direct vx held",
+                                        _guard_state["dist"])
+                            direct_velocity = (0.0, 0.0,
+                                               direct_velocity[2],
+                                               direct_velocity[3])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 log.warning("planner_cmd: bad payload %r: %s", parts[1], exc)
                 continue
@@ -2152,6 +2274,16 @@ def run(args: argparse.Namespace) -> int:
         args=(cmd_queue, args.cmd_host, cmd_port, args.cmd_topic, stop_event,
               bool(args.cmd_bind)),
         name="cmd-zmq", daemon=True,
+    )
+    thr.start()
+    threads.append(thr)
+
+    # Forward-obstacle guard feed (scan_guard_pub.py over ZMQ). Fails open:
+    # if that process is not running, _guard_blocked() stays False and the
+    # planner behaves exactly as before.
+    thr = threading.Thread(
+        target=_scan_guard_thread, args=(stop_event,),
+        name="scan-guard", daemon=True,
     )
     thr.start()
     threads.append(thr)

@@ -906,6 +906,10 @@ def _qpos_to_stream_frame(
 
 
 # ---------------------------------------------------------------------------
+# pad-vs-VR command ownership (see pc2_kplanner_onnx for rationale)
+_VR_OWNER_TIMEOUT_S = 2.0
+_cmd_owner = {"src": None, "vr_ts": 0.0}
+
 # Command sources (forked verbatim from x2_heuristic_planner with light edits)
 # ---------------------------------------------------------------------------
 
@@ -962,6 +966,44 @@ def _zmq_command_thread(
                     log.info("zmq command source: shutdown received")
                     stop_event.set()
                     continue
+                # ---- source ownership (pad vs VR mutual exclusion) ----
+                # Mirrors pc2_kplanner_onnx._zmq_command_thread so sim
+                # dual-source behavior matches the robot: one owner at a
+                # time, VR supersedes pad, release on VR idle or 2 s VR
+                # silence (manager keepalives every 0.5 s while engaged).
+                src = str(payload.get("source", "pad"))
+                now_own = time.monotonic()
+                if src == "vr":
+                    _cmd_owner["vr_ts"] = now_own
+                    if payload.get("vr_release"):
+                        # Explicit disengage from the manager: the ONLY
+                        # VR message that hands control back. A plain VR
+                        # idle is a stand-still command and keeps
+                        # ownership (sticks centered != disengage).
+                        if _cmd_owner["src"] == "vr":
+                            log.warning("cmd owner: VR released — "
+                                        "pad may re-acquire")
+                            _cmd_owner["src"] = None
+                        elif _cmd_owner["src"] == "pad":
+                            continue  # stray release while pad drives
+                    else:
+                        if _cmd_owner["src"] != "vr":
+                            log.warning("cmd owner: VR ENGAGED — pad input ignored")
+                            _cmd_owner["src"] = "vr"
+                else:
+                    if _cmd_owner["src"] == "vr":
+                        if now_own - _cmd_owner["vr_ts"] > _VR_OWNER_TIMEOUT_S:
+                            log.warning(
+                                "cmd owner: VR silent %.1fs > %.1fs — releasing "
+                                "to idle; pad re-acquires",
+                                now_own - _cmd_owner["vr_ts"], _VR_OWNER_TIMEOUT_S)
+                            _cmd_owner["src"] = None
+                            cmd_queue.put(LocomotionCommand(
+                                intent="idle", magnitude="default"))
+                            continue
+                        continue
+                    if _cmd_owner["src"] is None:
+                        _cmd_owner["src"] = "pad"
                 magnitude = str(payload.get("magnitude", "default"))
                 # Continuous locomotion (analog Quest3 sticks) carries
                 # three deadzone-rescaled deflections in [-1, 1]. Missing
