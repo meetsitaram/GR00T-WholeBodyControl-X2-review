@@ -16,11 +16,45 @@ start_tmux() {  # name, command
 start_tmux x2_pose_watchdog "bash /home/run/getsolo/start_x2_pose_watchdog_local.sh"
 start_tmux x2_hand_bridge   "bash /home/run/getsolo/log/start_x2_hand_bridge.sh"
 start_tmux x2_motor_monitor "bash /home/run/getsolo/log/start_x2_motor_monitor.sh"
-start_tmux pc2_kplanner "PYTHONPATH=$PS:$PS/motionbricks KPLANNER_FIXED_TURN_RAD_S=1.0 KPLANNER_FIXED_FWD_MPS=0.5 stdbuf -oL -eL $PY /home/run/getsolo/pc2_kplanner_onnx.py \
-  --onnx $PS/models/planner_onnx/x2_planner_template.onnx --planner-mode slow_walk --cmd-bind \
+# Visualiser + scan pipeline, then the obstacle guard, both BEFORE kplanner
+# so the scan is up before kplanner. The guard now starts AFTER kplanner:
+# its ZMQ SUB reconnects when the publisher appears, so the clamp arms a few
+# on /scan and the guard read inf. kplanner subscribes to ZMQ 5571 and zeroes
+# forward/lateral while blocked, latched until the deadman is released.
+# Toggle for the forward-obstacle guard (lumi scan pipeline + scan_guard_pub).
+# 0 = OFF: kplanner's clamp is FAIL-OPEN, so with no publisher it never
+# clamps — operator deadman is the only stop. Set to 1 to re-arm.
+ENABLE_SCAN_GUARD=0
+
+if [ "$ENABLE_SCAN_GUARD" = "1" ]; then
+bash /home/run/getsolo/lumi.sh >> /home/run/getsolo/log/scan_guard.log 2>&1
+sleep 8
+fi
+
+# Kplanner kitchen-teleop tuning 2026-08-02 (see gear_sonic_deploy/configs/
+# kplanner_tuning_history.md for the sweep evidence + old/new comparison):
+# FWD 0.5->0.4 (template floor ~0.45; 0.4 = smoothest), ARC_TURN default
+# 0.55->0.70 (walking-turn radius ~1.2m -> 0.6-0.85m), replan threshold
+# 32->48 (turn response at PC2 latency 0.68s -> 0.22s). Standing turn
+# stays 1.0 (July sweep, robot-verified).
+start_tmux pc2_kplanner "PYTHONPATH=$PS:$PS/motionbricks KPLANNER_FIXED_TURN_RAD_S=1.0 KPLANNER_FIXED_FWD_MPS=0.4 KPLANNER_FIXED_ARC_TURN_RAD_S=0.70 stdbuf -oL -eL $PY /home/run/getsolo/pc2_kplanner_onnx.py \
+  --onnx $PS/models/planner_onnx/x2_planner_template.onnx --planner-mode slow_walk --cmd-bind --replan-threshold-frames 48 \
   --warmup-qpos $PS/models/kplanner_idle_anchor_g1teleop_v3.pkl \
   --dances-dir $PS/models/dances_x2m2 --ort-gpu --playing-yaw-resync-dps 10 2>&1 | tee -a /home/run/getsolo/log/pc2_kplanner.log"
 sleep 3
+
+# SYSTEM python with absolute ROS paths: the gear_sonic venv has no rclpy and
+# a fresh post-reboot shell has no ROS env, so without these spelled out the
+# guard dies silently and the robot drives unguarded.
+if [ "$ENABLE_SCAN_GUARD" = "1" ]; then
+start_tmux scan_guard "LD_LIBRARY_PATH=/agibot/software/common/lib:/opt/ros/humble/lib \
+  AMENT_PREFIX_PATH=/agibot/software/common:/opt/ros/humble \
+  PYTHONPATH=/agibot/software/common/local/lib/python3.10/dist-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages \
+  stdbuf -oL -eL python3 /home/run/getsolo/scan_guard_pub.py \
+  2>&1 | tee -a /home/run/getsolo/log/scan_guard.log"
+sleep 4
+fi
+
 # Curated dance banks (was: every clip in dances_x2m2, 14 of them).
 #   L1+Y / L1+A  -> EASY
 #   L1+X / L1+B  -> MEDIUM
