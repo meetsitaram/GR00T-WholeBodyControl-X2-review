@@ -82,6 +82,53 @@ def serve(backend, warm, schedule, seconds, latency_ticks=0):
     return q, stills_mask, switch_ticks
 
 
+_FK = {"model": None, "data": None, "feet": None}
+
+
+def paper_metrics(q, t0=1.0):
+    """MotionBricks-paper-aligned metrics on a served [T,38] qpos stream:
+    Root Jitter + Joint Jitter (m/s^2, accel magnitude of positions) and
+    Foot Skate (m/frame, horizontal foot travel while in ground contact).
+    FK through the X2 MJCF (free-joint root + 31 dof)."""
+    import mujoco
+    if _FK["model"] is None:
+        mjcf = str(REPO / "gear_sonic/data/assets/robot_description/mjcf/x2_ultra.xml")
+        _FK["model"] = mujoco.MjModel.from_xml_path(mjcf)
+        _FK["data"] = mujoco.MjData(_FK["model"])
+        feet = [i for i in range(_FK["model"].nbody)
+                if "ankle_roll" in (mujoco.mj_id2name(
+                    _FK["model"], mujoco.mjtObj.mjOBJ_BODY, i) or "")]
+        _FK["feet"] = feet
+    m, d = _FK["model"], _FK["data"]
+    seg = q[int(t0 * 50):]
+    fps = 50.0
+    joints = []
+    feet_pos = []
+    for f in seg:
+        d.qpos[:38] = f
+        mujoco.mj_kinematics(m, d)
+        joints.append(d.xpos[1:].copy())
+        feet_pos.append(d.xpos[_FK["feet"]].copy())
+    J = np.asarray(joints)          # [T, nb, 3]
+    F = np.asarray(feet_pos)        # [T, nfeet, 3]
+    jvel = np.diff(J, axis=0) * fps
+    jacc = np.linalg.norm(np.diff(jvel, axis=0) * fps, axis=-1)
+    root_acc = np.linalg.norm(
+        np.diff(np.diff(q[int(t0*50):, 0:3], axis=0) * fps, axis=0) * fps,
+        axis=-1)
+    # foot skate: horizontal travel per frame while foot near ground
+    z_thresh = F[:, :, 2].min() + 0.03
+    contact = F[:, :, 2] < z_thresh
+    dxy = np.linalg.norm(np.diff(F[:, :, :2], axis=0), axis=-1)
+    both = contact[1:] & contact[:-1]
+    skate = float(dxy[both].mean()) if both.any() else 0.0
+    return {
+        "joint_jitter": float(np.mean(jacc)),
+        "root_jitter": float(np.mean(root_acc)),
+        "foot_skate": skate,
+    }
+
+
 def metrics(q, t0=1.0, t1=None):
     """Geometry metrics over [t0, t1] seconds of a [T,38] qpos stream."""
     i0 = int(t0 * 50)
@@ -189,6 +236,7 @@ def main():
             sched = [(0.0, (w, 0.0, v_cmd, hip))]
             q, sm, _ = serve(backend, warm, sched, 12.0)
             m = metrics(q, t0=2.0)
+            m.update(paper_metrics(q, t0=2.0))
             r_cmd = v / w
             row = {"kind": "circle", "fwd": v, "arc": w, "boost": b,
                    "R_cmd": r_cmd, **m, "still": still_frac(sm)}
@@ -197,7 +245,9 @@ def main():
                   f"{m['R_fit']:5.2f} {m['v_path']:6.2f} "
                   f"{m['yaw_rate_dps']/np.degrees(w):5.2f} "
                   f"{still_frac(sm)*100:5.0f}% "
-                  f"{m['stepP95']:6.2f} {m['accP95']:6.2f}")
+                  f"{m['stepP95']:6.2f} {m['accP95']:6.2f} "
+                  f"| jJit {m['joint_jitter']:5.2f} rJit {m['root_jitter']:5.2f} "
+                  f"skate {m['foot_skate']*1000:5.2f}mm")
         print("=== turn90 (walk 3s -> arc to 90 -> walk 3s) ===")
         for v, w, b in itertools.product(fwds, arcs, boosts):
             t_turn = (np.pi / 2) / w

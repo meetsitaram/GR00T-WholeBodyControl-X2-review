@@ -63,7 +63,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 if [[ -z "$PC2_IP" ]]; then
-  echo "usage: $0 <PC2_IP>            # e.g. $0 192.168.86.32" >&2
+  echo "usage: $0 <PC2_IP>            # e.g. $0 ${X2_PC2_HOST}" >&2
   echo "       $0 --pc2-host <PC2_IP> [--vr]" >&2
   echo "  the robot's IP is required: it is what makes this run certifiable." >&2
   exit 2
@@ -344,8 +344,10 @@ INPUT_FLAG=(--pad-only)
 [[ "$VR_MODE" -eq 1 ]] && INPUT_FLAG=(--pad-and-vr)
 
 # NOT exec'd: we must survive the stack to print the summary trap.
+# --no-record: the stack defaults WITH_RECORD=1 (2026-07-29), but this
+# launcher is teleop-only validation by design (robot runs no recorder).
 ./gear_sonic/scripts/run_x2_quest3_planner_stack.sh \
-  --duration 0 "${INPUT_FLAG[@]}" "${MODE_FLAG[@]}" "${SONIC_CKPT_FLAG[@]}" \
+  --duration 0 --no-record "${INPUT_FLAG[@]}" "${MODE_FLAG[@]}" "${SONIC_CKPT_FLAG[@]}" \
   --kplanner-warmup-qpos gear_sonic/data/motions/kplanner_idle_anchor_g1teleop_v3.pkl \
   --model "$SONIC_ONNX" \
   --kplanner-python "$HOME/miniconda3/envs/env_isaaclab/bin/python" || true

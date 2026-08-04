@@ -26,6 +26,26 @@ Known model-level limits (knobs cannot fix; training work):
 - In-place-turn quality / turn-in-walk crispness → kplanner retrain
   (root/vqvae/pose) with more in-place-turn clips
 
+### Why raising `--replan-threshold-frames` increases responsiveness
+(verified against the MotionBricks SIGGRAPH 2026 paper + code, 2026-08-03)
+
+The paper's reference design has TWO replan triggers (Alg. 1: "C changed
+OR |B| running low"; Appendix C: instant replan on command change, τ only
+3–9 frames; Orin deploy: "10 Hz or whenever commands change") — commands
+never queue there. Our PC2 port (`pc2_kplanner_onnx.py`) deliberately
+drops the instant-on-change trigger: CPU inference is 0.3–0.6 s and VR/pad
+sticks stream continuously-varying commands, so change-triggered replans
+would fire nonstop. A mid-walk command therefore waits until the ring
+drains to the threshold before the next replan reads it (only IDLE→PLAYING
+forces an immediate replan). The threshold is thus a refill-trigger level
+and the ONLY mid-walk responsiveness lever: 32→48 fires each replan 16
+model frames (~0.53 s at 30 fps) earlier, which is the measured 0.68 s →
+0.22 s turn response above. Floor: threshold must cover inference time in
+frames or the ring starves (16 starved at 0.53 s CPU inference, tape
+20260719 — hence 32; with `--ort-gpu` on Jetson, ~tens-of-ms inference
+would let it drop back toward 16). Deviation is now documented in the
+runtime's "Known deviations" header.
+
 ## 2026-07-28 — pre-tuning baseline (for reference)
 
 `KPLANNER_FIXED_FWD_MPS=0.5`, `KPLANNER_FIXED_TURN_RAD_S=1.0` (ritual),

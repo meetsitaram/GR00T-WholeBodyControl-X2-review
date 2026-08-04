@@ -367,6 +367,13 @@ def main():
         "--total-sim-seconds for a deterministic CI-style parity check.",
     )
     parser.add_argument(
+        "--qpos-dump",
+        default=None,
+        help="Headless only: write the executed qpos trajectory of the FIRST "
+        "episode to this .npz (arrays: t [T], qpos [T,7+31], plus fps and "
+        "end reason). For offline FK, e.g. reach-point extraction.",
+    )
+    parser.add_argument(
         "--obs-dump",
         default=None,
         help=(
@@ -691,11 +698,25 @@ def main():
     )
     exit_requested = False
     cumulative_sim_seconds = 0.0
+    qpos_rows: list[np.ndarray] = []
+    qpos_times: list[float] = []
 
     if args.no_viewer:
         # Tight loop with no real-time pacing or viewer sync.
         while not exit_requested:
             reason = step_once()
+            if args.qpos_dump is not None and episode_count == 0:
+                qpos_times.append(sim_time)
+                qpos_rows.append(mj_data.qpos[: 7 + NUM_DOFS].copy())
+                if reason is not None:
+                    np.savez_compressed(
+                        args.qpos_dump,
+                        t=np.asarray(qpos_times),
+                        qpos=np.stack(qpos_rows),
+                        fps=float(motion_fps),
+                        reason=str(reason),
+                    )
+                    print(f"  [qpos-dump] {len(qpos_rows)} steps -> {args.qpos_dump}", flush=True)
             cumulative_sim_seconds += CONTROL_DT
             if (
                 args.total_sim_seconds > 0
