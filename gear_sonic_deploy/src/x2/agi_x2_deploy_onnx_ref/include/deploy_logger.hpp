@@ -65,6 +65,7 @@ class DeployLogger {
   std::ofstream joint_vel_;
   std::ofstream action_il_;
   std::ofstream imu_;
+  double last_flush_s_ = 0.0;  // 1 Hz flush so power cuts keep evidence
 };
 
 }  // namespace agi_x2

@@ -85,7 +85,7 @@ class TiltWatchdog {
   explicit TiltWatchdog(double fall_tilt_cos = -0.3)
       : fall_tilt_cos_(fall_tilt_cos) {}
 
-  void   Reset()      { tripped_ = false; reason_.clear(); }
+  void   Reset()      { tripped_ = false; force_stage2_ = false; reason_.clear(); }
   bool   Tripped()    const { return tripped_; }
   double FallCos()    const { return fall_tilt_cos_; }
   const std::string& Reason() const { return reason_; }
@@ -95,10 +95,62 @@ class TiltWatchdog {
   /// stays true.
   bool Update(double gravity_body_z);
 
+  /// Operator e-stop from the pose wire (2026-08-04): terminal trip with
+  /// immediate stage-2 pure damping — the operator asked for everything
+  /// to stop NOW; no slump stage.
+  void ForceTripEstop() {
+    if (tripped_ && force_stage2_) return;
+    reason_ = "operator E-STOP (wire flag)";
+    tripped_ = true;
+    force_stage2_ = true;
+  }
+
+  /// Joint-velocity trip (G1-reference parity, g1_deploy_onnx_ref.cpp:2830:
+  /// any |dq| > 35 rad/s aborts the tick; their Stop() then writes the
+  /// Kp=0/Kd=8 damping command). A velocity breach means the fall or the
+  /// policy divergence is ALREADY violent, so this trips terminally AND
+  /// requests immediate stage-2 pure damping — no stage-1 slump.
+  void ForceTripVelocity(int mj_idx, double dq_rad_s);
+
+  /// True when stage-2 pure damping must engage immediately (velocity trip).
+  bool ForceStage2() const { return force_stage2_; }
+
  private:
   double      fall_tilt_cos_;
   bool        tripped_ = false;
+  bool        force_stage2_ = false;
   std::string reason_;
+};
+
+/// Motor thermal monitor (G1-parity port, 2026-08-04 audit #2): per-joint
+/// Schmitt-trigger on max(coil, motor) temperature — enter HOT at
+/// ``enter_c`` (default 90), exit below ``exit_c`` (default 85) — with
+/// throttled reporting so warnings don't spam the log. WARN-ONLY for now
+/// (no derating); the PC-side notifier turns reports into PC3-speaker
+/// beeps + pad rumble. Also finally answers the open lower-limb heat
+/// question: the wire always carried per-motor temps, we just dropped them.
+class ThermalMonitor {
+ public:
+  explicit ThermalMonitor(double enter_c = 90.0, double exit_c = 85.0,
+                          double remind_period_s = 5.0)
+      : enter_c_(enter_c), exit_c_(exit_c), remind_period_s_(remind_period_s) {
+    hot_.fill(false);
+  }
+
+  /// Feed current temps; returns a non-empty human-readable report string
+  /// when something newly enters/exits HOT or a periodic reminder is due.
+  std::string Update(const std::array<double, NUM_DOFS>& coil_c,
+                     const std::array<double, NUM_DOFS>& motor_c,
+                     double now_s);
+
+  bool  AnyHot()   const { return hot_count_ > 0; }
+  int   HotCount() const { return hot_count_; }
+
+ private:
+  double enter_c_, exit_c_, remind_period_s_;
+  std::array<bool, NUM_DOFS> hot_{};
+  int    hot_count_ = 0;
+  double last_report_s_ = -1e9;
 };
 
 /// Pose-ref starvation watchdog: monitors the age of the most recent ZMQ

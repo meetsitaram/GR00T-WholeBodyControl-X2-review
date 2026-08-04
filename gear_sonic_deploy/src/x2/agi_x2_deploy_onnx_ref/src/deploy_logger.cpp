@@ -96,6 +96,21 @@ void DeployLogger::Log(double                              now_s,
        << "," << base_ang_vel[1]
        << "," << base_ang_vel[2]
        << "\n";
+
+  // Flush all streams once a second. 2026-08-04 incident postmortem had
+  // ZERO rows — the operator pulled the battery ~14 s into the session
+  // and every CSV was still sitting in ofstream buffers. A 1 Hz flush
+  // costs nothing at this data rate and guarantees a power-cut leaves
+  // at most the last second unrecorded.
+  if (now_s - last_flush_s_ >= 1.0) {
+    last_flush_s_ = now_s;
+    tick_.flush();
+    target_pos_.flush();
+    joint_pos_.flush();
+    joint_vel_.flush();
+    action_il_.flush();
+    imu_.flush();
+  }
 }
 
 }  // namespace agi_x2

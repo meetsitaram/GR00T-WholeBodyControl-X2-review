@@ -215,7 +215,11 @@ void ZmqPoseInputSource::HandleDecoded(
     const auto& f = header.fields[i];
     const auto& b = buffers[i];
 
-    if (f.name == "joint_pos_mj") {
+    if (f.name == "estop") {
+      // Operator e-stop (2026-08-04): latch permanently; the control loop
+      // polls EstopRequested() and slams stage-2 pure damping.
+      estop_requested_.store(true, std::memory_order_release);
+    } else if (f.name == "joint_pos_mj") {
       if (CopyFloat32IntoDouble(f, b, next_frame.joint_pos_mj.data(), NUM_DOFS)) {
         got_body = true;
       }

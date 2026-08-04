@@ -69,6 +69,10 @@ namespace agi_x2 {
 struct RobotState {
   std::array<double, NUM_DOFS> joint_pos_mj{};   ///< rad
   std::array<double, NUM_DOFS> joint_vel_mj{};   ///< rad/s
+  // Motor thermals (deg C; 2026-08-04 G1-parity audit #2 — the wire always
+  // carried these, IngestJointGroup previously discarded them).
+  std::array<double, NUM_DOFS> coil_temp_c{};    ///< winding temperature
+  std::array<double, NUM_DOFS> motor_temp_c{};   ///< housing temperature
   std::array<double, 4>        base_quat_wxyz{1.0, 0.0, 0.0, 0.0}; ///< IMU orientation
   std::array<double, 3>        base_ang_vel{0, 0, 0};              ///< rad/s, body frame
 
@@ -117,6 +121,12 @@ class AimdkIo {
   /// True iff every source has reported within `max_age_s` seconds of now.
   /// Use this to gate INIT -> WAIT_FOR_CONTROL.
   bool AllStateFresh(double max_age_s = 0.5) const;
+
+  // Human-readable per-stream state ages ("leg=0.002s waist=0.541s ...";
+  // "never" for streams not yet seen). For diagnosing WHICH stream
+  // tripped the CONTROL staleness guard (2026-08-04 incident: guard
+  // tripped on real hardware with no per-stream evidence).
+  std::string StateAgeReport() const;
 
   /// Publish a 31-D MuJoCo-ordered command in one shot. The MJ vector is
   /// sliced according to the kLeg/kWaist/kArm/kHead constants and fanned

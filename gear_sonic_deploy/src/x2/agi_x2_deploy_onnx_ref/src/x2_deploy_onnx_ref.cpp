@@ -194,6 +194,9 @@ struct CliArgs {
   // many radians from the trained standing pose. This is the GLOBAL value
   // applied to every joint that doesn't have a per-group override below.
   double      max_target_dev    = -1.0;
+  // Joint-velocity watchdog bound (rad/s); G1-reference parity value 35.
+  // Breach = immediate stage-2 pure damping. <=0 disables (sim A/B only).
+  double      joint_vel_trip_rad_s = 35.0;
   // Per-group overrides for max_target_dev, indexed by MuJoCo joint group.
   // -1 = inherit the global ``max_target_dev``; >0 = clamp this group at the
   // given radian deviation. Designed for the case where one joint family
@@ -940,6 +943,7 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--tilt-cos")          a.tilt_cos          = std::stod(next("--tilt-cos"));
     else if (s == "--ramp-seconds")      a.ramp_seconds      = std::stod(next("--ramp-seconds"));
     else if (s == "--max-target-dev")    a.max_target_dev    = std::stod(next("--max-target-dev"));
+    else if (s == "--joint-vel-trip")    a.joint_vel_trip_rad_s = std::stod(next("--joint-vel-trip"));
     else if (s == "--max-target-dev-leg")   a.max_target_dev_leg   = std::stod(next("--max-target-dev-leg"));
     else if (s == "--max-target-dev-waist") a.max_target_dev_waist = std::stod(next("--max-target-dev-waist"));
     else if (s == "--max-target-dev-arm")   a.max_target_dev_arm   = std::stod(next("--max-target-dev-arm"));
@@ -2015,6 +2019,36 @@ class X2Deploy {
     RobotState rs{};
     const bool fresh = aimdk_io_->SnapshotState(rs);
 
+    // ---- CONTROL-phase staleness guard (2026-08-04, G1-parity audit #1;
+    // RETUNED after the 2026-08-04 live incident). ``fresh`` above is a
+    // have-I-ever-seen-it flag, NOT an age check. Original port used a
+    // 150 ms window — 3.3x tighter than G1's LOW_STATE_ABSENT (500 ms) —
+    // and tripped ~13 s into the first real-robot session: SAFE_HOLD ->
+    // stage-2 damping -> standing robot slumped with a violent gear whir,
+    // operator pulled the battery. Real aimdk streams can gap past 150 ms;
+    // sim never does, so preflight could not catch it. Now: G1-parity
+    // 500 ms AND 3 consecutive stale ticks (debounce: one hiccup at the
+    // 50 Hz loop never trips), with a per-stream age report on every
+    // strike so the offending stream is named in the log.
+    if (cur == State::CONTROL) {
+      if (!aimdk_io_->AllStateFresh(0.5)) {
+        ++stale_state_ticks_;
+        RCLCPP_WARN(node_->get_logger(),
+                    "robot state stale >500 ms in CONTROL (strike %d/3): %s",
+                    stale_state_ticks_,
+                    aimdk_io_->StateAgeReport().c_str());
+        if (stale_state_ticks_ >= 3) {
+          RCLCPP_FATAL(node_->get_logger(),
+                       "robot state stale 3 consecutive ticks — SAFE_HOLD "
+                       "(%s)", aimdk_io_->StateAgeReport().c_str());
+          state_.store(State::SAFE_HOLD);
+          return;
+        }
+      } else {
+        stale_state_ticks_ = 0;
+      }
+    }
+
     switch (cur) {
       case State::STANDBY: {
         // Touch the ready sentinel exactly once on the first STANDBY tick
@@ -2662,6 +2696,18 @@ class X2Deploy {
     // physics<->command relationship -- and (b) ``last_action_il_`` drifts
     // outside the training distribution, accelerating divergence. See the
     // 16k checkpoint smoke test on 2026-04-22 for the gory details.
+    // ---- NaN/finite guard (2026-08-04, audit #17: NEITHER deploy had one;
+    // std::clamp propagates NaN so a single bad ONNX output could reach the
+    // bus as a NaN target). Any non-finite action -> SAFE_HOLD.
+    for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+      if (!std::isfinite(action_il[i])) {
+        RCLCPP_FATAL(node_->get_logger(),
+                     "non-finite policy action at IL dof %zu — SAFE_HOLD", i);
+        state_.store(State::SAFE_HOLD);
+        return;
+      }
+    }
+
     std::size_t clipped_joint_count = 0;
     double max_pre_clip = 0.0;
     if (cli_.action_clip > 0.0) {
@@ -2724,6 +2770,47 @@ class X2Deploy {
       const double max_delta = ApplyWristBypass(target_pos_mj, ref_frame);
       ++wrist_bypass_tick_count_;
       if (max_delta > wrist_bypass_max_delta_) wrist_bypass_max_delta_ = max_delta;
+    }
+
+    // ---- Motor thermal monitor (warn-only; audit #2).
+    {
+      static thread_local ThermalMonitor thermal_;
+      const std::string rep = thermal_.Update(rs.coil_temp_c,
+                                              rs.motor_temp_c, now);
+      if (!rep.empty()) {
+        RCLCPP_WARN(node_->get_logger(), "THERMAL: %s", rep.c_str());
+      }
+    }
+
+    // ---- Operator e-stop from the pose wire (2026-08-04): the planner
+    // latches an ``estop`` field after the operator gesture; slam stage-2
+    // pure damping on the same tick. Terminal until deploy restart.
+    if (!watchdog_.Tripped()
+        && zmq_pose_source_ != nullptr
+        && zmq_pose_source_->EstopRequested()) {
+      RCLCPP_FATAL(node_->get_logger(),
+                   "operator E-STOP on pose wire — pure damping NOW");
+      watchdog_.ForceTripEstop();
+    }
+
+    // ---- Joint-velocity watchdog (G1-reference parity; added 2026-08-04).
+    // g1_deploy_onnx_ref checks every measured |dq| against 35 rad/s each
+    // tick and stops on breach; every G1 stop path ends in the Kp=0/Kd=8
+    // damping command. Here a breach force-trips the tilt watchdog with
+    // the stage-2 flag, so ApplySafetyStack engages pure damping on THIS
+    // tick — a joint at such speed means the fall or a policy divergence
+    // is already violent, and fighting it at kp~99 is the damage mode.
+    // 35 rad/s is far above any trained motion (fastest corpus joints
+    // ~14 rad/s; X2 wrist hardware limit 20.9) so false trips require
+    // genuinely impossible motion or sensor garbage.
+    if (!watchdog_.Tripped()) {
+      for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+        const double adq = std::abs(rs.joint_vel_mj[i]);
+        if (adq > cli_.joint_vel_trip_rad_s) {
+          watchdog_.ForceTripVelocity(static_cast<int>(i), adq);
+          break;
+        }
+      }
     }
 
     // ---- Safety stack ------------------------------------------------------
@@ -3233,6 +3320,8 @@ class X2Deploy {
   // x2_debug PUB sink, bound when --zmq-debug-port > 0. Both default-null;
   // the legacy motion-file path leaves them empty.
   ZmqPoseInputSource*                       zmq_pose_source_ = nullptr;
+  // CONTROL staleness debounce (see guard above): consecutive stale ticks.
+  int                                       stale_state_ticks_ = 0;
   std::unique_ptr<ZmqDebugPublisher>        zmq_debug_pub_;
   // Cumulative count of x2_debug frames sent (or attempted -- ZMQ HWM may
   // drop). Reported on the periodic status line so the operator can see

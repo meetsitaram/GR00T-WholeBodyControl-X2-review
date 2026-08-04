@@ -154,6 +154,10 @@ void AimdkIo::IngestJointGroup(const aimdk_msgs::msg::JointStateArray& msg,
   for (std::size_t i = 0; i < group_len; ++i) {
     latest_state_.joint_pos_mj[start_mj_idx + i] = msg.joints[i].position;
     latest_state_.joint_vel_mj[start_mj_idx + i] = msg.joints[i].velocity;
+    latest_state_.coil_temp_c[start_mj_idx + i] =
+        static_cast<double>(msg.joints[i].coil_temp);
+    latest_state_.motor_temp_c[start_mj_idx + i] =
+        static_cast<double>(msg.joints[i].motor_temp);
   }
   out_stamp_field = SteadyNowSec();
   out_seen_field  = true;
@@ -183,6 +187,26 @@ bool AimdkIo::AllStateFresh(double max_age_s) const
          fresh(latest_state_.arm_stamp_s) &&
          fresh(latest_state_.head_stamp_s) &&
          fresh(latest_state_.imu_stamp_s);
+}
+
+std::string AimdkIo::StateAgeReport() const
+{
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  const double now = SteadyNowSec();
+  auto one = [&](const char* name, bool seen, double stamp) {
+    char buf[48];
+    if (!seen) {
+      std::snprintf(buf, sizeof(buf), "%s=never", name);
+    } else {
+      std::snprintf(buf, sizeof(buf), "%s=%.3fs", name, now - stamp);
+    }
+    return std::string(buf);
+  };
+  return one("leg",   latest_state_.leg_seen,   latest_state_.leg_stamp_s)
+   + " " + one("waist", latest_state_.waist_seen, latest_state_.waist_stamp_s)
+   + " " + one("arm",   latest_state_.arm_seen,   latest_state_.arm_stamp_s)
+   + " " + one("head",  latest_state_.head_seen,  latest_state_.head_stamp_s)
+   + " " + one("imu",   latest_state_.imu_seen,   latest_state_.imu_stamp_s);
 }
 
 void AimdkIo::PublishGroup(
