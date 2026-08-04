@@ -31,6 +31,18 @@ import time
 import pygame
 import zmq
 
+import sys as _sys
+from pathlib import Path as _Path
+_REPO = _Path(__file__).resolve().parent.parent.parent
+if str(_REPO) not in _sys.path:
+    _sys.path.insert(0, str(_REPO))
+try:
+    from gear_sonic.utils.teleop.estop_gesture import EstopGesture  # noqa: E402
+except ImportError:
+    # PC2 runs this file standalone from /home/run/gear-sonic with
+    # estop_gesture.py shipped alongside it.
+    from estop_gesture import EstopGesture  # noqa: E402
+
 # Pad mapping (Xbox-style SDL defaults; PS DualSense/DS4 map the same core
 # indices under SDL2 for sticks/shoulders; verify with --probe if unsure).
 AXIS_LX, AXIS_LY = 0, 1
@@ -121,7 +133,7 @@ def main() -> int:
                     help="'local' = pygame reads a directly-attached pad; "
                          "'zmq' = consume pad_state events from a "
                          "pc2_pad_daemon (pad lives on the robot)")
-    ap.add_argument("--pad-host", default="192.168.86.32",
+    ap.add_argument("--pad-host", default="${X2_PC2_HOST}",
                     help="(--source zmq) host running pc2_pad_daemon")
     ap.add_argument("--pad-port", type=int, default=5569)
     ap.add_argument("--deadman", choices=("both", "left"), default="both",
@@ -145,8 +157,13 @@ def main() -> int:
                     help="recorder host owning the motion_clip_cmd SUB bind")
     ap.add_argument("--clip-port", type=int, default=5568)
     ap.add_argument("--clip-topic", default="motion_clip_cmd")
+    ap.add_argument("--no-log-buttons", dest="log_buttons",
+                    action="store_false",
+                    help="Silence per-press button logging (ON by default "
+                         "since 2026-08-03 e-stop debugging).")
     ap.add_argument("--log-buttons", action="store_true",
                     help="log every button-index rising edge (pad mapping aid)")
+    ap.set_defaults(log_buttons=True)
     ap.add_argument("--probe", action="store_true",
                     help="print axis/button events and exit on ctrl-c")
     ap.add_argument("--pad-name", default=os.environ.get("PAD_NAME", ""),
@@ -373,6 +390,8 @@ def main() -> int:
     showcase_buzzed = False
     clip_cooldown_until = 0.0
     pending_delta = 0.0
+    estop_gesture = EstopGesture()
+    _estop_armed_log_t = 0.0
 
     _dbg_prev_btns: set[int] = set()
     while True:
@@ -385,13 +404,57 @@ def main() -> int:
         if args.log_buttons and not isinstance(js, _ZmqPad):
             cur_btns = {b for b in range(js.get_numbuttons()) if js.get_button(b)}
             for b in sorted(cur_btns - _dbg_prev_btns):
-                print(f"[pad-bridge] button {b} pressed", flush=True)
+                _ts = time.strftime("[%H:%M:%S]")
+                print(f"{_ts} [pad-bridge] button {b} pressed", flush=True)
             _dbg_prev_btns = cur_btns
         lt = js.get_axis(AXIS_LT) > 0.0   # SDL triggers: -1 rest -> +1 pressed
         rt = js.get_axis(AXIS_RT) > 0.0
         lb, rb = bool(js.get_button(BTN_LB)), bool(js.get_button(BTN_RB))
         deadman_held = lt if args.deadman == "left" else (lt and rt)
         live = deadman_held and not (lb and rb)   # all-four = e-stop chord: go dead
+
+        # ---- Operator E-STOP gesture (design 2026-08-04): rapid L2/R2
+        # firing while A and X are HELD, >=3 trigger cycles inside 1 s.
+        # On trip: broadcast estop intent (planner idles immediately; the
+        # deploy's damping-slam handler consumes the same message once the
+        # rebuilt deploy ships) + touch the soft-shutdown sentinel if
+        # X2_SOFT_SHUTDOWN_SENTINEL is set (graceful RAMP_OUT today).
+        lt_lvl = (js.get_axis(AXIS_LT) + 1.0) / 2.0
+        rt_lvl = (js.get_axis(AXIS_RT) + 1.0) / 2.0
+        estop_chord = bool(js.get_button(0)) and bool(js.get_button(2))  # A+X
+        # NOTE (2026-08-03 incident): the both-sticks-pinned alternative
+        # chord was REMOVED. Left stick forward (walking) + right stick
+        # forward (no-op) is a normal driving posture, and L2/R2 are the
+        # deadman — an operator re-gripping mid-walk pumped 3 times and
+        # collapsed the robot. A+X is the sole chord: it cannot be held
+        # while a thumb drives a stick.
+        if estop_chord and time.monotonic() - _estop_armed_log_t > 0.5:
+            _estop_armed_log_t = time.monotonic()
+            print(f"[pad-bridge {time.strftime('%H:%M:%S')}] estop chord "
+                  f"armed (A+X): lt={lt_lvl:.2f} rt={rt_lvl:.2f} "
+                  f"pumps_1s={len(estop_gesture._pump_win)}", flush=True)
+        _ph = estop_gesture.tick(lt_lvl, rt_lvl, estop_chord)
+        if _ph == 1:
+            print("[pad-bridge] !!! E-STOP (SOFT): abort to idle stand — "
+                  "keep the gesture going ~1s more for PURE DAMPING",
+                  flush=True)
+            send({"intent": "estop", "phase": "soft",
+                  "magnitude": "default"})
+        elif _ph == 2:
+            print("[pad-bridge] !!! E-STOP ESCALATED: PURE DAMPING (terminal)",
+                  flush=True)
+            send({"intent": "estop", "phase": "damp",
+                  "magnitude": "default"})
+        if _ph:
+            sentinel = os.environ.get("X2_SOFT_SHUTDOWN_SENTINEL", "")
+            if sentinel:
+                try:
+                    open(sentinel, "w").close()
+                    print(f"[pad-bridge] soft-shutdown sentinel touched: "
+                          f"{sentinel}", flush=True)
+                except OSError as exc:
+                    print(f"[pad-bridge] sentinel write failed: {exc}",
+                          flush=True)
 
         # (Showcase chord L2+R2+Y REMOVED 2026-07-30 per operator: it committed
         # the robot to ~10 s of continuous walking with ~293 deg of turning —

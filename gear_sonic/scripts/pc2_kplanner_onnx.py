@@ -1731,6 +1731,40 @@ class ArmTargetIngest:
         self._stop.set()
 
 
+# Terminal operator e-stop latch: once set, every outgoing pose payload
+# carries an ``estop`` field (the deploy slams Kp=0 + the per-joint
+# damping profile on it; unknown fields are ignored by older deploys).
+# Cleared only by planner restart.
+_ESTOP_LATCH: list = [False]
+_DANCE_QUEUE_REF: list = [None]
+
+
+def _pc3_announce_estop(phase: str) -> None:
+    """Fire-and-forget spoken e-stop cue on the PC3 robot speaker.
+
+    Requires X2_PC3_HOST (and X2_PC3_PASS if the unit uses password
+    auth); a no-op when unset, so sim runs stay silent. Non-blocking,
+    every failure swallowed — the e-stop path must never wait on audio.
+    WAVs are staged by gear_sonic_deploy/scripts/gen_pc3_audio_prompts.py.
+    """
+    host = os.environ.get("X2_PC3_HOST", "")
+    if not host:
+        return
+    wav = "estop_damping.wav" if phase == "damp" else "estop_activating.wav"
+    cmd = ["ssh", "-o", "ConnectTimeout=2", "-o", "StrictHostKeyChecking=no",
+           host, f"aplay -D playback_def /opt/x2_interact/audio/{wav}"]
+    pw = os.environ.get("X2_PC3_PASS", "")
+    if pw:
+        cmd = ["sshpass", "-p", pw] + cmd
+    try:
+        import subprocess
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        pass
+
+
 class PosePublisher:
     """PUB bind + v4 packed encoder (port of x2_kplanner.PosePublisher,
     defaulting to bind-on-all-interfaces for the PC2 deployment)."""
@@ -1759,6 +1793,8 @@ class PosePublisher:
                          "ACTIVE (operator arm/hand targets on the wire)"
                          if applied else "cleared (planner arms restored)")
                 self._overlay_state = applied
+        if _ESTOP_LATCH[0]:
+            payload["estop"] = np.asarray([1.0], dtype=np.float32)
         self._sock.send(pack_pose_message(payload, topic=self._topic, version=4))
         self._tape_seq = getattr(self, "_tape_seq", -1) + 1
         _TAPE.ev("tick", seq=self._tape_seq)
@@ -1969,6 +2005,31 @@ def _zmq_command_thread(
                 if intent == "shutdown":
                     log.info("planner_cmd source: shutdown received")
                     stop_event.set()
+                    continue
+                if intent == "estop":
+                    # E-STOP OUTRANKS SOURCE OWNERSHIP. Two phases:
+                    #   soft (first trip): abort dance/locomotion -> idle
+                    #     stand. Recoverable; drive again after.
+                    #   damp (gesture continued ~1s more): additionally
+                    #     latch the wire estop flag -> the deploy slams
+                    #     Kp=0 + the vendor-fitted damping profile.
+                    #     TERMINAL until stack restart.
+                    phase = str(payload.get("phase",
+                                payload.get("magnitude", "soft")))
+                    if phase not in ("soft", "damp"):
+                        phase = "soft"
+                    log.critical("E-STOP (%s) from %s — aborting dance/"
+                                 "locomotion%s", phase,
+                                 payload.get("source", "?"),
+                                 " + WIRE DAMP FLAG (terminal)"
+                                 if phase == "damp" else "")
+                    if phase == "damp":
+                        _ESTOP_LATCH[0] = True
+                    _pc3_announce_estop(phase)
+                    if _DANCE_QUEUE_REF[0] is not None:
+                        _DANCE_QUEUE_REF[0].put(("stop",))
+                    cmd_queue.put(LocomotionCommand(
+                        intent="idle", magnitude="default", source="estop"))
                     continue
                 # ---- source ownership (mutual exclusion) --------------------
                 # Multiple PUBs may be connected (pad bridge + VR manager),
@@ -2573,6 +2634,7 @@ def run(args: argparse.Namespace) -> int:
 
     cmd_queue: "queue.Queue[LocomotionCommand]" = queue.Queue()
     dance_queue: "queue.Queue[tuple]" = queue.Queue()
+    _DANCE_QUEUE_REF[0] = dance_queue   # e-stop aborts an in-flight clip
     stop_event = threading.Event()
     replan_event = threading.Event()
     replan_lock = threading.Lock()

@@ -652,6 +652,12 @@ class _SubscribeModeState:
         # Optional 64-D wire token from body_pose (VLA bridge). None when
         # absent or invalid — subscribe loop then publishes zeros on pose.
         self._wire_motion_token: Optional[np.ndarray] = None
+        # Operator e-stop pass-through: the planner latches an ``estop``
+        # field on body_pose after the operator gesture; this merged
+        # ``pose`` payload is rebuilt key-by-key, so without an explicit
+        # latch the flag would be dropped and the deploy could never see
+        # it. Terminal (never cleared) — matches planner semantics.
+        self.estop_wire: bool = False
 
     def update_body_pose(
         self,
@@ -993,6 +999,20 @@ def _handle_body_pose_msg(
     except ValueError:
         return
     fields = decoded.fields
+    # Operator e-stop flag rides on every planner pose payload once
+    # latched; capture it BEFORE any shape gating so a malformed frame
+    # can't swallow the stop.
+    if "estop" in fields:
+        try:
+            if float(np.asarray(fields["estop"]).reshape(-1)[0]) >= 0.5:
+                if not state.estop_wire:
+                    print(
+                        "[recorder] !!! E-STOP flag on body_pose wire — "
+                        "forwarding to deploy on every merged pose frame "
+                        "(terminal)", flush=True)
+                state.estop_wire = True
+        except (IndexError, TypeError, ValueError):
+            pass
     if "joint_pos_mj" not in fields:
         return
     q = np.asarray(fields["joint_pos_mj"], dtype=np.float64).reshape(-1)
@@ -3437,6 +3457,9 @@ class X2DatasetRecorder:
         self._last_published_root_quat = payload["root_quat_xyzw"].astype(
             np.float32, copy=True
         )
+
+        if self._sub_state is not None and self._sub_state.estop_wire:
+            payload["estop"] = np.asarray([1.0], dtype=np.float32)
 
         msg = pack_pose_message(
             payload, topic=self._cfg.pub_topic, version=self._cfg.protocol_version

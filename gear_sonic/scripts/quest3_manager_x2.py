@@ -91,6 +91,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import os  # noqa: E402
+from gear_sonic.utils.teleop.estop_gesture import EstopGesture  # noqa: E402
 from gear_sonic.utils.teleop.finger_signal_filter import FingerFilterParams  # noqa: E402
 from gear_sonic.utils.teleop.operator_calibration import OperatorCalibration  # noqa: E402
 from gear_sonic.utils.teleop.vr.button_state_machine import (  # noqa: E402
@@ -713,6 +715,7 @@ class Quest3ManagerX2:
         # R-click. Reset on any transition to OFF.
         self._waist_frozen: bool = False
         self._button_sm = ButtonStateMachine(log_prefix="Input")
+        self._estop_gesture = EstopGesture()
 
         # Stick-click rising-edge trackers. The WebXR client polls the
         # gamepad ~50 Hz so a click typically holds True for several
@@ -1180,6 +1183,97 @@ class Quest3ManagerX2:
 
                 ev = self._button_sm.tick(*buttons)
                 a_held, _b_held, x_held, y_held = buttons
+                # Defer single-press side effects by 0.15s: pressing
+                # A+X for the e-stop chord lands across 1-2 ticks, and
+                # the leading edge used to fire the buttons' normal
+                # actions (A=arm toggle, B=mode flip, X=episode) — every
+                # e-stop attempt scrambled modes (operator 2026-08-03).
+                # If the chord forms within the window, pending singles
+                # are dropped; chord events still fire instantly.
+                ev = self._defer_button_singles(
+                    ev, bool(a_held), bool(x_held), tick_now)  # estop chord
+
+                # ---- Operator E-STOP gesture (v3 2026-08-04, operator
+                # spec): A+X HELD (right thumb + left thumb) while BOTH
+                # triggers fire rapidly (>=3 cycles in 1 s; keep going
+                # ~1s more to escalate to damp). Identical shape to the
+                # pad gesture (A+X + rapid L2/R2) — one gesture on every
+                # surface. Known one-shot side effects at chord press
+                # (tolerable mid-emergency): A = arm-tracking toggle,
+                # X = episode ping (recorder ignores in teleop-only).
+                _lt, _rt, _lg, _rg = triggers
+                _estop_chord = bool(a_held) and bool(x_held)
+                # NOTE (2026-08-03 incident): the both-sticks-pinned
+                # alternative chord was REMOVED on every surface — sticks
+                # forward + trigger activity is a normal driving /
+                # manipulation posture and collapsed the robot in sim.
+                # A+X is the sole chord: it cannot be held while a thumb
+                # drives a stick.
+                if _estop_chord and tick % 25 == 0:
+                    log.warning("[manager-x2] estop chord armed (A+X): "
+                                "lt=%.2f rt=%.2f pumps_1s=%d",
+                                float(_lt), float(_rt),
+                                len(self._estop_gesture._pump_win))
+                # VR input-link health (2026-08-03): controllers kept
+                # detaching at the WebXR level and ALL button/trigger
+                # input (incl. this e-stop) silently died while pose
+                # kept streaming — the operator pumped away at a dead
+                # surface. Scream about it so nobody discovers a dead
+                # e-stop mid-emergency. Pad e-stop is unaffected.
+                _src_n, _src_zero_age = self._quest.get_gamepad_health()
+                _unstable = _src_n == 0 or _src_zero_age < 10.0
+                if not _unstable:
+                    self._input_dead_since = None
+                elif getattr(self, "_input_dead_since", None) is None:
+                    self._input_dead_since = tick_now
+                # Cadence decay: 5s while fresh (operator mid-session
+                # must notice fast), 60s once it's clearly a parked /
+                # sleeping headset (operator feedback 2026-08-03:
+                # steady CRITICAL spam drowns the useful logs).
+                _warn_gap = (5.0 if self._input_dead_since is None
+                             or tick_now - self._input_dead_since < 30.0
+                             else 60.0)
+                if (_unstable
+                        and tick_now - getattr(
+                            self, "_input_dead_warn_t", 0.0) > _warn_gap):
+                    self._input_dead_warn_t = tick_now
+                    log.critical(
+                        "[manager-x2] !!! VR CONTROLLER INPUT UNSTABLE "
+                        "(sources=%d, last zero-drop %.1fs ago): buttons/"
+                        "triggers — INCLUDING VR E-STOP — may be DEAD. "
+                        "Use the GAMEPAD e-stop. Check controller "
+                        "batteries / re-grip to wake controllers.",
+                        _src_n, _src_zero_age)
+                _estop_ph = self._estop_gesture.tick(_lt, _rt, _estop_chord)
+                if _estop_ph == 1:
+                    self._play_audio_prompt(
+                        "estop_activating",
+                        fallback="Emergency stop activating.")
+                elif _estop_ph == 2:
+                    self._play_audio_prompt(
+                        "estop_damping",
+                        fallback="Emergency stop. Pure damping engaged.")
+                if _estop_ph == 1:
+                    log.critical("[manager-x2] !!! E-STOP (SOFT: A+X + "
+                                 "rapid triggers) — keep going ~1s more "
+                                 "for PURE DAMPING")
+                    self._publish_planner_cmd(
+                        LocomotionCmd(intent="estop", magnitude="soft"))
+                elif _estop_ph == 2:
+                    log.critical("[manager-x2] !!! E-STOP ESCALATED: "
+                                 "PURE DAMPING (terminal)")
+                    self._publish_planner_cmd(
+                        LocomotionCmd(intent="estop", magnitude="damp"))
+                if _estop_ph:
+                    _sentinel = os.environ.get("X2_SOFT_SHUTDOWN_SENTINEL", "")
+                    if _sentinel:
+                        try:
+                            open(_sentinel, "w").close()
+                            log.critical("[manager-x2] soft-shutdown "
+                                         "sentinel touched: %s", _sentinel)
+                        except OSError as exc:
+                            log.error("[manager-x2] sentinel write failed: %s",
+                                      exc)
 
                 # Split-topology SAFE_IDLE resume: A+B (without X+Y) held
                 # for >= resume_chord_hold_s. No-op unless --resume-pub-enabled.
@@ -2010,6 +2104,32 @@ class Quest3ManagerX2:
             log.debug("[sidecar] write failed: %s", exc)
 
     # -- quest3 raw capture --------------------------------------------------
+
+    def _defer_button_singles(self, ev, chord_a: bool, chord_x: bool,
+                              now: float):
+        """Hold each single-press event for 0.15s; drop all pending
+        singles the moment the A+X e-stop chord (or any 2/4-button
+        chord event) engages. Chord events pass through untouched."""
+        import dataclasses
+        pend = getattr(self, "_btn_defer", None)
+        if pend is None:
+            pend = self._btn_defer = {}
+        for nm in ("a", "b", "x", "y"):
+            if getattr(ev, f"{nm}_pressed"):
+                pend[nm] = now + 0.15
+        if ((chord_a and chord_x) or ev.abxy_pressed or ev.ab_pressed
+                or ev.xy_pressed or ev.ax_pressed or ev.by_pressed):
+            pend.clear()
+        fired = [nm for nm, ft in pend.items() if ft <= now]
+        for nm in fired:
+            del pend[nm]
+        return dataclasses.replace(
+            ev,
+            a_pressed="a" in fired,
+            b_pressed="b" in fired,
+            x_pressed="x" in fired,
+            y_pressed="y" in fired,
+        )
 
     def _quest3_raw_emit(
         self,

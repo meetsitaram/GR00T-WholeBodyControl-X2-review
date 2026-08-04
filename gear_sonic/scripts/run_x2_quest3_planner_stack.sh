@@ -193,9 +193,9 @@
 #   # quest stack with --takeover so its recorder PUBs operator pose
 #   # into the mux's override port instead of straight at the deploy:
 #   ./run_x2_vla_runtime.sh --model /path/to/hf_ckpt \
-#       --pc2-host 10.0.1.41 --enable-takeover &
+#       --pc2-host ${X2_PC2_HOST} --enable-takeover &
 #   ./run_x2_quest3_planner_stack.sh --duration 0 \
-#       --remote-deploy 10.0.1.41 --takeover
+#       --remote-deploy ${X2_PC2_HOST} --takeover
 #   # Equivalent: --pose-port 5560 (the mux's --override-port default).
 #
 #   # Split-topology / remote-deploy mode: laptop runs only the
@@ -206,7 +206,7 @@
 #   # binds the resume PUB on :5566 and SUBs the motor monitor at
 #   # tcp://PC2_HOST:5567.
 #   ./run_x2_quest3_planner_stack.sh --duration 0 \
-#       --remote-deploy 10.0.1.41
+#       --remote-deploy ${X2_PC2_HOST}
 #
 #   # Play a scripted YAML demo at startup, then idle-stand and wait
 #   # for VR takeover (operator straps on the headset and chord-presses
@@ -377,7 +377,7 @@ if [[ -n "${X2_PLANNER_SMOKE_MODEL:-}" ]]; then
 elif [[ -f "${SONIC_X2_MODELS_DIR}/sonic_policy/x2_sonic_policy.onnx" ]]; then
     SIM_MODEL="${SONIC_X2_MODELS_DIR}/sonic_policy/x2_sonic_policy.onnx"
 else
-    SIM_MODEL="/home/stickbot/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx"
+    SIM_MODEL="$HOME/x2_cloud_checkpoints/h200-iter-25000-sphere-feet-20260501/exported/model_step_025000_g1.onnx"
 fi
 # KPLANNER_ONNX default: when the env var is entirely UNSET and the model
 # cache holds the fused planner graph, use it (torch-free runtime =
@@ -473,7 +473,9 @@ KPLANNER_DEVICE="cuda"
 # Quest 3 with --enable-continuous-locomotion is the analog of the PKL
 # replay's mean-intent mode (no per-tick velocity flapping). 16 was
 # the original default; 2 is the empirically-validated shippable value.
-KPLANNER_REPLAN_THRESHOLD_FRAMES="2"
+# Env-overridable so deploy-parity sim runs can mirror the robot ritual
+# (which ships --replan-threshold-frames 48 for PC2's ~0.45s inference).
+KPLANNER_REPLAN_THRESHOLD_FRAMES="${KPLANNER_REPLAN_THRESHOLD_FRAMES:-2}"
 
 # Runtime velocity tuning passed straight through to ``x2_kplanner.py``.
 # Default empty -> let the daemon use its own defaults (yaw-lock OFF
@@ -686,7 +688,7 @@ X2_DEBUG_BRIDGE_RATE_CAP_HZ="${X2_DEBUG_BRIDGE_RATE_CAP_HZ:-200.0}"
 #
 # Use it like:
 #
-#   ./run_x2_quest3_planner_stack.sh --remote-deploy 10.0.1.41 --duration 0
+#   ./run_x2_quest3_planner_stack.sh --remote-deploy ${X2_PC2_HOST} --duration 0
 #
 # The --robocasa-env path is ignored in remote-deploy mode (the real
 # robot has no robocasa scene).
@@ -838,6 +840,7 @@ VLA_NO_POLICY=0                 # 1 -> bridge runs publisher + x2_debug SUB only
 # same passthrough trick).
 # --------------------------------------------------------------------------
 POSE_REF_WATCHDOG="auto"
+DEBUG_INPUT=0            # --debug-input: record 50Hz raw Quest input for replay
 
 usage() {
     # Print every comment line from "# Usage:" until the first
@@ -861,6 +864,7 @@ while [[ $# -gt 0 ]]; do
         --model) SIM_MODEL="$2"; shift 2 ;;
         --calibration) CALIBRATION_PATH="$2"; shift 2 ;;
         --operator-id) OPERATOR_ID="$2"; shift 2 ;;
+        --debug-input) DEBUG_INPUT=1; shift ;;
         --no-deploy) WITH_DEPLOY=0; shift ;;
         --no-sim-viewer) SIM_VIEWER=0; shift ;;
         --sim-profile) SIM_PROFILE="$2"; SIM_PROFILE_EXPLICIT=1; shift 2 ;;
@@ -2819,6 +2823,16 @@ fi
 # the Quest3Replayer (Part 2) so one live operator session becomes a
 # reusable fixture for input-smoothing knob sweeps without re-donning
 # the rig. See docs/source/references/x2_quest3_stick_smoothing.md.
+# Opt-in (operator decision 2026-08-03: not worth the ~25 MB / 10 min
+# disk cost on every session): --debug-input (or a QUEST3_RECORD_TO env
+# path) records the full 50 Hz raw Quest input into the session dir for
+# offline replay:
+#   python3 gear_sonic/scripts/replay_quest3_estop.py <session>/quest3_raw.jsonl
+# Turn it ON whenever debugging anything input-related — replaying a
+# capture beats asking the operator to re-don the headset.
+if [[ "${DEBUG_INPUT}" -eq 1 && -z "${QUEST3_RECORD_TO:-}" ]]; then
+    QUEST3_RECORD_TO="${LOG_DIR}/quest3_raw.jsonl"
+fi
 QUEST3_RECORD_TO="${QUEST3_RECORD_TO:-}"
 if [[ -n "${QUEST3_RECORD_TO}" ]]; then
     # mkdir -p the parent so the manager doesn't fail on first write
@@ -2898,7 +2912,7 @@ fi
 build_pad_bridge_extra() {
     PAD_BRIDGE_EXTRA=()
     if [[ "${PAD_SOURCE:-local}" == "zmq" ]]; then
-        PAD_BRIDGE_EXTRA+=(--source zmq --pad-host "${PAD_HOST:-192.168.86.32}")
+        PAD_BRIDGE_EXTRA+=(--source zmq --pad-host "${PAD_HOST:-${X2_PC2_HOST}}")
     fi
     if [[ "${PAD_LOCK_SPEED:-0}" == "1" ]]; then
         PAD_BRIDGE_EXTRA+=(--lock-speed)
@@ -2964,6 +2978,16 @@ if [[ "${PAD_AND_VR}" -eq 1 ]]; then
     # Dual-source: the kplanner owns the planner_cmd SUB bind, so the
     # manager must PUB-connect instead of its default bind.
     MANAGER_ARGS+=(--planner-cmd-connect)
+fi
+# Zombie-manager reap (2026-08-04): every prior stack launch leaked its
+# manager; 29 had accumulated since Jul 30 and the OLDEST owned the
+# headset WebSocket port — VR inputs streamed to five-day-old code (the
+# operator's VR e-stop silently no-oped). Kill any survivors before
+# spawning ours so the fresh manager always owns the headset.
+if pgrep -f "quest3_manager_x[2]" >/dev/null 2>&1; then
+    log "  reaping stale quest3_manager_x2 process(es): $(pgrep -f 'quest3_manager_x[2]' | tr '\n' ' ')"
+    pkill -9 -f "quest3_manager_x[2]" || true
+    sleep 0.5
 fi
 log "Step 3/4 — spawning quest3_manager_x2 -> ${MANAGER_LOG}"
 "${PYTHON}" "${MANAGER_ARGS[@]}" >"${MANAGER_LOG}" 2>&1 &
@@ -3538,7 +3562,7 @@ if [[ "${VLA_MODE}" -eq 0 ]]; then
     # prefix to a short '[mgr]' tag.
     tail -F -n 0 "${MANAGER_LOG}" 2>/dev/null \
         | grep --line-buffered -F 'quest3_manager_x2' \
-        | sed -u -E 's/^\[[^]]+ INFO quest3_manager_x2\][[:space:]]*/[mgr] /' &
+        | sed -u -E 's/^\[[0-9-]+ ([0-9:]+),[0-9]+ INFO quest3_manager_x2\][[:space:]]*/[mgr \1] /' &
     MANAGER_TAIL_PID=$!
 
     # Mirror a TIGHT subset of the recorder log too. We deliberately do
