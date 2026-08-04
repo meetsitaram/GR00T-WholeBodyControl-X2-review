@@ -85,6 +85,9 @@ parser.add_argument("--snap-dir", type=str, default=None,
                          "falls (both operator and agent can review them).")
 parser.add_argument("--screenshot", type=str, default=None,
                     help="capture a viewport PNG here at the end (needs --enable_cameras)")
+parser.add_argument("--shot-eye", type=float, nargs=3, default=None,
+                    help="screenshot camera eye offset dx dy dz relative to spawn "
+                    "(default 2.4 -2.4 1.2 — the proven kitchen viewpoint)")
 parser.add_argument("--num-robots", type=int, default=1,
                     help="spawn N X2s at preset offsets around --spawn (max 8)")
 parser.add_argument("--show-collision", action="store_true",
@@ -316,8 +319,10 @@ def main():
 
     # EXACT proven viewpoint from the M0 hero shot — raising or pulling back
     # lands inside counter/cabinet splats (fog). Adjust only with a clearance
-    # check against the collision mesh.
-    cam_eye = (x + 2.4, y - 2.4, spawn_z + 1.2)
+    # check against the collision mesh. --shot-eye dx dy dz overrides the
+    # offset (relative to spawn) for worlds where this default sits in fuzz.
+    _se = args.shot_eye if args.shot_eye else (2.4, -2.4, 1.2)
+    cam_eye = (x + _se[0], y + _se[1], spawn_z + _se[2])
     sim.set_camera_view(eye=cam_eye, target=(x, y, spawn_z))
     sim.reset()
     for r in robots:

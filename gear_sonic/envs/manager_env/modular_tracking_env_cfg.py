@@ -281,9 +281,20 @@ class MySceneCfg(InteractiveSceneCfg):
 
         self.eval_camera = None
         if config.get("render_results", False):
-            self.eval_camera = TiledCameraCfg(
+            # eval_camera_type "standard" swaps the tiled path for a
+            # per-camera RTX render product (CameraCfg) — an escape hatch for
+            # single-env eval when the tiled path misbehaves. Default is
+            # unchanged ("tiled"). NOTE: NuRec splats DO render through the
+            # tiled path; if a splat world looks empty, check world_pos
+            # (env origin offset) before suspecting the camera.
+            _cam_cls = (
+                CameraCfg
+                if config.get("eval_camera_type", "tiled") == "standard"
+                else TiledCameraCfg
+            )
+            self.eval_camera = _cam_cls(
                 prim_path="/World/envs/env_.*/eval_camera",
-                offset=TiledCameraCfg.OffsetCfg(
+                offset=_cam_cls.OffsetCfg(
                     pos=(0, 0, 0), rot=(1, 0, 0, 0), convention="world"
                 ),
                 data_types=["rgb"],
@@ -371,6 +382,24 @@ class MySceneCfg(InteractiveSceneCfg):
                 prim_path="/World/WorldCollision",
                 init_state=AssetBaseCfg.InitialStateCfg(pos=world_pos),
                 spawn=sim_utils.UsdFileCfg(usd_path=world_collision_usd),
+            )
+
+        # Optional static prop (x2-groot-vla pass-B: bake an object at the
+        # extracted reach point as a static scene entry — no rigid-object /
+        # motion-object-channel machinery). Config-gated; absent keys leave
+        # training scenes untouched. Global prim — num_envs=1 eval only.
+        prop_usd = config.get("prop_usd", None)
+        if prop_usd:
+            # prop_pos is in the WORLD-ASSET frame (kitchen frame): compose
+            # with world_pos like the world layers, since /World/Prop is a
+            # global prim while env content lives at the env origin.
+            _pp = tuple(config.get("prop_pos", (0.0, 0.0, 0.0)))
+            _prop_world = tuple(a + b for a, b in zip(_pp, world_pos))
+            print(f"[x2-groot-vla] prop {prop_usd} at world {_prop_world}", flush=True)
+            self.prop = AssetBaseCfg(
+                prim_path="/World/Prop",
+                init_state=AssetBaseCfg.InitialStateCfg(pos=_prop_world),
+                spawn=sim_utils.UsdFileCfg(usd_path=prop_usd),
             )
 
         # robots
