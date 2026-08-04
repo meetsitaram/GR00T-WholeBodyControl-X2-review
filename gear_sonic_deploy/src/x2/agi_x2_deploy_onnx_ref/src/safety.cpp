@@ -51,6 +51,46 @@ bool TiltWatchdog::Update(double gravity_body_z)
   return false;
 }
 
+std::string ThermalMonitor::Update(const std::array<double, NUM_DOFS>& coil_c,
+                                   const std::array<double, NUM_DOFS>& motor_c,
+                                   double now_s)
+{
+  std::ostringstream os;
+  bool transition = false;
+  for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+    const double t = std::max(coil_c[i], motor_c[i]);
+    if (!hot_[i] && t >= enter_c_) {
+      hot_[i] = true; ++hot_count_; transition = true;
+      os << "motor " << i << " HOT " << t << "C; ";
+    } else if (hot_[i] && t < exit_c_) {
+      hot_[i] = false; --hot_count_; transition = true;
+      os << "motor " << i << " cooled " << t << "C; ";
+    }
+  }
+  if (transition) { last_report_s_ = now_s; return os.str(); }
+  if (hot_count_ > 0 && (now_s - last_report_s_) >= remind_period_s_) {
+    last_report_s_ = now_s;
+    os << hot_count_ << " motor(s) still hot:";
+    for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+      if (hot_[i]) os << " " << i << "("
+                      << std::max(coil_c[i], motor_c[i]) << "C)";
+    }
+    return os.str();
+  }
+  return {};
+}
+
+void TiltWatchdog::ForceTripVelocity(int mj_idx, double dq_rad_s)
+{
+  if (tripped_ && force_stage2_) return;
+  std::ostringstream os;
+  os << "joint-velocity watchdog tripped: |dq[" << mj_idx << "]|="
+     << dq_rad_s << " rad/s (G1-parity bound; fall/divergence committed)";
+  reason_ = os.str();
+  tripped_ = true;
+  force_stage2_ = true;
+}
+
 // ---------------------------------------------------------------------------
 // PoseRefStarvationWatchdog
 // ---------------------------------------------------------------------------
@@ -141,18 +181,62 @@ SafeCommand ApplySafetyStack(const std::array<double, NUM_DOFS>& policy_target_m
   // Tilt watchdog runs first so a freshly-tripped command goes to the safe
   // hold-default branch immediately.
   watchdog.Update(current_gravity_body_z);
+  static thread_local double trip_start_s = -1.0;
+  if (!watchdog.Tripped()) trip_start_s = -1.0;   // re-arm cleanly
   if (watchdog.Tripped()) {
     cmd.tilt_trip = true;
-    for (std::size_t i = 0; i < NUM_DOFS; ++i) {
-      cmd.target_pos_mj[i] = default_angles[i];
-      // Same effective kp, but boost damping by 4x to gently slump back
-      // to default. kd_per_dof[i] already incorporates any operator kd
-      // scaling; the 4x is on top of that (the slump branch is the same
-      // factor regardless of trim).
-      cmd.damping_mj[i] = kd_per_dof[i] * 4.0;
+    // TWO-STAGE trip response (2026-08-04, SONIC paper S7 parity).
+    // Stage 1 (recoverable wobble): hold-default slump at kd*4 — the
+    // historical behavior; it has caught real waist-level trips.
+    // Stage 2 (fall committed): the paper's pure-damping mode
+    // (Kp=0, Kd=8 Nm*s/rad) so the robot COMPLIES through ground impact
+    // instead of rigidly fighting to stand (legs at kp~99 Nm/rad drove
+    // the rigid-fall damage mode). Stage 2 engages when EITHER the tilt
+    // deepens past ~55 deg from upright (gravity_body_z > -0.574,
+    // i.e. cos(125 deg)) OR stage 1 has persisted 0.7 s without
+    // recovery — past both points a fall is no longer recoverable.
+    if (trip_start_s < 0.0) trip_start_s = now_s;
+    const bool deep_tilt = current_gravity_body_z > -0.574;
+    const bool persisted = (now_s - trip_start_s) > 0.7;
+    if (deep_tilt || persisted || watchdog.ForceStage2()) {
+      // Per-joint damping profile fitted from the VENDOR MC's own
+      // damping mode (2026-08-04 hardware capture: 247k samples at
+      // 250 Hz through a commanded slump + hand back-driving of every
+      // limb; least-squares tau = -Kd*vel per joint, left/right agree
+      // to 0.01-0.1). The flat Kd=8 we shipped first (G1 paper value)
+      // matched the legs but over-damped the small high-gear joints
+      // 2-8x (wrists worst) — the operator-reported motor whir/growl
+      // during the e-stop damp collapse. MJCF joint order.
+      // DELIBERATE departure from vendor (operator fall-shaping,
+      // 2026-08-04): knees at 4.0 instead of the vendor's 8.0 so the
+      // legs are the preferential fold point — the robot drops onto
+      // its KNEES instead of staying stiff-legged and toppling onto
+      // its torso. Hips stay at vendor 9/8 to keep slowing torso
+      // pitch during the fold.
+      static constexpr std::array<double, 31> kVendorDampKd = {
+          9.0, 8.0, 8.0, 4.0, 7.5, 3.0,   // left  hip p/r/y, KNEE 4.0, ankle p/r
+          9.0, 8.0, 8.0, 4.0, 7.5, 3.0,   // right hip p/r/y, KNEE 4.0, ankle p/r
+          5.0, 6.25, 4.0,                 // waist yaw, pitch, roll
+          4.0, 5.0, 3.0, 3.0, 3.0, 1.0, 1.0,  // L shldr p/r/y, elbow, wrist y/p/r
+          4.0, 5.0, 3.0, 3.0, 3.0, 1.0, 1.0,  // R shldr p/r/y, elbow, wrist y/p/r
+          0.0, 0.0,                       // head yaw, pitch (vendor: undamped)
+      };
+      for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+        cmd.target_pos_mj[i] = default_angles[i];  // ignored at kp=0
+        cmd.stiffness_mj[i]  = 0.0;
+        cmd.damping_mj[i]    = kVendorDampKd[i];
+      }
+      cmd.reason = watchdog.Reason() + " -> PURE-DAMPING (fall committed)";
+    } else {
+      for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+        cmd.target_pos_mj[i] = default_angles[i];
+        // Same effective kp, but boost damping by 4x to gently slump
+        // back to default (stage 1, unchanged historical behavior).
+        cmd.damping_mj[i] = kd_per_dof[i] * 4.0;
+      }
+      cmd.reason = watchdog.Reason();
     }
     cmd.ramp_alpha = 0.0;
-    cmd.reason     = watchdog.Reason();
   } else {
     // Normal path: soft-start blend.
     cmd.target_pos_mj = policy_target_mj;

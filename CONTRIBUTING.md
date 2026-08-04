@@ -29,6 +29,19 @@ We welcome contributions from the community! Here's how to get started.
 See the [Installation Guide](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html)
 for setting up the training environment.
 
+### Pre-commit security hook
+
+This repo ships a pre-commit scan that blocks commits containing
+credential-shaped content (API keys, tokens, embedded git credentials,
+personal email addresses). Install it once per clone:
+
+```bash
+bash scripts/git-hooks/install.sh
+```
+
+It chains any pre-commit hook you already have. For a deliberate
+exception, commit with `SKIP_SECURITY_CHECK=1`.
+
 ## Questions
 
 For questions, open a [GitHub Discussion](https://github.com/NVlabs/GR00T-WholeBodyControl/issues)

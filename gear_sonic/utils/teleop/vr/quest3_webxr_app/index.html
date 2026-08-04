@@ -1538,6 +1538,38 @@ function onXRFrame(time, frame) {
        * them (multimodal). */
     }
 
+    /* --- Gamepad capability: buttons / triggers / sticks. ---
+     * READ UNCONDITIONALLY (2026-08-03 root-cause): this block used
+     * to live INSIDE the gripSpace-pose branch below, so whenever the
+     * headset cameras lost the controller (hands at your sides --
+     * below the camera FOV, which is the NATURAL stance for the
+     * e-stop chord) every button and trigger silently froze at 0
+     * while the gamepad object stayed alive and pressable. The
+     * operator rapid-fired a live controller at a dead reader for
+     * 90+ seconds. Buttons need no optical tracking -- never gate
+     * them on pose. */
+    if (src.gamepad) {
+      const gpadU = src.gamepad;
+      if (src.handedness === 'left') {
+        buttons.leftTrigger    = gpadU.buttons[0] ? gpadU.buttons[0].value : 0;
+        buttons.leftGrip       = gpadU.buttons[1] ? gpadU.buttons[1].value : 0;
+        buttons.leftStickClick = gpadU.buttons[3] ? gpadU.buttons[3].pressed : false;
+        buttons.x              = gpadU.buttons[4] ? gpadU.buttons[4].pressed : false;
+        buttons.y              = gpadU.buttons[5] ? gpadU.buttons[5].pressed : false;
+        axes.lx = gpadU.axes[2] || 0;
+        /* Invert Y so that forward = positive */
+        axes.ly = -(gpadU.axes[3] || 0);
+      } else if (src.handedness === 'right') {
+        buttons.rightTrigger    = gpadU.buttons[0] ? gpadU.buttons[0].value : 0;
+        buttons.rightGrip       = gpadU.buttons[1] ? gpadU.buttons[1].value : 0;
+        buttons.rightStickClick = gpadU.buttons[3] ? gpadU.buttons[3].pressed : false;
+        buttons.a               = gpadU.buttons[4] ? gpadU.buttons[4].pressed : false;
+        buttons.b               = gpadU.buttons[5] ? gpadU.buttons[5].pressed : false;
+        axes.rx = gpadU.axes[2] || 0;
+        axes.ry = -(gpadU.axes[3] || 0);
+      }
+    }
+
     /* --- Controller capability: capture pose + buttons --- */
     if (src.gripSpace) {
       const gp = frame.getPose(src.gripSpace, refSpace);

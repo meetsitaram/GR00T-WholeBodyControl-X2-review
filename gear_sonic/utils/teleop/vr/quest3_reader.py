@@ -33,6 +33,23 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as sRot
 
+
+def _ts_print(*args, **kwargs):
+    """Timestamped stand-in for print().
+
+    2026-08-03 debugging lesson: the reader's diagnostics (input-source
+    flaps, tracking transitions, heartbeats) carried no clock, so flap
+    DURATION was unmeasurable from the logs and got guessed instead —
+    a guess that then flowed into tuning. Every reader diagnostic now
+    carries wall-clock millis; keep it that way.
+    """
+    import builtins
+    builtins.print(time.strftime("[%H:%M:%S") +
+                   f".{int(time.time() * 1000) % 1000:03d}]", *args, **kwargs)
+
+
+print = _ts_print  # module-wide shadow: all reader diagnostics get a clock
+
 # WebXR -> Robot basis-change matrix
 # robot_x (forward) = -webxr_z, robot_y (left) = -webxr_x, robot_z (up) = webxr_y
 WEBXR_TO_ROBOT = np.array(
@@ -256,6 +273,19 @@ class Quest3Reader:
     def get_latest(self) -> dict | None:
         with self._lock:
             return self._latest
+
+    def get_gamepad_health(self) -> tuple[int, float]:
+        """(active input-source count, seconds since sources last hit 0).
+
+        Second value is ``inf`` if sources never dropped this session.
+        A recent zero-drop or count < 2 means button/trigger input —
+        INCLUDING the VR e-stop — is unreliable or dead even though
+        head/controller pose may still stream (heartbeats keep coming).
+        Consumers should surface this loudly to the operator."""
+        count = getattr(self, "_sources_count", -1)
+        zero_t = getattr(self, "_last_sources_zero_t", None)
+        age = float("inf") if zero_t is None else time.monotonic() - zero_t
+        return count, age
 
     def get_last_message_age_s(self) -> float:
         """Seconds since the last WebSocket packet was ingested into
@@ -587,6 +617,14 @@ class Quest3Reader:
                     for s in sources
                 ))
                 prev_sig = getattr(self, "_last_sources_sig", None)
+                # Gamepad-health bookkeeping (2026-08-03): controllers
+                # detaching mid-session silently killed ALL button and
+                # trigger input (including the operator e-stop) while
+                # pose kept streaming. Track the flap so consumers can
+                # warn loudly instead of failing silent.
+                self._sources_count = count
+                if count == 0:
+                    self._last_sources_zero_t = time.monotonic()
                 if sig == prev_sig:
                     return
                 self._last_sources_sig = sig

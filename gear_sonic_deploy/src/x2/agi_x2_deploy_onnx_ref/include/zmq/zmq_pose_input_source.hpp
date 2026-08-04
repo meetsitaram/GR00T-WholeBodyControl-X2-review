@@ -254,6 +254,20 @@ class ZmqPoseInputSource : public ReferenceMotion {
 
   std::atomic<int64_t>        total_frames_received_{0};
   std::atomic<bool>           has_body_reference_{false};
+
+ public:
+  /// Operator e-stop flag carried on the pose wire (2026-08-04): the
+  /// planner latches an ``estop`` field into every payload after an
+  /// operator e-stop gesture; the control loop polls this and slams
+  /// stage-2 pure damping. Latching (never cleared by the wire).
+  bool EstopRequested() const {
+    return estop_requested_.load(std::memory_order_acquire);
+  }
+
+ private:
+  std::atomic<bool>           estop_requested_{false};
+
+ public:
 };
 
 }  // namespace agi_x2
