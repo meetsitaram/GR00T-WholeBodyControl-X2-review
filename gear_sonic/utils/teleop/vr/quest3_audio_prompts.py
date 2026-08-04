@@ -95,6 +95,13 @@ PROMPT_TEXTS: dict[str, str] = {
     # we'd queue up a backlog of overlapping voice cues.
     "mode_off":              "Off.",
     "mode_locomotion":       "Locomotion.",
+    # Operator e-stop gesture (A+X + rapid triggers, 2026-08-03).
+    # Spoken the moment the SOFT phase trips so the operator gets
+    # immediate confirmation the gesture registered (the robot
+    # freezing to idle stand can be mistaken for a hang), and again
+    # on escalation to pure damping.
+    "estop_activating":      "Emergency stop activating.",
+    "estop_damping":         "Emergency stop. Pure damping engaged.",
     "mode_arm_manipulation": "Arm manipulation.",
     # Played in addition to ``mode_arm_manipulation`` when the operator
     # crosses LOCOMOTION -> ARM_MANIPULATION while holding a non-neutral
@@ -120,6 +127,8 @@ PROMPT_TEXTS: dict[str, str] = {
 # this to verify the WebXR client + audio cache stay in sync with the
 # server-side enums.
 MANAGER_PROMPT_KEYS: tuple[str, ...] = (
+    "estop_activating",
+    "estop_damping",
     "mode_off",
     "mode_locomotion",
     "mode_arm_manipulation",

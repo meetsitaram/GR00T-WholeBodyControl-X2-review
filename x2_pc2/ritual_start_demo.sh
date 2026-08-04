@@ -1,21 +1,21 @@
 #!/bin/bash
 # LAPTOP-FREE demo ignition. Chain: local-upstream watchdog -> plumbing ->
 # pc2 planner runtime (ONNX) -> pose-stream gate -> deploy -> pad bridge.
-LOG=/home/run/getsolo/log/ritual_fired.log
-PS=/home/run/getsolo/planner_stack
-PY=/home/run/getsolo/venv/bin/python
+LOG=/home/run/gear-sonic/log/ritual_fired.log
+PS=/home/run/gear-sonic/planner_stack
+PY=/home/run/gear-sonic/venv/bin/python
 echo "$(date +%F_%T) DEMO RITUAL START" >> $LOG
 start_tmux() {  # name, command
   tmux has-session -t $1 2>/dev/null && { echo "$(date +%F_%T) $1: running -- skipped" >> $LOG; return 0; }
   # `; rc=$?` tail: record the child exit status in the ritual log so a
   # killed session is distinguishable from a crashed one. Without this the
   # only trace was the tmux pane, which dies with the session.
-  tmux new-session -d -s $1 "$2 ; rc=\$?; echo \"$(date +%F_%T) $1: EXITED rc=\$rc\" >> /home/run/getsolo/log/ritual_fired.log"
+  tmux new-session -d -s $1 "$2 ; rc=\$?; echo \"$(date +%F_%T) $1: EXITED rc=\$rc\" >> /home/run/gear-sonic/log/ritual_fired.log"
   echo "$(date +%F_%T) $1: STARTED" >> $LOG
 }
-start_tmux x2_pose_watchdog "bash /home/run/getsolo/start_x2_pose_watchdog_local.sh"
-start_tmux x2_hand_bridge   "bash /home/run/getsolo/log/start_x2_hand_bridge.sh"
-start_tmux x2_motor_monitor "bash /home/run/getsolo/log/start_x2_motor_monitor.sh"
+start_tmux x2_pose_watchdog "bash /home/run/gear-sonic/start_x2_pose_watchdog_local.sh"
+start_tmux x2_hand_bridge   "bash /home/run/gear-sonic/log/start_x2_hand_bridge.sh"
+start_tmux x2_motor_monitor "bash /home/run/gear-sonic/log/start_x2_motor_monitor.sh"
 # Visualiser + scan pipeline, then the obstacle guard, both BEFORE kplanner
 # so the scan is up before kplanner. The guard now starts AFTER kplanner:
 # its ZMQ SUB reconnects when the publisher appears, so the clamp arms a few
@@ -27,7 +27,7 @@ start_tmux x2_motor_monitor "bash /home/run/getsolo/log/start_x2_motor_monitor.s
 ENABLE_SCAN_GUARD=0
 
 if [ "$ENABLE_SCAN_GUARD" = "1" ]; then
-bash /home/run/getsolo/lumi.sh >> /home/run/getsolo/log/scan_guard.log 2>&1
+bash /home/run/gear-sonic/lumi.sh >> /home/run/gear-sonic/log/scan_guard.log 2>&1
 sleep 8
 fi
 
@@ -37,10 +37,10 @@ fi
 # 0.55->0.70 (walking-turn radius ~1.2m -> 0.6-0.85m), replan threshold
 # 32->48 (turn response at PC2 latency 0.68s -> 0.22s). Standing turn
 # stays 1.0 (July sweep, robot-verified).
-start_tmux pc2_kplanner "PYTHONPATH=$PS:$PS/motionbricks KPLANNER_FIXED_TURN_RAD_S=1.0 KPLANNER_FIXED_FWD_MPS=0.4 KPLANNER_FIXED_ARC_TURN_RAD_S=0.70 stdbuf -oL -eL $PY /home/run/getsolo/pc2_kplanner_onnx.py \
+start_tmux pc2_kplanner "PYTHONPATH=$PS:$PS/motionbricks KPLANNER_FIXED_TURN_RAD_S=1.0 KPLANNER_FIXED_FWD_MPS=0.3 KPLANNER_FIXED_ARC_TURN_RAD_S=0.70 stdbuf -oL -eL $PY /home/run/gear-sonic/pc2_kplanner_onnx.py \
   --onnx $PS/models/planner_onnx/x2_planner_template.onnx --planner-mode slow_walk --cmd-bind --replan-threshold-frames 48 \
   --warmup-qpos $PS/models/kplanner_idle_anchor_g1teleop_v3.pkl \
-  --dances-dir $PS/models/dances_x2m2 --ort-gpu --playing-yaw-resync-dps 10 2>&1 | tee -a /home/run/getsolo/log/pc2_kplanner.log"
+  --dances-dir $PS/models/dances_x2m2 --ort-gpu --playing-yaw-resync-dps 10 2>&1 | tee -a /home/run/gear-sonic/log/pc2_kplanner.log"
 sleep 3
 
 # SYSTEM python with absolute ROS paths: the gear_sonic venv has no rclpy and
@@ -50,8 +50,8 @@ if [ "$ENABLE_SCAN_GUARD" = "1" ]; then
 start_tmux scan_guard "LD_LIBRARY_PATH=/agibot/software/common/lib:/opt/ros/humble/lib \
   AMENT_PREFIX_PATH=/agibot/software/common:/opt/ros/humble \
   PYTHONPATH=/agibot/software/common/local/lib/python3.10/dist-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages \
-  stdbuf -oL -eL python3 /home/run/getsolo/scan_guard_pub.py \
-  2>&1 | tee -a /home/run/getsolo/log/scan_guard.log"
+  stdbuf -oL -eL python3 /home/run/gear-sonic/scan_guard_pub.py \
+  2>&1 | tee -a /home/run/gear-sonic/log/scan_guard.log"
 sleep 4
 fi
 
@@ -89,14 +89,15 @@ GESTURES="right_wave_001,right_kiss_001,right_five_001,right_shake_001,turn_wave
 # bridge's ROS side) and getsolo/ itself; --cmd-bind on the planner means the
 # bridge CONNECTS for planner_cmd (no --bind here). Back-ported 2026-07-29
 # from the robot-verified PC2 copy that had drifted ahead of the repo.
-start_tmux pad_bridge "PYTHONPATH=/home/run/getsolo:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages:$PS/gear_sonic LD_LIBRARY_PATH=/opt/ros/humble/lib:\$LD_LIBRARY_PATH stdbuf -oL -eL $PY /home/run/getsolo/pad_locomotion_bridge.py \
+start_tmux thermal_notifier "source /opt/ros/humble/setup.bash && export AMENT_PREFIX_PATH=/agibot/software/housekeeper/bin/aimdk_msgs:\$AMENT_PREFIX_PATH && export LD_LIBRARY_PATH=/agibot/software/housekeeper/bin/aimdk_msgs/lib:\$LD_LIBRARY_PATH && source /home/run/gear-sonic/ws/install/setup.bash && export PYTHONPATH=/agibot/software/housekeeper/bin/aimdk_msgs/local/lib/python3.10/dist-packages:\${PYTHONPATH:-} && $PY /home/run/gear-sonic/x2_thermal_notifier.py 2>&1 | tee -a /home/run/gear-sonic/log/thermal_notifier.log"
+start_tmux pad_bridge "PYTHONPATH=/home/run/gear-sonic:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages:$PS/gear_sonic LD_LIBRARY_PATH=/opt/ros/humble/lib:\$LD_LIBRARY_PATH stdbuf -oL -eL $PY /home/run/gear-sonic/pad_locomotion_bridge.py \
   --source zmq --pad-host 127.0.0.1 --lock-speed --deadman left \
   --clip-pkl $PS/models/dances_x2m2 \\
   --clip-keys \"$EASY_DANCES\" --clip-keys-b \"$COMBAT\" \
   --clip-keys-g \"$GESTURES\" --clip-keys-m \"$MEDIUM\" \
   --clip-keys-turn \"$TURNS\" \
   --clip-key-dpad-up walk_circle_001 \\
-  2>&1 | tee -a /home/run/getsolo/log/pad_bridge.log"
+  2>&1 | tee -a /home/run/gear-sonic/log/pad_bridge.log"
 # gate: pose frames must flow (watchdog downstream :5558) before deploy exists
 $PY - <<PYEOF
 import zmq, sys, time
@@ -117,12 +118,12 @@ echo "$(date +%F_%T) GATE PASSED" >> $LOG
 # x2_pc2_daemons.sh start with that session's flags, and one without
 # --no-confirm leaves the deploy stuck at a y/N prompt no gamepad can
 # answer (2026-07-29 blocked-ignition incident).
-tmux has-session -t x2_deploy 2>/dev/null || tmux new-session -d -s x2_deploy "bash /home/run/getsolo/start_x2_deploy_ritual.sh"
+tmux has-session -t x2_deploy 2>/dev/null || tmux new-session -d -s x2_deploy "bash /home/run/gear-sonic/start_x2_deploy_ritual.sh"
 echo "$(date +%F_%T) x2_deploy: STARTED" >> $LOG
 
 # Partner-logo reel on the face display. Cosmetic only: runs AFTER the pose gate
 # and after deploy start, and swallows every failure, so it can never delay or
 # block ignition. Toggle live with L1/R1 chord -> interact/x2_face.sh toggle.
-( /home/run/getsolo/interact/x2_face.sh on >/dev/null 2>&1 \
+( /home/run/gear-sonic/interact/x2_face.sh on >/dev/null 2>&1 \
     && echo "$(date +%F_%T) face: logo reel ON" >> $LOG \
     || echo "$(date +%F_%T) face: logo reel FAILED (ignored)" >> $LOG ) &
