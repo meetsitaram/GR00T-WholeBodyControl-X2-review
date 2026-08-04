@@ -51,6 +51,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 - [Kinematic Planner](#kinematic-planner)
 - [SONIC Training](#sonic-training)
 - [TODOs](#todos)
+- [Operator Runbook (SKILL.md)](#operator-runbook)
 - [What's Included](#whats-included)
   - [Setup](#setup)
 - [Documentation](#documentation)
@@ -344,6 +345,19 @@ python check_environment.py
 Each use case has its own lightweight environment. The install scripts use `uv`
 and create isolated venvs automatically — you don't need to manage them manually.
 Training is the only one that requires Isaac Lab (installed separately).
+
+## Operator Runbook
+
+**[SKILL.md](SKILL.md)** is the end-to-end runbook for the X2 SONIC
+stacks: headless policy eval, gamepad-driven sim, VR teleop in sim, and
+real-robot deployment — including the gamepad ignition ritual, VR
+teleop + dataset recording, teardown order, and the safety invariants
+that must hold at every step.
+
+Companion reference:
+**[X2 Safety Checks](docs/source/references/x2_safety_checks.md)** —
+operator e-stop, the measured damping profile, watchdogs, and thermal
+alerting.
 
 ## Documentation
 
